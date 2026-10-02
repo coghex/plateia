@@ -68,6 +68,11 @@ These hold until the vision says otherwise:
   that passes the `review-approved` gate (`.github/workflows/review-gate.yml`)
   and, once CI exists, `build-test`. The kanban pipeline's drainer merges
   approved pull requests.
-- Documentation that belongs to a code change goes in the same pull request.
+- **Documentation** is tracked but never gated on CI or review. Land it on
+  `master` with `docs-push [-m "message"] <paths...>` from any worktree as soon
+  as it is ready, including documentation that goes with a code change: link
+  it from the pull request instead of committing it to the pull request's
+  branch. Markdown that tests read or agents execute is code and goes in the
+  pull request; `docs-push` refuses it and says why.
 - Keep pull requests focused: one issue per pull request unless the owner
   groups them.
