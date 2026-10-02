@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Local configuration and state: real values never enter this repository.
+# Ship examples as *.example instead.
+.env
+.env.*
+*.local
+*.local.*
+local/
+config.json
+config.toml
+secrets*
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
