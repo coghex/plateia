@@ -1,0 +1,12 @@
+{
+  "alias": "helper",
+  "assistant": "assistant",
+  "owner": "operator",
+  "logs": "~/.local/state/chat/logs",
+  "acks": "~/.local/state/chat/acks.jsonl",
+  "pchat": "/example/bin/pchat",
+  "manager_state": "~/.local/state/project-manager",
+  "projects": {
+    "alpha": {"channel": "#alpha", "prefix": "#a-", "manager": "a-manager"}
+  }
+}
