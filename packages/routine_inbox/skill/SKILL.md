@@ -36,7 +36,9 @@ Each scheduled run:
    acceptance, worker action, and resolution are different facts. A routine answer
    remains open until every outgoing fragment is accepted by the manager.
    An accepted escalation remains `waiting_owner` until a correlated owner or
-   manager answer/decision resolves the original question.
+   manager answer/decision resolves the original question. `awaiting_resolution`
+   means a resolution has begun but is unframed or incomplete; preserve it and do
+   not send another answer while waiting for a complete correlated resolution.
 
 Keep a run bounded to five items and stop before the next scheduled run. If a claim
 expires, re-collect and reconsider the current evidence before claiming again.

@@ -10,9 +10,11 @@ belong outside this public repository; there are no credential fields.
 
 The package and the existing chat adapter must be installed through the source/
 update/install lane approved for the shared skills. Staging is not deployment.
-`python3 -m routine_inbox.compat --installed <chat-scripts> --output <new-staging-dir>`
+`python3 -m routine_inbox.compat --installed <chat-scripts> --output <new-staging-dir>
+--package-root <reviewed-package-parent>`
 prepares three adapter files and refuses source drift. It never changes the originals.
-The adapter requires this package on Python's module path. Do not deploy only one
+The adapter loads its explicitly selected package parent without a global Python
+or shell environment change. Do not deploy only one
 side or restart a live bridge until the complete installation is approved,
 backed up and tested. Keep the existing service and credentials in place.
 
@@ -93,8 +95,9 @@ automatic retry. The send path rechecks logs for a resolution before attempting
 once. A successful CLI exit only establishes submission. Complete correlated
 outgoing fragments plus the exact manager's reply/ack establish acceptance.
 
-For an escalation, the manager should post the later owner resolution using the
-same request ID and `--reply-to` the original question's part-one server message ID.
+For an escalation, the manager should post the later owner resolution using `--to`
+the helper destination, the same request ID and `--reply-to` the original question's
+part-one server message ID. All resolution fragments must arrive before it closes.
 This closes `waiting_owner` without the assistant guessing that silence or an
 unrelated manager post settled it.
 

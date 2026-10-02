@@ -14,11 +14,17 @@ def replace(source, old, new):
     return source.replace(old,new,1)
 
 
-def stage(installed, output):
+def stage(installed, output, package_root):
     installed, output = Path(installed), Path(output)
+    package_root = Path(package_root).expanduser().absolute()
+    if not (package_root/'routine_inbox'/'protocol.py').is_file():
+        raise ValueError("package root must contain the reviewed routine_inbox package")
     sources = {name:(installed/name).read_text() for name in ("pchat","chatlib.py","chat-bridge")}
     s = sources["chatlib.py"]
-    s = replace(s,"import base64\n","import base64\nfrom routine_inbox.protocol import tags as routing_tags\n")
+    s = replace(s,"from pathlib import Path\n",
+                "from pathlib import Path\nimport sys\n"
+                f"sys.path.insert(0, {str(package_root)!r})\n"
+                "from routine_inbox.protocol import tags as routing_tags\n")
     s = replace(s,'def split_text(text: str, cont: str = "") -> list[str]:',
                 'def split_text(text: str, cont: str = "", max_bytes: int = MAX_TEXT) -> list[str]:')
     s = replace(s,'room = MAX_TEXT - len(prefix.encode())','room = max_bytes - len(prefix.encode())\n            if room < 1:\n                raise ChatError("continuation prefix exceeds message budget")')
@@ -100,5 +106,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--installed",required=True)
     parser.add_argument("--output",required=True)
+    parser.add_argument("--package-root",required=True,help="reviewed package parent; embedded in the private staged adapter")
     args = parser.parse_args()
-    stage(args.installed,args.output)
+    stage(args.installed,args.output,args.package_root)

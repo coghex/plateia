@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from routine_inbox.inbox import Blocked, Inbox
+from routine_inbox.inbox import Blocked, Inbox, config
 from routine_inbox.protocol import envelope, header, recipients, tags
 
 
@@ -210,12 +210,12 @@ class InboxTests(unittest.TestCase):
         bid=self.ready();self.prepare(bid,'escalate')
         self.append(self.echoed(bid));self.ack()
         self.assertEqual(self.box.poll()['items'][0]['status'],'waiting_owner')
-        self.append(self.entry('decision',routing=False,reply_to='m1',text='[decision job-1] Owner chose the documented option'))
+        self.append(self.entry('decision',reply_to='m1',text='[decision job-1] Owner chose the documented option'))
         self.assertEqual(self.box.poll()['items'],[])
 
     def test_manager_resolution_before_reply_prevents_new_action(self):
         bid=self.ready();token=self.box.claim(bid)['claim']
-        self.append(self.entry('decision',routing=False,reply_to='m1',text='[answer job-1] Already settled'))
+        self.append(self.entry('decision',reply_to='m1',text='[answer job-1] Already settled'))
         self.box.poll()
         with self.assertRaises(Blocked):self.box.prepare(bid,token,{'kind':'settled','answer':'x','source':'y'})
 
@@ -225,12 +225,12 @@ class InboxTests(unittest.TestCase):
 
     def test_prepare_rechecks_new_manager_resolution(self):
         bid=self.ready();token=self.box.claim(bid)['claim']
-        self.append(self.entry('decision',routing=False,reply_to='m1',text='[answer job-1] Already answered'))
+        self.append(self.entry('decision',reply_to='m1',text='[answer job-1] Already answered'))
         with self.assertRaises(Blocked):self.box.prepare(bid,token,{'kind':'settled','answer':'x','source':'y'})
 
     def test_send_rechecks_resolution_and_never_calls_transport(self):
         bid=self.ready();self.prepare(bid)
-        self.append(self.entry('decision',routing=False,reply_to='m1',text='[answer job-1] Already answered'))
+        self.append(self.entry('decision',reply_to='m1',text='[answer job-1] Already answered'))
         with self.assertRaises(Blocked):self.box.send(bid,lambda argv:self.fail('must not send'))
 
     def test_routing_identity_change_fails_closed(self):
@@ -263,6 +263,28 @@ class InboxTests(unittest.TestCase):
         with patch.object(self.box,'verify_manager',side_effect=Blocked('denied')):
             with self.assertRaises(Blocked):self.box.send(bid,lambda argv:self.fail('must not send'))
         self.assertEqual(self.box.poll()['items'][0]['status'],'prepared')
+
+    def test_missing_request_log_blocks_a_prepared_reply(self):
+        self.append(self.entry(channel='#a-job-1'))
+        bid=self.box.poll()['items'][0]['id'];self.prepare(bid)
+        (self.logs/'a-job-1.jsonl').unlink()
+        with self.assertRaises(Blocked):
+            self.box.send(bid,lambda argv:self.fail('must not reply with unknown channel coverage'))
+
+    def test_multipart_owner_resolution_waits_for_all_fragments(self):
+        bid=self.ready()
+        self.append(self.entry('d1',key='decision',part=1,parts=2,reply_to='m1',
+                               text='[decision job-1] Owner selected'))
+        self.assertEqual(len(self.box.poll()['items']),1)
+        self.append(self.entry('d2',key='decision',part=2,parts=2,reply_to='m1',
+                               text='… [decision job-1] the documented option'))
+        self.assertEqual(self.box.poll()['items'],[])
+
+    def test_malformed_config_shapes_are_blocked(self):
+        path=self.root/'bad.json'
+        for data in ([], {'projects':[]}, {**self.cfg,'manager_state':'/example/managers','projects':{'alpha':[]}}):
+            path.write_text(json.dumps(data))
+            with self.assertRaises(Blocked):config(path)
 
 
 if __name__ == '__main__':unittest.main()

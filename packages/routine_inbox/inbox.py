@@ -32,17 +32,19 @@ def timestamp(value):
 def config(path):
     data = json.loads(Path(path).read_text())
     required = {"alias", "assistant", "owner", "projects", "logs", "acks", "pchat", "manager_state"}
-    if not required <= data.keys() or not data["projects"]:
+    if not isinstance(data,dict) or not required <= data.keys() or not isinstance(data["projects"],dict) or not data["projects"]:
         raise Blocked("incomplete private routing manifest")
+    if any(not isinstance(data[k],str) or not data[k] for k in ('logs','acks','pchat','manager_state')):
+        raise Blocked("invalid private routing paths")
     names = [data[k] for k in ("alias", "assistant", "owner")]
     if any(not isinstance(n,str) or not TOKEN.fullmatch(n) for n in names):
         raise Blocked("invalid role or destination name")
     if len({n.lower() for n in names}) != 3:
         raise Blocked("destination alias and authenticated roles must be distinct")
-    for project in data["projects"].values():
-        if not {"channel", "prefix", "manager"} <= project.keys():
+    for name, project in data["projects"].items():
+        if not isinstance(name,str) or not TOKEN.fullmatch(name) or not isinstance(project,dict) or not {"channel", "prefix", "manager"} <= project.keys():
             raise Blocked("project lacks channel, prefix, or manager")
-        if not TOKEN.fullmatch(project["manager"]) or not all(
+        if any(not isinstance(project[k],str) for k in ('manager','channel','prefix')) or not TOKEN.fullmatch(project["manager"]) or not all(
                 re.fullmatch(r"#[a-z0-9_-]+",project[k]) for k in ("channel","prefix")):
             raise Blocked("invalid project routing identity")
     routes=list(data["projects"].values())
@@ -135,6 +137,11 @@ class Inbox:
     def problem(self, key, detail):
         self.db.execute("INSERT OR REPLACE INTO problems VALUES(?,?)", (key, detail))
 
+    def channel_problem(self, path, detail):
+        self.problem(str(path),detail)
+        self.db.execute("UPDATE batches SET problem=? WHERE channel=?",
+                        (detail,'#'+Path(path).stem))
+
     def manifest_digest(self):
         return hashlib.sha256(json.dumps(self.cfg,sort_keys=True).encode()).hexdigest()
 
@@ -150,14 +157,14 @@ class Inbox:
         paths = self.paths()
         missing = {r[0] for r in self.db.execute("SELECT path FROM cursors")} - {str(p) for p in paths}
         for path in missing:
-            self.problem(path,"previously observed channel log is missing; pending work retained")
+            self.channel_problem(path,"previously observed channel log is missing; pending work retained")
         for path in paths:
             st = path.stat()
             inode = f"{st.st_dev}:{st.st_ino}"
             cur = self.db.execute("SELECT * FROM cursors WHERE path=?", (str(path),)).fetchone()
             offset = cur["offset"] if cur else 0
             if cur and (cur["inode"] != inode or st.st_size < offset):
-                self.problem(str(path), "log replaced or truncated; cursor retained; manual reconciliation required")
+                self.channel_problem(path, "log replaced or truncated; cursor retained; manual reconciliation required")
                 continue
             with path.open("rb") as stream:
                 stream.seek(offset)
@@ -165,7 +172,7 @@ class Inbox:
             complete = raw.rfind(b"\n") + 1
             budget -= len(raw)
             if raw and not complete and st.st_size-offset > len(raw):
-                self.problem(str(path),"record exceeds collection budget; manual reconciliation required")
+                self.channel_problem(path,"record exceeds collection budget; manual reconciliation required")
             for line in raw[:complete].splitlines(keepends=True):
                 line_at = offset
                 offset += len(line)
@@ -178,6 +185,7 @@ class Inbox:
                     self.message(entry)
                 except (ValueError, KeyError, TypeError) as error:
                     self.problem(f"{path}:{line_at}", f"unreadable/untrusted record: {error}")
+                    self.channel_problem(path,"channel contains an unreadable record; pending work needs reconciliation")
             self.db.execute("INSERT OR REPLACE INTO cursors VALUES(?,?,?)", (str(path), inode, offset))
             if budget <= 0:
                 break
@@ -256,7 +264,21 @@ class Inbox:
                            and header(m.get("text",""))[:2] in
                            (("answer",batch["request"]),("decision",batch["request"]))]
             if resolutions:
-                self.db.execute("UPDATE items SET status='resolved' WHERE id=?",(item["id"],))
+                groups = {}
+                for resolution in resolutions:
+                    route = resolution.get('routing')
+                    if route:
+                        groups.setdefault((resolution['from'],route['key']),[]).append(resolution)
+                complete = False
+                for group in groups.values():
+                    totals = {m['routing']['parts'] for m in group}
+                    parts = {m['routing']['part'] for m in group}
+                    bodies = {n:{m['text'] for m in group if m['routing']['part']==n} for n in parts}
+                    if (len(totals)==1 and parts==set(range(1,next(iter(totals))+1))
+                            and all(len(values)==1 for values in bodies.values())):
+                        complete = True
+                self.db.execute("UPDATE items SET status=? WHERE id=?",
+                                ('resolved' if complete else 'awaiting_resolution',item["id"]))
                 continue
             if not item["action"]:
                 continue
