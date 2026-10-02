@@ -167,8 +167,10 @@ class CoreTests(unittest.TestCase):
         self.ready()
         before = self.query('SELECT * FROM cursors')
         self.adapter.messages.append(self.record('other', text='[question job-17] Conflicting text'))
-        with self.assertRaises(AdapterError): self.box.poll()
-        self.assertEqual(self.query('SELECT * FROM cursors'), before)
+        result = self.box.poll()
+        self.assertEqual(result['items'][0]['status'], 'quarantined')
+        self.assertTrue(result['problems'])
+        self.assertNotEqual(self.query('SELECT * FROM cursors'), before)
         self.assertEqual(len(self.query('SELECT * FROM items')), 1)
 
     def test_ack_before_delivery_survives_cursor_advance(self):
@@ -180,7 +182,9 @@ class CoreTests(unittest.TestCase):
 
     def test_send_uses_original_target_and_explicit_manager_recipient(self):
         self.ready(target='#a-work'); outgoing = self.send()
-        self.assertEqual(self.adapter.sends[0]['target'], '#a-work')
+        outgoing = self.adapter.sends[0]
+        self.assertEqual(outgoing['target'], '#a-work')
+        self.assertEqual(outgoing['tags']['+plateia/key'], self.item()['action'])
         self.assertEqual(outgoing['tags']['+plateia/to'], 'alpha-lead')
         self.assertEqual(outgoing['tags']['+draft/reply'], 'q1')
         self.assertEqual(outgoing['tags']['+plateia/auto'], 'settled')
@@ -221,11 +225,13 @@ class CoreTests(unittest.TestCase):
         self.ready(); outgoing = self.send()
         self.adapter.messages += [self.echo(outgoing, 'a1', parts=2), self.echo(outgoing, 'b1', parts=2),
                                   self.echo(outgoing, 'a2', part=2, parts=2)]
-        self.assertEqual(self.box.poll()['items'][0]['status'], 'submitted')
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'evidence_conflict')
 
     def test_escalation_waits_for_owner_resolution(self):
         self.ready(); outgoing = self.send(kind='escalate')
-        self.adapter.messages.append(self.echo(outgoing)); self.ack()
+        self.adapter.messages.append(self.echo(outgoing))
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'delivered')
+        self.ack()
         self.assertEqual(self.box.poll()['items'][0]['status'], 'waiting_owner')
         self.adapter.messages.append(self.resolution(account='operator'))
         self.assertEqual(self.box.poll()['items'], [])
@@ -256,6 +262,148 @@ class CoreTests(unittest.TestCase):
                 self.box.poll()
                 self.assertEqual(self.item()['status'], 'resolved')
                 self.assertEqual(len(self.adapter.sends), sends)
+
+    def test_reply_filter_cannot_stitch_around_missing_auto_or_invalid_envelope(self):
+        for broken in ('+plateia/auto', '+plateia/part'):
+            with self.subTest(broken=broken):
+                self.state = self.root / ('barrier-' + broken.rsplit('/', 1)[1])
+                self.adapter = FakeAdapter(); self.box = Inbox(self.state, self.cfg, self.adapter, clock=lambda: self.now)
+                self.box.initialize(); self.now += 1; self.ready(); outgoing = self.send(outcome='uncertain')
+                bad = self.echo(outgoing, 'b1', parts=2); bad['tags'].pop(broken)
+                self.adapter.messages += [self.echo(outgoing, 'a1', parts=2), bad,
+                                          self.echo(outgoing, 'b2', part=2, parts=2)]
+                self.ack('a1'); self.ack('b2')
+                result = self.box.poll()
+                self.assertEqual(result['items'][0]['status'], 'evidence_conflict')
+                self.assertTrue(result['problems'])
+
+    def test_mixed_kind_and_recipient_questions_are_quarantined(self):
+        for change in ('kind', 'recipient'):
+            with self.subTest(change=change):
+                self.state = self.root / ('framing-' + change)
+                self.adapter = FakeAdapter(); self.box = Inbox(self.state, self.cfg, self.adapter, clock=lambda: self.now)
+                self.box.initialize(); self.now += 1
+                first = self.record(parts=2, text='[blocked job-17] Trouble' if change == 'kind' else None)
+                second = self.record('q2', part=2, parts=2)
+                if change == 'recipient': second['tags']['+plateia/to'] = 'other-helper'
+                self.adapter.messages += [first, second]
+                result = self.box.poll()
+                self.assertEqual(result['items'][0]['status'], 'quarantined')
+                self.assertFalse(result['items'][0]['claimable'])
+                with self.assertRaises(Blocked): self.box.claim('q1')
+
+    def test_invalid_or_nonquestion_fragment_never_disappears_from_assembly(self):
+        for kind in ('status', 'bad-envelope'):
+            with self.subTest(kind=kind):
+                self.state = self.root / ('question-barrier-' + kind)
+                self.adapter = FakeAdapter(); self.box = Inbox(self.state, self.cfg, self.adapter, clock=lambda: self.now)
+                self.box.initialize(); self.now += 1
+                middle = self.record('middle', part=1, parts=2, text='[status job-17] different')
+                if kind == 'bad-envelope': middle['tags'].pop('+plateia/part')
+                self.adapter.messages += [self.record(parts=2), middle, self.record('last', part=2, parts=2)]
+                result = self.box.poll()
+                self.assertEqual(result['items'][0]['status'], 'quarantined')
+                self.assertFalse(result['items'][0]['claimable'])
+
+    def test_headerless_direct_questions_are_visible_quarantine(self):
+        self.adapter.messages += [self.record('one', route=False, text='@helper Which default?'),
+                                  self.record('two', route=False, text='mgr: helper: Which default?')]
+        rows = self.box.poll()['items']
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row['status'] == 'quarantined' for row in rows))
+
+    def test_expiry_during_outgoing_prevents_adapter_invocation(self):
+        self.ready(); token, _ = self.prepare(); original = self.box.outgoing
+        def expire(row):
+            outgoing = original(row); self.now += 601; return outgoing
+        with patch.object(self.box, 'outgoing', side_effect=expire):
+            with self.assertRaises(Blocked): self.box.send('q1', token)
+        self.assertEqual(self.adapter.sends, [])
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'uncertain')
+
+    def test_late_conflicting_copy_reopens_acceptance_as_visible_conflict(self):
+        for kind in ('settled', 'escalate'):
+            with self.subTest(kind=kind):
+                self.state = self.root / ('late-' + kind)
+                self.adapter = FakeAdapter(); self.box = Inbox(self.state, self.cfg, self.adapter, clock=lambda: self.now)
+                self.box.initialize(); self.now += 1; self.ready(); outgoing = self.send(kind=kind)
+                self.adapter.messages.append(self.echo(outgoing)); self.ack(); self.box.poll()
+                self.assertEqual(self.item()['status'], 'accepted' if kind == 'settled' else 'waiting_owner')
+                self.adapter.messages.append(self.echo(outgoing, 'conflict', text='[answer job-17] different'))
+                result = self.box.poll()
+                self.assertEqual(result['items'][0]['status'], 'evidence_conflict')
+                self.assertTrue(result['problems'])
+                self.assertEqual(self.box.poll()['items'][0]['status'], 'evidence_conflict')
+
+    def test_unrecognized_attested_account_does_not_block_other_questions(self):
+        for n, account in enumerate(('bob|away', 'alice[m]', 'bystanderé')):
+            self.adapter.messages.append(self.record('bystander-' + str(n), account=account))
+        self.assertEqual(self.ready(), 'q1')
+
+    def test_repin_lifetime_preserves_uncertain_action_and_records_audit(self):
+        self.ready(); self.send(outcome='uncertain'); action = self.item()['action']
+        proposed = {**self.cfg, 'claim_seconds': 900}
+        box = Inbox(self.state, proposed, self.adapter, clock=lambda: self.now)
+        with self.assertRaises(Blocked): box.poll()
+        box.repin_config('operator approves longer claims')
+        self.assertEqual(box.poll()['items'][0]['status'], 'uncertain')
+        self.assertEqual(self.item()['action'], action)
+        self.assertEqual(self.query("SELECT operation FROM audit WHERE operation='repin_config'")[0]['operation'], 'repin_config')
+        with self.assertRaises(Blocked): box.claim('q1')
+
+    def test_repin_checks_unread_obligations_before_manager_change(self):
+        self.adapter.messages.append(self.record())
+        proposed = deepcopy(self.cfg); proposed['projects']['alpha']['manager'] = 'new-manager'
+        box = Inbox(self.state, proposed, self.adapter, clock=lambda: self.now)
+        with self.assertRaises(Blocked): box.repin_config('operator requested rotation')
+        self.assertEqual(self.box.poll()['items'][0]['id'], 'q1')
+
+    def test_repin_added_project_starts_fresh_without_dropping_existing_work(self):
+        self.ready()
+        old = self.record('old-gamma', account='g-manager', target='#g-work', request='gamma-1')
+        self.now += 100
+        proposed = deepcopy(self.cfg)
+        proposed['projects']['gamma'] = {'prefix': '#g-', 'request_prefix': 'gamma-',
+                                         'manager': 'g-manager', 'recipient': 'g-manager'}
+        box = Inbox(self.state, proposed, self.adapter, clock=lambda: self.now)
+        box.repin_config('operator adds gamma')
+        self.adapter.messages += [old, self.record('new-gamma', key='new', account='g-manager', target='#g-work', request='gamma-2')]
+        self.assertEqual({i['id'] for i in box.poll()['items']}, {'q1', 'new-gamma'})
+
+    def test_repin_manager_rotation_after_terminal_item_keeps_history(self):
+        self.ready(); outgoing = self.send(); self.adapter.messages.append(self.echo(outgoing)); self.ack(); self.box.poll()
+        proposed = deepcopy(self.cfg); proposed['projects']['alpha']['manager'] = 'new-manager'
+        box = Inbox(self.state, proposed, self.adapter, clock=lambda: self.now)
+        box.repin_config('operator rotates manager after completion')
+        self.adapter.messages.append(self.record('new-question', key='new', account='new-manager'))
+        self.assertEqual(box.poll()['items'][0]['id'], 'new-question')
+        self.assertEqual(self.item()['status'], 'accepted')
+
+    def test_partial_resolution_is_visible_and_not_repeatedly_claimed(self):
+        self.ready(); self.adapter.messages.append(self.resolution() | {'tags': {}})
+        result = self.box.poll()
+        self.assertFalse(result['items'][0]['claimable']); self.assertTrue(result['problems'])
+        with self.assertRaises(Blocked): self.box.claim('q1')
+
+    def test_config_repin_command_is_explicit_and_preserves_existing_items(self):
+        self.ready()
+        self.configfile.write_text(json.dumps({**self.cfg, 'claim_seconds': 900}))
+        self.assertEqual(self.cli('poll'), 75)
+        self.assertEqual(self.cli('repin-config', '--reason', 'operator approved duration'), 0)
+        self.assertEqual(self.cli('poll'), 0)
+        self.assertEqual(self.item()['status'], 'new')
+
+    def test_poll_does_not_publish_claim_bearer_token(self):
+        self.ready(); self.prepare()
+        self.assertNotIn('claim', self.box.poll()['items'][0])
+
+    def test_reinitialization_never_mutates_an_older_database(self):
+        state = self.root / 'older'; state.mkdir()
+        with contextlib.closing(sqlite3.connect(state / 'inbox.sqlite3')) as db:
+            db.execute('CREATE TABLE legacy(value TEXT)'); db.commit()
+        before = self.snapshot(state)
+        with self.assertRaises(Blocked): Inbox(state, self.cfg, self.adapter).initialize()
+        self.assertEqual(self.snapshot(state), before)
 
     def test_invalid_resolution_cannot_close_question(self):
         self.ready()
@@ -336,7 +484,7 @@ class CoreTests(unittest.TestCase):
         self.ready(); outgoing = self.send(outcome='unknown')
         self.adapter.messages += [self.echo(outgoing, 'first'), self.echo(outgoing, 'second', text='[answer job-17] different')]
         self.ack('first'); self.ack('second')
-        self.assertEqual(self.box.poll()['items'][0]['status'], 'uncertain')
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'evidence_conflict')
 
     def test_malformed_server_record_blocks_without_advancing_cursor(self):
         self.adapter.messages.append(self.record() | {'at': 'bad timestamp'})

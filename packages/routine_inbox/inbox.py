@@ -78,50 +78,49 @@ def decode(record):
     if not isinstance(record.get("tags", {}), dict):
         raise AdapterError("invalid normalized tags")
     raw = record.get("tags", {})
-    routing = envelope(raw)
+    routing_error = None
+    try:
+        routing = envelope(raw)
+    except ValueError as error:
+        routing, routing_error = None, str(error)
     kind, request, body, continued = header(record["text"])
     account = record.get("account")
-    if account is not None and (not isinstance(account, str) or not TOKEN.fullmatch(account)):
+    if account is not None and not isinstance(account, str):
         raise AdapterError("invalid attested account")
     if record.get("reply_to") is not None and not isinstance(record["reply_to"], str):
         raise AdapterError("invalid reply correlation")
-    return {**record, "account": account.lower() if account else None,
-            "routing": routing, "kind": kind, "request": request, "body": body,
+    return {**record, "account": account.lower() if account and TOKEN.fullmatch(account) else account,
+            "routing": routing, "routing_error": routing_error, "kind": kind, "request": request, "body": body,
             "continued": continued}
 
 
-def complete_copies(records):
-    """Accept only noninterleaved, ordered complete copies; never stitch retries.
-
-    A second part one before completion makes this key ambiguous. The protocol
-    has no per-attempt identity, so ambiguity is deliberately not guessed away.
-    """
+def complete_copies(records, valid=lambda message: True):
+    """Return complete copies and an explicit conflict, preserving every boundary."""
     copies, current = [], []
     for m in records:
         route = m.get("routing")
-        if not route:
-            return []
+        if not route or m.get("routing_error") or not valid(m):
+            return [], "inconsistent reply framing or correlation"
         part, total = route["part"], route["parts"]
         if part == 1:
             if current:
-                return []
+                return [], "interleaved multipart copies"
             current = [m]
         elif not current or part != len(current) + 1 or total != current[0]["routing"]["parts"]:
-            return []
+            return [], "orphaned or inconsistent multipart boundary"
         else:
             current.append(m)
         if len(current) == total:
             if any(m["kind"] != current[0]["kind"] or m["routing"]["to"] != current[0]["routing"]["to"]
                    or m["routing"].get("auto") != current[0]["routing"].get("auto") for m in current):
-                return []
+                return [], "multipart framing conflicts"
             copies.append(current)
             current = []
-    # A complete earlier copy remains usable when a later retry is incomplete.
     if copies:
         bodies = [[m["text"] for m in copy] for copy in copies]
         if any(body != bodies[0] for body in bodies[1:]):
-            return []
-    return copies
+            return [], "complete copies have conflicting text"
+    return copies, None
 
 
 class Inbox:
@@ -134,6 +133,8 @@ class Inbox:
 
     @contextlib.contextmanager
     def operation(self, initialize=False):
+        if initialize and (self.state / "inbox.sqlite3").exists():
+            raise Blocked("existing inbox must not be reinitialized or implicitly migrated")
         if initialize:
             self.state.mkdir(parents=True, exist_ok=True)
         elif not self.state.is_dir():
@@ -148,6 +149,8 @@ class Inbox:
                 raise Blocked("another inbox operation holds the lock") from None
             path = self.state / "inbox.sqlite3"
             try:
+                if initialize and path.exists():
+                    raise Blocked("inbox appeared during initialization; preserve it")
                 if not initialize and not path.exists():
                     raise Blocked("initialize explicitly before using an inbox")
                 db = sqlite3.connect(path, timeout=0)
@@ -155,7 +158,7 @@ class Inbox:
                 db.row_factory = sqlite3.Row
                 if initialize:
                     self.schema()
-                elif db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0] != "2":
+                elif db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0] != "3":
                     raise Blocked("unsupported inbox schema; preserve it for explicit migration")
                 with db:
                     yield
@@ -170,10 +173,12 @@ class Inbox:
         PRAGMA synchronous=FULL;
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS cursors(stream TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS messages(msgid TEXT PRIMARY KEY, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS messages(msgid TEXT PRIMARY KEY, payload TEXT NOT NULL,
+          account TEXT, target TEXT, message_key TEXT);
+        CREATE INDEX IF NOT EXISTS message_key_index ON messages(account,target,message_key);
         CREATE TABLE IF NOT EXISTS acks(identity TEXT PRIMARY KEY, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS groups(gid TEXT PRIMARY KEY, project TEXT, target TEXT,
-          account TEXT, request TEXT, parts INTEGER, root TEXT, problem TEXT);
+          account TEXT, request TEXT, parts INTEGER, root TEXT, problem TEXT, framing TEXT, context TEXT);
         CREATE TABLE IF NOT EXISTS fragments(gid TEXT, part INTEGER, msgid TEXT, body TEXT,
           PRIMARY KEY(gid,part));
         CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY, gid TEXT UNIQUE, status TEXT,
@@ -190,7 +195,9 @@ class Inbox:
             if self.db.execute("SELECT 1 FROM meta").fetchone():
                 raise Blocked("already initialized; preserve pending work")
             self.db.executemany("INSERT INTO meta VALUES(?,?)", [
-                ("schema", "2"), ("cutover", str(self.clock())), ("configuration", self.digest())])
+                ("schema", "3"), ("cutover", str(self.clock())), ("configuration", self.digest()),
+                ("configuration_snapshot", json.dumps(self.cfg, sort_keys=True)),
+                ("project_cutovers", json.dumps({name: self.clock() for name in self.cfg["projects"]}))])
             return {"initialized": True, "historical_requests_enrolled": 0}
 
     def project(self, target):
@@ -204,7 +211,7 @@ class Inbox:
     def read(self):
         if self.db.execute("SELECT value FROM meta WHERE key='configuration'").fetchone()[0] != self.digest():
             raise Blocked("configuration changed; explicit reconciliation required")
-        cutoff = float(self.db.execute("SELECT value FROM meta WHERE key='cutover'").fetchone()[0])
+        cutoffs = json.loads(self.db.execute("SELECT value FROM meta WHERE key='project_cutovers'").fetchone()[0])
         batches = []
         for name, p in self.cfg["projects"].items():
             selector = {k: p[k] for k in ("channel", "prefix") if k in p}
@@ -213,14 +220,10 @@ class Inbox:
         # All reads must succeed before any evidence or cursor is committed.
         for name, batch in batches:
             for raw in batch.records:
-                try:
-                    entry = decode(raw)
-                except ValueError as error:
-                    self.problem(raw.get("msgid", "invalid"), str(error))
-                    continue  # invalid client routing is not evidence
+                entry = decode(raw)
                 if self.project(entry["target"])[0] != name:
                     raise AdapterError("adapter returned a record outside its target selector")
-                if timestamp(entry["at"]) < cutoff:
+                if timestamp(entry["at"]) < cutoffs[name]:
                     continue
                 self.message(entry)
         for ack in ack_batch.records:
@@ -242,6 +245,11 @@ class Inbox:
     def problem(self, identity, detail):
         self.db.execute("INSERT OR REPLACE INTO problems VALUES(?,?)", (identity, detail))
 
+    def quarantine_group(self, gid, detail):
+        self.problem(gid, detail)
+        self.db.execute("UPDATE groups SET problem=? WHERE gid=?", (detail, gid))
+        self.db.execute("UPDATE items SET status=CASE WHEN attempts=0 THEN 'quarantined' ELSE 'evidence_conflict' END WHERE gid=?", (gid,))
+
     def message(self, e):
         mid = e["msgid"]
         payload = json.dumps(e, sort_keys=True)
@@ -250,76 +258,135 @@ class Inbox:
             if previous[0] != payload:
                 raise AdapterError("stable message identity has conflicting contents")
             return
-        self.db.execute("INSERT INTO messages VALUES(?,?)", (mid, payload))
+        raw_key = e.get("tags", {}).get("+plateia/key")
+        raw_key = raw_key if isinstance(raw_key, str) else None
+        self.db.execute("INSERT INTO messages VALUES(?,?,?,?,?)", (mid, payload, e["account"], e["target"], raw_key))
         name, p = self.project(e["target"])
+        if e.get("routing_error"):
+            self.problem(mid, e["routing_error"])
+            if e["account"] == p["manager"] and raw_key:
+                gid = hashlib.sha256(json.dumps([name, e["target"], e["account"], raw_key]).encode()).hexdigest()
+                self.quarantine_group(gid, "invalid multipart question envelope")
+            return  # retain its boundary, but never count it as evidence
         if e["account"] != p["manager"] or e["account"] == self.cfg["assistant"]:
-            return
-        if e["kind"] not in ("question", "blocked"):
             return
         route = e["routing"]
         addressed = self.cfg["alias"] in (route["to"] if route else recipients(e["text"], {self.cfg["alias"]}))
-        if not addressed:
+        key = route["key"] if route else mid
+        gid = hashlib.sha256(json.dumps([name, e["target"], e["account"], key]).encode()).hexdigest()
+        previous = self.db.execute("SELECT * FROM groups WHERE gid=?", (gid,)).fetchone()
+        if e["kind"] not in (None, "question", "blocked") and not previous:
+            return
+        if not addressed and not previous:
             return
         if e["request"] and any(e["request"].startswith(other["request_prefix"])
                 for project, other in self.cfg["projects"].items() if project != name):
             self.problem(mid, "request ID belongs to another project")
             return
-        key = route["key"] if route else mid
-        gid = hashlib.sha256(json.dumps([name, e["target"], e["account"], key]).encode()).hexdigest()
         part, parts = (route["part"], route["parts"]) if route else (1, 1)
         problem = None if route and e["request"] and e["kind"] == "question" else "legacy or blocked question requires manager reconciliation"
-        previous = self.db.execute("SELECT * FROM groups WHERE gid=?", (gid,)).fetchone()
-        if previous and (previous["parts"] != parts or previous["request"] != e["request"]):
-            raise AdapterError("multipart question metadata conflicts")
+        framing = json.dumps({"kind": e["kind"], "to": route["to"] if route else None,
+                              "auto": route.get("auto") if route else None}, sort_keys=True)
+        context = json.dumps({"assistant": self.cfg["assistant"], "owner": self.cfg["owner"],
+                              "alias": self.cfg["alias"], "manager": p["manager"], "recipient": p["recipient"]})
+        if route:
+            for raw in self.db.execute("SELECT payload FROM messages WHERE account=? AND target=? AND message_key=?",
+                                       (e["account"], e["target"], raw_key)):
+                prior = json.loads(raw[0])
+                pr = prior["routing"]
+                if (not pr or prior.get("routing_error") or prior["kind"] != e["kind"]
+                        or prior["request"] != e["request"] or pr["parts"] != parts
+                        or pr["to"] != route["to"] or pr.get("auto") != route.get("auto")):
+                    problem = "multipart question framing conflicts"
+        if previous and (previous["parts"] != parts or previous["request"] != e["request"]
+                         or previous["framing"] != framing):
+            problem = "multipart question framing conflicts"
         fragment = self.db.execute("SELECT body FROM fragments WHERE gid=? AND part=?", (gid, part)).fetchone()
         if fragment and fragment[0] != e["body"]:
-            raise AdapterError("multipart question content conflicts")
-        self.db.execute("INSERT OR IGNORE INTO groups VALUES(?,?,?,?,?,?,?,?)",
-                        (gid, name, e["target"], e["account"], e["request"], parts, mid if part == 1 else None, problem))
+            problem = "multipart question content conflicts"
+        self.db.execute("INSERT OR IGNORE INTO groups VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (gid, name, e["target"], e["account"], e["request"], parts,
+                         mid if part == 1 else None, problem, framing, context))
+        if problem:
+            self.quarantine_group(gid, problem)
         self.db.execute("INSERT OR IGNORE INTO fragments VALUES(?,?,?,?)", (gid, part, mid, e["body"]))
         if part == 1:
             self.db.execute("UPDATE groups SET root=COALESCE(root,?) WHERE gid=?", (mid, gid))
         group = self.db.execute("SELECT * FROM groups WHERE gid=?", (gid,)).fetchone()
         count = self.db.execute("SELECT count(*) FROM fragments WHERE gid=?", (gid,)).fetchone()[0]
-        if group["root"] and count == parts:
+        if group["root"] and (count == group["parts"] or group["problem"]):
             self.db.execute("INSERT OR IGNORE INTO items(id,gid,status) VALUES(?,?,?)",
-                            (group["root"], gid, "quarantined" if problem else "new"))
+                            (group["root"], gid, "quarantined" if group["problem"] else "new"))
 
     def row(self, item):
-        return self.db.execute("SELECT i.*,g.project,g.target,g.request,g.problem FROM items i JOIN groups g USING(gid) WHERE id=?", (item,)).fetchone()
+        return self.db.execute("SELECT i.*,g.project,g.target,g.request,g.problem,g.context FROM items i JOIN groups g USING(gid) WHERE id=?", (item,)).fetchone()
+
+    def conflict(self, row, detail):
+        self.problem(row["id"], detail)
+        if row["status"] != "evidence_conflict":
+            self.db.execute("INSERT INTO audit VALUES(?,?,?,?)",
+                            (self.clock(), row["id"], "evidence_conflict", row["status"] + ": " + detail))
+        self.db.execute("UPDATE items SET status='evidence_conflict' WHERE id=?", (row["id"],))
+
+    def resolution_evidence(self, row, messages):
+        context = json.loads(row["context"])
+        related = [m for m in messages if m["account"] in (context["manager"], context["owner"])
+                   and m["target"] == row["target"]]
+        def references(m):
+            return m.get("reply_to") == row["id"] and m["request"] == row["request"] and m["kind"] in ("answer", "decision")
+        groups = {}
+        for m in related:
+            key = m.get("tags", {}).get("+plateia/key")
+            if isinstance(key, str):
+                groups.setdefault((m["account"], key), []).append(m)
+        complete = False
+        for group in groups.values():
+            if any(references(m) for m in group):
+                copies, conflict = complete_copies(group, references)
+                if conflict:
+                    return False, True, conflict
+                complete |= bool(copies)
+        return complete, any(references(m) for m in related), None
 
     def reconcile(self):
         messages = [json.loads(r[0]) for r in self.db.execute("SELECT payload FROM messages ORDER BY rowid")]
         acks = [json.loads(r[0]) for r in self.db.execute("SELECT payload FROM acks")]
-        for ident in [r[0] for r in self.db.execute("SELECT id FROM items WHERE status NOT IN ('accepted','resolved','quarantined')")]:
+        for ident in [r[0] for r in self.db.execute("SELECT id FROM items WHERE status NOT IN ('resolved','quarantined')")]:
             row = self.row(ident)
-            p = self.cfg["projects"][row["project"]]
-            resolutions = [m for m in messages if m["account"] in (p["manager"], self.cfg["owner"])
-                and m["target"] == row["target"] and m.get("reply_to") == ident
-                and m["request"] == row["request"] and m["kind"] in ("answer", "decision")]
-            groups = {}
-            for m in resolutions:
-                if m["routing"]:
-                    groups.setdefault((m["account"], m["routing"]["key"]), []).append(m)
-            if any(complete_copies(group) for group in groups.values()):
+            context = json.loads(row["context"])
+            resolved, pending_resolution, conflict = self.resolution_evidence(row, messages)
+            if conflict:
+                self.conflict(row, conflict)
+                continue
+            if resolved:
+                self.db.execute("DELETE FROM problems WHERE identity IN (?,?)", (ident, ident + ':resolution'))
                 self.db.execute("UPDATE items SET status='resolved' WHERE id=?", (ident,))
                 continue
+            if pending_resolution:
+                self.problem(ident + ':resolution', 'incomplete or unframed resolution; automatic handling suspended')
             if row["status"] == "sending" and row["claim_until"] <= self.clock():
                 self.db.execute("UPDATE items SET status='uncertain' WHERE id=?", (ident,))
             if not row["attempts"]:
                 continue
             decision = json.loads(row["decision"])
-            replies = [m for m in messages if m["account"] == self.cfg["assistant"]
-                and m["target"] == row["target"] and m.get("reply_to") == ident
-                and m["request"] == row["request"] and m["kind"] == "answer"
-                and m["routing"] and m["routing"]["key"] == row["action"]
-                and m["routing"]["to"] == [p["recipient"]]
-                and m["routing"].get("auto") == decision["kind"]]
-            copies = complete_copies(replies)
-            if not copies:
+            # Preserve every physical boundary from this sender/target/action.
+            # Validate correlation and markers only after retaining the sequence.
+            replies = [m for m in messages if m["account"] == context["assistant"]
+                and m["target"] == row["target"]
+                and m.get("tags", {}).get("+plateia/key") == row["action"]]
+            def valid_reply(m):
+                return (m.get("reply_to") == ident and m["request"] == row["request"]
+                        and m["kind"] == "answer" and m["routing"]["to"] == [context["recipient"]]
+                        and m["routing"].get("auto") == decision["kind"])
+            copies, conflict = complete_copies(replies, valid_reply)
+            if conflict:
+                self.conflict(row, conflict)
                 continue
-            accepted = {a["msgid"] for a in acks if a["account"] == p["manager"] and a["target"] == row["target"]}
-            accepted |= {m.get("reply_to") for m in messages if m["account"] == p["manager"] and m["target"] == row["target"]}
+            if not copies or row["status"] == "evidence_conflict":
+                continue
+            accepted = {a["msgid"] for a in acks if a["account"] == context["manager"] and a["target"] == row["target"]}
+            accepted |= {m.get("reply_to") for m in messages if m["account"] == context["manager"]
+                         and m["target"] == row["target"] and not m.get("routing_error")}
             status = "delivered"
             if any({m["msgid"] for m in copy} <= accepted for copy in copies):
                 status = "waiting_owner" if decision["kind"] == "escalate" else "accepted"
@@ -338,8 +405,11 @@ class Inbox:
             for ident in [r[0] for r in self.db.execute("SELECT id FROM items WHERE status NOT IN ('accepted','resolved') ORDER BY rowid")]:
                 row = dict(self.row(ident))
                 row["text"] = "\n".join(r[0] for r in self.db.execute("SELECT body FROM fragments WHERE gid=? ORDER BY part", (row["gid"],)))
-                row["claimable"] = row["status"] in ("new", "send_failed") or (
-                    row["status"] == "claimed" and row["claim_until"] <= self.clock())
+                suspended = self.db.execute("SELECT 1 FROM problems WHERE identity=?", (ident + ':resolution',)).fetchone()
+                row["claimable"] = not suspended and (row["status"] in ("new", "send_failed") or (
+                    row["status"] == "claimed" and row["claim_until"] <= self.clock()))
+                row.pop("claim", None)  # only claim() returns the bearer token
+
                 items.append(row)
             items.sort(key=lambda i: not i["claimable"])
             result = {"items": items[:limit], "remaining": max(0, len(items)-limit),
@@ -355,6 +425,8 @@ class Inbox:
         with self.operation():
             self.refresh()
             row = self.row(ident)
+            if self.db.execute("SELECT 1 FROM problems WHERE identity=?", (ident + ':resolution',)).fetchone():
+                raise Blocked("resolution evidence requires reconciliation")
             if not row or not (row["status"] in ("new", "send_failed") or
                     row["status"] == "claimed" and row["claim_until"] <= self.clock()):
                 raise Blocked("item is not claimable")
@@ -408,6 +480,8 @@ class Inbox:
             outgoing = self.outgoing(row)
             self.db.execute("UPDATE items SET status='sending',attempts=attempts+1 WHERE id=?", (ident,))
             self.db.commit()  # crash after this point must never cause an automatic duplicate
+            if row["claim_until"] <= self.clock():
+                raise Blocked("claim expired before Send; retain committed intent without dispatch")
             try:
                 result = self.adapter.send(**outgoing)
             except Exception:
@@ -436,3 +510,39 @@ class Inbox:
             self.db.execute("INSERT INTO audit VALUES(?,?,?,?)", (self.clock(), ident, "authorize_resend", reason))
             self.db.execute("UPDATE items SET status='new',claim=NULL,claim_until=NULL WHERE id=?", (ident,))
             return {"id": ident, "action": row["action"], "status": "new"}
+
+    def repin_config(self, reason):
+        """Explicit operator-only reconciliation; never abandons pending evidence."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise Blocked("configuration reconciliation requires an operator reason")
+        with self.operation():
+            old = json.loads(self.db.execute("SELECT value FROM meta WHERE key='configuration_snapshot'").fetchone()[0])
+            proposed = self.cfg
+            try:
+                self.cfg = old
+                self.refresh()  # include unread old-route obligations before changing identities
+            finally:
+                self.cfg = proposed
+            for row in self.db.execute("SELECT g.*,i.status FROM groups g LEFT JOIN items i USING(gid) WHERE i.status IS NULL OR i.status NOT IN ('accepted','resolved','quarantined')"):
+                project, route = self.project(row["target"])
+                context = json.loads(row["context"])
+                if (project != row["project"] or not route or route["manager"] != context["manager"]
+                        or route["recipient"] != context["recipient"]
+                        or any(self.cfg[k] != context[k] for k in ('assistant','owner','alias'))
+                        or row["request"] and any(row["request"].startswith(p["request_prefix"])
+                            for n, p in self.cfg["projects"].items() if n != project)):
+                    raise Blocked("new configuration changes pending question identity or routing")
+            cutoffs = json.loads(self.db.execute("SELECT value FROM meta WHERE key='project_cutovers'").fetchone()[0])
+            for name, route in self.cfg["projects"].items():
+                before = old['projects'].get(name)
+                if before is None:
+                    cutoffs[name] = self.clock()
+                    self.db.execute("DELETE FROM cursors WHERE stream=?", (name,))
+                elif any(before.get(k) != route.get(k) for k in ('channel','prefix')):
+                    raise Blocked("changing a recorded project's target selector needs a separately designed history migration")
+            self.db.execute("INSERT INTO audit VALUES(?,?,?,?)", (self.clock(), None, 'repin_config',
+                json.dumps({'reason': reason, 'before': old, 'after': self.cfg}, sort_keys=True)))
+            self.db.executemany("INSERT OR REPLACE INTO meta VALUES(?,?)", [
+                ('configuration', self.digest()), ('configuration_snapshot', json.dumps(self.cfg, sort_keys=True)),
+                ('project_cutovers', json.dumps(cutoffs))])
+            return {'configuration_reconciled': True, 'pending_evidence_preserved': True}

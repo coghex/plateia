@@ -29,6 +29,8 @@ def main(argv=None, adapter=None):
     resend = commands.add_parser("authorize-resend", help="explicit operator action; never a periodic retry")
     resend.add_argument("id")
     resend.add_argument("--reason", required=True)
+    repin = commands.add_parser("repin-config", help="explicit operator reconciliation, never periodic")
+    repin.add_argument("--reason", required=True)
     args = parser.parse_args(argv)
     try:
         box = Inbox(args.state, config(args.config), adapter)
@@ -42,6 +44,8 @@ def main(argv=None, adapter=None):
             result = box.prepare(args.id, args.claim, json.loads(Path(args.decision).read_text()))
         elif args.command == "send":
             result = box.send(args.id, args.claim)
+        elif args.command == "repin-config":
+            result = box.repin_config(args.reason)
         else:
             result = box.authorize_resend(args.id, args.reason)
         print(json.dumps(result, indent=2))

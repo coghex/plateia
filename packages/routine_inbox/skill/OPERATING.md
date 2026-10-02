@@ -101,8 +101,11 @@ Part numbers satisfy `1 <= part <= parts`. The adapter repeats envelope metadata
 on every physical part. A new question uses `[question <id>]` addressed to the
 configured assistant `alias`. Its identity is part one's server `msgid`. All parts
 must be consistent and present before admission; earlier fragments remain durable.
-Legacy/unframed questions, missing-ID questions and helper-addressed blocked reports
-are quarantined and visible. They require manager reconciliation or a structured
+Legacy/unframed questions (including headerless leading addresses), missing-ID
+questions and helper-addressed blocked reports
+are quarantined and visible. Question kind, recipients, automatic marker, request
+ID and total count must agree across every fragment. Inconsistent assembly remains
+quarantined; a later fragment cannot remove the earlier quarantine classification. They require manager reconciliation or a structured
 resend, which is a separate item. They are never claimed automatically.
 
 A reply uses `[answer <id>]`, `+draft/reply=<question-part-one-msgid>`, the item's
@@ -118,15 +121,25 @@ delivery and acceptance are different facts. Unrelated messages never count.
 A manager or configured owner resolves the question with a complete structured
 `[answer <id>]` or `[decision <id>]` replying to the original question's part-one
 msgid. It cannot be confused with acceptance, which references the reply's parts.
-Partial or unframed resolution evidence suppresses sending until reconciled.
+Partial or unframed resolution evidence is visible as a problem and suspends
+claiming and sending until reconciled, so periodic runs do not repeatedly fail
+at the same send.
 
 For repeated sends with the same action key, read-back must contain an ordered
 complete copy: parts `1..N`, with no second part one interrupting it. Acceptance
 must cover every msgid of **one** complete copy; it cannot combine acknowledgements
-from different copies. All complete copies must agree on text and framing. An
+from different copies. The full same-key sequence is validated before filtering
+markers, headers, recipients or correlation; an invalid intervening part cannot
+disappear and join different copies. All complete copies must agree on text and framing. An
 interleaved or ambiguous sequence remains unknown because this envelope has no
 per-attempt identity. A future adapter must preserve this ordering constraint;
-the core does not infer which retry supplied a missing part.
+the core does not infer which retry supplied a missing part. Missing fragments and
+conflicting evidence are different: an incomplete trailing copy waits, while an
+invalid, interleaved or contradictory sequence creates a durable `evidence_conflict`.
+This stays visible even if a previous poll recorded delivery, acceptance or waiting
+for the owner; the earlier state is retained in the audit record. No automatic
+claim or resend is permitted. A complete correlated resolution can resolve the
+question; the conflict history remains in evidence and audit records.
 
 ## Configuration and activation
 
@@ -143,7 +156,10 @@ from a private configuration, never from credentials:
   project's prefix is rejected. An otherwise unfamiliar ID remains legitimate.
 
 Channels/prefixes and request prefixes must be unambiguous across projects.
-Account and alias tokens use the alphabet above. Channels/prefixes begin `#` and
+Configured account and alias tokens use the alphabet above. Other string-valued
+server-attested accounts are unrecognized by this configuration and are ignored
+for authority; they do not block unrelated questions. Non-string accounts are
+malformed adapter records and block the read. Channels/prefixes begin `#` and
 contain lowercase letters, digits, underscore or hyphen. Real routing identities,
 messages, decisions and state stay outside this public repository.
 
@@ -152,10 +168,21 @@ its actual source/install route is deferred. A standalone invocation without an
 adapter exits 75 without creating state. Never substitute live transport code to
 bypass this gate.
 
-Explicit `initialize` creates schema version 2 and a cutover time. It admits no
+Explicit `initialize` creates schema version 3 and a cutover time. It admits no
 history. Subsequent reads consume history through adapter cursors but admit only
 messages at or after cutover. Do not reset cutover to recover a problem. The
-configuration digest is pinned; identity changes require explicit reconciliation.
+configuration digest is pinned; changes require explicit `repin-config` reconciliation.
+This is an operator-only command, never part of polling. It takes an authorization
+reason, first reads/reconciles the old configuration, then audits and pins the new
+one. Every incomplete or non-terminal question must still map to the same project,
+target and manager, with unchanged assistant/owner/alias/manager-recipient identities.
+Conflicting changes are refused without discarding evidence or advancing cursors.
+Existing claim expiry times and action keys are preserved; a lifetime change applies
+to future claims. New projects start at the reconciliation time, without enrolling
+old history. Terminal and quarantined records retain their original authority context.
+A completed project's manager may rotate without rewriting that history. Changing
+an existing target selector needs a separately designed history migration and is
+refused by this command; adding a distinct project is supported.
 Older experimental state is not automatically migrated or overwritten.
 
 ## State transitions and fences
@@ -176,9 +203,10 @@ operator-authorized resend.
 | `sending` | `send_failed` | Adapter returns `failed` with positive no-send proof while claim is valid |
 | `sending` | `uncertain` | Ambiguous result/exception while claim is valid, or expired sending lease observed after interruption |
 | `submitted`, `uncertain`, `sending` | `delivered` | Complete consistent reply copy read from the assistant in the original target |
-| `delivered` | `accepted` | Manager accepts one complete `settled` copy; terminal |
+| `delivered` | `accepted` | Manager accepts one complete `settled` copy; no more automatic action, but later contradictory evidence stays visible |
 | `delivered` | `waiting_owner` | Manager accepts one complete `escalate` copy |
-| `new`, `claimed`, `sending`, `send_failed`, `uncertain`, `submitted`, `delivered`, `waiting_owner` | `resolved` | Complete correlated resolution; terminal |
+| `new`, `claimed`, `sending`, `send_failed`, `uncertain`, `submitted`, `delivered`, `waiting_owner`, `evidence_conflict` | `resolved` | Complete correlated resolution; terminal |
+| Any action state, including `accepted` | `evidence_conflict` | Conflicting or ambiguous read-back, recorded durably with the prior state in audit |
 | `uncertain` | `new` | Explicit operator `authorize-resend` with recorded reason; original key/content retained |
 
 One reconciliation can observe delivery and acceptance together. No later state
@@ -187,7 +215,9 @@ visible. Incomplete multipart input is shown by the poll's `incomplete` count.
 A partial resolution does not create a terminal state. A completed resolution
 read before Send prevents Send entirely.
 
-Expired or superseded claimants cannot send or record results. A live `sending`
+Expired or superseded claimants cannot send or record results. Expiry is rechecked
+at the adapter boundary, after intent commit and immediately before dispatch; if
+it expired, no Send occurs and the committed intent remains conservatively unknown. A live `sending`
 lease is never moved to uncertain merely because another poll ran. A crash leaves
 durable intent; after lease expiry it becomes uncertain, never automatically new.
 Only proven `send_failed` permits an automatic new claim. An unsent expired claim
@@ -206,7 +236,8 @@ A host can call `main(argv, adapter)` with the normal options:
 `initialize`, `poll --limit 5`, `claim <id>`,
 `prepare <id> --claim <token> --decision <private-json>`,
 `send <id> --claim <token>`, and the operator-only
-`authorize-resend <id> --reason <explicit-authorization>`.
+`authorize-resend <id> --reason <explicit-authorization>`, plus operator-only
+`repin-config --reason <explicit-authorization>`.
 
 Exit 0 confirms only that command's result. Exit 75 means blocked: invalid or
 incomplete configuration, overlap, adapter read error, stale claim, missing adapter
@@ -218,7 +249,7 @@ its durable intent and reconcile. A blocked send's fresh read is rolled back;
 a subsequent poll records any observed resolution without sending.
 
 Polling/refresh never calls Send. Keep routine handling bounded to five items,
-one run at a time. A suggested future cadence is ten minutes; no schedule is
+one run at a time. Poll output omits claim bearer tokens; only `claim` returns one. A suggested future cadence is ten minutes; no schedule is
 created by this package. Follow SKILL.md before answering.
 
 Python 3.10 or newer, standard library only. From the repository root:
