@@ -207,7 +207,7 @@ comparing them (owner decision pending). What the owner can rely on:
 ### V-13. Plateia is the face; the workflow lives beneath it
 
 Plateia owns browser interaction and presentation (from the first review of
-this draft, 2026-10-02). The workflow itself lives in shared
+the vision, 2026-10-02). The workflow itself lives in shared
 services and skills that work without plateia and serve every interface,
 including the command line and `kanban`'s board:
 
