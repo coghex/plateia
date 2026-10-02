@@ -1,0 +1,15 @@
+{
+  "alias": "helper",
+  "assistant": "assistant",
+  "owner": "operator",
+  "claim_seconds": 600,
+  "projects": {
+    "alpha": {
+      "channel": "#alpha",
+      "prefix": "#a-",
+      "request_prefix": "alpha-",
+      "manager": "a-manager",
+      "recipient": "a-manager"
+    }
+  }
+}
