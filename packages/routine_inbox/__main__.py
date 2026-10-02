@@ -25,6 +25,7 @@ def main():
     reply.add_argument("--decision",required=True,help="JSON file with kind, answer and source")
     send = commands.add_parser("send", help="attempt the prepared action once using existing identity")
     send.add_argument("id")
+    send.add_argument("--claim",required=True)
     args = parser.parse_args()
     box = None
     try:
@@ -48,7 +49,7 @@ def main():
             checked = subprocess.run([box.cfg["pchat"],"post","--help"],capture_output=True,text=True,timeout=10)
             if checked.returncode or "--message-key" not in checked.stdout or "--to" not in checked.stdout:
                 raise Blocked("installed pchat lacks the reviewed routing adapter; nothing sent")
-            result = box.send(args.id,lambda argv: subprocess.run(argv,capture_output=True,text=True,timeout=45))
+            result = box.send(args.id,args.claim,lambda argv: subprocess.run(argv,capture_output=True,text=True,timeout=45))
         print(json.dumps(result,indent=2))
         return 0
     except (Blocked,OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:

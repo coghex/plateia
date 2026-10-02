@@ -79,6 +79,51 @@ class InboxTests(unittest.TestCase):
         return self.box.prepare(bid,token,{'kind':kind,'answer':'Use the documented default',
                                          'source':'approved issue 17, acceptance criterion 2'})
 
+    def send(self,bid,run):
+        row=self.box.db.execute('SELECT claim FROM items WHERE id=?',(bid,)).fetchone()
+        return self.box.send(bid,row['claim'],run)
+
+    def test_expired_or_wrong_claim_cannot_send_prepared_answer(self):
+        bid=self.ready();self.prepare(bid)
+        row=self.box.db.execute('SELECT * FROM items WHERE id=?',(bid,)).fetchone()
+        with self.assertRaises(Blocked):
+            self.box.send(bid,'wrong',lambda argv:self.fail('stale claimant sent'))
+        with patch('routine_inbox.inbox.time.time',return_value=row['claim_until']+1):
+            with self.assertRaises(Blocked):
+                self.box.send(bid,row['claim'],lambda argv:self.fail('expired claimant sent'))
+        self.assertEqual(self.box.db.execute('SELECT status FROM items WHERE id=?',(bid,)).fetchone()[0],'prepared')
+
+    def test_expired_prepared_claim_is_reconsidered_with_same_action_key(self):
+        bid=self.ready();self.prepare(bid)
+        row=self.box.db.execute('SELECT * FROM items WHERE id=?',(bid,)).fetchone()
+        with patch('routine_inbox.inbox.time.time',return_value=row['claim_until']+1):
+            self.assertTrue(self.box.poll()['items'][0]['claimable'])
+            token=self.box.claim(bid)['claim']
+            with self.assertRaises(Blocked):
+                self.box.send(bid,row['claim'],lambda argv:self.fail('old claim sent'))
+            self.box.prepare(bid,token,{'kind':'settled','answer':'Rechecked default','source':'approved policy'})
+            self.assertEqual(self.box.db.execute('SELECT action FROM items WHERE id=?',(bid,)).fetchone()[0],row['action'])
+            self.box.send(bid,token,lambda argv:subprocess.CompletedProcess(argv,0))
+
+    def test_expiry_during_preflight_prevents_send(self):
+        bid=self.ready();self.prepare(bid)
+        clock=patch('routine_inbox.inbox.time.time',return_value=10**12)
+        self.addCleanup(clock.stop)
+        with patch.object(self.box,'verify_manager',side_effect=lambda project:clock.start()):
+            with self.assertRaises(Blocked):self.send(bid,lambda argv:self.fail('expired preflight sent'))
+        self.assertEqual(self.box.db.execute('SELECT status FROM items WHERE id=?',(bid,)).fetchone()[0],'prepared')
+
+    def test_expiry_during_send_preserves_uncertainty(self):
+        bid=self.ready();self.prepare(bid)
+        clock=patch('routine_inbox.inbox.time.time',return_value=10**12)
+        self.addCleanup(clock.stop)
+        def send(argv):
+            clock.start()
+            return subprocess.CompletedProcess(argv,0)
+        with self.assertRaises(Blocked):self.send(bid,send)
+        self.assertEqual(self.box.db.execute('SELECT status FROM items WHERE id=?',(bid,)).fetchone()[0],'uncertain')
+        with self.assertRaises(Blocked):self.send(bid,lambda argv:self.fail('uncertain send retried'))
+
     def echoed(self,bid,mid='reply1',part=1,parts=1):
         item=self.box.db.execute('SELECT * FROM items WHERE id=?',(bid,)).fetchone()
         return self.entry(mid,sender='assistant',text='[answer job-1] See approved issue 17',
@@ -180,21 +225,21 @@ class InboxTests(unittest.TestCase):
     def test_uncertain_send_is_never_retried(self):
         bid=self.ready();self.prepare(bid)
         def fail(argv):raise TimeoutError('unknown send outcome')
-        with self.assertRaises(TimeoutError):self.box.send(bid,fail)
+        with self.assertRaises(TimeoutError):self.send(bid,fail)
         self.box.db.close();self.box=Inbox(self.state,self.cfg)
-        with self.assertRaises(Blocked):self.box.send(bid,fail)
+        with self.assertRaises(Blocked):self.send(bid,fail)
         self.assertEqual(self.box.poll()['items'][0]['status'],'uncertain')
 
     def test_outbox_exit_does_not_duplicate_send(self):
         bid=self.ready();self.prepare(bid)
-        self.box.send(bid,lambda argv:subprocess.CompletedProcess(argv,3))
-        with self.assertRaises(Blocked):self.box.send(bid,lambda argv:None)
+        self.send(bid,lambda argv:subprocess.CompletedProcess(argv,3))
+        with self.assertRaises(Blocked):self.send(bid,lambda argv:None)
         self.append(self.echoed(bid))
         self.assertEqual(self.box.poll()['items'][0]['status'],'awaiting_manager_ack')
 
     def test_delivery_and_unrelated_manager_post_are_not_acceptance(self):
         bid=self.ready();self.prepare(bid)
-        self.box.send(bid,lambda argv:subprocess.CompletedProcess(argv,0))
+        self.send(bid,lambda argv:subprocess.CompletedProcess(argv,0))
         self.append(self.echoed(bid),self.entry('status',routing=False,text='[status job-1] working'))
         self.ack(by='a-worker')
         self.assertEqual(self.box.poll()['items'][0]['status'],'awaiting_manager_ack')
@@ -231,7 +276,7 @@ class InboxTests(unittest.TestCase):
     def test_send_rechecks_resolution_and_never_calls_transport(self):
         bid=self.ready();self.prepare(bid)
         self.append(self.entry('decision',reply_to='m1',text='[answer job-1] Already answered'))
-        with self.assertRaises(Blocked):self.box.send(bid,lambda argv:self.fail('must not send'))
+        with self.assertRaises(Blocked):self.send(bid,lambda argv:self.fail('must not send'))
 
     def test_routing_identity_change_fails_closed(self):
         self.box.cfg={**self.cfg,'assistant':'different-assistant'}
@@ -261,7 +306,7 @@ class InboxTests(unittest.TestCase):
     def test_failed_live_manager_preflight_preserves_prepared_unsent_action(self):
         bid=self.ready();self.prepare(bid)
         with patch.object(self.box,'verify_manager',side_effect=Blocked('denied')):
-            with self.assertRaises(Blocked):self.box.send(bid,lambda argv:self.fail('must not send'))
+            with self.assertRaises(Blocked):self.send(bid,lambda argv:self.fail('must not send'))
         self.assertEqual(self.box.poll()['items'][0]['status'],'prepared')
 
     def test_missing_request_log_blocks_a_prepared_reply(self):
@@ -269,7 +314,7 @@ class InboxTests(unittest.TestCase):
         bid=self.box.poll()['items'][0]['id'];self.prepare(bid)
         (self.logs/'a-job-1.jsonl').unlink()
         with self.assertRaises(Blocked):
-            self.box.send(bid,lambda argv:self.fail('must not reply with unknown channel coverage'))
+            self.send(bid,lambda argv:self.fail('must not reply with unknown channel coverage'))
 
     def test_multipart_owner_resolution_waits_for_all_fragments(self):
         bid=self.ready()

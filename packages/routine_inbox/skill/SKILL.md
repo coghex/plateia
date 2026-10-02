@@ -28,7 +28,7 @@ Each scheduled run:
    `kind: "settled"`, `answer`, and `source`. Otherwise use `kind: "escalate"`
    with the specific unresolved choice and relevant evidence. Prepare using
    `prepare <id> --claim <token> --decision <private-json-file>`, inspect the
-   returned argument list, then `send <id>` only within the owner's granted scope
+   returned argument list, then `send <id> --claim <token>` only within the owner's granted scope
    and permitted execution environment. The sender is the existing assistant
    identity; the recipient is the same project's manager. Never borrow the owner
    or manager account. The original request and exact source message are retained.

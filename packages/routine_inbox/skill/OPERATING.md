@@ -6,6 +6,11 @@ boundary, or start/stop any service. The example configuration uses invented
 identities. Real routing manifests, messages, checkpoints, decisions and logs
 belong outside this public repository; there are no credential fields.
 
+Routine manager clarifications go to an assistant that answers only what existing
+approved evidence settles and escalates everything else through the manager
+(owner decision 2026-10-02). This package implements that routing decision within
+the independently runnable shared tooling described by vision V-13.
+
 ## Installation gate
 
 The package and the existing chat adapter must be installed through the source/
@@ -53,7 +58,7 @@ pushes have acquired a distributed exactly-once guarantee.
 
 ## Private setup and periodic command
 
-Create a private manifest from `routing.example.json`, verifying the existing
+Create a private manifest from `routing.json.example`, verifying the existing
 assistant identity, five project channels/prefixes and manager identities against
 authenticated logs and manager metadata. It must not contain passwords, tokens or
 the notification URL. Create state in a writable, persistent private directory.
@@ -94,6 +99,12 @@ transmission. Claims expire after ten minutes; action intent never expires into 
 automatic retry. The send path rechecks logs for a resolution before attempting
 once. A successful CLI exit only establishes submission. Complete correlated
 outgoing fragments plus the exact manager's reply/ack establish acceptance.
+
+Sending requires `send <id> --claim <token>`. An expired or superseded claimant
+cannot send or record a result. If an unsent prepared answer's claim expires, a
+new claimant must reconsider the evidence and prepare again; its existing action
+key is retained. Once a send starts, expiry leaves its outcome uncertain and can
+never return it to an automatic send.
 
 For an escalation, the manager should post the later owner resolution using `--to`
 the helper destination, the same request ID and `--reply-to` the original question's

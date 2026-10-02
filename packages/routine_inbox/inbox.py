@@ -313,7 +313,7 @@ class Inbox:
                 fragments = self.db.execute("SELECT part,body FROM fragments WHERE batch=? ORDER BY part", (row["id"],)).fetchall()
                 item["text"] = "\n".join(r["body"] for r in fragments)
                 item["complete"] = len(fragments) == row["parts"] and bool(row["root"])
-                item["claimable"] = (row["status"] == "pending" and item["complete"] and not row["problem"]
+                item["claimable"] = (row["status"] in ("pending","prepared") and item["complete"] and not row["problem"]
                                      and (not row["claim_until"] or row["claim_until"] < time.time()))
                 out.append(item)
             out.sort(key=lambda i:not i["claimable"])
@@ -330,12 +330,12 @@ class Inbox:
         with self.locked():
             row = self.db.execute("SELECT i.*,b.parts,b.root,b.problem FROM items i JOIN batches b USING(id) WHERE id=?", (bid,)).fetchone()
             count = self.db.execute("SELECT count(*) FROM fragments WHERE batch=?", (bid,)).fetchone()[0]
-            if not row or row["status"] != "pending" or row["problem"] or not row["root"] or count != row["parts"]:
+            if not row or row["status"] not in ("pending","prepared") or row["problem"] or not row["root"] or count != row["parts"]:
                 raise Blocked("item is incomplete, quarantined, or already acted on")
             if row["claim_until"] and row["claim_until"] > time.time():
                 raise Blocked("another run holds this item")
             token = uuid.uuid4().hex
-            self.db.execute("UPDATE items SET claim=?,claim_until=? WHERE id=?", (token,time.time()+600,bid))
+            self.db.execute("UPDATE items SET status='pending',claim=?,claim_until=?,decision=NULL WHERE id=?", (token,time.time()+600,bid))
             return {"id": bid, "claim": token, "expires_in_seconds": 600}
 
     def prepare(self, bid, token, decision):
@@ -353,7 +353,7 @@ class Inbox:
                 raise Blocked("blocked reports require escalation")
             if self.cfg["owner"].lower() in {x.lower() for x in re.findall(r"@([A-Za-z0-9_-]+)",json.dumps(decision))}:
                 raise Blocked("reply must not contain a literal owner mention, even as a quotation")
-            action = uuid.uuid4().hex
+            action = row["action"] or uuid.uuid4().hex
             manager = self.cfg["projects"][row["project"]]["manager"]
             prefix = "Settled clarification" if decision["kind"] == "settled" else "Owner decision needed; please escalate once"
             body = (f"{prefix}: {decision['answer']} Source: {decision['source']}. "
@@ -365,7 +365,7 @@ class Inbox:
                             (action,json.dumps({**decision,"argv":args}),bid))
             return args
 
-    def send(self, bid, run):
+    def send(self, bid, token, run):
         # Hold the nonblocking lock across the bounded subprocess. A crash after
         # this commit leaves uncertain intent; no timer or lease permits a retry.
         with (self.state / "run.lock").open("a") as lock:
@@ -379,10 +379,16 @@ class Inbox:
             row = self.db.execute("SELECT i.*,b.problem,b.project FROM items i JOIN batches b USING(id) WHERE id=?",(bid,)).fetchone()
             if not row or row["status"] != "prepared" or row["problem"]:
                 raise Blocked("send is already attempted or was not prepared; reconcile, never retry blindly")
+            if row["claim"] != token or not row["claim_until"] or row["claim_until"] <= time.time():
+                raise Blocked("missing or expired send claim; no send attempted")
             self.verify_manager(row["project"])
+            if row["claim_until"] <= time.time():
+                raise Blocked("claim expired during preflight; no send attempted")
             with self.db:
                 self.db.execute("UPDATE items SET status='uncertain' WHERE id=?",(bid,))
             result = run(json.loads(row["decision"])["argv"])
+            if row["claim_until"] <= time.time():
+                raise Blocked("claim expired while sending; preserve uncertain intent and reconcile")
             with self.db:
                 # Even rc=0 proves only submission. rc=3 belongs to pchat's
                 # durable outbox; the caller must never create another copy.
