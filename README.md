@@ -17,8 +17,8 @@ It runs on the owner's own machine and is reached only over a private
 
 ## Status
 
-Early: there is nothing to run yet. Direction will live in
-[docs/vision.md](docs/vision.md) once it is written.
+Early: there is nothing to run yet. The direction is in
+[docs/vision.md](docs/vision.md).
 
 ## Working on it
 

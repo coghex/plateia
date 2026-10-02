@@ -8,10 +8,10 @@ file is the single authority on **how to work** here, for every agent.
 `CLAUDE.md` imports it; don't keep rules anywhere else.
 
 What to build and why lives in [docs/vision.md](docs/vision.md), the owner's
-direction. **It hasn't been written yet.** Until it exists, ask the owner
-before deciding scope, direction, the technology stack or anything
-user-visible. If code and the vision disagree, stop and ask the owner. Never
-change the vision to fit code.
+direction (principles V-1 … V-13). `$guide` / `/guide` reviews work against
+it. Anything the vision leaves open (scope, the technology stack, anything
+user-visible) is the owner's call: ask. If code and the vision disagree, stop
+and ask the owner. Never change the vision to fit code.
 
 ## This repository is public; the owner's data is not
 
