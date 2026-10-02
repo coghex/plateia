@@ -55,10 +55,12 @@ def recipients(text, known):
 
 def envelope(tags):
     """Return normalized explicit metadata, None for legacy, or raise on corruption."""
-    if not any(key in tags for key in FIELDS):
+    if not any(key in tags for key in FIELDS) and "+plateia/auto" not in tags:
         return None
     if not all(key in tags for key in FIELDS):
         raise ValueError("incomplete routing envelope")
+    if any(not isinstance(tags[key], str) for key in FIELDS):
+        raise ValueError("routing values must be strings")
     targets = tags[FIELDS[0]].split(",")
     if not targets or any(not TOKEN.fullmatch(x) for x in targets):
         raise ValueError("invalid recipients")
@@ -71,11 +73,18 @@ def envelope(tags):
         raise ValueError("invalid multipart counts") from None
     if not 1 <= part <= parts <= 100:
         raise ValueError("invalid multipart range")
-    return {"to": sorted(set(x.lower() for x in targets)), "key": key,
-            "part": part, "parts": parts}
+    result = {"to": sorted(set(x.lower() for x in targets)), "key": key,
+              "part": part, "parts": parts}
+    if "+plateia/auto" in tags:
+        if tags["+plateia/auto"] not in ("settled", "escalate"):
+            raise ValueError("invalid automatic reply marker")
+        result["auto"] = tags["+plateia/auto"]
+    return result
 
 
-def tags(targets, key, part, parts):
+def tags(targets, key, part, parts, automatic=None):
     raw = dict(zip(FIELDS, (",".join(targets), key, str(part), str(parts))))
+    if automatic is not None:
+        raw["+plateia/auto"] = automatic
     envelope(raw)
     return raw

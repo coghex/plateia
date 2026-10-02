@@ -2,11 +2,14 @@
   "alias": "helper",
   "assistant": "assistant",
   "owner": "operator",
-  "logs": "~/.local/state/chat/logs",
-  "acks": "~/.local/state/chat/acks.jsonl",
-  "pchat": "/example/bin/pchat",
-  "manager_state": "~/.local/state/project-manager",
+  "claim_seconds": 600,
   "projects": {
-    "alpha": {"channel": "#alpha", "prefix": "#a-", "manager": "a-manager"}
+    "alpha": {
+      "channel": "#alpha",
+      "prefix": "#a-",
+      "request_prefix": "alpha-",
+      "manager": "a-manager",
+      "recipient": "a-manager"
+    }
   }
 }

@@ -1,25 +1,21 @@
-"""Durable collection and conservative send reconciliation; stdlib only."""
+"""Durable transport-neutral inbox and fenced reply lifecycle; Python 3.10+."""
 import contextlib
 import datetime as dt
 import fcntl
 import hashlib
 import json
-import re
 from pathlib import Path
+import re
 import sqlite3
-import subprocess
 import time
 import uuid
 
-from .protocol import TOKEN, envelope, header, recipients
+from .adapter import AdapterError, matches
+from .protocol import TOKEN, envelope, header, recipients, tags
 
 
 class Blocked(RuntimeError):
     pass
-
-
-def utc():
-    return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
 def timestamp(value):
@@ -29,386 +25,414 @@ def timestamp(value):
     return parsed.timestamp()
 
 
-def config(path):
-    data = json.loads(Path(path).read_text())
-    required = {"alias", "assistant", "owner", "projects", "logs", "acks", "pchat", "manager_state"}
-    if not isinstance(data,dict) or not required <= data.keys() or not isinstance(data["projects"],dict) or not data["projects"]:
-        raise Blocked("incomplete private routing manifest")
-    if any(not isinstance(data[k],str) or not data[k] for k in ('logs','acks','pchat','manager_state')):
-        raise Blocked("invalid private routing paths")
+def config(value):
+    data = json.loads(Path(value).read_text()) if isinstance(value, (str, Path)) else value
+    if not isinstance(data, dict) or not {"alias", "assistant", "owner", "projects", "claim_seconds"} <= data.keys():
+        raise Blocked("incomplete routing configuration")
+    data = json.loads(json.dumps(data))
     names = [data[k] for k in ("alias", "assistant", "owner")]
-    if any(not isinstance(n,str) or not TOKEN.fullmatch(n) for n in names):
-        raise Blocked("invalid role or destination name")
-    if len({n.lower() for n in names}) != 3:
-        raise Blocked("destination alias and authenticated roles must be distinct")
-    for name, project in data["projects"].items():
-        if not isinstance(name,str) or not TOKEN.fullmatch(name) or not isinstance(project,dict) or not {"channel", "prefix", "manager"} <= project.keys():
-            raise Blocked("project lacks channel, prefix, or manager")
-        if any(not isinstance(project[k],str) for k in ('manager','channel','prefix')) or not TOKEN.fullmatch(project["manager"]) or not all(
-                re.fullmatch(r"#[a-z0-9_-]+",project[k]) for k in ("channel","prefix")):
-            raise Blocked("invalid project routing identity")
-    routes=list(data["projects"].values())
-    for i, left in enumerate(routes):
-        for right in routes[i+1:]:
-            if (left["channel"] == right["channel"] or left["prefix"].startswith(right["prefix"])
-                    or right["prefix"].startswith(left["prefix"])
-                    or left["channel"].startswith(right["prefix"])
-                    or right["channel"].startswith(left["prefix"])):
-                raise Blocked("ambiguous project channel/prefix mapping")
+    if any(not isinstance(n, str) or not TOKEN.fullmatch(n) for n in names):
+        raise Blocked("invalid account or recipient")
+    for k in ("alias", "assistant", "owner"):
+        data[k] = data[k].lower()
+    if data["assistant"] == data["owner"]:
+        raise Blocked("assistant and owner accounts must differ")
+    if type(data["claim_seconds"]) is not int or not 1 <= data["claim_seconds"] <= 86400:
+        raise Blocked("claim_seconds must be an integer from 1 through 86400")
+    if not isinstance(data["projects"], dict) or not data["projects"]:
+        raise Blocked("projects must be a nonempty mapping")
+    for name, p in data["projects"].items():
+        if not isinstance(name, str) or not TOKEN.fullmatch(name) or not isinstance(p, dict):
+            raise Blocked("invalid project")
+        if not {"manager", "recipient", "request_prefix"} <= p.keys() or not (p.get("channel") or p.get("prefix")):
+            raise Blocked("project lacks routing fields")
+        if any(not isinstance(p[k], str) or not TOKEN.fullmatch(p[k]) for k in ("manager", "recipient", "request_prefix")):
+            raise Blocked("invalid project account, recipient, or request prefix")
+        p["manager"], p["recipient"] = p["manager"].lower(), p["recipient"].lower()
+        if p["manager"] == data["assistant"]:
+            raise Blocked("assistant and manager accounts must differ")
+        if any(not isinstance(p[k], str) or not re.fullmatch(r"#[a-z0-9_-]+", p[k]) for k in ("channel", "prefix") if k in p):
+            raise Blocked("invalid channel or channel prefix")
+    projects = list(data["projects"].values())
+    for i, left in enumerate(projects):
+        for right in projects[i + 1:]:
+            if (left.get("channel") and matches(left["channel"], right)
+                    or right.get("channel") and matches(right["channel"], left)
+                    or left.get("prefix") and right.get("prefix") and (
+                        left["prefix"].startswith(right["prefix"]) or right["prefix"].startswith(left["prefix"]))
+                    or left["request_prefix"].startswith(right["request_prefix"])
+                    or right["request_prefix"].startswith(left["request_prefix"])):
+                raise Blocked("ambiguous target or request-prefix mapping")
     return data
 
 
+def decode(record):
+    """Validate the normalized adapter record and decode only the protocol layer."""
+    if not isinstance(record, dict) or not all(isinstance(record.get(k), str) and record[k]
+            for k in ("msgid", "at", "target", "text")):
+        raise AdapterError("invalid normalized message")
+    try:
+        timestamp(record["at"])
+    except ValueError as error:
+        raise AdapterError("invalid server timestamp") from error
+    if not isinstance(record.get("tags", {}), dict):
+        raise AdapterError("invalid normalized tags")
+    raw = record.get("tags", {})
+    routing = envelope(raw)
+    kind, request, body, continued = header(record["text"])
+    account = record.get("account")
+    if account is not None and (not isinstance(account, str) or not TOKEN.fullmatch(account)):
+        raise AdapterError("invalid attested account")
+    if record.get("reply_to") is not None and not isinstance(record["reply_to"], str):
+        raise AdapterError("invalid reply correlation")
+    return {**record, "account": account.lower() if account else None,
+            "routing": routing, "kind": kind, "request": request, "body": body,
+            "continued": continued}
+
+
+def complete_copies(records):
+    """Accept only noninterleaved, ordered complete copies; never stitch retries.
+
+    A second part one before completion makes this key ambiguous. The protocol
+    has no per-attempt identity, so ambiguity is deliberately not guessed away.
+    """
+    copies, current = [], []
+    for m in records:
+        route = m.get("routing")
+        if not route:
+            return []
+        part, total = route["part"], route["parts"]
+        if part == 1:
+            if current:
+                return []
+            current = [m]
+        elif not current or part != len(current) + 1 or total != current[0]["routing"]["parts"]:
+            return []
+        else:
+            current.append(m)
+        if len(current) == total:
+            if any(m["kind"] != current[0]["kind"] or m["routing"]["to"] != current[0]["routing"]["to"]
+                   or m["routing"].get("auto") != current[0]["routing"].get("auto") for m in current):
+                return []
+            copies.append(current)
+            current = []
+    # A complete earlier copy remains usable when a later retry is incomplete.
+    if copies:
+        bodies = [[m["text"] for m in copy] for copy in copies]
+        if any(body != bodies[0] for body in bodies[1:]):
+            return []
+    return copies
+
+
 class Inbox:
-    def __init__(self, state, cfg):
-        self.state, self.cfg = Path(state), cfg
-        self.state.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.state / "inbox.sqlite3", timeout=0)
-        self.db.row_factory = sqlite3.Row
-        self.db.executescript("""
-        PRAGMA journal_mode=WAL;
-        PRAGMA synchronous=FULL;
-        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS cursors(path TEXT PRIMARY KEY, inode TEXT, offset INTEGER);
-        CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, payload TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY, project TEXT, channel TEXT,
-          sender TEXT, request TEXT, kind TEXT, parts INTEGER, root TEXT, updated REAL,
-          problem TEXT);
-        CREATE TABLE IF NOT EXISTS fragments(batch TEXT, part INTEGER, id TEXT, body TEXT,
-          PRIMARY KEY(batch,part));
-        CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY, status TEXT,
-          claim TEXT, claim_until REAL, action TEXT, decision TEXT, reply_ids TEXT);
-        CREATE TABLE IF NOT EXISTS problems(id TEXT PRIMARY KEY, detail TEXT);
-        """)
+    def __init__(self, state, cfg, adapter, clock=time.time):
+        self.cfg = config(cfg)  # validate before touching the state directory
+        if adapter is None:
+            raise Blocked("no adapter supplied; live integration awaits the approved install route")
+        self.state, self.adapter, self.clock = Path(state), adapter, clock
+        self.db = None
 
     @contextlib.contextmanager
-    def locked(self):
-        with (self.state / "run.lock").open("a") as lock:
+    def operation(self, initialize=False):
+        if initialize:
+            self.state.mkdir(parents=True, exist_ok=True)
+        elif not self.state.is_dir():
+            raise Blocked("initialize explicitly before using an inbox")
+        lockpath = self.state / "run.lock"
+        if not initialize and not lockpath.exists():
+            raise Blocked("inbox lock is missing")
+        with lockpath.open("a" if initialize else "r+") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise Blocked("another inbox operation holds the lock") from None
+            path = self.state / "inbox.sqlite3"
             try:
-                with self.db:
+                if not initialize and not path.exists():
+                    raise Blocked("initialize explicitly before using an inbox")
+                db = sqlite3.connect(path, timeout=0)
+                self.db = db
+                db.row_factory = sqlite3.Row
+                if initialize:
+                    self.schema()
+                elif db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0] != "2":
+                    raise Blocked("unsupported inbox schema; preserve it for explicit migration")
+                with db:
                     yield
             finally:
+                if self.db is not None:
+                    self.db.close()
+                    self.db = None
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
-    def project(self, channel):
-        matches = [(name, p) for name, p in self.cfg["projects"].items()
-                   if channel == p["channel"] or channel.startswith(p["prefix"])]
-        if len(matches) != 1:
-            return None, None
-        return matches[0]
+    def schema(self):
+        self.db.executescript("""
+        PRAGMA synchronous=FULL;
+        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS cursors(stream TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS messages(msgid TEXT PRIMARY KEY, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS acks(identity TEXT PRIMARY KEY, payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS groups(gid TEXT PRIMARY KEY, project TEXT, target TEXT,
+          account TEXT, request TEXT, parts INTEGER, root TEXT, problem TEXT);
+        CREATE TABLE IF NOT EXISTS fragments(gid TEXT, part INTEGER, msgid TEXT, body TEXT,
+          PRIMARY KEY(gid,part));
+        CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY, gid TEXT UNIQUE, status TEXT,
+          claim TEXT, claim_until REAL, action TEXT, decision TEXT, attempts INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS problems(identity TEXT PRIMARY KEY, detail TEXT);
+        CREATE TABLE IF NOT EXISTS audit(at REAL, item TEXT, operation TEXT, reason TEXT);
+        """)
 
-    def paths(self):
-        root = Path(self.cfg["logs"]).expanduser()
-        if not root.is_dir():
-            raise Blocked("chat log directory is unavailable")
-        paths = [p for p in sorted(root.glob("*.jsonl")) if self.project("#" + p.stem)[0]]
-        if not {p["channel"] for p in self.cfg["projects"].values()} <= {"#"+p.stem for p in paths}:
-            raise Blocked("a configured project's main log is missing; coverage is unknown")
-        return paths
-
-    def initialized(self):
-        return self.db.execute("SELECT value FROM meta WHERE key='cutover'").fetchone()
+    def digest(self):
+        return hashlib.sha256(json.dumps(self.cfg, sort_keys=True).encode()).hexdigest()
 
     def initialize(self):
-        """Explicit first-run baseline. Never retrospectively turn history into requests."""
-        with self.locked():
-            if self.initialized():
-                raise Blocked("already initialized; refusing to discard pending work")
-            paths = self.paths()
-            mains = {p["channel"] for p in self.cfg["projects"].values()}
-            if not mains <= {"#" + p.stem for p in paths}:
-                raise Blocked("a configured project's main log is missing")
-            cutover = utc()
-            for path in paths:
-                st = path.stat()
-                # A partial final record belongs to the next scan, not the baseline.
-                raw = path.read_bytes()
-                offset = raw.rfind(b"\n") + 1
-                self.db.execute("INSERT INTO cursors VALUES(?,?,?)",
-                                (str(path), f"{st.st_dev}:{st.st_ino}", offset))
-            self.db.execute("INSERT INTO meta VALUES('cutover',?)", (cutover,))
-            self.db.execute("INSERT INTO meta VALUES('manifest',?)", (self.manifest_digest(),))
-            return {"initialized": True, "cutover": cutover, "channels": len(paths),
-                    "historical_requests_enrolled": 0}
+        with self.operation(initialize=True):
+            if self.db.execute("SELECT 1 FROM meta").fetchone():
+                raise Blocked("already initialized; preserve pending work")
+            self.db.executemany("INSERT INTO meta VALUES(?,?)", [
+                ("schema", "2"), ("cutover", str(self.clock())), ("configuration", self.digest())])
+            return {"initialized": True, "historical_requests_enrolled": 0}
 
-    def problem(self, key, detail):
-        self.db.execute("INSERT OR REPLACE INTO problems VALUES(?,?)", (key, detail))
+    def project(self, target):
+        found = [(n, p) for n, p in self.cfg["projects"].items() if matches(target, p)]
+        return found[0] if len(found) == 1 else (None, None)
 
-    def channel_problem(self, path, detail):
-        self.problem(str(path),detail)
-        self.db.execute("UPDATE batches SET problem=? WHERE channel=?",
-                        (detail,'#'+Path(path).stem))
+    def cursor(self, stream):
+        row = self.db.execute("SELECT value FROM cursors WHERE stream=?", (stream,)).fetchone()
+        return json.loads(row[0]) if row else None
 
-    def manifest_digest(self):
-        return hashlib.sha256(json.dumps(self.cfg,sort_keys=True).encode()).hexdigest()
-
-    def ingest(self):
-        baseline = self.initialized()
-        if not baseline:
-            raise Blocked("initialize explicitly before polling")
-        pinned = self.db.execute("SELECT value FROM meta WHERE key='manifest'").fetchone()
-        if not pinned or pinned[0] != self.manifest_digest():
-            raise Blocked("routing manifest changed; explicit reconciliation is required before using another identity or source")
-        cutoff = timestamp(baseline[0])
-        budget = 2 * 1024 * 1024
-        paths = self.paths()
-        missing = {r[0] for r in self.db.execute("SELECT path FROM cursors")} - {str(p) for p in paths}
-        for path in missing:
-            self.channel_problem(path,"previously observed channel log is missing; pending work retained")
-        for path in paths:
-            st = path.stat()
-            inode = f"{st.st_dev}:{st.st_ino}"
-            cur = self.db.execute("SELECT * FROM cursors WHERE path=?", (str(path),)).fetchone()
-            offset = cur["offset"] if cur else 0
-            if cur and (cur["inode"] != inode or st.st_size < offset):
-                self.channel_problem(path, "log replaced or truncated; cursor retained; manual reconciliation required")
-                continue
-            with path.open("rb") as stream:
-                stream.seek(offset)
-                raw = stream.read(min(st.st_size - offset,budget))
-            complete = raw.rfind(b"\n") + 1
-            budget -= len(raw)
-            if raw and not complete and st.st_size-offset > len(raw):
-                self.channel_problem(path,"record exceeds collection budget; manual reconciliation required")
-            for line in raw[:complete].splitlines(keepends=True):
-                line_at = offset
-                offset += len(line)
+    def read(self):
+        if self.db.execute("SELECT value FROM meta WHERE key='configuration'").fetchone()[0] != self.digest():
+            raise Blocked("configuration changed; explicit reconciliation required")
+        cutoff = float(self.db.execute("SELECT value FROM meta WHERE key='cutover'").fetchone()[0])
+        batches = []
+        for name, p in self.cfg["projects"].items():
+            selector = {k: p[k] for k in ("channel", "prefix") if k in p}
+            batches.append((name, self.adapter.read_messages(selector, self.cursor(name))))
+        ack_batch = self.adapter.read_acknowledgements(self.cursor("@acks"))
+        # All reads must succeed before any evidence or cursor is committed.
+        for name, batch in batches:
+            for raw in batch.records:
                 try:
-                    entry = json.loads(line)
-                    if entry.get("channel") != "#" + path.stem:
-                        raise ValueError("channel does not match its log")
-                    if timestamp(entry["at"]) < cutoff:
-                        continue
-                    self.message(entry)
-                except (ValueError, KeyError, TypeError) as error:
-                    self.problem(f"{path}:{line_at}", f"unreadable/untrusted record: {error}")
-                    self.channel_problem(path,"channel contains an unreadable record; pending work needs reconciliation")
-            self.db.execute("INSERT OR REPLACE INTO cursors VALUES(?,?,?)", (str(path), inode, offset))
-            if budget <= 0:
-                break
+                    entry = decode(raw)
+                except ValueError as error:
+                    self.problem(raw.get("msgid", "invalid"), str(error))
+                    continue  # invalid client routing is not evidence
+                if self.project(entry["target"])[0] != name:
+                    raise AdapterError("adapter returned a record outside its target selector")
+                if timestamp(entry["at"]) < cutoff:
+                    continue
+                self.message(entry)
+        for ack in ack_batch.records:
+            if not isinstance(ack, dict) or not all(isinstance(ack.get(k), str) and ack[k]
+                    for k in ("msgid", "at", "target")):
+                raise AdapterError("invalid normalized acknowledgement")
+            timestamp(ack["at"])
+            if not isinstance(ack.get("account"), str) or not TOKEN.fullmatch(ack["account"]):
+                continue
+            ack = {**ack, "account": ack["account"].lower()}
+            value = json.dumps(ack, sort_keys=True)
+            self.db.execute("INSERT OR IGNORE INTO acks VALUES(?,?)", (hashlib.sha256(value.encode()).hexdigest(), value))
+        self.advance_cursors([(n, b.cursor) for n, b in batches] + [("@acks", ack_batch.cursor)])
+
+    def advance_cursors(self, values):
+        self.db.executemany("INSERT OR REPLACE INTO cursors VALUES(?,?)",
+                            [(stream, json.dumps(cursor)) for stream, cursor in values])
+
+    def problem(self, identity, detail):
+        self.db.execute("INSERT OR REPLACE INTO problems VALUES(?,?)", (identity, detail))
 
     def message(self, e):
-        mid = e.get("msgid")
-        if not isinstance(mid, str) or not mid:
-            self.problem(hashlib.sha256(json.dumps(e, sort_keys=True).encode()).hexdigest(),
-                         "record has no stable message ID; never answer automatically")
-            return
-        previous = self.db.execute("SELECT payload FROM messages WHERE id=?", (mid,)).fetchone()
+        mid = e["msgid"]
+        payload = json.dumps(e, sort_keys=True)
+        previous = self.db.execute("SELECT payload FROM messages WHERE msgid=?", (mid,)).fetchone()
         if previous:
-            old = json.loads(previous[0])
-            # Replayed is observation metadata, not message identity.
-            if any(old.get(k) != e.get(k) for k in ("channel", "from", "text", "reply_to", "routing")):
-                self.problem(mid, "same message ID has conflicting content")
-                self.db.execute("UPDATE batches SET problem='conflicting message ID' WHERE id IN "
-                                "(SELECT batch FROM fragments WHERE id=?)",(mid,))
+            if previous[0] != payload:
+                raise AdapterError("stable message identity has conflicting contents")
             return
-        self.db.execute("INSERT INTO messages VALUES(?,?)", (mid, json.dumps(e)))
-        project, p = self.project(e["channel"])
-        if e.get("verified") is not True or e.get("from") != p["manager"]:
+        self.db.execute("INSERT INTO messages VALUES(?,?)", (mid, payload))
+        name, p = self.project(e["target"])
+        if e["account"] != p["manager"] or e["account"] == self.cfg["assistant"]:
             return
-        kind, request, body, continued = header(e.get("text", ""))
-        routing = e.get("routing")
-        if e.get("routing_error"):
-            self.problem(mid, "invalid routing envelope; no automatic action")
+        if e["kind"] not in ("question", "blocked"):
             return
-        if routing:
-            # Revalidate persisted metadata as well as wire metadata.
-            routing = envelope(dict(zip(("+plateia/to", "+plateia/key", "+plateia/part", "+plateia/parts"),
-                                        (",".join(routing["to"]), routing["key"],
-                                         str(routing["part"]), str(routing["parts"])))))
-            addressed = self.cfg["alias"].lower() in routing["to"]
-        else:
-            addressed = self.cfg["alias"] in recipients(e.get("text", ""), {self.cfg["alias"]})
-        if not addressed or kind not in ("question", "blocked"):
+        route = e["routing"]
+        addressed = self.cfg["alias"] in (route["to"] if route else recipients(e["text"], {self.cfg["alias"]}))
+        if not addressed:
             return
-        if not request:
-            self.problem(mid, "addressed question lacks a request ID")
+        if e["request"] and any(e["request"].startswith(other["request_prefix"])
+                for project, other in self.cfg["projects"].items() if project != name):
+            self.problem(mid, "request ID belongs to another project")
             return
-        key = routing["key"] if routing else mid
-        bid = hashlib.sha256(f"{project}\0{e['channel']}\0{e['from']}\0{key}".encode()).hexdigest()[:32]
-        part, total = (routing["part"], routing["parts"]) if routing else (1, 1)
-        old = self.db.execute("SELECT * FROM batches WHERE id=?", (bid,)).fetchone()
-        problem = None if routing else "legacy unframed question: ask manager to resend using explicit --to metadata"
-        if old and (old["parts"] != total or old["request"] != request or old["kind"] != kind):
-            problem = "multipart metadata conflicts"
-        self.db.execute("INSERT OR IGNORE INTO batches VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (bid, project, e["channel"], e["from"], request, kind, total,
-                         mid if part == 1 else None, time.time(), problem))
-        prior = self.db.execute("SELECT body FROM fragments WHERE batch=? AND part=?", (bid, part)).fetchone()
-        if prior and prior[0] != body:
-            problem = "multipart content conflicts"
-        if problem:
-            self.db.execute("UPDATE batches SET problem=? WHERE id=?", (problem, bid))
-        if not prior:
-            self.db.execute("INSERT INTO fragments VALUES(?,?,?,?)", (bid, part, mid, body))
-            self.db.execute("UPDATE batches SET updated=?, root=COALESCE(root,?) WHERE id=?",
-                            (time.time(), mid if part == 1 else None, bid))
-        self.db.execute("INSERT OR IGNORE INTO items(id,status) VALUES(?,'pending')", (bid,))
+        key = route["key"] if route else mid
+        gid = hashlib.sha256(json.dumps([name, e["target"], e["account"], key]).encode()).hexdigest()
+        part, parts = (route["part"], route["parts"]) if route else (1, 1)
+        problem = None if route and e["request"] and e["kind"] == "question" else "legacy or blocked question requires manager reconciliation"
+        previous = self.db.execute("SELECT * FROM groups WHERE gid=?", (gid,)).fetchone()
+        if previous and (previous["parts"] != parts or previous["request"] != e["request"]):
+            raise AdapterError("multipart question metadata conflicts")
+        fragment = self.db.execute("SELECT body FROM fragments WHERE gid=? AND part=?", (gid, part)).fetchone()
+        if fragment and fragment[0] != e["body"]:
+            raise AdapterError("multipart question content conflicts")
+        self.db.execute("INSERT OR IGNORE INTO groups VALUES(?,?,?,?,?,?,?,?)",
+                        (gid, name, e["target"], e["account"], e["request"], parts, mid if part == 1 else None, problem))
+        self.db.execute("INSERT OR IGNORE INTO fragments VALUES(?,?,?,?)", (gid, part, mid, e["body"]))
+        if part == 1:
+            self.db.execute("UPDATE groups SET root=COALESCE(root,?) WHERE gid=?", (mid, gid))
+        group = self.db.execute("SELECT * FROM groups WHERE gid=?", (gid,)).fetchone()
+        count = self.db.execute("SELECT count(*) FROM fragments WHERE gid=?", (gid,)).fetchone()[0]
+        if group["root"] and count == parts:
+            self.db.execute("INSERT OR IGNORE INTO items(id,gid,status) VALUES(?,?,?)",
+                            (group["root"], gid, "quarantined" if problem else "new"))
+
+    def row(self, item):
+        return self.db.execute("SELECT i.*,g.project,g.target,g.request,g.problem FROM items i JOIN groups g USING(gid) WHERE id=?", (item,)).fetchone()
 
     def reconcile(self):
-        messages = [json.loads(r[0]) for r in self.db.execute("SELECT payload FROM messages")]
-        path = Path(self.cfg["acks"]).expanduser()
-        if not path.exists():
-            raise Blocked("acceptance log unavailable; refusing to infer manager acceptance")
-        acks = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-        for item in self.db.execute("SELECT * FROM items WHERE status NOT IN ('accepted','resolved')").fetchall():
-            batch = self.db.execute("SELECT * FROM batches WHERE id=?", (item["id"],)).fetchone()
-            manager = self.cfg["projects"][batch["project"]]["manager"]
-            resolutions = [m for m in messages if m.get("verified") is True
-                           and m.get("from") in (manager,self.cfg["owner"])
-                           and m.get("channel") == batch["channel"]
-                           and m.get("reply_to") == batch["root"]
-                           and header(m.get("text",""))[:2] in
-                           (("answer",batch["request"]),("decision",batch["request"]))]
-            if resolutions:
-                groups = {}
-                for resolution in resolutions:
-                    route = resolution.get('routing')
-                    if route:
-                        groups.setdefault((resolution['from'],route['key']),[]).append(resolution)
-                complete = False
-                for group in groups.values():
-                    totals = {m['routing']['parts'] for m in group}
-                    parts = {m['routing']['part'] for m in group}
-                    bodies = {n:{m['text'] for m in group if m['routing']['part']==n} for n in parts}
-                    if (len(totals)==1 and parts==set(range(1,next(iter(totals))+1))
-                            and all(len(values)==1 for values in bodies.values())):
-                        complete = True
-                self.db.execute("UPDATE items SET status=? WHERE id=?",
-                                ('resolved' if complete else 'awaiting_resolution',item["id"]))
+        messages = [json.loads(r[0]) for r in self.db.execute("SELECT payload FROM messages ORDER BY rowid")]
+        acks = [json.loads(r[0]) for r in self.db.execute("SELECT payload FROM acks")]
+        for ident in [r[0] for r in self.db.execute("SELECT id FROM items WHERE status NOT IN ('accepted','resolved','quarantined')")]:
+            row = self.row(ident)
+            p = self.cfg["projects"][row["project"]]
+            resolutions = [m for m in messages if m["account"] in (p["manager"], self.cfg["owner"])
+                and m["target"] == row["target"] and m.get("reply_to") == ident
+                and m["request"] == row["request"] and m["kind"] in ("answer", "decision")]
+            groups = {}
+            for m in resolutions:
+                if m["routing"]:
+                    groups.setdefault((m["account"], m["routing"]["key"]), []).append(m)
+            if any(complete_copies(group) for group in groups.values()):
+                self.db.execute("UPDATE items SET status='resolved' WHERE id=?", (ident,))
                 continue
-            if not item["action"]:
+            if row["status"] == "sending" and row["claim_until"] <= self.clock():
+                self.db.execute("UPDATE items SET status='uncertain' WHERE id=?", (ident,))
+            if not row["attempts"]:
                 continue
-            replies = [m for m in messages if m.get("verified") is True
-                       and m.get("from") == self.cfg["assistant"] and m.get("channel") == batch["channel"]
-                       and m.get("reply_to") == batch["root"]
-                       and m.get("routing", {}).get("key") == item["action"]]
-            ids = {r["msgid"] for r in replies}
-            if not ids:
+            decision = json.loads(row["decision"])
+            replies = [m for m in messages if m["account"] == self.cfg["assistant"]
+                and m["target"] == row["target"] and m.get("reply_to") == ident
+                and m["request"] == row["request"] and m["kind"] == "answer"
+                and m["routing"] and m["routing"]["key"] == row["action"]
+                and m["routing"]["to"] == [p["recipient"]]
+                and m["routing"].get("auto") == decision["kind"]]
+            copies = complete_copies(replies)
+            if not copies:
                 continue
-            totals = {r["routing"]["parts"] for r in replies}
-            parts = {r["routing"]["part"] for r in replies}
-            complete = len(totals) == 1 and parts == set(range(1, next(iter(totals)) + 1))
-            accepted = {a.get("reply_to") for a in acks if a.get("by") == manager
-                        and a.get("channel") == batch["channel"] and a.get("project") == batch["project"]}
-            accepted |= {m.get("reply_to") for m in messages if m.get("verified") is True
-                         and m.get("from") == manager and m.get("channel") == batch["channel"]}
-            status = "accepted" if complete and ids <= accepted else "awaiting_manager_ack"
-            if status == "accepted" and json.loads(item["decision"])["kind"] == "escalate":
-                status = "waiting_owner"
-            self.db.execute("UPDATE items SET status=?, reply_ids=? WHERE id=?",
-                            (status, json.dumps(sorted(ids)), item["id"]))
+            accepted = {a["msgid"] for a in acks if a["account"] == p["manager"] and a["target"] == row["target"]}
+            accepted |= {m.get("reply_to") for m in messages if m["account"] == p["manager"] and m["target"] == row["target"]}
+            status = "delivered"
+            if any({m["msgid"] for m in copy} <= accepted for copy in copies):
+                status = "waiting_owner" if decision["kind"] == "escalate" else "accepted"
+            self.db.execute("UPDATE items SET status=? WHERE id=?", (status, ident))
+
+    def refresh(self):
+        self.read()
+        self.reconcile()
 
     def poll(self, limit=5):
-        with self.locked():
-            self.ingest()
-            self.reconcile()
-            out = []
-            for row in self.db.execute("SELECT i.*, b.project,b.channel,b.request,b.kind,b.parts,b.root,b.problem "
-                                       "FROM items i JOIN batches b USING(id) WHERE status NOT IN ('accepted','resolved') ORDER BY b.updated"):
-                item = dict(row)
-                fragments = self.db.execute("SELECT part,body FROM fragments WHERE batch=? ORDER BY part", (row["id"],)).fetchall()
-                item["text"] = "\n".join(r["body"] for r in fragments)
-                item["complete"] = len(fragments) == row["parts"] and bool(row["root"])
-                item["claimable"] = (row["status"] in ("pending","prepared") and item["complete"] and not row["problem"]
-                                     and (not row["claim_until"] or row["claim_until"] < time.time()))
-                out.append(item)
-            out.sort(key=lambda i:not i["claimable"])
-            result = {"items": out[:limit], "remaining": max(0, len(out)-limit),
-                      "problems": [dict(r) for r in self.db.execute("SELECT * FROM problems")],
-                      "cutover": self.initialized()[0]}
-            digest = hashlib.sha256(json.dumps(result,sort_keys=True).encode()).hexdigest()
+        if type(limit) is not int or not 1 <= limit <= 20:
+            raise Blocked("poll limit must be from 1 through 20")
+        with self.operation():
+            self.refresh()
+            items = []
+            for ident in [r[0] for r in self.db.execute("SELECT id FROM items WHERE status NOT IN ('accepted','resolved') ORDER BY rowid")]:
+                row = dict(self.row(ident))
+                row["text"] = "\n".join(r[0] for r in self.db.execute("SELECT body FROM fragments WHERE gid=? ORDER BY part", (row["gid"],)))
+                row["claimable"] = row["status"] in ("new", "send_failed") or (
+                    row["status"] == "claimed" and row["claim_until"] <= self.clock())
+                items.append(row)
+            items.sort(key=lambda i: not i["claimable"])
+            result = {"items": items[:limit], "remaining": max(0, len(items)-limit),
+                      "incomplete": self.db.execute("SELECT count(*) FROM groups WHERE gid NOT IN (SELECT gid FROM items)").fetchone()[0],
+                      "problems": [dict(r) for r in self.db.execute("SELECT * FROM problems")]}
+            digest = hashlib.sha256(json.dumps(result, sort_keys=True).encode()).hexdigest()
             prior = self.db.execute("SELECT value FROM meta WHERE key='last_poll'").fetchone()
             result["changed"] = not prior or prior[0] != digest
-            self.db.execute("INSERT OR REPLACE INTO meta VALUES('last_poll',?)",(digest,))
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES('last_poll',?)", (digest,))
             return result
 
-    def claim(self, bid):
-        with self.locked():
-            row = self.db.execute("SELECT i.*,b.parts,b.root,b.problem FROM items i JOIN batches b USING(id) WHERE id=?", (bid,)).fetchone()
-            count = self.db.execute("SELECT count(*) FROM fragments WHERE batch=?", (bid,)).fetchone()[0]
-            if not row or row["status"] not in ("pending","prepared") or row["problem"] or not row["root"] or count != row["parts"]:
-                raise Blocked("item is incomplete, quarantined, or already acted on")
-            if row["claim_until"] and row["claim_until"] > time.time():
-                raise Blocked("another run holds this item")
+    def claim(self, ident):
+        with self.operation():
+            self.refresh()
+            row = self.row(ident)
+            if not row or not (row["status"] in ("new", "send_failed") or
+                    row["status"] == "claimed" and row["claim_until"] <= self.clock()):
+                raise Blocked("item is not claimable")
             token = uuid.uuid4().hex
-            self.db.execute("UPDATE items SET status='pending',claim=?,claim_until=?,decision=NULL WHERE id=?", (token,time.time()+600,bid))
-            return {"id": bid, "claim": token, "expires_in_seconds": 600}
+            self.db.execute("UPDATE items SET status='claimed',claim=?,claim_until=?,decision=CASE WHEN attempts=0 THEN NULL ELSE decision END WHERE id=?",
+                            (token, self.clock()+self.cfg["claim_seconds"], ident))
+            return {"id": ident, "claim": token}
 
-    def prepare(self, bid, token, decision):
-        """Commit intent before a sender can run. A repeated call never resends."""
-        with self.locked():
-            self.ingest()
-            self.reconcile()
-            row = self.db.execute("SELECT i.*,b.channel,b.root,b.project,b.request,b.kind,b.problem FROM items i JOIN batches b USING(id) WHERE id=?", (bid,)).fetchone()
-            if not row or row["problem"] or row["status"] != "pending" or row["claim"] != token or row["claim_until"] < time.time():
-                raise Blocked("missing, expired, or already consumed claim")
-            if decision.get("kind") not in ("settled", "escalate") or any(
-                    not isinstance(decision.get(k),str) or not decision[k].strip() for k in ("source","answer")):
-                raise Blocked("decision requires kind, evidence source and answer/question")
-            if row["kind"] == "blocked" and decision["kind"] != "escalate":
-                raise Blocked("blocked reports require escalation")
-            if self.cfg["owner"].lower() in {x.lower() for x in re.findall(r"@([A-Za-z0-9_-]+)",json.dumps(decision))}:
-                raise Blocked("reply must not contain a literal owner mention, even as a quotation")
+    def claimant(self, ident, token):
+        row = self.row(ident)
+        if not row or row["status"] != "claimed" or row["claim"] != token or row["claim_until"] <= self.clock():
+            raise Blocked("missing, expired, or consumed claim")
+        return row
+
+    def prepare(self, ident, token, decision):
+        with self.operation():
+            self.refresh()
+            row = self.claimant(ident, token)
+            if not isinstance(decision, dict) or decision.get("kind") not in ("settled", "escalate") or any(
+                    not isinstance(decision.get(k), str) or not decision[k].strip() for k in ("answer", "source")):
+                raise Blocked("decision requires kind, answer or unresolved choice, and source evidence")
+            decision = {k: decision[k] for k in ("kind", "answer", "source")}
+            if self.cfg["owner"] in {m.lower() for m in re.findall(r"@([A-Za-z0-9_-]+)", json.dumps(decision))}:
+                raise Blocked("reply contains an owner mention")
+            if row["attempts"] and json.loads(row["decision"]) != decision:
+                raise Blocked("a retried action must retain its original content")
             action = row["action"] or uuid.uuid4().hex
-            manager = self.cfg["projects"][row["project"]]["manager"]
-            prefix = "Settled clarification" if decision["kind"] == "settled" else "Owner decision needed; please escalate once"
-            body = (f"{prefix}: {decision['answer']} Source: {decision['source']}. "
-                    "Existing request scope and endpoint unchanged; no new action authority.")
-            args = [str(Path(self.cfg["pchat"]).expanduser()), "post", row["channel"],
-                    "--as", self.cfg["assistant"], "--to", manager, "--message-key", action,
-                    "--reply-to", row["root"], "--type", "answer", "--re", row["request"], body]
-            self.db.execute("UPDATE items SET status='prepared',action=?,decision=? WHERE id=?",
-                            (action,json.dumps({**decision,"argv":args}),bid))
-            return args
+            self.db.execute("UPDATE items SET action=?,decision=? WHERE id=?", (action, json.dumps(decision), ident))
+            return self.outgoing(self.row(ident))
 
-    def send(self, bid, token, run):
-        # Hold the nonblocking lock across the bounded subprocess. A crash after
-        # this commit leaves uncertain intent; no timer or lease permits a retry.
-        with (self.state / "run.lock").open("a") as lock:
+    def outgoing(self, row):
+        decision = json.loads(row["decision"])
+        wire = tags([self.cfg["projects"][row["project"]]["recipient"]], row["action"], 1, 1, decision["kind"])
+        wire["+draft/reply"] = row["id"]
+        text = (f"[answer {row['request']}] Automatic routine clarification ({decision['kind']}): "
+                f"{decision['answer']} Source: {decision['source']}. "
+                "No new scope, solve, merge, permission, credential or security authority.")
+        return {"target": row["target"], "text": text, "tags": wire}
+
+    def send(self, ident, token):
+        with self.operation():
+            self.refresh()
+            row = self.claimant(ident, token)
+            if not row["decision"]:
+                raise Blocked("prepare the decision before sending")
+            # Partial/unframed resolutions suppress sends until reconciled.
+            for raw in self.db.execute("SELECT payload FROM messages"):
+                m = json.loads(raw[0])
+                if m["account"] in (self.cfg["owner"], self.cfg["projects"][row["project"]]["manager"]) and m["target"] == row["target"] and m.get("reply_to") == ident and m["request"] == row["request"] and m["kind"] in ("answer", "decision"):
+                    raise Blocked("incomplete resolution evidence; reconcile before sending")
+            outgoing = self.outgoing(row)
+            self.db.execute("UPDATE items SET status='sending',attempts=attempts+1 WHERE id=?", (ident,))
+            self.db.commit()  # crash after this point must never cause an automatic duplicate
             try:
-                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise Blocked("another inbox operation holds the lock") from None
-            with self.db:
-                self.ingest()
-                self.reconcile()
-            row = self.db.execute("SELECT i.*,b.problem,b.project FROM items i JOIN batches b USING(id) WHERE id=?",(bid,)).fetchone()
-            if not row or row["status"] != "prepared" or row["problem"]:
-                raise Blocked("send is already attempted or was not prepared; reconcile, never retry blindly")
-            if row["claim"] != token or not row["claim_until"] or row["claim_until"] <= time.time():
-                raise Blocked("missing or expired send claim; no send attempted")
-            self.verify_manager(row["project"])
-            if row["claim_until"] <= time.time():
-                raise Blocked("claim expired during preflight; no send attempted")
-            with self.db:
-                self.db.execute("UPDATE items SET status='uncertain' WHERE id=?",(bid,))
-            result = run(json.loads(row["decision"])["argv"])
-            if row["claim_until"] <= time.time():
-                raise Blocked("claim expired while sending; preserve uncertain intent and reconcile")
-            with self.db:
-                # Even rc=0 proves only submission. rc=3 belongs to pchat's
-                # durable outbox; the caller must never create another copy.
-                self.db.execute("UPDATE items SET status=? WHERE id=?",
-                                ("submitted" if result.returncode == 0 else "outbox_or_uncertain",bid))
-            return {"returncode": result.returncode, "resolved": False,
-                    "next": "poll for correlated chat evidence and exact manager acceptance"}
+                result = self.adapter.send(**outgoing)
+            except Exception:
+                if row["claim_until"] > self.clock():
+                    self.db.execute("UPDATE items SET status='uncertain' WHERE id=?", (ident,))
+                    self.db.commit()
+                raise
+            if row["claim_until"] <= self.clock():
+                raise Blocked("claim expired while sending; reconcile the durable sending intent")
+            outcome, proof = getattr(result, "outcome", None), getattr(result, "proof", None)
+            status = {"sent": "submitted", "uncertain": "uncertain"}.get(outcome, "uncertain")
+            if outcome == "failed" and isinstance(proof, str) and proof.strip():
+                status = "send_failed"
+            self.db.execute("UPDATE items SET status=? WHERE id=?", (status, ident))
+            return {"id": ident, "status": status}
 
-    def verify_manager(self, project):
-        """Read-only identity preflight; never type, retarget, or weaken permissions."""
-        path = Path(self.cfg["manager_state"]).expanduser()/project/'manager.json'
-        metadata = json.loads(path.read_text())
-        if metadata.get('project') != project or not metadata.get('surface_id') or not metadata.get('workspace_id'):
-            raise Blocked("registered manager identity is incomplete")
-        target = {k:metadata[k] for k in ('workspace_id','surface_id')}
-        result = subprocess.run(['cmux','rpc','surface.input_state',json.dumps(target)],
-                                capture_output=True,text=True,timeout=10)
-        if result.returncode:
-            raise Blocked("live manager preflight denied or unavailable; no send attempted")
-        state = json.loads(result.stdout)
-        if any(state.get(k) != v for k,v in target.items()) or state.get('agent') is not True:
-            raise Blocked("registered manager surface is stale or no longer an agent")
-        return {"project":project,"manager":self.cfg['projects'][project]['manager'],"live":True}
+    def authorize_resend(self, ident, reason):
+        """Explicit operator action only; the periodic skill must never call this."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise Blocked("operator resend requires its explicit authorization reason")
+        with self.operation():
+            self.refresh()
+            row = self.row(ident)
+            if not row or row["status"] != "uncertain":
+                raise Blocked("only an uncertain action can receive operator resend authorization")
+            self.db.execute("INSERT INTO audit VALUES(?,?,?,?)", (self.clock(), ident, "authorize_resend", reason))
+            self.db.execute("UPDATE items SET status='new',claim=NULL,claim_until=NULL WHERE id=?", (ident,))
+            return {"id": ident, "action": row["action"], "status": "new"}

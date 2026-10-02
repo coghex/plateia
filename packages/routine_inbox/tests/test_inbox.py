@@ -1,335 +1,450 @@
 import contextlib
+from copy import deepcopy
 import datetime as dt
 import fcntl
+import io
 import json
 from pathlib import Path
+import socket
+import sqlite3
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
+from routine_inbox.adapter import AdapterError, FakeAdapter, SendResult
 from routine_inbox.inbox import Blocked, Inbox, config
+from routine_inbox.__main__ import main
 from routine_inbox.protocol import envelope, header, recipients, tags
 
 
-class ProtocolTests(unittest.TestCase):
-    def test_only_leading_addressee_routes(self):
-        known = {"operator","helper","a-manager"}
-        positives = {"@helper hi":{"helper"}, "[question job-1] mgr: @helper hi":{"helper"},
-                     "[blocked job-1] solve/R2: @operator help":{"operator"},
-                     "[question] operator: hi":{"operator"},
-                     "[question] @HELPER @a-manager hi":{"helper","a-manager"}}
-        for text, expected in positives.items():
-            self.assertEqual(recipients(text,known),expected,text)
-        for text in ('[answer] the earlier @operator question', '`@operator`',
-                     '> @operator hi', '"@operator hi"', '[status] mgr: quoted: @operator',
-                     '[question] @helper-long hi', '… [question] @operator incidental'):
-            self.assertEqual(recipients(text,known),set(),text)
-
-    def test_envelope_is_explicit_and_complete(self):
-        self.assertIsNone(envelope({"+draft/reply":"msg"}))
-        self.assertEqual(envelope(tags(["helper"],"batch",2,3))["part"],2)
-        for raw in ({"+plateia/to":"helper"}, tags(["helper"],"batch",1,1)|{"+plateia/parts":"0"}):
-            with self.assertRaises(ValueError):envelope(raw)
-
-    def test_old_double_tags_and_continuation(self):
-        self.assertEqual(header('… [question job-1] [question job-1] tail'),
-                         ('question','job-1','tail',True))
+CFG = {
+    'alias': 'helper', 'assistant': 'assistant', 'owner': 'operator', 'claim_seconds': 600,
+    'projects': {
+        'alpha': {'channel': '#alpha', 'prefix': '#a-', 'request_prefix': 'alpha-',
+                  'manager': 'a-manager', 'recipient': 'alpha-lead'},
+        'beta': {'prefix': '#b-', 'request_prefix': 'beta-', 'manager': 'b-manager', 'recipient': 'beta-lead'},
+    },
+}
+DECISION = {'kind': 'settled', 'answer': 'Use the approved default', 'source': 'approved issue 17 criterion 2'}
 
 
-class InboxTests(unittest.TestCase):
+class CoreTests(unittest.TestCase):
     def setUp(self):
-        preflight=patch.object(Inbox,'verify_manager',return_value={'live':True})
-        preflight.start();self.addCleanup(preflight.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.logs = self.root/'logs'; self.logs.mkdir()
-        (self.logs/'alpha.jsonl').touch()
-        self.acks = self.root/'acks.jsonl';self.acks.touch()
-        self.cfg = {'alias':'helper','assistant':'assistant','owner':'operator',
-                    'projects':{'alpha':{'channel':'#alpha','prefix':'#a-','manager':'a-manager'}},
-                    'logs':str(self.logs),'acks':str(self.acks),'pchat':'/example/pchat'}
-        self.state = self.root/'state'
-        self.box = Inbox(self.state,self.cfg)
+        self.now = 1800000000.0
+        self.cfg = deepcopy(CFG)
+        self.adapter = FakeAdapter()
+        self.state = self.root / 'state'
+        self.box = Inbox(self.state, self.cfg, self.adapter, clock=lambda: self.now)
         self.box.initialize()
-        self.when = dt.datetime.now(dt.timezone.utc)+dt.timedelta(seconds=2)
+        self.now += 1
+        self.configfile = self.root / 'routing.json'
+        self.configfile.write_text(json.dumps(self.cfg))
+        for owner, name in ((socket, 'socket'), (subprocess, 'run'), (subprocess, 'Popen')):
+            guard = patch.object(owner, name, side_effect=AssertionError('live I/O forbidden'))
+            guard.start(); self.addCleanup(guard.stop)
 
-    def tearDown(self):
-        self.box.db.close()
+    def record(self, mid='q1', key='question', part=1, parts=1, account='a-manager',
+               target='#alpha', text=None, request='job-17', reply_to=None, route=True, auto=None):
+        wire = tags(['helper'], key, part, parts, auto) if route else {}
+        return {'msgid': mid, 'at': dt.datetime.fromtimestamp(self.now, dt.timezone.utc).isoformat(),
+                'account': account, 'target': target, 'text': text or f'[question {request}] Which approved default?',
+                'tags': wire, 'reply_to': reply_to}
 
-    def entry(self, mid='m1', *, part=1, parts=1, key='q1', sender='a-manager',
-              text=None, channel='#alpha', reply_to=None, verified=True, routing=True):
-        e={'at':self.when.isoformat(),'msgid':mid,'from':sender,'verified':verified,'channel':channel,
-           'text':text or ('[question job-1] Which documented default?' if part==1 else '… [question job-1] more context')}
-        if routing:e['routing']=envelope(tags(['helper'],key,part,parts))
-        if reply_to:e['reply_to']=reply_to
-        return e
+    def query(self, sql, args=()):
+        with contextlib.closing(sqlite3.connect(self.state / 'inbox.sqlite3')) as db:
+            db.row_factory = sqlite3.Row
+            return [dict(row) for row in db.execute(sql, args)]
 
-    def append(self,*entries):
-        for e in entries:
-            with (self.logs/(e['channel'][1:]+'.jsonl')).open('a') as f:f.write(json.dumps(e)+'\n')
+    def item(self, ident='q1'):
+        return self.query('SELECT * FROM items WHERE id=?', (ident,))[0]
 
-    def ready(self):
-        self.append(self.entry())
+    def ready(self, **kwargs):
+        self.adapter.messages.append(self.record(**kwargs))
         return self.box.poll()['items'][0]['id']
 
-    def prepare(self,bid,kind='settled'):
-        token=self.box.claim(bid)['claim']
-        return self.box.prepare(bid,token,{'kind':kind,'answer':'Use the documented default',
-                                         'source':'approved issue 17, acceptance criterion 2'})
+    def prepare(self, ident='q1', kind='settled'):
+        token = self.box.claim(ident)['claim']
+        outgoing = self.box.prepare(ident, token, {**DECISION, 'kind': kind})
+        return token, outgoing
 
-    def send(self,bid,run):
-        row=self.box.db.execute('SELECT claim FROM items WHERE id=?',(bid,)).fetchone()
-        return self.box.send(bid,row['claim'],run)
+    def send(self, ident='q1', kind='settled', outcome='sent', proof=''):
+        token, outgoing = self.prepare(ident, kind)
+        self.adapter.send_result = SendResult(outcome, proof)
+        self.box.send(ident, token)
+        return outgoing
 
-    def test_expired_or_wrong_claim_cannot_send_prepared_answer(self):
-        bid=self.ready();self.prepare(bid)
-        row=self.box.db.execute('SELECT * FROM items WHERE id=?',(bid,)).fetchone()
-        with self.assertRaises(Blocked):
-            self.box.send(bid,'wrong',lambda argv:self.fail('stale claimant sent'))
-        with patch('routine_inbox.inbox.time.time',return_value=row['claim_until']+1):
-            with self.assertRaises(Blocked):
-                self.box.send(bid,row['claim'],lambda argv:self.fail('expired claimant sent'))
-        self.assertEqual(self.box.db.execute('SELECT status FROM items WHERE id=?',(bid,)).fetchone()[0],'prepared')
+    def echo(self, outgoing, mid='r1', part=1, parts=1, **updates):
+        wire = {**outgoing['tags'], '+plateia/part': str(part), '+plateia/parts': str(parts)}
+        return {**self.record(mid, account='assistant', target=outgoing['target'], text=outgoing['text'],
+                              reply_to=wire['+draft/reply']), 'tags': wire, **updates}
 
-    def test_expired_prepared_claim_is_reconsidered_with_same_action_key(self):
-        bid=self.ready();self.prepare(bid)
-        row=self.box.db.execute('SELECT * FROM items WHERE id=?',(bid,)).fetchone()
-        with patch('routine_inbox.inbox.time.time',return_value=row['claim_until']+1):
-            self.assertTrue(self.box.poll()['items'][0]['claimable'])
-            token=self.box.claim(bid)['claim']
-            with self.assertRaises(Blocked):
-                self.box.send(bid,row['claim'],lambda argv:self.fail('old claim sent'))
-            self.box.prepare(bid,token,{'kind':'settled','answer':'Rechecked default','source':'approved policy'})
-            self.assertEqual(self.box.db.execute('SELECT action FROM items WHERE id=?',(bid,)).fetchone()[0],row['action'])
-            self.box.send(bid,token,lambda argv:subprocess.CompletedProcess(argv,0))
+    def ack(self, mid='r1', account='a-manager', target='#alpha'):
+        self.adapter.acknowledgements.append({'msgid': mid, 'at': self.record()['at'], 'account': account, 'target': target})
 
-    def test_expiry_during_preflight_prevents_send(self):
-        bid=self.ready();self.prepare(bid)
-        clock=patch('routine_inbox.inbox.time.time',return_value=10**12)
-        self.addCleanup(clock.stop)
-        with patch.object(self.box,'verify_manager',side_effect=lambda project:clock.start()):
-            with self.assertRaises(Blocked):self.send(bid,lambda argv:self.fail('expired preflight sent'))
-        self.assertEqual(self.box.db.execute('SELECT status FROM items WHERE id=?',(bid,)).fetchone()[0],'prepared')
+    def resolution(self, mid='d1', account='a-manager', part=1, parts=1, reply_to='q1', **updates):
+        return {**self.record(mid, key='resolution', part=part, parts=parts, account=account,
+                              text='[decision job-17] The owner settled this', reply_to=reply_to), **updates}
 
-    def test_expiry_during_send_preserves_uncertainty(self):
-        bid=self.ready();self.prepare(bid)
-        clock=patch('routine_inbox.inbox.time.time',return_value=10**12)
-        self.addCleanup(clock.stop)
-        def send(argv):
-            clock.start()
-            return subprocess.CompletedProcess(argv,0)
-        with self.assertRaises(Blocked):self.send(bid,send)
-        self.assertEqual(self.box.db.execute('SELECT status FROM items WHERE id=?',(bid,)).fetchone()[0],'uncertain')
-        with self.assertRaises(Blocked):self.send(bid,lambda argv:self.fail('uncertain send retried'))
+    def cli(self, *args, state=None, configfile=None, adapter=True):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return main(['--config', str(configfile or self.configfile), '--state', str(state or self.state), *args],
+                        adapter=self.adapter if adapter else None)
 
-    def echoed(self,bid,mid='reply1',part=1,parts=1):
-        item=self.box.db.execute('SELECT * FROM items WHERE id=?',(bid,)).fetchone()
-        return self.entry(mid,sender='assistant',text='[answer job-1] See approved issue 17',
-                          key=item['action'],reply_to='m1',part=part,parts=parts)|{
-                              'routing':envelope(tags(['a-manager'],item['action'],part,parts))}
+    def snapshot(self, state=None):
+        path = state or self.state
+        return {str(p.relative_to(path)): p.read_bytes() for p in path.rglob('*') if p.is_file()} if path.exists() else {}
 
-    def ack(self,mid='reply1',by='a-manager'):
-        with self.acks.open('a') as f:f.write(json.dumps({'reply_to':mid,'by':by,'channel':'#alpha','project':'alpha'})+'\n')
+    def test_initial_cutover_does_not_enroll_history(self):
+        self.adapter.messages.append(self.record() | {'at': '2020-01-01T00:00:00Z'})
+        self.assertEqual(self.box.poll()['items'], [])
+        with self.assertRaises(Blocked): self.box.initialize()
 
-    def test_baseline_never_replays_history(self):
-        self.box.db.close()
-        state=self.root/'other'
-        self.append(self.entry())
-        other=Inbox(state,self.cfg)
-        self.addCleanup(other.db.close)
-        self.assertEqual(other.initialize()['historical_requests_enrolled'],0)
-        self.assertEqual(other.poll()['items'],[])
-        with self.assertRaises(Blocked):other.initialize()
-
-    def test_restart_replay_and_duplicate_poll_keep_one_question(self):
-        bid=self.ready()
-        self.box.db.close();self.box=Inbox(self.state,self.cfg)
-        self.append(self.entry()|{'replayed':True})
-        self.assertEqual([x['id'] for x in self.box.poll()['items']],[bid])
-        self.assertEqual(len(self.box.poll()['items']),1)
-
-    def test_late_older_server_time_is_collected(self):
+    def test_replay_and_restart_preserve_one_item(self):
         self.ready()
-        self.when-=dt.timedelta(seconds=1)
-        self.append(self.entry('m2',key='q2'))
-        self.assertEqual(len(self.box.poll()['items']),2)
+        self.adapter.messages.append(deepcopy(self.adapter.messages[0]))
+        self.box = Inbox(self.state, self.cfg, self.adapter, clock=lambda: self.now)
+        self.assertEqual(len(self.box.poll()['items']), 1)
+        self.assertEqual(len(self.query('SELECT * FROM messages')), 1)
 
-    def test_new_request_channel_is_discovered(self):
-        self.append(self.entry(channel='#a-job-1'))
-        self.assertEqual(len(self.box.poll()['items']),1)
+    def test_interruption_before_cursor_advance_rolls_back_admission(self):
+        self.adapter.messages.append(self.record())
+        with patch.object(self.box, 'advance_cursors', side_effect=RuntimeError('interrupted')):
+            with self.assertRaises(RuntimeError): self.box.poll()
+        self.assertEqual(self.query('SELECT * FROM items'), [])
+        self.assertEqual(self.query('SELECT * FROM cursors'), [])
+        self.assertEqual(len(self.box.poll()['items']), 1)
 
-    def test_old_replay_in_new_channel_is_not_new_work(self):
-        self.when-=dt.timedelta(days=1)
-        self.append(self.entry(channel='#a-old'))
-        self.assertEqual(self.box.poll()['items'],[])
+    def test_multipart_admitted_once_after_different_poll_runs(self):
+        self.adapter.messages.append(self.record(parts=2))
+        first = self.box.poll()
+        self.assertEqual(first['items'], []); self.assertEqual(first['incomplete'], 1)
+        self.adapter.messages.append(self.record('q2', part=2, parts=2, text='… [question job-17] more context'))
+        self.assertEqual(self.box.poll()['items'][0]['id'], 'q1')
+        self.assertEqual(len(self.box.poll()['items']), 1)
 
-    def test_unverified_or_worker_cannot_enroll_questions(self):
-        self.append(self.entry('m1',verified=False),self.entry('m2',sender='a-worker'))
-        self.assertEqual(self.box.poll()['items'],[])
+    def test_nonmanager_spoof_missing_account_and_cross_project_rejected(self):
+        self.adapter.messages += [
+            self.record('worker', account='a-worker'),
+            self.record('spoof', account='outsider', text='[question job-17] I am a-manager'),
+            self.record('nick', account=None) | {'nick': 'a-manager'},
+            self.record('cross', account='a-manager', target='#b-work'),
+            self.record('self', account='assistant'),
+            self.record('wrong-request', request='beta-17'),
+        ]
+        self.assertEqual(self.box.poll()['items'], [])
 
-    def test_incidental_or_quoted_legacy_mention_is_ignored(self):
-        self.append(self.entry(routing=False,text='[question job-1] Earlier @helper example'))
-        self.assertEqual(self.box.poll()['items'],[])
+    def test_legitimate_nonmatching_request_prefix_is_allowed(self):
+        self.assertEqual(self.ready(request='job-17'), 'q1')
 
-    def test_legacy_direct_question_retained_but_not_autoanswered(self):
-        self.append(self.entry(routing=False,text='[question job-1] @helper choose?'))
-        item=self.box.poll()['items'][0]
-        self.assertFalse(item['claimable'])
-        self.assertIn('unframed',item['problem'])
-        with self.assertRaises(Blocked):self.box.claim(item['id'])
-
-    def test_out_of_order_multiline_survives_restart(self):
-        self.append(self.entry('m2',part=2,parts=2))
-        item=self.box.poll()['items'][0]
-        self.assertFalse(item['complete'])
-        with self.assertRaises(Blocked):self.box.claim(item['id'])
-        self.box.db.close();self.box=Inbox(self.state,self.cfg)
-        self.append(self.entry(parts=2))
-        item=self.box.poll()['items'][0]
-        self.assertTrue(item['complete']);self.assertTrue(item['claimable'])
-        self.assertEqual(item['root'],'m1')
-        self.assertIn('more context',item['text'])
-
-    def test_duplicate_transport_part_is_deduped(self):
-        self.append(self.entry(),self.entry('duplicate'))
-        self.assertEqual(len(self.box.poll()['items']),1)
-        self.assertEqual(self.box.db.execute('SELECT count(*) FROM fragments').fetchone()[0],1)
-
-    def test_conflicting_part_blocks_action(self):
-        self.append(self.entry(),self.entry('different',text='[question job-1] Changed question'))
-        item=self.box.poll()['items'][0]
-        self.assertFalse(item['claimable']);self.assertIn('conflicts',item['problem'])
-
-    def test_partial_line_keeps_cursor_before_record(self):
-        raw=json.dumps(self.entry()).encode()
-        path=self.logs/'alpha.jsonl';path.write_bytes(raw[:30])
-        self.assertEqual(self.box.poll()['items'],[])
-        with path.open('ab') as f:f.write(raw[30:]+b'\n')
-        self.assertEqual(len(self.box.poll()['items']),1)
-
-    def test_truncated_log_reports_problem_without_forgetting_pending(self):
-        self.ready();(self.logs/'alpha.jsonl').write_text('')
-        result=self.box.poll()
-        self.assertEqual(len(result['items']),1);self.assertTrue(result['problems'])
-
-    def test_single_run_and_item_claim_locks(self):
-        bid=self.ready()
-        with (self.state/'run.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            with self.assertRaises(Blocked):self.box.poll()
-        self.box.claim(bid)
-        with self.assertRaises(Blocked):self.box.claim(bid)
-
-    def test_uncertain_send_is_never_retried(self):
-        bid=self.ready();self.prepare(bid)
-        def fail(argv):raise TimeoutError('unknown send outcome')
-        with self.assertRaises(TimeoutError):self.send(bid,fail)
-        self.box.db.close();self.box=Inbox(self.state,self.cfg)
-        with self.assertRaises(Blocked):self.send(bid,fail)
-        self.assertEqual(self.box.poll()['items'][0]['status'],'uncertain')
-
-    def test_outbox_exit_does_not_duplicate_send(self):
-        bid=self.ready();self.prepare(bid)
-        self.send(bid,lambda argv:subprocess.CompletedProcess(argv,3))
-        with self.assertRaises(Blocked):self.send(bid,lambda argv:None)
-        self.append(self.echoed(bid))
-        self.assertEqual(self.box.poll()['items'][0]['status'],'awaiting_manager_ack')
-
-    def test_delivery_and_unrelated_manager_post_are_not_acceptance(self):
-        bid=self.ready();self.prepare(bid)
-        self.send(bid,lambda argv:subprocess.CompletedProcess(argv,0))
-        self.append(self.echoed(bid),self.entry('status',routing=False,text='[status job-1] working'))
-        self.ack(by='a-worker')
-        self.assertEqual(self.box.poll()['items'][0]['status'],'awaiting_manager_ack')
-        self.ack();self.assertEqual(self.box.poll()['items'],[])
-
-    def test_every_outgoing_fragment_needs_acceptance(self):
-        bid=self.ready();self.prepare(bid)
-        self.append(self.echoed(bid,parts=2),self.echoed(bid,'reply2',part=2,parts=2))
-        self.ack();self.assertEqual(self.box.poll()['items'][0]['status'],'awaiting_manager_ack')
-        self.ack('reply2');self.assertEqual(self.box.poll()['items'],[])
-
-    def test_escalation_ack_retains_unresolved_owner_question(self):
-        bid=self.ready();self.prepare(bid,'escalate')
-        self.append(self.echoed(bid));self.ack()
-        self.assertEqual(self.box.poll()['items'][0]['status'],'waiting_owner')
-        self.append(self.entry('decision',reply_to='m1',text='[decision job-1] Owner chose the documented option'))
-        self.assertEqual(self.box.poll()['items'],[])
-
-    def test_manager_resolution_before_reply_prevents_new_action(self):
-        bid=self.ready();token=self.box.claim(bid)['claim']
-        self.append(self.entry('decision',reply_to='m1',text='[answer job-1] Already settled'))
+    def test_invalid_envelope_is_not_question_or_acceptance(self):
+        self.adapter.messages.append(self.record() | {'tags': {'+plateia/to': 'helper'}})
+        self.assertEqual(self.box.poll()['items'], [])
+        self.adapter.messages.append(self.record('q2', key='question2'))
         self.box.poll()
-        with self.assertRaises(Blocked):self.box.prepare(bid,token,{'kind':'settled','answer':'x','source':'y'})
+        outgoing = self.send('q2')
+        self.adapter.messages += [self.echo(outgoing), self.record('bad-ack', reply_to='r1') | {'tags': {'+plateia/key': 'broken'}}]
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'delivered')
 
-    def test_owner_tag_cannot_leak_into_routine_reply(self):
-        bid=self.ready();token=self.box.claim(bid)['claim']
-        with self.assertRaises(Blocked):self.box.prepare(bid,token,{'kind':'settled','answer':'Earlier `@operator` example','source':'approved issue'})
+    def test_incidental_and_quoted_mentions_do_not_enroll(self):
+        for n, text in enumerate(('[question job-17] Prior @helper example', '[question job-17] `@helper`',
+                                 '[question job-17] > @helper', '… [question job-17] @helper')):
+            self.adapter.messages.append(self.record(str(n), route=False, text=text))
+        self.assertEqual(self.box.poll()['items'], [])
 
-    def test_prepare_rechecks_new_manager_resolution(self):
-        bid=self.ready();token=self.box.claim(bid)['claim']
-        self.append(self.entry('decision',reply_to='m1',text='[answer job-1] Already answered'))
-        with self.assertRaises(Blocked):self.box.prepare(bid,token,{'kind':'settled','answer':'x','source':'y'})
+    def test_legacy_quarantine_and_structured_resend(self):
+        self.adapter.messages.append(self.record('old', route=False, text='[question] @helper choose?'))
+        row = self.box.poll()['items'][0]
+        self.assertEqual(row['status'], 'quarantined')
+        with self.assertRaises(Blocked): self.box.claim('old')
+        self.adapter.messages.append(self.record())
+        self.assertEqual(self.box.poll()['items'][0]['id'], 'q1')
 
-    def test_send_rechecks_resolution_and_never_calls_transport(self):
-        bid=self.ready();self.prepare(bid)
-        self.append(self.entry('decision',reply_to='m1',text='[answer job-1] Already answered'))
-        with self.assertRaises(Blocked):self.send(bid,lambda argv:self.fail('must not send'))
+    def test_metadata_and_content_conflicts_block_without_cursor_loss(self):
+        self.ready()
+        before = self.query('SELECT * FROM cursors')
+        self.adapter.messages.append(self.record('other', text='[question job-17] Conflicting text'))
+        with self.assertRaises(AdapterError): self.box.poll()
+        self.assertEqual(self.query('SELECT * FROM cursors'), before)
+        self.assertEqual(len(self.query('SELECT * FROM items')), 1)
 
-    def test_routing_identity_change_fails_closed(self):
-        self.box.cfg={**self.cfg,'assistant':'different-assistant'}
-        with self.assertRaises(Blocked):self.box.poll()
+    def test_ack_before_delivery_survives_cursor_advance(self):
+        self.ready(); outgoing = self.send()
+        self.ack(); self.box.poll()
+        self.adapter.messages.append(self.echo(outgoing))
+        self.assertEqual(self.box.poll()['items'], [])
+        self.assertEqual(self.item()['status'], 'accepted')
+
+    def test_send_uses_original_target_and_explicit_manager_recipient(self):
+        self.ready(target='#a-work'); outgoing = self.send()
+        self.assertEqual(self.adapter.sends[0]['target'], '#a-work')
+        self.assertEqual(outgoing['tags']['+plateia/to'], 'alpha-lead')
+        self.assertEqual(outgoing['tags']['+draft/reply'], 'q1')
+        self.assertEqual(outgoing['tags']['+plateia/auto'], 'settled')
+        self.assertIn('[answer job-17] Automatic routine clarification (settled):', outgoing['text'])
+        self.assertIn('No new scope, solve, merge, permission, credential or security authority.', outgoing['text'])
+        self.assertEqual(self.item()['status'], 'submitted')
+
+    def test_submitted_then_delivered_then_accepted_by_reply(self):
+        self.ready(); outgoing = self.send()
+        self.adapter.messages.append(self.echo(outgoing))
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'delivered')
+        self.adapter.messages.append(self.record('ack', route=False, text='[status job-17] accepted', reply_to='r1'))
+        self.assertEqual(self.box.poll()['items'], [])
+
+    def test_unrelated_or_wrong_author_acceptance_never_counts(self):
+        self.ready(); outgoing = self.send()
+        self.adapter.messages += [self.echo(outgoing), self.record('status', route=False, text='[status job-17] working')]
+        for who in ('a-worker', None, 'b-manager'):
+            self.ack(account=who)
+        self.adapter.messages.append(self.record('reply', account='outsider', reply_to='r1'))
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'delivered')
+
+    def test_every_part_of_one_copy_needs_acceptance(self):
+        self.ready(); outgoing = self.send()
+        self.adapter.messages += [self.echo(outgoing, parts=2), self.echo(outgoing, 'r2', part=2, parts=2)]
+        self.ack(); self.assertEqual(self.box.poll()['items'][0]['status'], 'delivered')
+        self.ack('r2'); self.assertEqual(self.box.poll()['items'], [])
+
+    def test_retry_copies_never_mix_accepted_parts(self):
+        self.ready(); outgoing = self.send()
+        self.adapter.messages += [self.echo(outgoing, 'a1', parts=2), self.echo(outgoing, 'a2', part=2, parts=2),
+                                  self.echo(outgoing, 'b1', parts=2), self.echo(outgoing, 'b2', part=2, parts=2)]
+        self.ack('a1'); self.ack('b2')
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'delivered')
+        self.ack('b1'); self.assertEqual(self.box.poll()['items'], [])
+
+    def test_interleaved_or_conflicting_copies_are_not_delivery(self):
+        self.ready(); outgoing = self.send()
+        self.adapter.messages += [self.echo(outgoing, 'a1', parts=2), self.echo(outgoing, 'b1', parts=2),
+                                  self.echo(outgoing, 'a2', part=2, parts=2)]
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'submitted')
+
+    def test_escalation_waits_for_owner_resolution(self):
+        self.ready(); outgoing = self.send(kind='escalate')
+        self.adapter.messages.append(self.echo(outgoing)); self.ack()
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'waiting_owner')
+        self.adapter.messages.append(self.resolution(account='operator'))
+        self.assertEqual(self.box.poll()['items'], [])
+        self.assertEqual(self.item()['status'], 'resolved')
+
+    def test_resolution_transitions_from_each_nonterminal_state(self):
+        for state in ('new', 'claimed', 'sending', 'send_failed', 'uncertain', 'submitted', 'delivered', 'waiting_owner'):
+            with self.subTest(state=state):
+                self.state = self.root / ('case-' + state)
+                self.adapter = FakeAdapter()
+                self.box = Inbox(self.state, self.cfg, self.adapter, clock=lambda: self.now)
+                self.box.initialize(); self.now += 1; self.ready()
+                if state == 'claimed': self.prepare()
+                elif state == 'sending':
+                    token, _ = self.prepare(); self.adapter.send_result = KeyboardInterrupt()
+                    with self.assertRaises(KeyboardInterrupt): self.box.send('q1', token)
+                elif state in ('send_failed', 'uncertain', 'submitted', 'delivered', 'waiting_owner'):
+                    outcome = {'send_failed': 'failed', 'uncertain': 'uncertain'}.get(state, 'sent')
+                    outgoing = self.send(kind='escalate' if state == 'waiting_owner' else 'settled',
+                                         outcome=outcome, proof='positive fake proof')
+                    if state in ('delivered', 'waiting_owner'):
+                        self.adapter.messages.append(self.echo(outgoing))
+                        if state == 'waiting_owner': self.ack()
+                        self.box.poll()
+                self.assertEqual(self.item()['status'], state)
+                sends = len(self.adapter.sends)
+                self.adapter.messages.append(self.resolution())
+                self.box.poll()
+                self.assertEqual(self.item()['status'], 'resolved')
+                self.assertEqual(len(self.adapter.sends), sends)
+
+    def test_invalid_resolution_cannot_close_question(self):
+        self.ready()
+        self.adapter.messages += [self.resolution('bad-author', account='outsider'), self.resolution('wrong-root', reply_to='another')]
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'new')
+
+    def test_resolution_before_prepare_or_send_suppresses_answer(self):
+        self.ready(); token, _ = self.prepare()
+        self.adapter.messages.append(self.resolution())
+        with self.assertRaises(Blocked): self.box.send('q1', token)
+        self.assertEqual(self.adapter.sends, [])
+        # A blocked send rolls back its reconciliation; a read-only poll records it.
+        self.box.poll(); self.assertEqual(self.item()['status'], 'resolved')
+
+    def test_partial_resolution_blocks_send_until_complete(self):
+        self.ready(); token, _ = self.prepare()
+        self.adapter.messages.append(self.resolution(parts=2))
+        with self.assertRaises(Blocked): self.box.send('q1', token)
+        self.assertEqual(self.adapter.sends, [])
+        self.adapter.messages.append(self.resolution('d2', part=2, parts=2))
+        self.assertEqual(self.box.poll()['items'], [])
+
+    def test_overlapping_claimants_and_expired_token(self):
+        self.ready(); old = self.box.claim('q1')['claim']
+        with self.assertRaises(Blocked): self.box.claim('q1')
+        self.now += 601
+        fresh = self.box.claim('q1')['claim']
+        with self.assertRaises(Blocked): self.box.prepare('q1', old, DECISION)
+        self.box.prepare('q1', fresh, DECISION)
+        with self.assertRaises(Blocked): self.box.send('q1', old)
+        self.box.send('q1', fresh)
+
+    def test_expired_prepared_claim_can_be_reconsidered_without_changing_key(self):
+        self.ready(); token, first = self.prepare()
+        self.now += 601
+        with self.assertRaises(Blocked): self.box.send('q1', token)
+        new = self.box.claim('q1')['claim']
+        second = self.box.prepare('q1', new, {**DECISION, 'source': 'rechecked approved issue'})
+        self.assertEqual(first['tags']['+plateia/key'], second['tags']['+plateia/key'])
+
+    def test_crash_after_send_intent_never_automatically_retries(self):
+        self.ready(); token, _ = self.prepare()
+        self.adapter.send_result = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt): self.box.send('q1', token)
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'sending')
+        self.box = Inbox(self.state, self.cfg, self.adapter, clock=lambda: self.now)
+        self.now += 601
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'uncertain')
+        with self.assertRaises(Blocked): self.box.claim('q1')
+        with self.assertRaises(Blocked): self.box.send('q1', token)
+        self.assertEqual(len(self.adapter.sends), 1)
+
+    def test_expiry_during_send_cannot_record_result(self):
+        self.ready(); token, _ = self.prepare()
+        def expires(**kwargs):
+            self.now += 601
+            return SendResult('sent')
+        with patch.object(self.adapter, 'send', side_effect=expires):
+            with self.assertRaises(Blocked): self.box.send('q1', token)
+        self.assertEqual(self.item()['status'], 'sending')
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'uncertain')
+
+    def test_uncertain_exception_and_unknown_outcomes_never_retry(self):
+        self.ready(); token, _ = self.prepare()
+        self.adapter.send_result = TimeoutError('ambiguous outcome')
+        with self.assertRaises(TimeoutError): self.box.send('q1', token)
+        self.assertEqual(self.item()['status'], 'uncertain')
+        with self.assertRaises(Blocked): self.box.claim('q1')
+
+    def test_sending_can_reconcile_delivery_without_recording_sender_result(self):
+        self.ready(); token, outgoing = self.prepare()
+        self.adapter.send_result = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt): self.box.send('q1', token)
+        self.adapter.messages.append(self.echo(outgoing))
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'delivered')
+
+    def test_unknown_result_and_conflicting_complete_copies_remain_uncertain(self):
+        self.ready(); outgoing = self.send(outcome='unknown')
+        self.adapter.messages += [self.echo(outgoing, 'first'), self.echo(outgoing, 'second', text='[answer job-17] different')]
+        self.ack('first'); self.ack('second')
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'uncertain')
+
+    def test_malformed_server_record_blocks_without_advancing_cursor(self):
+        self.adapter.messages.append(self.record() | {'at': 'bad timestamp'})
+        with self.assertRaises(AdapterError): self.box.poll()
+        self.assertEqual(self.query('SELECT * FROM cursors'), [])
+
+    def test_uncertain_becomes_delivered_only_on_complete_evidence(self):
+        self.ready(); outgoing = self.send(outcome='uncertain')
+        self.adapter.messages.append(self.echo(outgoing, parts=2))
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'uncertain')
+        self.adapter.messages.append(self.echo(outgoing, 'r2', part=2, parts=2))
+        self.assertEqual(self.box.poll()['items'][0]['status'], 'delivered')
+
+    def test_proven_send_failure_allows_new_claim_and_same_action(self):
+        self.ready(); first = self.send(outcome='failed', proof='fake rejected before any submission')
+        self.assertEqual(self.item()['status'], 'send_failed')
+        second = self.send()
+        self.assertEqual(first, second)
+        self.assertEqual(self.item()['status'], 'submitted')
+
+    def test_unproven_failure_is_uncertain(self):
+        self.ready(); self.send(outcome='failed')
+        self.assertEqual(self.item()['status'], 'uncertain')
+
+    def test_operator_resend_is_explicit_audited_and_preserves_key_and_content(self):
+        self.ready(); first = self.send(outcome='uncertain')
+        with self.assertRaises(Blocked): self.box.authorize_resend('q1', '')
+        self.box.authorize_resend('q1', 'owner authorized this resend after inspection')
+        token = self.box.claim('q1')['claim']
+        with self.assertRaises(Blocked): self.box.prepare('q1', token, {**DECISION, 'answer': 'different'})
+        second = self.box.prepare('q1', token, DECISION)
+        self.assertEqual(first, second)
+        self.assertEqual(len(self.query('SELECT * FROM audit')), 1)
+
+    def test_invalid_reply_fields_and_owner_mentions_are_refused(self):
+        self.ready(); token = self.box.claim('q1')['claim']
+        for decision in ({**DECISION, 'source': ''}, {'kind': 'escalate', 'answer': '', 'source': 'evidence'},
+                         {'kind': 'escalate', 'answer': 'choice', 'source': ''}, [],
+                         {**DECISION, 'answer': 'quoted `@operator`'}):
+            with self.assertRaises(Blocked): self.box.prepare('q1', token, decision)
+        self.assertEqual(self.adapter.sends, [])
+
+    def test_adapter_read_errors_rollback_both_cursors_and_item_state(self):
+        self.ready(); outgoing = self.send()
+        before = self.query('SELECT * FROM cursors')
+        self.adapter.messages.append(self.echo(outgoing)); self.ack()
+        self.adapter.ack_error = 'ack source unavailable'
+        self.assertEqual(self.cli('poll'), 75)
+        self.assertEqual(self.query('SELECT * FROM cursors'), before)
+        self.assertEqual(self.item()['status'], 'submitted')
+        self.adapter.ack_error = None; self.adapter.message_error = 'history replaced'
+        self.assertEqual(self.cli('poll'), 75)
+        self.assertEqual(self.query('SELECT * FROM cursors'), before)
+        self.adapter.message_error = None
+        self.assertEqual(self.box.poll()['items'], [])
+
+    def test_poll_and_reconciliation_never_send(self):
+        self.ready(); self.box.poll(); self.box.poll()
+        self.assertEqual(self.adapter.sends, [])
+
+    def test_incomplete_config_leaves_existing_and_absent_state_unchanged(self):
+        before = self.snapshot(); self.configfile.write_text('{}')
+        self.assertEqual(self.cli('poll'), 75); self.assertEqual(self.snapshot(), before)
+        missing = self.root / 'absent'
+        self.assertEqual(self.cli('poll', state=missing), 75); self.assertFalse(missing.exists())
+
+    def test_identity_collision_and_ambiguous_targets_are_incomplete(self):
+        for cfg in ({**self.cfg, 'assistant': 'operator'}, {**self.cfg, 'assistant': 'a-manager'},
+                    {**self.cfg, 'projects': {**self.cfg['projects'], 'copy': {**self.cfg['projects']['alpha'], 'request_prefix': 'copy-'}}}):
+            self.configfile.write_text(json.dumps(cfg)); before = self.snapshot()
+            self.assertEqual(self.cli('poll'), 75); self.assertEqual(self.snapshot(), before)
+
+    def test_overlap_existing_and_before_first_initialization_changes_nothing(self):
+        for state in (self.state, self.root / 'first'):
+            state.mkdir(exist_ok=True)
+            with (state/'run.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                before = self.snapshot(state)
+                self.assertEqual(self.cli('poll', state=state), 75)
+                self.assertEqual(self.snapshot(state), before)
+
+    def test_no_adapter_or_missing_state_never_initializes_silently(self):
+        missing = self.root / 'absent'
+        self.assertEqual(self.cli('poll', state=missing, adapter=False), 75)
+        self.assertEqual(self.cli('poll', state=missing), 75)
+        self.assertFalse(missing.exists())
+
+    def test_manifest_change_is_blocked(self):
+        box = Inbox(self.state, {**self.cfg, 'alias': 'other-helper'}, self.adapter)
+        with self.assertRaises(Blocked): box.poll()
 
     def test_quiet_unchanged_poll(self):
-        self.box.poll()
-        self.assertFalse(self.box.poll()['changed'])
-
-    def test_new_pending_question_is_not_starved_by_waiting_owner(self):
-        bid=self.ready();self.prepare(bid,'escalate')
-        self.append(self.echoed(bid));self.ack();self.box.poll()
-        self.append(self.entry('new',key='q2'))
-        item=self.box.poll(limit=1)['items'][0]
-        self.assertTrue(item['claimable'])
-
-    def test_missing_main_log_is_unknown_not_empty(self):
-        (self.logs/'alpha.jsonl').unlink()
-        with self.assertRaises(Blocked):self.box.poll()
-
-    def test_removed_request_log_preserves_pending_question(self):
-        self.append(self.entry(channel='#a-job-1'))
-        self.box.poll();(self.logs/'a-job-1.jsonl').unlink()
-        result=self.box.poll()
-        self.assertEqual(len(result['items']),1);self.assertTrue(result['problems'])
-
-    def test_failed_live_manager_preflight_preserves_prepared_unsent_action(self):
-        bid=self.ready();self.prepare(bid)
-        with patch.object(self.box,'verify_manager',side_effect=Blocked('denied')):
-            with self.assertRaises(Blocked):self.send(bid,lambda argv:self.fail('must not send'))
-        self.assertEqual(self.box.poll()['items'][0]['status'],'prepared')
-
-    def test_missing_request_log_blocks_a_prepared_reply(self):
-        self.append(self.entry(channel='#a-job-1'))
-        bid=self.box.poll()['items'][0]['id'];self.prepare(bid)
-        (self.logs/'a-job-1.jsonl').unlink()
-        with self.assertRaises(Blocked):
-            self.send(bid,lambda argv:self.fail('must not reply with unknown channel coverage'))
-
-    def test_multipart_owner_resolution_waits_for_all_fragments(self):
-        bid=self.ready()
-        self.append(self.entry('d1',key='decision',part=1,parts=2,reply_to='m1',
-                               text='[decision job-1] Owner selected'))
-        self.assertEqual(len(self.box.poll()['items']),1)
-        self.append(self.entry('d2',key='decision',part=2,parts=2,reply_to='m1',
-                               text='… [decision job-1] the documented option'))
-        self.assertEqual(self.box.poll()['items'],[])
-
-    def test_malformed_config_shapes_are_blocked(self):
-        path=self.root/'bad.json'
-        for data in ([], {'projects':[]}, {**self.cfg,'manager_state':'/example/managers','projects':{'alpha':[]}}):
-            path.write_text(json.dumps(data))
-            with self.assertRaises(Blocked):config(path)
+        self.box.poll(); self.assertFalse(self.box.poll()['changed'])
 
 
-if __name__ == '__main__':unittest.main()
+class ProtocolTests(unittest.TestCase):
+    def test_leading_address_forms_and_standard_nametags(self):
+        for text in ('@helper hi', '[question job-1] mgr: @helper hi', '[question] helper: hi',
+                     '[question job-1] solve/R2: @helper hi'):
+            self.assertEqual(recipients(text, {'helper'}), {'helper'})
+        self.assertEqual(header('… [question job-1] tail'), ('question', 'job-1', 'tail', True))
+
+    def test_auto_marker_requires_complete_envelope_and_valid_kind(self):
+        self.assertEqual(envelope(tags(['helper'], 'key', 1, 1, 'settled'))['auto'], 'settled')
+        for raw in ({'+plateia/auto': 'settled'}, tags(['helper'], 'key', 1, 1) | {'+plateia/auto': 'grant'},
+                    tags(['helper'], 'key', 1, 1) | {'+plateia/to': 7}):
+            with self.assertRaises(ValueError): envelope(raw)
+
+
+if __name__ == '__main__':
+    unittest.main()

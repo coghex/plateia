@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stable entry point; no environment changes or credentials are needed to poll."""
+"""Core command shell; stops unless a reviewed host supplies an adapter."""
 import sys
 from pathlib import Path
 
