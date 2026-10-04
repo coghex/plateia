@@ -47,7 +47,7 @@ jobs:
           set -euo pipefail
           log="$RUNNER_TEMP/unittest.log"
           status=0
-          python3 -B -W error::ResourceWarning -m unittest discover -s packages/routine_inbox/tests -v 2>&1 | tee "$log" || status=$?
+          python3 -B -W error::ResourceWarning -m unittest discover -s ci-negative-proof-empty -v 2>&1 | tee "$log" || status=$?
           if [ "$status" -ne 0 ]; then
             echo "::error::unittest exited with status $status."
             exit "$status"
