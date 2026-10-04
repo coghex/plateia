@@ -1,0 +1,99 @@
+# Runs the package's tests on every pull request and every push to master, and
+# publishes `build-test`, the one CI check the PR drainer requires. The design
+# and its owner decisions are in docs/ci_design.md.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels its superseded run; every master push
+# keeps a run of its own, so a breaking commit always reports its own result.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('push-{0}', github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor skill/OPERATING.md promises; 3.14 is the version
+        # in use.
+        python-version: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The command skill/OPERATING.md documents, plus -v so the log names each
+      # test. unittest's own exit status decides first. Then the step refuses a
+      # run that tested nothing: Python 3.10 and 3.11 exit 0 on an empty
+      # discovery, which would let a moved test directory pass.
+      - name: Run the tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/unittest.log"
+          status=0
+          python3 -B -W error::ResourceWarning -m unittest discover -s packages/routine_inbox/tests -v 2>&1 | tee "$log" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::unittest exited with status $status."
+            exit "$status"
+          fi
+          summary="$(grep -E '^Ran [0-9]+ tests? in ' "$log" | tail -n 1 || true)"
+          count="$(printf '%s\n' "$summary" | sed -nE 's/^Ran ([0-9]+) tests? in .*/\1/p')"
+          if [ -z "$count" ] || [ "$count" -eq 0 ]; then
+            echo "::error::unittest reported no tests run (${summary:-no summary line}); refusing an empty run."
+            exit 1
+          fi
+          echo "unittest ran $count tests."
+
+  # The single required CI context. A failed dependency *skips* a dependent
+  # job, and a skipped check is not a failed one to the drainer, so this job
+  # runs under `if: always()` and refuses any dependency result that is not
+  # `success`. The script is kanban's (.github/workflows/ci.yml at f5469d9),
+  # unchanged. It cannot cover a run cancelled as a whole by a superseding
+  # push: that leaves `build-test` cancelled or unreported, never successful.
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs: [test]
+    steps:
+      - name: Require every other job to have succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          results = json.loads(os.environ["NEEDS"])
+          if not results:
+              sys.exit("build-test depends on no job, so it gates nothing.")
+
+          refused = []
+          for job in sorted(results):
+              result = results[job].get("result")
+              print(f"{job}: {result}")
+              if result != "success":
+                  refused.append(f"{job} reported {result}")
+
+          if refused:
+              sys.exit("Refusing: " + ", ".join(refused) + ".")
+
+          print(f"Every job in this workflow succeeded ({len(results)} of them).")
+          PY
