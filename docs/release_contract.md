@@ -186,7 +186,10 @@ arm64, CPython 3.14.8), using this PR's build step.
 
 - **Inputs:**
   - **Builder:** this PR's `packages/release/build_release.py`, at builder
-    revision `2ab6c29ac2dd025769d67efe0b181716082be2cf`, not dirty.
+    revision `01d0d57a14fbdde5a1d0a70dc5a617d2b02a711d`, not dirty. That is
+    the PR head after its first review. The first run, with `2ab6c29`, gave
+    the same outcomes and byte-identical artifacts; only the builder's own
+    identity in the manifest differed.
   - **Source:** a clean detached checkout of `origin/master` at
     `48b901ac3e81d1f0c2b249f9381cf1af4aa2524a`. That commit contains #11's
     and #12's code.
@@ -196,7 +199,7 @@ arm64, CPython 3.14.8), using this PR's build step.
 
 | Step | Command | Outcome |
 | --- | --- | --- |
-| build | `build_release.py build --source <src> --commit origin/master --out <out>` | `built: plateia-chat-0.1.0+g48b901ac3e81 from 48b901ac3e81 (2 artifacts)` |
+| build | `build_release.py build --source <src> --commit 48b901ac3e81d1f0c2b249f9381cf1af4aa2524a --out <out>` | `built: plateia-chat-0.1.0+g48b901ac3e81 from 48b901ac3e81 (2 artifacts)` |
 | verify | `build_release.py verify <out>/plateia-chat-0.1.0+g48b901ac3e81` | `verified: ...; 2 artifacts match the manifest` |
 | hashes | `shasum -a 256` of each artifact | wheel `29351bf4fd71e85a0644d94134e35ffa7156a5f22873eda0d784abaf96a5f87f`, skill `5b495b854124e063a11960fbf62be8fad4ce1706d25ca094bcc93c0399f8c2af`, both equal to the manifest |
 | install | `python3 -m venv <env>`; `<env>/bin/python -m pip install --no-index --no-deps <wheel>` (pip variables above, invented `HOME`) | `Successfully installed plateia-chat-0.1.0+g48b901ac3e81` |
