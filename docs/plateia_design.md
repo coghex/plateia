@@ -1276,6 +1276,23 @@ inbox core already on `master` joins a release when PLT-13 gives it a live
 adapter. Packaging the inbox core in the first release was not selected: it
 would ship a package nothing runs yet.
 
+### D-26. PLT-12 approved; the chat import location is a managed target
+
+Owner decision and signoff in this conversation, 2026-10-08: the PLT-12 entry
+is approved with an explicit managed-target list: the `pchat` symlink, the
+bridge and log-rotation LaunchAgent program paths, the WeeChat color-script
+symlinks, the chat skill folder (read by both Claude and Codex), and the
+`chat/scripts` import location itself. At activation (PLT-14) that location
+becomes a thin layer handing off to the selected release, so the launch hook
+and the `project-manager` scripts that import chat modules by path load the
+release's modules without being edited. Staging only records and checks these
+targets; it replaces nothing.
+
+Editing each path-bound importer to find the release was not selected: it is
+the broader skill migration D-17 deferred, and adds drift-protected files.
+Leaving those importers on the old tree was rejected: two identity
+implementations would write one registry, the split D-23 exists to prevent.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1672,22 +1689,28 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   managed-target ownership/hash inventory, durable stage journal and interrupted
   stage reconciliation. Exercise isolated invented home/state fixtures; include
   operator contracts and crash evidence in this PR. Installer execution on the
-  owner's machine remains separately held.
+  owner's machine remains separately held. Managed targets for the first
+  release (D-26): the `pchat` symlink, the bridge and log-rotation LaunchAgent
+  program paths, the WeeChat color-script symlinks, the chat skill folder and
+  the `chat/scripts` import location used by the launch hook and
+  `project-manager` scripts.
 - **Owning repository:** `coghex/plateia`.
 - **Phase:** release preparation prerequisite.
 - **Depends on:** PLT-11.
 - **Ordering:** critical path for deployment; independent of offline card work.
-- **Relevant decisions:** D-2, D-6, D-7, D-15, D-16, D-17, D-23.
+- **Relevant decisions:** D-2, D-6, D-7, D-15, D-16, D-17, D-23, D-26.
 - **Acceptance signals:** staging preserves active/modified files, identities,
   private settings, queues and service state; unknown ownership, mismatched
   interpreter, incompatible state and tampered artifacts block. Repeated or
   interrupted staging reconciles the same operation; no partial environment
-  is activated and no identity rollout helper is called.
+  is activated and no identity rollout helper is called. The plan lists every
+  D-26 target, including path-bound importers, and a fixture with an importer
+  outside the list is reported rather than silently left on the old code.
 - **Out of scope:** selecting active code, service restart/start, schema or
   credential changes, account provisioning and live installation in this task.
-- **Open questions:** Q-11 for boundary signoff. A concrete compatible target
-  plan is a later deployment prerequisite, not an installation exception.
-  **Stop before processing.**
+- **Open questions:** None; boundary approved by D-26. A concrete compatible
+  target plan is a later deployment prerequisite, not an installation
+  exception. **Stop before processing** until the design is ready.
 
 ### PLT-14. Add guarded activation and state-preserving rollback
 
