@@ -1326,6 +1326,12 @@ Keeping PLT-10 as one slice was not selected: it would mix a pure restructure
 with new behavior, hiding behavior changes from review. Splitting by consumer
 was not selected: every slice would touch the shared evidence model.
 
+### D-29. PLT-10 and PLT-16 entries approved as written
+
+Owner signoff in this conversation, 2026-10-08: the PLT-10 and PLT-16 delivery
+entries (outcome, scope, dependencies, acceptance signals and out of scope),
+as recorded under D-28, are approved. This settles Q-11 for these two slices.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1429,8 +1435,9 @@ evidence freshness before the affected implementation slices are processed.
 splits it into PLT-9 (core) and PLT-15 (bridge), excluding `install-identities`.
 D-21 keeps the receipt experiment in PLT-15 as is. **Q-11 is resolved for
 PLT-9 and PLT-15 (D-22, amended by D-24), PLT-11 (D-25), PLT-12 (D-26) and
-PLT-14 (D-27)**, in D-23's order. PLT-10, PLT-13, PLT-1 to PLT-7, PLT-2 and
-PLT-8 remain unsigned, as does the first browser boundary below.
+PLT-14 (D-27), and PLT-10 and PLT-16 (D-28, D-29)**, in D-23's order. PLT-13,
+PLT-1 to PLT-7, PLT-2 and PLT-8 remain unsigned, as does the first browser
+boundary below.
 
 The first browser slice is proposed to cover the specified existing-approved
 issue's Solve/Hold/resume path and actual status progression. Other mid-term
@@ -1811,8 +1818,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Out of scope:** attested evidence records and uncertain-send results
   (PLT-16); shared inbox/card-move framing (Q-14, PLT-1); card revisions and
   receipts (PLT-1); release activation; new services.
-- **Open questions:** Q-11 for signoff of this entry. **Stop before
-  processing.**
+- **Open questions:** None; boundary approved by D-29. **Stop before
+  processing** until the design is ready.
 
 ### PLT-16. Add normalized, attested chat evidence to the shared API
 
@@ -1841,8 +1848,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   data; existing command behavior from PLT-10 is unchanged.
 - **Out of scope:** the inbox adapter itself (PLT-13); shared framing for
   `card-move/v1` (Q-14, PLT-1); card revisions and durable receipts (PLT-1).
-- **Open questions:** Q-11 for signoff of this entry. **Stop before
-  processing.**
+- **Open questions:** None; boundary approved by D-29. **Stop before
+  processing** until the design is ready.
 
 ### PLT-13. Adapt the approved clarification inbox to shared chat
 
@@ -2120,8 +2127,10 @@ owner. Re-run the drift comparison before processing PLT-9. D-23 then
 reorders release work ahead of the API (PLT-15 → PLT-11 → PLT-12 → PLT-14 →
 PLT-10). D-24 to D-27 then add the chat guidance to PLT-15 and approve
 PLT-11, PLT-12 (with its managed-target list) and PLT-14 (with the first
-activation's rollback and skills-repository commit rules). Next for Q-11:
-PLT-10, then PLT-13, the card slices and the first browser boundary.
+activation's rollback and skills-repository commit rules). D-28/D-29 split
+the API work into PLT-10 (behavior-preserving API) and PLT-16 (attested
+evidence) and approve both. Next for Q-11: PLT-13, then the card slices and
+the first browser boundary.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
