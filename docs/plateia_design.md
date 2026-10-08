@@ -24,7 +24,7 @@ concrete precondition
 ## Processing status
 
 - [x] EPIC. Build the shared chat foundation and the first board card lifecycle — [#10]
-- [ ] PLT-9. Capture the shared chat identity and transport core
+- [x] PLT-9. Capture the shared chat identity and transport core — [#11]
 - [ ] PLT-15. Capture the shared chat bridge
 - [ ] PLT-11. Build immutable pinned shared-package releases
 - [ ] PLT-12. Stage releases without changing active tools or services
