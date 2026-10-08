@@ -82,6 +82,12 @@ behavior. The second is the capture tooling. Neither needs an IRC server,
 cmux, the network or the real home directory. `_isolation` gives each run a
 throwaway home and refuses any access to live state.
 
+Run them with `XDG_CONFIG_HOME` and `XDG_STATE_HOME` unset (`env -u
+XDG_CONFIG_HOME -u XDG_STATE_HOME ...`, as CI does) when either is exported
+under the real home. Otherwise a test that restores the environment trips
+the guard, which refuses to write a live path back, and the restore stops
+partway.
+
 ## Drift check
 
 ```sh
