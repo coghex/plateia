@@ -1,16 +1,28 @@
 {
   "schema": "plateia-chat-capture/1",
-  "slice": "PLT-9 (#11): shared chat identity and transport core",
+  "slices": [
+    "PLT-9 (#11): shared chat identity and transport core",
+    "PLT-15 (#12): shared chat bridge, log rotation and the chat skill's guidance"
+  ],
   "source": {
     "repository": "~/.codex/skills, the owner's local skills repository (it has no remote)",
-    "monitored": "chat/scripts"
+    "monitored": "chat"
   },
   "baseline": "c572bad60b06f262d11a7175f52fd62f23257241",
-  "effective_source": "c572bad60b06f262d11a7175f52fd62f23257241",
-  "carried_commits": [],
-  "carried_commits_note": "The drift check at capture time (2026-10-08) found no newer skills commit and no uncommitted edit touching a captured file, so the effective source is the baseline.",
+  "effective_source": "8ff325ee307b92e53157594e570235bc9f2f5229",
+  "carried_commits": [
+    {
+      "commit": "8ff325ee307b92e53157594e570235bc9f2f5229",
+      "files": [
+        "chat/SKILL.md"
+      ],
+      "summary": "workflow: bound machine quiet to timing measurements — adds the 7-line \"Timing reservations\" paragraph to chat/SKILL.md",
+      "carried_in": "PLT-15 (#12)"
+    }
+  ],
+  "carried_commits_note": "PLT-9's drift check (2026-10-08) found no newer commit touching its files. PLT-15's (2026-10-08) found one, 8ff325e, on chat/SKILL.md only, and no uncommitted edit to any captured file. Each captured entry's source_commit is the commit its effective_sha256 was taken from: the baseline, or the carried commit for a file it changed.",
   "monitored": {
-    "root": "chat/scripts",
+    "root": "chat",
     "exclude": [
       {
         "pattern": "__pycache__",
@@ -25,31 +37,7 @@
         "reason": "Finder metadata, ignored by the skills repository"
       },
       {
-        "pattern": "chat-bridge",
-        "reason": "the bridge: PLT-15 (#12)"
-      },
-      {
-        "pattern": "rotate-logs",
-        "reason": "log rotation: PLT-15 (#12)"
-      },
-      {
-        "pattern": "tests/test_bridge.py",
-        "reason": "bridge tests: PLT-15 (#12)"
-      },
-      {
-        "pattern": "tests/test_receipt_experiment.py",
-        "reason": "bridge-dependent receipt test: PLT-15 (#12), D-69"
-      },
-      {
-        "pattern": "tests/test_rotate_logs.py",
-        "reason": "log-rotation tests: PLT-15 (#12)"
-      },
-      {
-        "pattern": "tests/fixtures",
-        "reason": "bridge test fixtures: PLT-15 (#12)"
-      },
-      {
-        "pattern": "install-identities",
+        "pattern": "scripts/install-identities",
         "reason": "identity rollout, excluded from every capture (D-20)"
       }
     ]
@@ -58,11 +46,13 @@
     {
       "baseline_path": "chat/scripts/agentcli.py",
       "path": "packages/chat/scripts/agentcli.py",
+      "slice": "PLT-9 (#11)",
       "baseline": {
         "type": "file",
         "mode": "100644",
         "sha256": "262d42bf09af99eac65e19ef4e50ec6fea7d7072969c8308d3ff58848c94e272"
       },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "262d42bf09af99eac65e19ef4e50ec6fea7d7072969c8308d3ff58848c94e272",
       "capture": "changed",
       "sha256": "0c829109ced770f70049ad718a066cc18fba6d46ca29b688fc3ef06491dff0eb",
@@ -76,11 +66,13 @@
     {
       "baseline_path": "chat/scripts/binding.py",
       "path": "packages/chat/scripts/binding.py",
+      "slice": "PLT-9 (#11)",
       "baseline": {
         "type": "file",
         "mode": "100644",
         "sha256": "0be53af256758f7f2753e930edd03127f1d21894d38e4edd33e7d0dcc6b27680"
       },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "0be53af256758f7f2753e930edd03127f1d21894d38e4edd33e7d0dcc6b27680",
       "capture": "changed",
       "sha256": "d71e6249ad63a153a1cdf2659d5c736e39cfc08724e06c28d247d73b23ae9709",
@@ -94,11 +86,13 @@
     {
       "baseline_path": "chat/scripts/chatlib.py",
       "path": "packages/chat/scripts/chatlib.py",
+      "slice": "PLT-9 (#11)",
       "baseline": {
         "type": "file",
         "mode": "100644",
         "sha256": "d5fd3bca06e139c3f61dfb6d34ef56947255c0b723fb9778c6da3afea874e8d0"
       },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "d5fd3bca06e139c3f61dfb6d34ef56947255c0b723fb9778c6da3afea874e8d0",
       "capture": "changed",
       "sha256": "745369360dc58c67566c2d8a70e42c7673ad7a00ded36192268072c2f51793a5",
@@ -112,11 +106,13 @@
     {
       "baseline_path": "chat/scripts/identities.py",
       "path": "packages/chat/scripts/identities.py",
+      "slice": "PLT-9 (#11)",
       "baseline": {
         "type": "file",
         "mode": "100644",
         "sha256": "c7938456c2bc18218a67d6d74847d9ab9cdc27915c6786f214f06e0d7f25f8d0"
       },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "c7938456c2bc18218a67d6d74847d9ab9cdc27915c6786f214f06e0d7f25f8d0",
       "capture": "byte-for-byte",
       "sha256": "c7938456c2bc18218a67d6d74847d9ab9cdc27915c6786f214f06e0d7f25f8d0",
@@ -125,11 +121,13 @@
     {
       "baseline_path": "chat/scripts/pchat",
       "path": "packages/chat/scripts/pchat",
+      "slice": "PLT-9 (#11)",
       "baseline": {
         "type": "file",
         "mode": "100755",
         "sha256": "edf4615c95b572c9b677994bfb65da9d2158513dca4d2ec943ed11d86a558227"
       },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "edf4615c95b572c9b677994bfb65da9d2158513dca4d2ec943ed11d86a558227",
       "capture": "byte-for-byte",
       "sha256": "edf4615c95b572c9b677994bfb65da9d2158513dca4d2ec943ed11d86a558227",
@@ -138,11 +136,13 @@
     {
       "baseline_path": "chat/scripts/receipt_experiment.py",
       "path": "packages/chat/scripts/receipt_experiment.py",
+      "slice": "PLT-9 (#11)",
       "baseline": {
         "type": "file",
         "mode": "100644",
         "sha256": "bf71ea47e81134994a9c99c72b9f3a15e187e478d7aea176e0f5e4474f958bc6"
       },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "bf71ea47e81134994a9c99c72b9f3a15e187e478d7aea176e0f5e4474f958bc6",
       "capture": "byte-for-byte",
       "sha256": "bf71ea47e81134994a9c99c72b9f3a15e187e478d7aea176e0f5e4474f958bc6",
@@ -151,11 +151,13 @@
     {
       "baseline_path": "chat/scripts/role_colors.py",
       "path": "packages/chat/scripts/role_colors.py",
+      "slice": "PLT-9 (#11)",
       "baseline": {
         "type": "file",
         "mode": "100644",
         "sha256": "2b0f48e1289758d5205934e87a1d6252d40748cbc67a9faebe9f78d969513e8e"
       },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "2b0f48e1289758d5205934e87a1d6252d40748cbc67a9faebe9f78d969513e8e",
       "capture": "changed",
       "sha256": "ddcc92d61c0781b202f0d455e4ec155f67a0d4af18020205cb3f43c3d091a148",
@@ -173,11 +175,13 @@
     {
       "baseline_path": "chat/scripts/runstore.py",
       "path": "packages/chat/scripts/runstore.py",
+      "slice": "PLT-9 (#11)",
       "baseline": {
         "type": "file",
         "mode": "100644",
         "sha256": "f77d0d94bf7b847ef20c598698a8b98e7155094271cdccc7bd8fd029cb32ee49"
       },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "f77d0d94bf7b847ef20c598698a8b98e7155094271cdccc7bd8fd029cb32ee49",
       "capture": "byte-for-byte",
       "sha256": "f77d0d94bf7b847ef20c598698a8b98e7155094271cdccc7bd8fd029cb32ee49",
@@ -186,11 +190,13 @@
     {
       "baseline_path": "chat/scripts/tests/_isolation.py",
       "path": "packages/chat/scripts/tests/_isolation.py",
+      "slice": "PLT-9 (#11)",
       "baseline": {
         "type": "file",
         "mode": "100644",
         "sha256": "6cebc364396e74ac90ceae219a87fb9634717937c11a77ea4c0d48e14c07c984"
       },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "6cebc364396e74ac90ceae219a87fb9634717937c11a77ea4c0d48e14c07c984",
       "capture": "byte-for-byte",
       "sha256": "6cebc364396e74ac90ceae219a87fb9634717937c11a77ea4c0d48e14c07c984",
@@ -199,11 +205,13 @@
     {
       "baseline_path": "chat/scripts/tests/test_binding.py",
       "path": "packages/chat/scripts/tests/test_binding.py",
+      "slice": "PLT-9 (#11)",
       "baseline": {
         "type": "file",
         "mode": "100644",
         "sha256": "5081e8295b4c2193269676e743399ac35cd8a2be8aeebb92453dc14b112ffb6b"
       },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "5081e8295b4c2193269676e743399ac35cd8a2be8aeebb92453dc14b112ffb6b",
       "capture": "changed",
       "sha256": "5d755b8c313ed15bd79a5ab444bb2fc9f5f77f94a96ba579e5b3e8987907f33a",
@@ -217,11 +225,13 @@
     {
       "baseline_path": "chat/scripts/tests/test_identities.py",
       "path": "packages/chat/scripts/tests/test_identities.py",
+      "slice": "PLT-9 (#11)",
       "baseline": {
         "type": "file",
         "mode": "100644",
         "sha256": "02e8b2f30187c7d1bac5eb33040ca68eb2bbd58d3aa7f5f10c4121053426b15f"
       },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "02e8b2f30187c7d1bac5eb33040ca68eb2bbd58d3aa7f5f10c4121053426b15f",
       "capture": "changed",
       "sha256": "3b705eda03f664c9bba9e3609e3760a24929ea77d2e8407343fe3b5a29d3ff14",
@@ -239,11 +249,13 @@
     {
       "baseline_path": "chat/scripts/tests/test_silence.py",
       "path": "packages/chat/scripts/tests/test_silence.py",
+      "slice": "PLT-9 (#11)",
       "baseline": {
         "type": "file",
         "mode": "100644",
         "sha256": "b10abf6868762cf26f9b4461f113307a371f7227a6a6a6c62f6b3c21549ce35b"
       },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "b10abf6868762cf26f9b4461f113307a371f7227a6a6a6c62f6b3c21549ce35b",
       "capture": "changed",
       "sha256": "694432cfe66650c879aa78aa1ff680e1cf38f6398abcb215865e2d44fb779f61",
@@ -251,6 +263,152 @@
         {
           "change": "Invented names: every real project name and agent-name prefix in fixtures is replaced by an invented one (projects alpha, beta, gamma, delta; prefixes alp, bet).",
           "reason": "Remove real project and agent-name data from fixtures (requirement 3)."
+        }
+      ]
+    },
+    {
+      "baseline_path": "chat/scripts/chat-bridge",
+      "path": "packages/chat/scripts/chat-bridge",
+      "slice": "PLT-15 (#12)",
+      "baseline": {
+        "type": "file",
+        "mode": "100755",
+        "sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210"
+      },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
+      "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
+      "capture": "changed",
+      "sha256": "bc0c1802af66beff9a77c1162f1f57edec17840a33d8b07f5946970fd9949d29",
+      "changes": [
+        {
+          "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
+          "reason": "Deliberate deviation from c572bad, by owner decision on PR #16's first review: a catch-up cut short leaves the checkpoint behind, so after a restart more than 5,000 replayed messages would be logged again and an accepted request queued again (PLT-15 requirement 8). The running bridge keeps the baseline behavior until activation."
+        }
+      ]
+    },
+    {
+      "baseline_path": "chat/scripts/rotate-logs",
+      "path": "packages/chat/scripts/rotate-logs",
+      "slice": "PLT-15 (#12)",
+      "baseline": {
+        "type": "file",
+        "mode": "100755",
+        "sha256": "5b6e014cef466b3b75a524e478a2dc76d59284183c97afb989bae41e7828bd22"
+      },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
+      "effective_sha256": "5b6e014cef466b3b75a524e478a2dc76d59284183c97afb989bae41e7828bd22",
+      "capture": "byte-for-byte",
+      "sha256": "5b6e014cef466b3b75a524e478a2dc76d59284183c97afb989bae41e7828bd22",
+      "changes": []
+    },
+    {
+      "baseline_path": "chat/scripts/tests/test_bridge.py",
+      "path": "packages/chat/scripts/tests/test_bridge.py",
+      "slice": "PLT-15 (#12)",
+      "baseline": {
+        "type": "file",
+        "mode": "100644",
+        "sha256": "fdd9f514078f0c0739c1c1bc24805228b3ab4687dae45a16f5f4db3dce63100a"
+      },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
+      "effective_sha256": "fdd9f514078f0c0739c1c1bc24805228b3ab4687dae45a16f5f4db3dce63100a",
+      "capture": "changed",
+      "sha256": "2896fe5eac6820c43d6cd088c25504475fcf49fd624b97128f107346ea64df04",
+      "changes": [
+        {
+          "change": "Invented names: every real account, project name, agent-name prefix and channel in fixtures is replaced by an invented one (owner pat, assistant sam; projects nova, alpha, gamma, delta, epsilon, zeta; prefixes nov, alp, gam, del, eps, zet). The beta/bet of the core slice's tests is nova/nov here because the bridge sorts the accounts it wakes and one routing test's expected order depends on the prefix sorting after \"manager\".",
+          "reason": "Remove real account, project and agent-name data from fixtures (PLT-15 requirement 3)."
+        }
+      ]
+    },
+    {
+      "baseline_path": "chat/scripts/tests/test_receipt_experiment.py",
+      "path": "packages/chat/scripts/tests/test_receipt_experiment.py",
+      "slice": "PLT-15 (#12)",
+      "baseline": {
+        "type": "file",
+        "mode": "100644",
+        "sha256": "fd78e9af1caa1bf33852b299c63597b98c44ba7446c574d2e89c5e20fc75f93a"
+      },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
+      "effective_sha256": "fd78e9af1caa1bf33852b299c63597b98c44ba7446c574d2e89c5e20fc75f93a",
+      "capture": "changed",
+      "sha256": "9d9a25871ec940538f31112cc6e475f46eb811b93c804f102afdde3eee0641f8",
+      "changes": [
+        {
+          "change": "Invented names: every real account, project name, agent-name prefix and channel in fixtures is replaced by an invented one (owner pat, assistant sam; projects nova, alpha, gamma, delta, epsilon, zeta; prefixes nov, alp, gam, del, eps, zet). The beta/bet of the core slice's tests is nova/nov here because the bridge sorts the accounts it wakes and one routing test's expected order depends on the prefix sorting after \"manager\"; one test name carries the invented project (test_gamma_ambiguous_receipt_retains_delivery).",
+          "reason": "Remove real account, project and agent-name data from fixtures (PLT-15 requirement 3)."
+        }
+      ]
+    },
+    {
+      "baseline_path": "chat/scripts/tests/test_rotate_logs.py",
+      "path": "packages/chat/scripts/tests/test_rotate_logs.py",
+      "slice": "PLT-15 (#12)",
+      "baseline": {
+        "type": "file",
+        "mode": "100644",
+        "sha256": "facaaf638e33169b17f39613918a195735ff1e921f4f9b39d8e7733373ae095b"
+      },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
+      "effective_sha256": "facaaf638e33169b17f39613918a195735ff1e921f4f9b39d8e7733373ae095b",
+      "capture": "byte-for-byte",
+      "sha256": "facaaf638e33169b17f39613918a195735ff1e921f4f9b39d8e7733373ae095b",
+      "changes": []
+    },
+    {
+      "baseline_path": "chat/scripts/tests/fixtures/codex-interrupted-background.txt",
+      "path": "packages/chat/scripts/tests/fixtures/codex-interrupted-background.txt",
+      "slice": "PLT-15 (#12)",
+      "baseline": {
+        "type": "file",
+        "mode": "100644",
+        "sha256": "71ece61c6e0528a591cfcb898734b8c4d3ab11e09d61273f5ab2189bead6dad7"
+      },
+      "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
+      "effective_sha256": "71ece61c6e0528a591cfcb898734b8c4d3ab11e09d61273f5ab2189bead6dad7",
+      "capture": "byte-for-byte",
+      "sha256": "71ece61c6e0528a591cfcb898734b8c4d3ab11e09d61273f5ab2189bead6dad7",
+      "changes": []
+    },
+    {
+      "baseline_path": "chat/SKILL.md",
+      "path": "packages/chat/SKILL.md",
+      "slice": "PLT-15 (#12)",
+      "baseline": {
+        "type": "file",
+        "mode": "100644",
+        "sha256": "c4dab3d0c488f1c04ebb57aca6f39ad0c571c0148a9e96ce337ec0641d4e20b0"
+      },
+      "source_commit": "8ff325ee307b92e53157594e570235bc9f2f5229",
+      "effective_sha256": "e5eda84d2d8b8773ef5b4660b40f1dee0e2545d2db764d5d0e1b20929d7fe438",
+      "capture": "changed",
+      "sha256": "003953fccd1166c62a791bd57bc7754ff5de62d1d3247d7de4902cefaac1572b",
+      "changes": [
+        {
+          "change": "Where the guidance named the owner's or the global assistant's account, it now says where that account is configured (`owner` and `assistants` in the chat config); examples that used the owner's or assistant's account use `<assistant>` / `@<owner>`.",
+          "reason": "No real account names in the guidance (PLT-15 requirement 3)."
+        },
+        {
+          "change": "Examples use invented projects, prefixes, agents, channels and request IDs (beta/bet, alpha/alp); the example request and search text is invented (\"parser crash\").",
+          "reason": "No real project names, channels or messages in the guidance (PLT-15 requirement 3)."
+        }
+      ],
+      "external_references": [
+        {
+          "reference": "../project-manager/references/timing-reservation.md",
+          "kept": "verbatim, as carried from 8ff325e",
+          "note": "a link to the project-manager skill's timing-reservation protocol, a file outside this capture (PLT-15 requirement 4); not captured"
+        },
+        {
+          "reference": "chat/scripts/install-identities",
+          "kept": "verbatim",
+          "note": "the identity rollout helper, excluded from every capture (D-20); the guidance's paragraph about it and its options (--apply, --review-source) describe that uncaptured command"
+        },
+        {
+          "reference": "project-manager, modelclass, docs-push",
+          "kept": "verbatim",
+          "note": "other skills and tools the guidance names; outside this capture"
         }
       ]
     }
@@ -287,6 +445,14 @@
     {
       "path": "packages/chat/scripts/tests/test_isolation_guard.py",
       "purpose": "The isolation guard fails closed on real state, the network and live agents."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_skill_guidance.py",
+      "purpose": "Every pchat subcommand and option SKILL.md mentions exists in the captured pchat (PLT-15)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_replay_dedup.py",
+      "purpose": "Message-ID deduplication after acceptance recovery, across a crash, a restart and a restart after a cut-short catch-up of six full pages (PLT-15 requirement 8)."
     }
   ]
 }

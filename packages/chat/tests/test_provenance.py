@@ -1,7 +1,8 @@
 """The captured chat source matches its provenance record: every captured file
-has the recorded hash and mode, a byte-for-byte file still hashes to the
-baseline, a changed one lists its changes, and nothing else sits in the
-captured tree unrecorded."""
+has the recorded hash and mode, a byte-for-byte file still hashes to its
+source commit's content, a changed one lists its changes, a carried commit
+names the files it changed, and nothing else sits in the captured tree
+unrecorded."""
 import hashlib
 import json
 import os
@@ -30,12 +31,37 @@ class ProvenanceTests(unittest.TestCase):
         self.assertIsInstance(carried, list)
         if not carried:
             self.assertEqual(PROVENANCE["effective_source"], PROVENANCE["baseline"])
+        else:
+            self.assertEqual(PROVENANCE["effective_source"], carried[-1]["commit"])
+
+    def test_each_file_names_its_source_commit(self):
+        base = PROVENANCE["baseline"]
+        carried = {c["commit"]: set(c["files"]) for c in PROVENANCE["carried_commits"]}
+        for commit in carried:
+            self.assertRegex(commit, r"^[0-9a-f]{40}$")
+        changed_by_carry = set().union(*carried.values()) if carried else set()
+        for entry in PROVENANCE["captured"]:
+            with self.subTest(path=entry["path"]):
+                source = entry["source_commit"]
+                if source == base:
+                    self.assertNotIn(entry["baseline_path"], changed_by_carry)
+                    self.assertEqual(entry["effective_sha256"], entry["baseline"]["sha256"])
+                else:
+                    self.assertIn(entry["baseline_path"], carried[source])
+                    self.assertNotEqual(entry["effective_sha256"], entry["baseline"]["sha256"])
+
+    def test_the_carried_timing_link_is_kept_and_recorded_as_external(self):
+        entry = next(e for e in PROVENANCE["captured"] if e["baseline_path"] == "chat/SKILL.md")
+        link = "../project-manager/references/timing-reservation.md"
+        self.assertIn(f"]({link})", (REPO / entry["path"]).read_text(encoding="utf-8"))
+        self.assertIn(link, [r["reference"] for r in entry["external_references"]])
+        self.assertFalse((REPO / entry["path"]).parent.joinpath(link).exists())
 
     def test_every_captured_file_has_its_recorded_hash_and_mode(self):
         for entry in PROVENANCE["captured"]:
             path = REPO / entry["path"]
             with self.subTest(path=entry["path"]):
-                self.assertEqual(entry["path"], "packages/chat/scripts/" + entry["baseline_path"][len("chat/scripts/"):])
+                self.assertEqual(entry["path"], "packages/" + entry["baseline_path"])
                 self.assertEqual(sha256(path), entry["sha256"])
                 executable = bool(path.stat().st_mode & stat.S_IXUSR)
                 self.assertEqual(executable, entry["baseline"]["mode"] == "100755")

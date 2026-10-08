@@ -1,0 +1,1016 @@
+#!/usr/bin/env python3
+"""The chat listener: keeps the record and wakes people up, durably.
+
+Runs as a service (launchd). Logged in as the `chatbridge` account, it:
+- joins every channel on the server (re-checked every 10s) and every channel it
+  has a log for, so restarts never let a channel empty out;
+- appends every channel message to ~/.local/state/chat/logs/<channel>.jsonl
+  with the server-verified account, the server's message id (`msgid`) and, for
+  replies, the id replied to (`reply_to`), never twice;
+- once per channel per connection, asks the server for everything it missed
+  since the channel's checkpoint in checkpoints.json (CHATHISTORY, paged 1000
+  at a time) and handles it as if it had just arrived (`"replayed": true`).
+  The checkpoint is where the log is known complete, which only a finished
+  catch-up or a fully handled live message advances, so a catch-up cut short
+  is resumed, never skipped. Replayed joins never trigger another catch-up;
+- queues each wake-up and phone push in pending.json BEFORE logging the
+  message (a crash can duplicate a wake-up, never lose one), retries failures
+  with backoff, follows wake-ups until cmux reports them delivered (a message
+  cmux is holding is waiting, not failing: it is followed for up to a day, and
+  the owner is told once if their or an assistant's post waits 30 minutes),
+  re-targets them if the recipient's surface changes, and moves exhausted ones
+  to dead-letters.jsonl, telling the owner; every attempt is recorded in
+  deliveries.jsonl;
+- checks a delegation: when one project's manager posts in another project's
+  channels citing `authority: msgid=<id>`, it looks the cited post up in the
+  record and tells the receiving manager whether it is a verified owner or
+  assistant post, quoting it; a verified delegation needs acceptance like the
+  owner's own request;
+- keeps what the record cites: a file under /tmp cited in a post is copied
+  into evidence/ by content hash (evidence.jsonl maps it), so a scratchpad
+  path stays resolvable after a reboot;
+- carries out interrupts (a post starting `!!`, or `[interrupt ...]`, from the
+  owner, an assistant, or the target's own manager): stops the named agent's
+  turn with Esc (twice for Claude's vim insert mode), types the instruction
+  into its prompt, reports what happened in the channel as chatbridge, and
+  waits for the agent's own acknowledgement; holds rather than pressing Esc
+  into a dialog or typing over someone's draft;
+- reads a draft/multiline batch as the one post it is, with one msgid, so a
+  long post is one wake-up needing one acceptance;
+- for a post from the owner or an assistant (other than a [status] or [done]
+  report), keeps the wake-up open after
+  delivery until the project's manager ACCEPTS it: a reply to that exact
+  message (`pchat post --reply-to <msgid>`) or an acknowledgment
+  (`pchat ack <msgid>`), recorded in acks.jsonl. Unaccepted wake-ups are
+  re-sent as reminders, then dead-lettered with a content-free push to the
+  owner;
+- when a manager is waiting on the owner and the sender has the owner's
+  authority (`owner`/`assistants` in the config), types the post into the
+  manager's empty prompt, pressing Enter only when the whole draft matches,
+  and counts it delivered only on evidence that it was submitted;
+- flushes the outbox (posts that failed earlier) every minute;
+- pushes an ntfy notification to the owner when the owner is @-mentioned. The
+  push says who needs the owner and where, never the message text;
+- routes by who speaks to whom. The manager hears its project's unaddressed
+  posts, posts naming it, and any post where someone else goes over its head
+  to the owner or an assistant. When the owner or an assistant names a
+  specific agent, the bridge delivers to that agent's own session from the
+  identity registry and leaves the manager out; the manager learns of such
+  work when it reconciles. An agent with no live session falls back to its
+  manager. Claude Code sessions get a cmux agent message; Codex sessions,
+  which cmux agent messages can't wake, get the post typed into their empty
+  prompt, which a busy Codex takes after its next tool call.
+"""
+import datetime
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import chatlib  # noqa: E402
+import identities  # noqa: E402
+import receipt_experiment  # noqa: E402
+
+PM_STATE = Path.home() / ".local" / "state" / "project-manager"
+CAPS = ("server-time", "account-tag", "message-tags", "batch", "draft/chathistory",
+        "draft/event-playback",  # replay joins/quits as events, not HistServ messages
+        "draft/multiline")       # a multi-line post arrives as one batch with one msgid
+SERVICE_NICKS = {"histserv", "nickserv", "chanserv"}
+PENDING = chatlib.STATE_DIR / "pending.json"
+DELIVERIES = chatlib.STATE_DIR / "deliveries.jsonl"
+DEAD_LETTERS = chatlib.STATE_DIR / "dead-letters.jsonl"
+CHECKPOINTS = chatlib.STATE_DIR / "checkpoints.json"
+EVIDENCE_DIR = chatlib.STATE_DIR / "evidence"
+EVIDENCE_LOG = chatlib.STATE_DIR / "evidence.jsonl"
+EVIDENCE_MAX = 20_000_000  # bytes; a larger cited file is recorded but not copied
+TMP_PATH = re.compile(r"(?<![\w/])((?:/private)?/tmp/[^\s`'\"()<>\[\]{}|]+)")
+ACKS = chatlib.STATE_DIR / "acks.jsonl"
+BRIDGE_LOG = chatlib.STATE_DIR / "bridge.log"
+LOG_LIMIT = 5_000_000
+BACKOFF = (5, 30, 120, 600, 1800)  # seconds before attempts 2..6; then dead-letter
+ACCEPT_WAIT = 900                  # seconds a delivered request may wait for acceptance
+MAX_REMINDERS = 2
+WAITING = None                     # a delivery outcome: cmux holds it or the recipient is busy; not a failure
+WAIT_CHECK = 60                    # seconds between checks on a waiting delivery
+STUCK_ALERT = 1800                 # tell the owner once when their (or an assistant's) post waits this long
+MAX_WAIT = 86400                   # then dead-letter a delivery that is still waiting
+INTERRUPT_ACK_WAIT = 600           # an interrupted agent should acknowledge within this
+HISTORY_PAGE = 1000
+REQUEST_ID = re.compile(r"\[[a-z]+ ([a-z0-9-]+-\d{8}-\d+)\]")
+POST_TYPE = re.compile(r"\[([a-z]+)[\] ]")
+INFORMATIONAL = ("status", "done")  # owner/assistant posts of these types need no acceptance
+AUTHORITY = re.compile(r"authority: msgid=([A-Za-z0-9_-]+)")  # a delegation's cited owner/assistant post
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def parse_time(s):
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
+def log(msg):
+    """Append to our own log, bounded: at 5 MB it becomes bridge.log.1 (one old
+    copy) and the next line starts a fresh file. The file is opened per line,
+    never inherited, because a handle launchd holds open would follow the
+    rename and grow without limit; launchd's own output is bridge.stderr.log."""
+    line = f"{datetime.datetime.now().isoformat(timespec='seconds')} {msg}\n"
+    try:
+        if BRIDGE_LOG.exists() and BRIDGE_LOG.stat().st_size > LOG_LIMIT:
+            os.replace(BRIDGE_LOG, BRIDGE_LOG.with_suffix(".log.1"))
+        with BRIDGE_LOG.open("a") as f:
+            f.write(line)
+    except OSError:
+        sys.stderr.write(line)
+
+
+def project_for(channel, cfg):
+    ch = channel.lower()
+    for name, p in cfg.get("projects", {}).items():
+        if ch == p["channel"].lower() or ch.startswith(p["prefix"].lower()):
+            return name, p
+    return None, None
+
+
+def mentions(text, accounts):
+    found = set(re.findall(r"@([A-Za-z0-9_\-]+)", text))
+    m = re.match(r"^([A-Za-z0-9_\-]+)[:,]\s", text)
+    if m:
+        found.add(m.group(1))
+    return {a for a in found if a in accounts}
+
+
+def _append_jsonl(path, obj):
+    with path.open("a") as f:
+        f.write(json.dumps(obj) + "\n")
+
+
+# --- the record -------------------------------------------------------------
+
+class Record:
+    """Per-channel logs, deduplicated by msgid, with a cursor for catch-up."""
+
+    def __init__(self):
+        self.seen = {}
+
+    def _load(self, channel):
+        if channel not in self.seen:
+            ids = set()
+            path = chatlib.channel_log(channel)
+            if path.exists():
+                # Every line, not only the newest: a catch-up cut short leaves
+                # the checkpoint behind, so after a restart all of it is
+                # replayed, however many lines it logged.
+                for line in path.read_text().splitlines():
+                    try:
+                        mid = json.loads(line).get("msgid")
+                    except ValueError:
+                        continue
+                    if mid:
+                        ids.add(mid)
+            self.seen[channel] = ids
+        return self.seen[channel]
+
+    def known(self, entry):
+        mid = entry.get("msgid")
+        return bool(mid) and mid in self._load(entry["channel"].lower())
+
+    def append(self, entry):
+        ch = entry["channel"].lower()
+        path = chatlib.channel_log(ch)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+        if entry.get("msgid"):
+            self._load(ch).add(entry["msgid"])
+
+    @staticmethod
+    def cursor(channel):
+        """The NEWEST logged message by server time, not the last line: live
+        messages logged during a catch-up sit above older replayed ones, and
+        the cursor must never move backward."""
+        path = chatlib.channel_log(channel)
+        if not path.exists():
+            return None
+        best = None
+        for line in path.read_text().splitlines()[-5000:]:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("at") and (best is None or parse_time(e["at"]) > parse_time(best["at"])):
+                best = e
+        if not best:
+            return None
+        return f"msgid={best['msgid']}" if best.get("msgid") else f"timestamp={best['at']}"
+
+
+class Checkpoints:
+    """Per channel, the message through which the log is known to be complete.
+    It moves only when a catch-up finishes, or after a live message in a
+    caught-up channel is fully handled. So a catch-up cut short resumes where
+    completeness ends, not after a newer live message logged meanwhile. A
+    channel without one is seeded, durably, from its newest logged message
+    when it is first needed, before this connection logs anything new."""
+
+    def __init__(self):
+        try:
+            self.marks = json.loads(CHECKPOINTS.read_text())
+        except (OSError, ValueError):
+            self.marks = {}
+
+    def get(self, channel):
+        if not self.marks.get(channel.lower()):
+            self.set(channel, Record.cursor(channel))
+        return self.marks.get(channel.lower())
+
+    def set(self, channel, mark):
+        if mark and self.marks.get(channel.lower()) != mark:
+            self.marks[channel.lower()] = mark
+            tmp = CHECKPOINTS.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.marks))
+            os.replace(tmp, CHECKPOINTS)
+
+
+class HistoryPager:
+    """Tracks CHATHISTORY batches; when a batch comes back full, asks for the
+    next page after its last item, so a long outage is caught up completely."""
+
+    def __init__(self, page=HISTORY_PAGE):
+        self.page, self.batches = page, {}
+
+    def start(self, ref, target):
+        self.batches[ref] = {"target": target, "count": 0, "last": None}
+
+    def item(self, ref, msg):
+        b = self.batches.get(ref)
+        if msg.get("command") == "BATCH" and msg["params"][0].startswith("-"):
+            return  # a nested batch's closing line; its opening line was the item
+        if b is not None:
+            b["count"] += 1
+            mid, t = msg["tags"].get("msgid"), msg["tags"].get("time")
+            b["last"] = f"msgid={mid}" if mid else (f"timestamp={t}" if t else b["last"])
+
+    def is_history(self, ref):
+        return ref in self.batches
+
+    def target(self, ref):
+        return self.batches.get(ref, {}).get("target")
+
+    def end(self, ref):
+        """Returns the next CHATHISTORY command, or None when caught up."""
+        b = self.batches.pop(ref, None)
+        if b and b["count"] >= self.page and b["last"]:
+            return f"CHATHISTORY AFTER {b['target']} {b['last']} {self.page}"
+        return None
+
+
+def join_multiline(opener, lines):
+    """One PRIVMSG from a draft/multiline batch. The batch's opening line
+    carries the post's msgid, time, account and reply; its lines are joined
+    with newlines, except a line marked multiline-concat, which continues the
+    one before it."""
+    text = ""
+    for i, m in enumerate(lines):
+        piece = m["params"][-1]
+        text += piece if i == 0 or "draft/multiline-concat" in m["tags"] else "\n" + piece
+    return {"tags": {k: v for k, v in opener["tags"].items() if k != "batch"},
+            "prefix": opener["prefix"], "command": "PRIVMSG", "params": [opener["params"][2], text]}
+
+
+def capture_cited(entry):
+    """The record keeps what it cites. A post citing a file under /tmp (a session
+    scratchpad, a survey result) would become a dead reference at the next
+    reboot, so copy each cited file that exists into evidence/, named by its
+    content hash, and log the mapping in evidence.jsonl. Never raises."""
+    for raw in TMP_PATH.findall(entry.get("text", "")):
+        cited = raw.rstrip(".,;:!?")
+        try:
+            path = Path(cited)
+            if not path.is_file():
+                continue
+            size = path.stat().st_size
+            record = {"at": now_iso(), "msgid": entry.get("msgid"), "channel": entry.get("channel"),
+                      "from": entry.get("from"), "cited": cited, "bytes": size}
+            if size > EVIDENCE_MAX:
+                record["stored"] = None
+                record["note"] = f"over {EVIDENCE_MAX} bytes; not copied"
+            else:
+                data = path.read_bytes()
+                digest = hashlib.sha256(data).hexdigest()
+                stored = EVIDENCE_DIR / f"{digest[:16]}-{path.name}"
+                if not stored.exists():
+                    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+                    tmp = stored.with_name(stored.name + ".part")
+                    tmp.write_bytes(data)
+                    os.replace(tmp, stored)
+                record.update(stored=str(stored), sha256=digest)
+            _append_jsonl(EVIDENCE_LOG, record)
+            log(f"evidence: kept {cited} cited in {entry.get('channel')} as {record.get('stored')}")
+        except OSError as e:
+            log(f"evidence: could not keep {cited}: {e!r:.100}")
+
+
+# --- durable delivery -------------------------------------------------------
+
+class Deliveries:
+    def __init__(self):
+        try:
+            self.items = json.loads(PENDING.read_text())
+        except (OSError, ValueError):
+            self.items = []
+
+    def _save(self):
+        tmp = PENDING.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.items))
+        os.replace(tmp, PENDING)
+
+    def add_all(self, new_items):
+        if new_items:
+            self.items.extend(new_items)
+            self._save()
+
+    def _record(self, item, ok, detail):
+        _append_jsonl(DELIVERIES, {"at": now_iso(), "kind": item["kind"], "msgid": item["msgid"],
+                                   "channel": item["channel"], "project": item["project"],
+                                   "attempt": item["attempt"], "ok": ok, "detail": detail})
+
+    def _dead(self, item, detail, cfg, reason=None):
+        """Give up on a delivery. Every dead-lettered wake-up tells the owner,
+        without the message text; a dead-lettered push only logs, so it can't loop."""
+        self.items.remove(item)
+        _append_jsonl(DEAD_LETTERS, {**item, "dead_at": now_iso(), "last_detail": detail})
+        self._record(item, False, f"dead-lettered: {detail}")
+        log(f"{item['kind']} DEAD-LETTERED ({item['channel']}): {detail}")
+        if item["kind"] == "ring":
+            self._alert(item, f"delivery to {_recipient(item)} {reason or 'failed: ' + detail[:80]}")
+
+    def _alert(self, item, text):
+        self.items.append({"kind": "push", "msgid": item["msgid"], "channel": item["channel"],
+                           "sender": "chatbridge", "project": None, "attempt": 0, "next_at": 0, "text": text})
+
+    def accept(self, msgid, by, how, cfg):
+        """The wake-up's recipient accepted message `msgid`: its manager, or for
+        a direct delivery (an interrupt) the agent it was for."""
+        for item in [i for i in self.items if i["kind"] == "ring" and i["msgid"] == msgid]:
+            owner = item.get("target") or cfg.get("projects", {}).get(item["project"], {}).get("manager")
+            if owner != by:
+                continue
+            self.items.remove(item)
+            self._record(item, True, f"accepted by {by} ({how})")
+            if item.get("agent_msg_id"):  # the queued cmux copy is now redundant
+                _cmux("rpc", "agent.message.mark_read", json.dumps({"ids": [item["agent_msg_id"]]}))
+            log(f"ring accepted ({item['channel']}) by {by} ({how})")
+            self._save()
+
+    def process(self, cfg):
+        due = [i for i in self.items if i["next_at"] <= time.time()]
+        for item in due:
+            if item.get("phase") == "accept":  # delivered, but never accepted in time
+                if item.get("interrupt"):  # re-sending would interrupt it again
+                    self._dead(item, "interrupted, but never acknowledged", cfg,
+                               reason=f"was interrupted but has not acknowledged it after {INTERRUPT_ACK_WAIT // 60} min")
+                    continue
+                if item.get("reminders", 0) < MAX_REMINDERS:
+                    item.update(phase="deliver", reminders=item.get("reminders", 0) + 1,
+                                attempt=0, next_at=0)
+                    for k in ("agent_msg_id", "waiting_since", "stuck_alerted"):
+                        item.pop(k, None)
+                    self._record(item, False, f"not accepted after {ACCEPT_WAIT // 60} min; reminder {item['reminders']}")
+                    continue
+                self._dead(item, "delivered but never accepted by the manager", cfg,
+                           reason=f"was never accepted (from {item['sender']})")
+                continue
+            if item["kind"] == "push":
+                ok, detail = push_owner(cfg, item)
+            else:
+                ok, detail = (ring_agent if item.get("target") else ring_manager)(cfg, item)
+            if ok is WAITING:  # cmux is holding it, or the recipient is busy: follow it, don't count it
+                self._record(item, None, detail)
+                if item.get("interrupt") and detail.startswith("held") and not item.get("held_announced"):
+                    item["held_announced"] = True
+                    announce(cfg, item, f"interrupt → {item['target']}: {detail}")
+                since = item.setdefault("waiting_since", time.time())
+                authority = {cfg.get("owner")} | set(cfg.get("assistants", []))
+                if time.time() - since > MAX_WAIT:
+                    self._dead(item, detail, cfg, reason=f"still waiting after {MAX_WAIT // 3600} h")
+                    continue
+                if (time.time() - since > STUCK_ALERT and not item.get("stuck_alerted")
+                        and item["sender"] in authority):
+                    item["stuck_alerted"] = True
+                    self._alert(item, f"{_recipient(item)} has not taken a post from {item['sender']}"
+                                      f" after {STUCK_ALERT // 60} min (still queued)")
+                item["next_at"] = time.time() + WAIT_CHECK
+                continue
+            item["attempt"] += 1
+            self._record(item, ok, detail)
+            if ok and item.get("interrupt"):
+                stop = (f"turn stopped {item['stopped_at'][11:19]}Z" if item.get("stopped_at")
+                        else "it was not working")
+                announce(cfg, item, f"interrupt → {item['target']}: {stop}; instruction delivered;"
+                                    f" waiting for its acknowledgement")
+                item.update(phase="accept", next_at=time.time() + INTERRUPT_ACK_WAIT)
+                log(f"interrupt delivered ({item['channel']}) to {item['target']}: {detail}")
+            elif ok and item.get("needs_ack"):
+                item.update(phase="accept", next_at=time.time() + ACCEPT_WAIT)
+                log(f"ring delivered ({item['channel']}); awaiting acceptance: {detail}")
+            elif ok:
+                self.items.remove(item)
+                log(f"{item['kind']} done ({item['channel']}, attempt {item['attempt']}): {detail}")
+            elif item["attempt"] > len(BACKOFF):
+                self._dead(item, detail, cfg)
+            else:
+                item["next_at"] = time.time() + BACKOFF[item["attempt"] - 1]
+                log(f"{item['kind']} pending ({item['channel']}, attempt {item['attempt']}): {detail}")
+        if due:
+            self._save()
+
+
+def _cmux(*args):
+    r = subprocess.run(["cmux", *args], capture_output=True, text=True)
+    return r.returncode, r.stdout, r.stderr.strip()
+
+
+def _input_state(surface):
+    _, out, _ = _cmux("rpc", "surface.input_state", json.dumps({"surface_id": surface}))
+    try:
+        d = json.loads(out)
+    except ValueError:
+        return {}
+    return d if d.get("surface_id") == surface else {}
+
+
+def _recipient(item):
+    return item.get("target") or f"the {item['project']} manager"
+
+
+def _message_state(surface, msg_id):
+    # The inbox lists only the newest 50 by default; a busy manager has more.
+    _, out, _ = _cmux("agent", "inbox", "--surface", surface, "--limit", "100000", "--json")
+    try:
+        for m in json.loads(out).get("messages", []):
+            if m.get("id") == msg_id:
+                return m.get("state")
+    except ValueError:
+        pass
+    return None
+
+
+def _flat(text):
+    return re.sub(r"\s+", "", text)
+
+
+PROMPT_MARK = {"claude": "❯", "codex": "›"}
+
+
+def _split_prompt(screen, brand="claude"):
+    """(transcript above the prompt box, text inside the prompt box). Claude's
+    box ends at its lower border; Codex's composer ends at a blank line."""
+    mark = PROMPT_MARK[brand]
+    lines = screen.splitlines()
+    starts = [i for i, l in enumerate(lines) if l.lstrip().startswith(mark)]
+    if not starts:
+        return screen, ""
+    i, box = starts[-1], []
+    for l in lines[starts[-1]:]:
+        if l.strip().startswith("─") or (box and not l.strip()):
+            break
+        box.append(l)
+    return "\n".join(lines[:i]), "\n".join(box).lstrip().removeprefix(mark)
+
+
+def _clear_draft(surface, idle=False):
+    st = _input_state(surface)
+    if st.get("state") == "draft" and (idle or st.get("lifecycle") != "running"):
+        _cmux("send-key", "--surface", surface, "ctrl+c")  # Claude: clears a non-empty prompt
+
+
+def _type_into_prompt(surface, text, brand="claude", idle=False):
+    """Deliver by typing, as the owner would answer. Types only into an empty
+    prompt; presses Enter only when the whole draft on screen matches the text
+    exactly (ignoring line wrapping); reports success only on evidence the
+    prompt was submitted. A draft that fails a check is cleared again."""
+    if _input_state(surface).get("state") != "empty":
+        return False, "prompt not empty; not typing"
+    if brand == "codex" and _codex_browsing(_screen(surface)):
+        return WAITING, "held: Codex is browsing its transcript; not typing"
+    line = " ".join(text.split())
+    if _cmux("send", "--surface", surface, "--", line)[0] != 0:
+        return False, "send failed"
+    time.sleep(0.8)
+    _, box = _split_prompt(_cmux("read-screen", "--surface", surface)[1], brand)
+    if _input_state(surface).get("state") != "draft" or _flat(box) != _flat(line):
+        _clear_draft(surface, idle)
+        return False, "draft on screen did not match exactly; cleared, not submitted"
+    if _cmux("send-key", "--surface", surface, "enter")[0] != 0:
+        _clear_draft(surface, idle)
+        return False, "Enter failed; draft cleared"
+    for _ in range(16):
+        time.sleep(0.5)
+        st = _input_state(surface)
+        _, box = _split_prompt(_cmux("read-screen", "--surface", surface)[1], brand)
+        # Submitted: the prompt is empty and our text has left the box. An empty box can
+        # still show a placeholder or a suggestion, and cmux's lifecycle can be stale.
+        if st.get("state") == "empty" and _flat(line[:60]) not in _flat(box):
+            return True, "typed into prompt and submitted"
+    _clear_draft(surface, idle)
+    return False, "no evidence the prompt was submitted"
+
+
+def _wake_text(item, limit=700):
+    head = f"[{item['channel']} msgid={item['msgid']}] <{item['sender']}>"
+    if item.get("reminders"):
+        head = f"(reminder {item['reminders']}: not yet accepted) " + head
+    tail = ""
+    if item.get("needs_ack"):
+        tail = (f" -- accept with `pchat ack {item['channel']} {item['msgid']} --as <you>` or reply with"
+                f" `pchat post <channel> --reply-to {item['msgid']} ...`")
+    elif item.get("interrupt"):
+        tail = (f" -- URGENT: you were interrupted for this; it supersedes earlier instructions."
+                f" Acknowledge: pchat post {item['channel']} --reply-to {item['msgid']} --type status"
+                f" \"<what you stopped or changed>\"")
+    elif item.get("target"):
+        tail = f" -- addressed to you ({item['target']}) directly; your manager was not told"
+    body = item["text"]
+    if len(body) > limit:
+        body = body[:limit] + " …(truncated; full text in the chat log)"
+    if item.get("authority"):
+        head += f" [{item['authority']}]"
+    return f"{head} {body}{tail}"
+
+
+def _screen(surface):
+    return _cmux("read-screen", "--surface", surface)[1]
+
+
+def _footer(screen):
+    """The status lines under Claude's prompt box."""
+    lines = [l for l in screen.splitlines() if l.strip()]
+    borders = [i for i, l in enumerate(lines) if l.strip().startswith("─")]
+    return "\n".join(lines[borders[-1] + 1:]) if borders else ""
+
+
+def _codex_browsing(screen):
+    """The transcript browser can look like an empty composer to cmux."""
+    lines = [l.strip() for l in screen.splitlines() if l.strip()]
+    return bool(lines) and lines[-1].startswith("Browsing transcript")
+
+
+def _codex_interrupted(screen):
+    """Codex's last event before its composer is an interrupt: idle, whatever cmux says."""
+    if _codex_browsing(screen):
+        return False
+    lines = [l.strip() for l in screen.splitlines() if l.strip()]
+    marks = [i for i, l in enumerate(lines) if l.lstrip().startswith(PROMPT_MARK["codex"])]
+    if not marks:
+        return False
+    previous = marks[-1] - 1
+    # Background tools survive a foreground interrupt. Their status sits between
+    # the last event and the composer; ignore only this known UI line, not output
+    # from a newer turn or an unknown prompt/notice.
+    if previous >= 0 and re.fullmatch(
+            r"\d+ background terminals? running\s+·\s+/ps to view\s+·\s+/stop to close", lines[previous]):
+        previous -= 1
+    return previous >= 0 and lines[previous].startswith("■ Conversation interrupted")
+
+
+def _wait_for(check, timeout=6.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        time.sleep(0.5)
+        if check():
+            return True
+    return False
+
+
+def _stop_turn(surface, brand):
+    """Stop a running turn with Esc, as the owner would. Returns (stopped, detail):
+    True once stopped, None if no turn was running, False if Esc didn't stop it.
+    cmux's lifecycle stays "running" after an interrupt, so this reads the screen."""
+    esc = lambda: _cmux("send-key", "--surface", surface, "escape")
+    if brand == "codex":
+        if _input_state(surface).get("lifecycle") != "running" or _codex_interrupted(_screen(surface)):
+            return None, "not working"
+        esc()
+        if _wait_for(lambda: _codex_interrupted(_screen(surface))):
+            return True, "turn stopped"
+        return False, "Esc did not stop the Codex turn"
+    # Claude in vim mode: Esc first leaves insert mode. Only in normal mode does the
+    # footer say "esc to interrupt", and only while a turn runs.
+    if "-- INSERT --" in _footer(_screen(surface)):
+        esc()
+        time.sleep(0.6)
+    if "esc to interrupt" not in _footer(_screen(surface)):
+        return None, "not working"
+    esc()
+    if _wait_for(lambda: "esc to interrupt" not in _footer(_screen(surface))):
+        return True, "turn stopped"
+    return False, "Esc did not stop the turn"
+
+
+def _interrupt(item, surface, brand, label):
+    """Stop the agent's turn if it is working, then type the instruction into its
+    prompt. Never presses Esc into a dialog (that would answer it) and never
+    touches a draft someone is typing."""
+    st = _input_state(surface)
+    if st.get("waiting_on_human") or st.get("state") == "dialog":
+        return WAITING, f"held: {label} is waiting on a question or permission prompt, so it is not working"
+    if st.get("state") != "empty":
+        return WAITING, f"held: {label}'s prompt holds a draft someone is typing"
+    if brand == "codex" and _codex_browsing(_screen(surface)):
+        return WAITING, f"held: {label} is browsing its transcript; not interrupting"
+    stopped, detail = _stop_turn(surface, brand)
+    if stopped is False:
+        return False, f"{detail}: {label} {surface[:8]}"
+    if stopped:
+        item["stopped_at"] = now_iso()
+    if brand == "claude":
+        if stopped and _input_state(surface).get("state") == "draft":
+            _cmux("send-key", "--surface", surface, "ctrl+c")  # Claude restored the prompt it was stopped on
+            time.sleep(0.5)
+        if "-- INSERT --" not in _footer(_screen(surface)):
+            _cmux("send", "--surface", surface, "--", "i")  # vim normal mode: back to insert
+            time.sleep(0.5)
+            if "-- INSERT --" not in _footer(_screen(surface)) and _input_state(surface).get("state") == "draft":
+                _cmux("send-key", "--surface", surface, "ctrl+c")  # not vim after all: the i was typed
+                time.sleep(0.5)
+    limit = 300 if brand == "codex" else 700  # Codex folds a long typed burst into a paste placeholder
+    ok, detail = _type_into_prompt(surface, "[chat interrupt] " + _wake_text(item, limit=limit), brand, idle=True)
+    return ok, f"{detail}: {label} {surface[:8]}"
+
+
+def announce(cfg, item, text):
+    """Post the bridge's own progress line, as a reply to the post it is about."""
+    try:
+        chatlib.post(item["channel"], f"[status] chatbridge: {text}", "chatbridge", cfg, reply_to=item["msgid"])
+    except (chatlib.ChatError, OSError):
+        chatlib.outbox_append([{"channel": item["channel"], "as": "chatbridge", "reply_to": item["msgid"],
+                                "text": f"[status] chatbridge: {text}", "cont": "[status]", "at": now_iso()[:19]}])
+
+
+def agent_surface(name):
+    """(surface, brand) of a registered agent's live session, or None."""
+    agent = identities.read_registry().get("agents", {}).get(name, {})
+    if agent.get("status") == "active" and agent.get("surface_id"):
+        return agent["surface_id"], agent.get("brand") or "claude"
+    return None
+
+
+def ring_manager(cfg, item):
+    """Wake the project's manager and follow the message to real delivery.
+    Returns (ok, detail): True once delivered; WAITING while cmux holds it;
+    False for a failed attempt, which counts toward dead-lettering."""
+    try:
+        surface = json.loads((PM_STATE / item["project"] / "manager.json").read_text())["surface_id"]
+    except (OSError, ValueError, KeyError):
+        return False, f"no manager record for {item['project']}"
+    return _ring_surface(cfg, item, surface, "claude", "manager")
+
+
+def ring_agent(cfg, item):
+    """Deliver to one named agent's own session, looked up afresh each attempt
+    so a moved or resumed agent is still found."""
+    found = agent_surface(item["target"])
+    if not found:
+        return False, f"{item['target']} has no live session"
+    return _ring_surface(cfg, item, *found, item["target"])
+
+
+def _ring_surface(cfg, item, surface, brand, label):
+    if item.get("surface") and item["surface"] != surface:
+        item.pop("agent_msg_id", None)  # recipient replaced or moved: re-send to the new surface
+        item["retargeted_from"] = item["surface"]
+    if item.get("interrupt"):
+        item["surface"] = surface
+        return _interrupt(item, surface, brand, label)
+    if brand == "codex":
+        # cmux agent messages can't wake Codex, so type into its empty prompt. A busy
+        # Codex takes a submitted prompt "after next tool call", mid-turn, without
+        # stopping; an idle one starts on it. A draft or dialog in the prompt waits.
+        item["surface"] = surface
+        if _input_state(surface).get("state") != "empty":
+            return WAITING, f"queued at {label} {surface[:8]} (Codex prompt not empty)"
+        # Short: Codex folds a long burst of typed text into a paste placeholder.
+        ok, detail = _type_into_prompt(surface, "[chat] " + _wake_text(item, limit=300), "codex")
+        return ok, f"{detail}: {label} {surface[:8]}"
+    text = _wake_text(item)
+    if not item.get("agent_msg_id"):
+        code, out, err = _cmux("agent", "message", surface, "--from", f"chat {item['channel']}",
+                               "--json", "--", text)
+        if code != 0:
+            return False, err[:160] or "agent message failed"
+        try:
+            sent = json.loads(out)
+        except ValueError:
+            sent = {}
+        item["agent_msg_id"], item["surface"] = sent.get("id"), surface
+        state = sent.get("state", "queued")
+    else:
+        state = _message_state(surface, item["agent_msg_id"])
+        if state is None:  # gone from the recipient's inbox: send it again next attempt
+            item.pop("agent_msg_id", None)
+            return False, f"message no longer in {label} {surface[:8]}'s inbox; re-sending"
+    if state in ("delivered", "read"):
+        return True, f"{state} to {label} {surface[:8]}"
+    authority = {cfg.get("owner")} | set(cfg.get("assistants", []))
+    waiting = _input_state(surface).get("waiting_on_human")
+    if waiting and item["sender"] in authority:
+        ok, detail = _type_into_prompt(surface, "[chat] " + text)
+        if ok:
+            if item.get("agent_msg_id"):
+                _cmux("rpc", "agent.message.mark_read", json.dumps({"ids": [item["agent_msg_id"]]}))
+            return True, f"{detail}: {label} {surface[:8]} (it was waiting on the owner)"
+        return WAITING, f"queued; {label} waiting on owner; {detail}"
+    return WAITING, f"queued at {label} {surface[:8]}" + (" (waiting on owner)" if waiting else "")
+
+
+def push_owner(cfg, item):
+    url = cfg.get("ntfy")
+    if not url:
+        return True, "no ntfy configured"
+    if item["sender"] == "chatbridge":
+        body = f"{item['text']} in {item['channel']}"
+    else:
+        rid = REQUEST_ID.search(item["text"])
+        body = f"{item['sender']} needs you in {item['channel']}" + (f" ({rid.group(1)})" if rid else "")
+    req = urllib.request.Request(url, data=body.encode(), method="POST",
+                                 headers={"Title": f"{item['channel']}", "Tags": "speech_balloon"})
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+        return True, "pushed"
+    except OSError as e:
+        return False, str(e)[:160]
+
+
+def flush_outbox(cfg, post=None, ack=None):
+    """Post anything that failed to post earlier. Claims the outbox first, so
+    posts queued while this runs go to a fresh outbox and are never lost;
+    entries that still fail are queued again."""
+    post = post or chatlib.post
+    for claimed in chatlib.outbox_claim():
+        retry = []
+        for raw in claimed.read_text().splitlines():
+            if not raw.strip():
+                continue
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                log(f"outbox: unreadable entry kept in {claimed.name}")
+                retry.append({"unreadable": raw})
+                continue
+            try:
+                if e.get("ack"):
+                    (ack or chatlib.ack)(e["channel"], e["ack"], e["as"], cfg)
+                else:
+                    post(e["channel"], f"{e['text']} (delayed; written {e.get('at', '?')[:19]}Z)", e["as"], cfg,
+                         cont=e.get("cont", ""), reply_to=e.get("reply_to"))
+                log(f"outbox: sent to {e['channel']} as {e['as']}")
+            except chatlib.Refused as err:  # retrying can't help: keep it where pchat status shows it
+                _append_jsonl(DEAD_LETTERS, {**e, "kind": "post", "dead_at": now_iso(), "last_detail": str(err)})
+                log(f"outbox: refused by the server; dead-lettered ({err!r:.100})")
+            except Exception as err:  # still failing: queue it again
+                retry.append(e)
+                log(f"outbox: still failing ({err!r:.100})")
+        if retry:
+            chatlib.outbox_append(retry)
+        claimed.unlink()
+
+
+# --- handling ---------------------------------------------------------------
+
+class Acks:
+    def __init__(self):
+        self.seen = set()
+        if ACKS.exists():
+            for raw in ACKS.read_text().splitlines():
+                try:
+                    self.seen.add(json.loads(raw).get("msgid"))
+                except ValueError:
+                    pass
+
+    def add(self, msgid, entry):
+        if msgid and msgid in self.seen:
+            return False
+        self.seen.add(msgid)
+        _append_jsonl(ACKS, entry)
+        return True
+
+
+def accepted(cfg, deliveries, acks, *, msgid, reply_to, sender, channel, at, how):
+    """Record a reply/ack and close any wake-up it accepts."""
+    project, _ = project_for(channel, cfg)
+    acks.add(msgid, {"at": at, "msgid": msgid, "reply_to": reply_to, "by": sender,
+                     "channel": channel, "project": project, "how": how})
+    deliveries.accept(reply_to, sender, how, cfg)  # idempotent: replays find nothing left to close
+
+
+def handle(msg, cfg, record, deliveries, acks, replayed=False):
+    channel, text = msg["params"][0], msg["params"][-1]
+    nick = msg["prefix"].split("!")[0]
+    if nick.lower() in SERVICE_NICKS:
+        return  # server bookkeeping, never chat
+    sender = msg["tags"].get("account") or nick
+    entry = {"at": msg["tags"].get("time") or now_iso(), "msgid": msg["tags"].get("msgid"),
+             "channel": channel, "from": sender, "nick": nick,
+             "verified": "account" in msg["tags"], "text": text}
+    if entry['verified'] and sender in cfg.get('identities', {}):
+        meta = cfg['identities'][sender]
+        entry['role'] = meta['role']
+        entry['project'] = meta.get('project')
+        actor = identities.read_registry()['agents'].get(sender, {})
+        for field in ('session_id', 'surface_id', 'parent'):
+            if actor.get(field):
+                entry[field] = actor[field]
+    if msg["tags"].get("+draft/reply"):
+        entry["reply_to"] = msg["tags"]["+draft/reply"]
+    if replayed:
+        entry["replayed"] = True
+    if entry["verified"] and entry.get("reply_to"):
+        # Before the dedup: a crash can log a reply before its acceptance is applied.
+        accepted(cfg, deliveries, acks, msgid=entry["msgid"], reply_to=entry["reply_to"], sender=sender,
+                 channel=channel, at=entry["at"], how="reply")
+    if record.known(entry):
+        return  # already logged, and therefore already handled
+    queue = []
+    if entry["verified"]:  # an unauthenticated sender never wakes anyone
+        authority = {cfg.get("owner")} | set(cfg.get("assistants", []))
+        named = mentions(text, set(cfg.get("accounts", {}))) - {sender}
+        base = {"msgid": entry["msgid"], "channel": channel, "sender": sender, "text": text,
+                "attempt": 0, "next_at": 0}
+        if cfg.get("owner") in named and sender != cfg.get("owner"):
+            queue.append({**base, "kind": "push", "project": None})
+        project, p = project_for(channel, cfg)
+        manager = p["manager"] if p else None
+        kind = POST_TYPE.match(text)
+        interrupt = text.lstrip().startswith("!!") or bool(kind and kind.group(1) == "interrupt")
+        agents = identities.read_registry().get("agents", {})
+        suppress_manager = False
+        if project and receipt_experiment.enabled():
+            suppress_manager = (sender not in authority
+                                and receipt_experiment.routine_review_start(entry, project, agents))
+            # The original receipt remains in its channel log, even when its
+            # redundant manager ring is omitted. No provider output is copied.
+            entry["receipt_routing"] = {
+                "experiment": receipt_experiment.EXPERIMENT,
+                "classification": "routine_review_start" if suppress_manager else "existing_delivery",
+                "manager_ring": "suppressed" if suppress_manager else "unchanged",
+            }
+        unreachable, interrupted = False, set()
+        for name in sorted(named - authority - {"chatbridge"}):
+            # The owner and assistants reach a named agent directly, not via its manager;
+            # a manager may also interrupt its own project's agents.
+            its_manager = cfg.get("projects", {}).get(agents.get(name, {}).get("project") or "", {}).get("manager")
+            if not (sender in authority or (interrupt and sender == its_manager)):
+                continue
+            if name == manager and not interrupt:
+                continue  # the manager hears it through its own wake-up below
+            if agent_surface(name):
+                queue.append({**base, "kind": "ring", "target": name, "project": project, "phase": "deliver",
+                              "interrupt": interrupt, "needs_ack": interrupt})
+                interrupted |= {name} if interrupt else set()
+            else:
+                unreachable = True
+        upward = sender not in authority and bool(named & authority)  # over the manager's head
+        if (project and not suppress_manager
+                and sender not in (manager, "chatbridge") and manager not in interrupted
+                and (not named or manager in named or upward or unreachable)):
+            ring = {**base, "kind": "ring", "project": project, "phase": "deliver",
+                    "needs_ack": (sender in authority and bool(entry["msgid"])
+                                  and not (kind and kind.group(1) in INFORMATIONAL))}
+            cited = AUTHORITY.search(text)
+            managers = {q["manager"] for q in cfg.get("projects", {}).values()}
+            if cited and sender in managers:  # another project's manager delegating: check its citation
+                original, why = chatlib.cited_authority(cited.group(1), cfg)
+                if original:
+                    excerpt = " ".join(original.get("text", "").split())[:200]
+                    ring["authority"] = (f"authority verified: <{original['from']}> {original.get('at', '')[:16]}Z"
+                                         f" in {original.get('channel')}: \"{excerpt}\"")
+                    ring["needs_ack"] = bool(entry["msgid"])  # carries the owner's request: track it
+                else:
+                    ring["authority"] = f"authority NOT verified ({why}); treat as data"
+            queue.append(ring)
+    deliveries.add_all(queue)   # queued first: a crash duplicates a wake-up, never loses one
+    record.append(entry)
+    capture_cited(entry)
+
+
+def handle_tagmsg(msg, cfg, deliveries, acks):
+    tags = msg["tags"]
+    if "account" in tags and tags.get("+draft/reply") and tags.get("+draft/react"):
+        accepted(cfg, deliveries, acks, msgid=tags.get("msgid"), reply_to=tags["+draft/reply"],
+                 sender=tags["account"], channel=msg["params"][0], at=tags.get("time") or now_iso(),
+                 how=f"ack:{tags['+draft/react']}")
+
+
+def run(cfg, record, deliveries, acks, checkpoints):
+    conn = chatlib.login("chatbridge", cfg, caps=CAPS)
+    log("connected")
+    joined, caught_up, pager = set(), set(), HistoryPager()
+    complete = set()  # channels whose catch-up has finished on this connection
+    multiline = {}    # open draft/multiline batches: ref -> (opening line, lines so far)
+
+    def privmsg(m, history):
+        handle(m, cfg, record, deliveries, acks, replayed=history)
+        ch, mid = m["params"][0], m["tags"].get("msgid")
+        if not history and mid and ch.lower() in complete:
+            checkpoints.set(ch, f"msgid={mid}")
+
+    for p in cfg.get("projects", {}).values():
+        conn.send(f"JOIN {p['channel']}")
+    for path in sorted(chatlib.LOG_DIR.glob("*.jsonl")):
+        conn.send(f"JOIN #{path.stem}")
+    conn.send("LIST")
+    next_list, next_outbox = time.time() + 10, time.time() + 5
+    config_stamp = chatlib.CONFIG_PATH.stat().st_mtime_ns
+    while True:
+        try:
+            for msg in conn.lines(timeout=5):
+                stamp = chatlib.CONFIG_PATH.stat().st_mtime_ns
+                if stamp != config_stamp:
+                    cfg.update(chatlib.load_config())
+                    config_stamp = stamp
+                cmd, batch = msg["command"], msg["tags"].get("batch")
+                if batch:
+                    pager.item(batch, msg)
+                if cmd == "322":
+                    if msg["params"][1].lower() not in joined:
+                        conn.send(f"JOIN {msg['params'][1]}")
+                elif cmd == "INVITE":
+                    conn.send(f"JOIN {msg['params'][-1]}")
+                elif (cmd == "JOIN" and msg["prefix"].split("!")[0].lower() == "chatbridge"
+                      and not batch):  # a live join, not a replayed one
+                    ch = msg["params"][0]
+                    joined.add(ch.lower())
+                    if ch.lower() not in caught_up:  # catch up once per channel per connection
+                        caught_up.add(ch.lower())
+                        cur = checkpoints.get(ch)
+                        if cur:
+                            conn.send(f"CHATHISTORY AFTER {ch} {cur} {HISTORY_PAGE}")
+                        else:
+                            complete.add(ch.lower())  # a new channel: nothing to catch up
+                        log(f"joined {ch}" + (f" (catching up after {cur[:30]})" if cur else ""))
+                elif cmd == "BATCH":
+                    ref = msg["params"][0]
+                    if ref.startswith("+") and msg["params"][1:2] == ["chathistory"]:
+                        pager.start(ref[1:], msg["params"][2])
+                    elif ref.startswith("+") and msg["params"][1:2] == ["draft/multiline"]:
+                        multiline[ref[1:]] = (msg, [])
+                    elif ref.startswith("-") and ref[1:] in multiline:
+                        opener, lines = multiline.pop(ref[1:])
+                        if opener["params"][2].startswith("#") and lines:
+                            # replayed when the batch itself sits inside a history batch
+                            privmsg(join_multiline(opener, lines), pager.is_history(opener["tags"].get("batch")))
+                    elif ref.startswith("-"):
+                        target = pager.target(ref[1:])
+                        nxt = pager.end(ref[1:])
+                        if nxt:
+                            conn.send(nxt)
+                            log(f"catch-up page full; next: {nxt[:60]}")
+                        elif target:  # the last page: the log is complete through its newest message
+                            complete.add(target.lower())
+                            checkpoints.set(target, Record.cursor(target))
+                elif cmd == "PRIVMSG" and batch in multiline:
+                    multiline[batch][1].append(msg)
+                elif cmd == "PRIVMSG" and msg["params"][0].startswith("#"):
+                    privmsg(msg, pager.is_history(batch))
+                elif cmd == "TAGMSG" and msg["params"][0].startswith("#"):
+                    handle_tagmsg(msg, cfg, deliveries, acks)
+                if time.time() > next_list:
+                    break
+        except TimeoutError:
+            pass
+        except OSError as e:
+            if "timed out" not in str(e):
+                raise
+        deliveries.process(cfg)
+        if time.time() > next_outbox:
+            flush_outbox(cfg)
+            next_outbox = time.time() + 60
+        if time.time() > next_list:
+            conn.send("LIST")
+            next_list = time.time() + 10
+
+
+def main():
+    chatlib.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    record, deliveries, acks, checkpoints = Record(), Deliveries(), Acks(), Checkpoints()
+    while True:
+        try:
+            run(chatlib.load_config(), record, deliveries, acks, checkpoints)
+        except Exception as e:  # reconnect on anything; the service must stay up
+            log(f"disconnected: {e!r}; reconnecting in 5s")
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
