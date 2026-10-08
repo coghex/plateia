@@ -5,7 +5,17 @@ seeing its real progress. This design serves the accepted [vision](vision.md),
 V-1 through V-13. It does not amend it. The first exploration follows one
 invented issue card through Solve, Hold, resume, review, merge, cleanup and Done.
 
-Design state: `exploring`
+Design state: `ready for issue processing`
+
+Readiness signed off on 2026-10-08 by this design session under the owner's
+explicit delegation (the owner asked the session to verify an external review,
+decide the revisions and "sign off on the doc when you think it is ready"),
+after the owner resolved Q-17 to Q-19. Deliberately open: Q-4 (framework,
+decided by PLT-2; stops PLT-8 and PLT-21 until recorded) and Q-20 (review
+baselines; stops PLT-20 only). The tracker had no open issues or PRs at
+signoff. Readiness authorizes issue processing only: no installation,
+activation, service start, merge-worker start, drainer cutover or commit in
+the skills repository.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -31,6 +41,7 @@ concrete precondition
 - [ ] PLT-19. Run fresh finalization in an explicit-start shared merge worker
 - [ ] PLT-20. Update behind PRs and carry approval across proven-equivalent updates
 - [ ] PLT-6. Project the card's real lifecycle from shared evidence
+- [ ] PLT-22. Notify the owner of failures through ntfy until browser push
 - [ ] PLT-7. Persist board intent and reconcile shared receipts in plateia
 - [ ] PLT-2. Compare page frameworks with the same recovery prototype
 - [ ] PLT-8. Deliver the read-only board on phone and desktop
@@ -39,12 +50,12 @@ concrete precondition
 These IDs are stable conversation and processing cursors; existing PLT-2
 retains its bake-off meaning despite appearing later in dependency order.
 The owner approved shared prerequisites before the plateia card slice (D-5).
-The twenty-one proposed boundaries below are not all approved, and none is ready
+The twenty-two boundaries below are all approved, and none is ready
 for issue processing; PLT-15 (2026-10-08) holds the bridge half of the former
 PLT-9 (D-20), PLT-16 the evidence half of the former PLT-10 (D-28), and PLT-17 the
 terminal and record half of the former PLT-1 (D-38); PLT-18 to PLT-20 split
 finalization (D-44); PLT-21 splits card moves from the read-only board
-(D-56). New code is plateia-owned (D-7); the merger starts fresh
+(D-56); PLT-22 adds interim ntfy notifications (D-67). New code is plateia-owned (D-7); the merger starts fresh
 from finalize (D-9), rather than porting the existing drainer. Finalizer runtime
 ownership is approved (D-12); approval continuity and its metadata-only initial
 boundary are selected (D-14/D-18). D-15/D-16/D-17 settle distribution, the
@@ -82,7 +93,8 @@ status, not the decision. Still no tracker artifacts exist for this design.
   V-12's five guarantees are demonstrated for that walk, including separate
   and combined plateia, bridge and browser outages; shared delivery, Hold and
   execution keep working with the plateia web process stopped (V-13); and the
-  shared chat code runs from an activated plateia release.
+  shared chat code runs from an activated plateia release; and this epic's
+  failure facts notify the owner through the interim ntfy watcher (PLT-22).
 - **Users and operators:** one owner; existing managers, workers, review
   services and the shared merge worker carry out the work.
 - **Not this epic:** the rest of the vision's mid-term scope (Approve and
@@ -484,7 +496,7 @@ the vision. The vision's out-of-scope items remain out of scope.
 | Approve and Inbox cancel moves | PLT-1 submission, PLT-3 control, PLT-4 pause, PLT-18 cleanup |
 | PR-only cards, replacement and multiple PRs | PLT-6 status view; Q-7's open rules |
 | Chat in the browser: posting, direct addressing (V-6), search, unread and "needs you", reactions, images | PLT-16 evidence, PLT-17 trace, PLT-8 room view, D-64 trust boundary |
-| Browser push replacing ntfy (V-9) | PLT-6 failure facts; Q-18's interim choice |
+| Browser push replacing ntfy (V-9) | PLT-6 failure facts; replaces PLT-22's interim watcher (D-67) |
 | Setup script for projects and machines (V-1) | PLT-11, PLT-12 and PLT-14 release path |
 | Cutover from the live drainer | PLT-19; a separate owner decision |
 
@@ -1910,6 +1922,41 @@ documents land with `docs-push` and are linked from the PR before final review
 (such as `SKILL.md`) stay in the PR. A lightweight map of later epics sits
 under "Scope and vision traceability".
 
+### D-66. A card's room is its request room
+
+Owner decision in this conversation, 2026-10-08, resolving Q-17: V-2's
+"request" is read as the card's work, matching today's chat convention of
+request channels named by issue. A card's room is its issue's request channel
+(D-31); each move is a request record inside it (D-33), and superseding a move
+doesn't change the room. A reopened issue reuses the same room, unarchived.
+The room is archived when the card reaches Done, and never deleted (V-2). A new
+room per lifecycle (for example, a second room on reopening) was not selected.
+The vision is unchanged.
+
+### D-67. Interim failure notifications through the existing ntfy path
+
+Owner decision in this conversation, 2026-10-08, resolving Q-18: a new slice,
+PLT-22, adds a watcher independent of the bridge, the manager and the plateia
+web process that sends this epic's V-9 failure facts through the owner's
+existing ntfy delivery until the browser-push epic replaces it. Triggers:
+undeliverable or never-accepted moves, pauses stuck past D-61's threshold,
+merge-worker incidents, and the chat bridge, chat server or a manager being
+down. One notification per incident and one when it resolves; acknowledgement
+(D-51) stops repeats. Routine progress never notifies. Board-only failures for
+this epic were not selected.
+
+### D-68. An explicit merge-worker start stands until an explicit stop or an incident
+
+Owner decision in this conversation, 2026-10-08, resolving Q-19: the owner's
+explicit start (D-6, D-12) is recorded as the worker's durable desired state.
+A crash or reboot is not a stop: the service supervisor restarts the worker
+while that state stands. An explicit stop, or an incident, sets it stopped;
+after an incident only a new explicit start resumes it. Start and stop
+requests are deduplicated by request ID. A blocked PR is skipped with its
+reason visible, and later eligible PRs still merge in number order; each pass
+rechecks the blocked one. Treating a crash as a stop was not selected: merging
+would halt quietly after every reboot.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -2182,6 +2229,8 @@ remain reviewed implementation in PLT-20.
 
 ### Q-17. Is a request room the card's room? (V-2)
 
+**Resolved by D-66, 2026-10-08.**
+
 Review item 7. V-2 gives each request its own room. D-31 puts every move for a
 card in that issue's channel, and D-33 makes each move its own request, so
 several requests share one room per card. Today's chat convention already
@@ -2191,6 +2240,8 @@ unarchived), and when the room is archived. **Blocks PLT-1 and PLT-17.**
 
 ### Q-18. What does this epic notify, and how?
 
+**Resolved by D-67, 2026-10-08** (new slice PLT-22).
+
 Review item 10. The walk says an undeliverable Hold notifies (V-9), but browser
 push is outside this epic (D-58). The first slices produce new failure facts
 (undeliverable or never-accepted moves, stuck pauses, merge-worker incidents).
@@ -2199,6 +2250,8 @@ push epic, or are board-only. A notifier must not depend on the failed
 component to report its own failure. **Blocks PLT-6 and PLT-21.**
 
 ### Q-19. Does an explicit merge-worker start survive a crash or reboot?
+
+**Resolved by D-68, 2026-10-08.**
 
 Review item 9. D-6 and D-12 allow the worker to run only after an explicit
 start, "until stopped". Decide whether a crash or reboot counts as stopped
@@ -2568,7 +2621,7 @@ the PR.
 - **Out of scope:** the terminal command, trace by card and hand-typed flag
   (PLT-17); manager execution changes; safe worker pause; drainer inhibition;
   plateia database and browser framework.
-- **Open questions:** Q-17 (room semantics); boundary approved by D-39. **Stop before
+- **Open questions:** None; boundary approved by D-39; rooms per D-66. **Stop before
   processing** until the design is ready.
 
 ### PLT-17. Add card moves to the terminal and the record
@@ -2589,7 +2642,7 @@ the PR.
   order; a hand-typed move is flagged visibly and wakes no worker; existing
   `pchat` commands are unchanged.
 - **Out of scope:** manager behavior, Hold control, the browser.
-- **Open questions:** Q-17 (room semantics); boundary approved by D-39. **Stop before
+- **Open questions:** None; boundary approved by D-39; rooms per D-66. **Stop before
   processing** until the design is ready.
 
 ### PLT-3. Reconcile ordered card intent before manager dispatch
@@ -2760,15 +2813,18 @@ the PR.
 - **Depends on:** PLT-18.
 - **Ordering:** critical path for automatic merging; not needed for the
   status view to observe merges.
-- **Relevant decisions:** D-2, D-6, D-7, D-9, D-12, D-13, D-44.
+- **Relevant decisions:** D-2, D-6, D-7, D-9, D-12, D-13, D-44, D-68.
 - **Acceptance signals:** no move, resume, approval, installation or
   reconciliation starts the worker; a stopped worker stays stopped and
   approved cards wait visibly; a held card is skipped; an incident stops the
-  worker visibly; only one active merge authority per repository.
+  worker visibly; only one active merge authority per repository; after a
+  simulated crash or reboot the worker resumes while the start stands, and
+  after an incident it stays stopped; a blocked PR is skipped visibly while a
+  later eligible PR merges; a repeated start or stop request has one effect.
 - **Out of scope:** cutover from the live drainer, which needs a separate
   owner decision; installing or starting the worker on the owner's machine.
-- **Open questions:** Q-19 (restart after crash or reboot; blocked PRs);
-  boundary approved by D-46. **Stop before
+- **Open questions:** None; boundary approved by D-46; restart and blocked-PR
+  rules are D-68. **Stop before
   processing** until the design is ready.
 
 ### PLT-20. Update behind PRs and carry approval across proven-equivalent updates
@@ -2841,9 +2897,40 @@ the PR.
   synthetic test; contradictory evidence shows "inconsistent evidence".
 - **Out of scope:** PR-only and multi-PR association rules (Q-7), the agent
   directory UI, browser push and the page framework.
-- **Open questions:** Q-18 (how failures reach the owner); boundary approved by
-  D-50. Default intervals and
+- **Open questions:** None; boundary approved by D-50; its failure facts feed
+  PLT-22 (D-67). Default intervals and
   thresholds are D-52. **Stop before processing** until the design is ready.
+
+### PLT-22. Notify the owner of failures through ntfy until browser push
+
+- **Outcome:** this epic's failure facts reach the owner's phone through the
+  existing ntfy delivery, once per incident, from a watcher that doesn't
+  depend on the failed component.
+- **Scope:** a small shared watcher, independent of the chat bridge, chat
+  server, managers and the plateia web process, reads PLT-6's failure facts
+  and service health and sends D-67's triggers through the existing ntfy
+  path: undeliverable or never-accepted moves, pauses stuck past D-61's
+  threshold, merge-worker incidents, and the bridge, chat server or a manager
+  down. One notification per incident and one on resolution, deduplicated by
+  incident identity across restarts; acknowledgement (D-51) stops repeats.
+  Notification configuration stays private. The watcher's service definition
+  is a managed target installed only through an owner-authorized release.
+- **Owning repository:** `coghex/plateia`.
+- **Phase:** lifecycle observation follow-up; interim until the browser-push
+  epic.
+- **Depends on:** PLT-6.
+- **Ordering:** critical path for this epic's V-9 coverage; independent of
+  PLT-7 onward.
+- **Relevant decisions:** D-2, D-36, D-51, D-52, D-61, D-63, D-67, D-68.
+- **Acceptance signals:** each trigger, injected with invented services,
+  sends exactly one notification and one resolution notice; a restart of the
+  watcher sends no duplicates; a stopped bridge or manager is reported by the
+  watcher, not by itself; routine progress and an intentionally stopped
+  merge worker don't notify; nothing private enters the repository.
+- **Out of scope:** browser push and its subscription UI; replacing ntfy;
+  notification content beyond a short fact and a link.
+- **Open questions:** None; boundary approved by D-67. **Stop before
+  processing** until the design is ready.
 
 ### PLT-7. Persist board intent and reconcile shared receipts in plateia
 
@@ -2976,8 +3063,8 @@ the PR.
   explicitly asks for startup.
 - **Out of scope:** posting free text in rooms, Approve and Inbox cancel, push
   and setup.
-- **Open questions:** Q-18 (how failures reach the owner); boundary approved by
-  D-57. **Stop before
+- **Open questions:** None; boundary approved by D-57; failures notify through
+  PLT-22 (D-67). **Stop before
   processing** until the PLT-2 framework decision exists and the design is
   ready.
 
@@ -3033,8 +3120,11 @@ external review was verified the same day: D-59 to D-65 (decided by this
 session under the owner's delegation) close its gaps in authority, execution
 ownership, Hold confirmation, board recovery, display rules, the browser trust
 boundary and documentation landing. Q-17 (rooms and V-2), Q-18 (notifications
-in this epic) and Q-19 (merge-worker restart) need the owner before
-readiness; Q-20 is deliberately open and blocks only PLT-20.
+in this epic) and Q-19 (merge-worker restart) were then resolved by the owner
+as D-66 to D-68, adding PLT-22; Q-20 is deliberately open and blocks only
+PLT-20. The design was then signed off as ready for issue processing.
+`/process-design-doc` processes the epic first, then exactly one child per
+invocation in ledger order, each with its own approval.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
