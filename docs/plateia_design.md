@@ -2607,9 +2607,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   unsupported association is shown, not guessed.
 - **Out of scope:** PR-only and multi-PR association rules (Q-7), the agent
   directory UI, browser push and the page framework.
-- **Open questions:** None; boundary approved by D-50. Q-6 sets the default
-  intervals and thresholds before PLT-7 and PLT-8, not before this slice.
-  **Stop before processing** until the design is ready.
+- **Open questions:** None; boundary approved by D-50. Default intervals and
+  thresholds are D-52. **Stop before processing** until the design is ready.
 
 ### PLT-7. Persist board intent and reconcile shared receipts in plateia
 
