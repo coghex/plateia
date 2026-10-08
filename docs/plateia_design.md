@@ -1441,6 +1441,31 @@ started is the manager's call, and a newer Hold acts through shared control.
 Having the manager mark superseded during reconciliation was not selected:
 superseded moves would stay open, and keep reminding, until the manager acts.
 
+### D-37. Card-move mechanics fixed as constraints; spelling left to PLT-1 review
+
+Owner decision in this conversation, 2026-10-08: these constraints bind
+`card-move/v1`; exact spelling is settled in PLT-1's reviewed implementation.
+
+1. **IDs:** clients generate random operation IDs (for example a UUID); the
+   shared service allocates request IDs in today's `<project>-<yyyymmdd>-<n>`
+   style; both use today's request-ID character set `[a-z0-9-]`.
+2. **No free text in a move:** every field is a restricted token, so nothing
+   needs escaping; anything else is a separate ordinary post.
+3. **Size:** a move is one line, far under the server's 4096-byte limit; a
+   move that would need splitting is refused before sending, never sent in
+   parts.
+4. **Duplicates:** the same operation ID with the same content returns the
+   original receipt; with different content it is visibly rejected. Clients
+   never send a revision; the service assigns it, so submissions cannot carry a
+   conflicting revision.
+5. **Lookup and retention:** receipts are queryable by operation ID, request ID
+   or card key through the PLT-16 API, and kept as long as the chat record,
+   which V-2 says is never deleted.
+
+With D-31 to D-36 this resolves Q-14 for issue cards. Whether the browser
+warns about near-simultaneous moves from two devices is Q-6; PR-only cards
+stay with Q-7.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1612,6 +1637,10 @@ was not selected. Exact lookup/retention/reconciliation API remains Q-14;
 browser storage of the original move ID remains Q-6.
 
 ### Q-14. What is the exact wire and receipt schema?
+
+**Resolved for issue cards by D-31 to D-37, 2026-10-08.** Remaining: PR-only
+card routing (with Q-7) and multi-device move warnings (Q-6). The history
+below is kept.
 
 After D-8's envelope approval, settle operation-ID/request-ID generation,
 escaping and size bounds, destination/endpoint fields, channel routing for
@@ -2021,7 +2050,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Depends on:** PLT-16 (D-28), PLT-11.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11, D-15, D-16, D-17, D-28,
-  D-31, D-32, D-33, D-34, D-35, D-36.
+  D-31, D-32, D-33, D-34, D-35, D-36, D-37.
 - **Acceptance signals:** synthetic non-web submission survives bridge/service
   restart and ambiguous send success; retries preserve the same logical move
   and receipt; mismatched duplicate content is visibly rejected; queued,
@@ -2029,8 +2058,9 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   and receipt recovery work with plateia stopped.
 - **Out of scope:** manager execution changes, safe worker pause, drainer
   inhibition, plateia database and browser framework.
-- **Open questions:** Q-11, Q-14; Q-12 supplies deployment prerequisites,
-  not an unresolved installation choice. **Stop before processing.**
+- **Open questions:** Q-11 (Q-14 resolved for issue cards by D-31 to D-37);
+  Q-12 supplies deployment prerequisites, not an unresolved installation
+  choice. **Stop before processing.**
 
 ### PLT-3. Reconcile ordered card intent before manager dispatch
 
@@ -2057,8 +2087,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   permits startup through shared tooling.
 - **Out of scope:** worker safe-pause implementation, drainer merge checks,
   board order and browser interaction.
-- **Open questions:** Q-11, Q-14; deployment follows C-7/Q-12.
-  **Stop before processing.**
+- **Open questions:** Q-11 (Q-14 resolved for issue cards by D-31 to D-37);
+  deployment follows C-7/Q-12. **Stop before processing.**
 
 ### PLT-4. Pause and resume workers and review loops at safe boundaries
 
@@ -2170,7 +2200,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   mutation by the application.
 - **Out of scope:** page framework, production browser controls, image
   storage and new workflow logic.
-- **Open questions:** Q-6, Q-7, Q-11, Q-14. **Stop before processing.**
+- **Open questions:** Q-6, Q-7, Q-11 (Q-14 resolved for issue cards by D-31
+  to D-37). **Stop before processing.**
 
 ### PLT-2. Compare page frameworks with the same recovery prototype
 
