@@ -1502,6 +1502,22 @@ was rejected: one skill would come from two sources, the drift D-23 removed.
 Owner signoff in this conversation, 2026-10-08: the PLT-3 delivery entry, as
 rewritten under D-40, is approved. This settles Q-11 for PLT-3.
 
+### D-42. Hold is enforced by message and a Python pre-action hook
+
+Owner decision in this conversation, 2026-10-08: Hold uses both paths. The
+manager's queued inbox message lets the worker save recovery context
+(`pchat card checkpoint`) and post its pause report; a pre-tool-use hook in
+Claude Code and Codex sessions bound to a card refuses every other tool action
+while the card is held or control is unreadable, logging each refusal. The
+hook is a Python executable, not a prompt- or Markdown-based hook. A confirmed
+Hold is a recorded checkpoint plus hook evidence, independent of the agent's
+own report. The hook configuration for both runtimes is a new managed target
+added to D-26's list, installed only through an owner-authorized release.
+
+Message-only enforcement was not selected: it relies on agent compliance and
+self-reported evidence. Hook-only enforcement was not selected: the agent
+would learn of the Hold only by being blocked.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -2160,26 +2176,45 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 
 ### PLT-4. Pause and resume workers and review loops at safe boundaries
 
-- **Outcome:** the existing worker/review execution can report a verified
-  safe pause and resume its kept work through shared control.
-- **Scope:** integrate the approved checkpoint rule with solver and review
-  loop boundaries, persist recovery context and correlated pause/resume
-  evidence, and prevent the next stage while held. Retain branch, worktree,
-  uncommitted work, PR, claim and review evidence; keep freshness gates.
-- **Owning repository:** `coghex/plateia` (D-7) for the shared mechanism;
-  worker and review-loop skill changes follow D-40: a written specification
+- **Outcome:** a worker or review loop on a held card stops before its next
+  action with its recovery context saved, the pause is verified independently
+  of what the agent says, and a newer Solve resumes the same work.
+- **Scope:** per D-42, both paths. **Cooperative:** the manager's queued inbox
+  message tells the worker; the worker saves recovery context with a new
+  `pchat card checkpoint` command and posts its pause report. **Enforced:** a
+  pre-tool-use hook, written in Python, for Claude Code and Codex sessions
+  bound to a card; before every tool action it reads shared card control and,
+  while the card is held, refuses everything except the checkpoint and
+  pause-report commands, logging each refusal. Unreadable control refuses the
+  same way and reads as unknown (D-10). A running background reviewer finishes
+  its current review; the next round is refused. A confirmed Hold is a
+  recorded checkpoint plus hook evidence. Resume clears the inhibition for the
+  newer revision and the worker continues from its checkpoint, keeping branch,
+  worktree, uncommitted work, PR, claim and review evidence. The hook
+  configuration for both runtimes becomes a managed target, added to D-26's
+  list and installed only through an owner-authorized release. Per D-40, a
+  written specification of the worker and review-loop skill changes
   accompanies the PR, and the owner applies it in the skills repository.
+- **Owning repository:** `coghex/plateia` (D-7) for the hook, commands and
+  control; skill changes follow D-40.
 - **Phase:** shared execution prerequisite.
 - **Depends on:** PLT-3.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-4, D-5, D-7, D-10, D-40.
-- **Acceptance signals:** Hold during an in-flight step yields pause pending
-  until a safe checkpoint; no forced terminal edit/kill; replayed Hold does
-  not lose work; newer Solve resumes the same execution/artifacts; a missing
-  worker/checkpoint is unknown, not safely held; works without plateia.
-- **Out of scope:** drainer eligibility, plateia projection and UI; general
-  mid-step interruption remains outside the vision's scope.
-- **Open questions:** Q-11; deployment follows C-7/Q-12. **Stop before processing.**
+- **Relevant decisions:** D-2, D-4, D-5, D-7, D-10, D-40, D-42.
+- **Acceptance signals:** with invented sessions, a Hold during an in-flight
+  action lets it finish and refuses the next one; the checkpoint and pause
+  report are still allowed; an agent that ignores the message is still
+  stopped and the refusal is logged; a replayed Hold loses no work; unreadable
+  control refuses and reads as unknown; a missing worker or checkpoint is
+  unknown, not safely held; a newer Solve resumes the same execution and
+  artifacts with no new claim, branch or PR; no terminal kill or forced prompt
+  edit; it works with the plateia web process stopped; the hook is a Python
+  executable, not prompt or Markdown text.
+- **Out of scope:** merge eligibility (PLT-5), the projection and UI,
+  committing in the skills repository, and general mid-step interruption,
+  which the vision excludes.
+- **Open questions:** Q-11 for signoff of this entry; deployment follows
+  C-7/Q-12. **Stop before processing.**
 
 ### PLT-5. Build shared finalization from the finalize contract
 
