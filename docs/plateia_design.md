@@ -20,6 +20,7 @@ concrete precondition
 - [ ] PLT-12. Stage releases without changing active tools or services
 - [ ] PLT-14. Add guarded activation and state-preserving rollback
 - [ ] PLT-10. Expose one shared chat API with compatible non-web entry points
+- [ ] PLT-16. Add normalized, attested chat evidence to the shared API
 - [ ] PLT-13. Adapt the approved clarification inbox to shared chat
 - [ ] PLT-1. Add durable logical card-move submission to shared chat
 - [ ] PLT-3. Reconcile ordered card intent before manager dispatch
@@ -33,9 +34,9 @@ concrete precondition
 These IDs are stable conversation and processing cursors; existing PLT-2
 retains its bake-off meaning despite appearing later in dependency order.
 The owner approved shared prerequisites before the plateia card slice (D-5).
-The fifteen proposed boundaries below are not individually approved or ready
+The sixteen proposed boundaries below are not all approved, and none is ready
 for issue processing; PLT-15 (2026-10-08) holds the bridge half of the former
-PLT-9, split by D-20. New code is plateia-owned (D-7); the merger starts fresh
+PLT-9 (D-20), and PLT-16 the evidence half of the former PLT-10 (D-28). New code is plateia-owned (D-7); the merger starts fresh
 from finalize (D-9), rather than porting the existing drainer. Finalizer runtime
 ownership is approved (D-12); approval continuity and its metadata-only initial
 boundary are selected (D-14/D-18). D-15/D-16/D-17 settle distribution, the
@@ -1310,6 +1311,21 @@ Fix-forward only for the first activation was not selected: it would drop
 C-7's rollback guarantee at the riskiest moment. Having the controller commit
 into the skills repository was not selected.
 
+### D-28. Split the API work: behavior-preserving API first, attested evidence second
+
+Owner decision in this conversation, 2026-10-08: PLT-10 introduces the
+versioned shared chat API over today's behavior only; the CLI, bridge and
+`pchat agent` entry points go through it with unchanged output and exit codes.
+A new PLT-16 then adds the normalized, server-attested evidence that the
+merged inbox core's adapter contract needs (read messages, read
+acknowledgements, send with submitted, proven-no-send or uncertain results).
+The framing shared between the inbox envelope and `card-move/v1` stays with
+Q-14 and PLT-1; until then the inbox keeps its own envelope.
+
+Keeping PLT-10 as one slice was not selected: it would mix a pure restructure
+with new behavior, hiding behavior changes from review. Splitting by consumer
+was not selected: every slice would touch the shared evidence model.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1770,30 +1786,63 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 
 ### PLT-10. Expose one shared chat API with compatible non-web entry points
 
-- **Outcome:** existing bridge/client processes use one versioned Python API
-  with normalized chat evidence and compatible thin entry points.
-- **Scope:** API/common codec/capabilities, CLI/skill delegation, full server-
-  attested account/msgid/tag/reply/history/ack records, shared identity/presence
-  reads, explicit errors and uncertain-send results. Preserve current non-web
-  command/output/exit contracts; include operating guidance and synthetic
-  caller fixtures. Support the inbox's existing envelope without privately
-  patching installed scripts. Card-move-specific framing still needs Q-14.
+- **Outcome:** the CLI, bridge and `pchat agent` entry points go through one
+  versioned Python API, with today's behavior unchanged.
+- **Scope:** the API module with version and capability checks over the
+  existing posting, history, acknowledgement, identity and presence functions;
+  `pchat`, `chat-bridge` and `agentcli` delegate to it. Every existing
+  command's arguments, output and exit codes stay as they are (for example,
+  `pchat` exit 3 still means a queued outbox entry). The API version joins the
+  release manifest. Update the packaged `SKILL.md` guidance and add synthetic
+  caller transcripts as compatibility fixtures. No new evidence semantics
+  (PLT-16) and no shared message format (Q-14).
 - **Owning repository:** `coghex/plateia`.
 - **Phase:** shared API prerequisite, after the first activation (D-23); its
   changes reach the live tools only through the PLT-11/PLT-12/PLT-14 release
   path.
 - **Depends on:** PLT-14 (D-23).
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-7, D-8, D-15, D-16, D-17, D-23.
-- **Acceptance signals:** no nick/text-derived attestation; complete multipart
-  evidence survives reads; missing/truncated/conflicting history or unavailable
-  acks block the affected action. Queued outbox never means proven no-send.
-  Incompatible callers fail visibly; legacy specified behavior remains valid;
-  bridge/CLI/API operate with plateia web stopped and no extra IPC daemon.
-- **Out of scope:** card revision/durable receipt storage (PLT-1), release
-  activation, a duplicate inbox core/router/identity allocator or new services.
-- **Open questions:** Q-11; Q-14 for codec/routing handoff. **Stop before
-  processing the affected framing behavior until its contract is settled.**
+- **Relevant decisions:** D-2, D-7, D-15, D-16, D-17, D-23, D-28.
+- **Acceptance signals:** the PLT-9/PLT-15 fixtures and the caller transcripts
+  pass unchanged through the API; an incompatible caller or API version fails
+  visibly rather than being reinterpreted; the bridge and CLI run with the
+  plateia web process stopped and no extra IPC daemon; no second identity
+  allocator, router or chat-library copy exists.
+- **Out of scope:** attested evidence records and uncertain-send results
+  (PLT-16); shared inbox/card-move framing (Q-14, PLT-1); card revisions and
+  receipts (PLT-1); release activation; new services.
+- **Open questions:** Q-11 for signoff of this entry. **Stop before
+  processing.**
+
+### PLT-16. Add normalized, attested chat evidence to the shared API
+
+- **Outcome:** a non-web consumer can read complete, server-attested chat
+  evidence and send with an honest outcome, meeting the merged inbox core's
+  adapter contract.
+- **Scope:** read messages for a channel or prefix in server order with
+  server-attested account, stable message ID, server time, target, complete
+  tags, reply relationship and multipart part evidence; read server-attested
+  acknowledgements; send one logical message (numbering its physical lines if
+  split) with a submitted, proven-no-send or uncertain result and its proof.
+  Missing, truncated, replaced or conflicting history and unavailable
+  acknowledgements are explicit errors. Legacy records lacking attestation are
+  unusable for automatic actions, not upgraded by guessing. Include contracts
+  and synthetic fixtures in the same PR.
+- **Owning repository:** `coghex/plateia`.
+- **Phase:** shared evidence prerequisite.
+- **Depends on:** PLT-10.
+- **Ordering:** critical path.
+- **Relevant decisions:** D-2, D-7, D-15, D-16, D-17, D-23, D-28.
+- **Acceptance signals:** no account is derived from nick patterns, colors,
+  client tags or text; complete multipart evidence survives reads, and
+  orphaned or interleaved parts block; a queued outbox entry never reads as
+  proven no-send, and an uncertain send is never automatically resent; the
+  inbox core's existing tests pass against this adapter surface with synthetic
+  data; existing command behavior from PLT-10 is unchanged.
+- **Out of scope:** the inbox adapter itself (PLT-13); shared framing for
+  `card-move/v1` (Q-14, PLT-1); card revisions and durable receipts (PLT-1).
+- **Open questions:** Q-11 for signoff of this entry. **Stop before
+  processing.**
 
 ### PLT-13. Adapt the approved clarification inbox to shared chat
 
@@ -1805,11 +1854,12 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   private script copies or substitute assistant identity.
 - **Owning repository:** `coghex/plateia`.
 - **Phase:** non-web consumer follow-up, separate from the already tracked core.
-- **Depends on:** PLT-10, PLT-11. The former external prerequisite, PR #1/issue
+- **Depends on:** PLT-16 (D-28), PLT-11. The former external prerequisite, PR #1/issue
   #2's core, was met on 2026-10-04 (`ef86f17`); the adapter builds on that
   merged core without amending its contract.
 - **Ordering:** independent of card-move implementation once the API exists.
-- **Relevant decisions:** D-2, D-7, D-15, D-16, D-17; preserve issue #2's contract.
+- **Relevant decisions:** D-2, D-7, D-15, D-16, D-17, D-28; preserve issue #2's
+  contract.
 - **Acceptance signals:** synthetic questions collect durably once; only the
   configured manager's attested account introduces questions/accepts replies;
   quoted/inline mentions add no inbox recipients; replies stay with that
@@ -1833,9 +1883,9 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   of the plateia web process. D-15/D-16/D-17 and PLT-9, PLT-15, PLT-10 and PLT-11 establish
   source/distribution/API compatibility; Q-12 lists deployment prerequisites.
 - **Phase:** shared delivery prerequisite; first card-move implementation target.
-- **Depends on:** PLT-10, PLT-11.
+- **Depends on:** PLT-16 (D-28), PLT-11.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11, D-15, D-16, D-17.
+- **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11, D-15, D-16, D-17, D-28.
 - **Acceptance signals:** synthetic non-web submission survives bridge/service
   restart and ambiguous send success; retries preserve the same logical move
   and receipt; mismatched duplicate content is visibly rejected; queued,
