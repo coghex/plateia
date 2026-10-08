@@ -63,10 +63,17 @@ A release is `plateia-chat-<package version>`. The version is the
 - **An output directory inside the source checkout, or under the live
   tools' locations:** `~/.codex/skills`, `~/.config/chat`, `~/.config/cmux`,
   `~/.local/state`, `~/.local/bin` and `~/Library/LaunchAgents`, plus
-  wherever `CHAT_STATE` and `CHAT_CONFIG` point when they are set. Both the
-  output path and each protected location are resolved before comparing,
-  and the unresolved spellings are checked too. So neither a symlinked
-  output path nor a symlinked live location gets through.
+  wherever `CHAT_STATE` and `CHAT_CONFIG` point when they are set.
+  - **Concrete runtime locations count on their own**, because each may be
+    a symlink elsewhere: `~/.local/state/chat`, `~/.local/state/project-manager`,
+    `~/.local/state/ergo`, `~/.codex/skills/chat` and its `scripts/`, and
+    WeeChat's directories.
+  - **So does every symlink directly inside a protected location:** a
+    symlinked directory's target, or a symlinked file's target directory,
+    as with `~/.local/bin/pchat`.
+  - **Both sides of every comparison are resolved**, and the unresolved
+    spellings are checked too. So neither a symlinked output path nor a
+    symlinked live location gets through.
 - **An artifact that would carry private data:** a home-directory path other
   than the invented `/Users/someone`, a credential pattern, or a chat-state or
   configuration file.
@@ -191,9 +198,9 @@ arm64, CPython 3.14.8), using this PR's build step.
 
 - **Inputs:**
   - **Builder:** this PR's `packages/release/build_release.py`, at builder
-    revision `706a986f3661ab63bb67581d2c07f22e4c4f1b31`, not dirty: the PR
-    head after its second review. Earlier runs with `2ab6c29` and `01d0d57`
-    gave the same outcomes and byte-identical artifacts. Only the manifest's
+    revision `f5b268b2a9f85f764605e7b120c29ab6662c5174`, not dirty: the PR
+    head after its third review. Earlier runs with `2ab6c29`, `01d0d57` and
+    `706a986` gave the same outcomes and byte-identical artifacts. Only the manifest's
     builder identity and format inventory differed.
   - **Source:** a clean detached checkout of `origin/master` at
     `48b901ac3e81d1f0c2b249f9381cf1af4aa2524a`. That commit contains #11's
