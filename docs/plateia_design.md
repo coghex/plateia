@@ -16,11 +16,11 @@ concrete precondition
 - [ ] EPIC. Make plateia the owner's trustworthy chat and work board
 - [ ] PLT-9. Capture the shared chat identity and transport core
 - [ ] PLT-15. Capture the shared chat bridge
-- [ ] PLT-10. Expose one shared chat API with compatible non-web entry points
 - [ ] PLT-11. Build immutable pinned shared-package releases
 - [ ] PLT-12. Stage releases without changing active tools or services
-- [ ] PLT-13. Adapt the approved clarification inbox to shared chat
 - [ ] PLT-14. Add guarded activation and state-preserving rollback
+- [ ] PLT-10. Expose one shared chat API with compatible non-web entry points
+- [ ] PLT-13. Adapt the approved clarification inbox to shared chat
 - [ ] PLT-1. Add durable logical card-move submission to shared chat
 - [ ] PLT-3. Reconcile ordered card intent before manager dispatch
 - [ ] PLT-4. Pause and resume workers and review loops at safe boundaries
@@ -1230,6 +1230,28 @@ as recorded under D-19/D-20/D-21, are approved. This settles Q-11 for these two
 slices only. It is not readiness signoff for the design, and neither slice can
 be processed until the D-19 baseline commit exists.
 
+### D-23. Activate the captured code before restructuring it into the API
+
+Owner decision in this conversation, 2026-10-08: reorder the release work ahead
+of the API: PLT-9 → PLT-15 → PLT-11 (build) → PLT-12 (stage) → PLT-14
+(activate) → PLT-10 (API). The first activation runs captured code that behaves
+as today's live tools. From that activation on, plateia is the single source
+of the shared chat code, and PLT-10 restructures it there alone.
+
+Until that activation, the local skills repository remains what runs and may
+still change. Each slice from PLT-9 to PLT-14 starts with a drift check
+against the D-19 baseline and carries any newer skills commits into plateia
+before its own change. D-15 is unchanged: pinned, staged and guarded releases
+with no installation exception, and each real activation still needs its own
+explicit owner authorization. The release manifest gains an API version only
+from PLT-10 onward.
+
+Fixing both copies by hand from PLT-9 onward was not selected (fixes get
+missed), nor was keeping the skills repository authoritative until a later
+activation (four slices of growing divergence, harder after the API refactor).
+A shortcut activation after PLT-15, such as repointing symlinks, was not
+selected because it would reopen D-15.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1584,45 +1606,22 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Open questions:** None; boundary approved by D-22. **Stop before
   processing** until the D-19 baseline exists and the design is ready.
 
-### PLT-10. Expose one shared chat API with compatible non-web entry points
-
-- **Outcome:** existing bridge/client processes use one versioned Python API
-  with normalized chat evidence and compatible thin entry points.
-- **Scope:** API/common codec/capabilities, CLI/skill delegation, full server-
-  attested account/msgid/tag/reply/history/ack records, shared identity/presence
-  reads, explicit errors and uncertain-send results. Preserve current non-web
-  command/output/exit contracts; include operating guidance and synthetic
-  caller fixtures. Support the inbox's existing envelope without privately
-  patching installed scripts. Card-move-specific framing still needs Q-14.
-- **Owning repository:** `coghex/plateia`.
-- **Phase:** shared API prerequisite.
-- **Depends on:** PLT-9, PLT-15.
-- **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-7, D-8, D-15, D-16, D-17.
-- **Acceptance signals:** no nick/text-derived attestation; complete multipart
-  evidence survives reads; missing/truncated/conflicting history or unavailable
-  acks block the affected action. Queued outbox never means proven no-send.
-  Incompatible callers fail visibly; legacy specified behavior remains valid;
-  bridge/CLI/API operate with plateia web stopped and no extra IPC daemon.
-- **Out of scope:** card revision/durable receipt storage (PLT-1), release
-  activation, a duplicate inbox core/router/identity allocator or new services.
-- **Open questions:** Q-11; Q-14 for codec/routing handoff. **Stop before
-  processing the affected framing behavior until its contract is settled.**
-
 ### PLT-11. Build immutable pinned shared-package releases
 
 - **Outcome:** a clean reviewed commit produces identifiable package/skill
   artifacts with exact dependency and compatibility metadata.
 - **Scope:** source/artifact hashes, Python/platform requirements, pinned
-  dependencies, API/wire/state versions and packaged guidance. Test built
+  dependencies, wire/state versions and packaged guidance; the API version
+  joins the manifest from PLT-10 onward (D-23). Test built
   artifacts outside the source checkout. Shared-chat artifacts come first;
   an inbox release consumes the existing core merged on `master`. No
   duplicate core or editable runtime imports.
 - **Owning repository:** `coghex/plateia`.
 - **Phase:** release prerequisite.
-- **Depends on:** PLT-10. The inbox core (PR #1/issue #2) is already merged.
+- **Depends on:** PLT-15 (D-23). The inbox core (PR #1/issue #2) is already
+  merged.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-7, D-15, D-16, D-17.
+- **Relevant decisions:** D-2, D-7, D-15, D-16, D-17, D-23.
 - **Acceptance signals:** missing/tampered/unpinned inputs refuse; manifest
   identifies exact source/artifacts and supported versions; artifacts contain
   no private settings/data; declared environments run without checkout imports;
@@ -1646,7 +1645,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Phase:** release preparation prerequisite.
 - **Depends on:** PLT-11.
 - **Ordering:** critical path for deployment; independent of offline card work.
-- **Relevant decisions:** D-2, D-6, D-7, D-15, D-16, D-17.
+- **Relevant decisions:** D-2, D-6, D-7, D-15, D-16, D-17, D-23.
 - **Acceptance signals:** staging preserves active/modified files, identities,
   private settings, queues and service state; unknown ownership, mismatched
   interpreter, incompatible state and tampered artifacts block. Repeated or
@@ -1657,6 +1656,62 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Open questions:** Q-11 for boundary signoff. A concrete compatible target
   plan is a later deployment prerequisite, not an installation exception.
   **Stop before processing.**
+
+### PLT-14. Add guarded activation and state-preserving rollback
+
+- **Outcome:** separately authorized release selection reconciles interruption
+  and can revert compatible code while preserving latest private state/work.
+- **Scope:** fenced upgrade journal, target hash/link recheck, durable atomic
+  binding, staged/selected/running version evidence, safe affected-writer
+  coordination, compatibility matrix and code-only rollback. Retain all versions
+  referenced by live processes, cached skills/hooks, entry points or services.
+  Include operator contract and synthetic interruption/rollback evidence in
+  the same PR; implementing a controller never authorizes live execution.
+  Its first target is the captured, behavior-identical code (D-23).
+- **Owning repository:** `coghex/plateia`.
+- **Phase:** deployment/recovery preparation.
+- **Depends on:** PLT-12 (D-23).
+- **Ordering:** critical path for activation; independent of offline board work.
+- **Relevant decisions:** D-2, D-6, D-7, D-10, D-12, D-15, D-16, D-17, D-23.
+- **Acceptance signals:** unknown/modified installed files block replacement;
+  concurrent upgraders cannot interleave; binding/journal crash outcomes
+  reconcile reality. Latest identity counters, settings, requests, accepted
+  messages, cursors, claims, Hold, reviews and cleanup debt survive rollback.
+  Incompatible rollback exposes repair/roll-forward; referenced releases are
+  not retired. No mid-action worker interruption or implicit account/config/
+  service/merger/schedule action occurs.
+- **Out of scope:** breaking migrations, real activation/deployment, automatic
+  recovery authority, merger cutover/start and merge actions.
+- **Open questions:** Q-11 for boundary signoff. Any live activation/recovery
+  plan needs separate explicit authorization; none is requested or implied
+  here. **Stop before processing.**
+
+### PLT-10. Expose one shared chat API with compatible non-web entry points
+
+- **Outcome:** existing bridge/client processes use one versioned Python API
+  with normalized chat evidence and compatible thin entry points.
+- **Scope:** API/common codec/capabilities, CLI/skill delegation, full server-
+  attested account/msgid/tag/reply/history/ack records, shared identity/presence
+  reads, explicit errors and uncertain-send results. Preserve current non-web
+  command/output/exit contracts; include operating guidance and synthetic
+  caller fixtures. Support the inbox's existing envelope without privately
+  patching installed scripts. Card-move-specific framing still needs Q-14.
+- **Owning repository:** `coghex/plateia`.
+- **Phase:** shared API prerequisite, after the first activation (D-23); its
+  changes reach the live tools only through the PLT-11/PLT-12/PLT-14 release
+  path.
+- **Depends on:** PLT-14 (D-23).
+- **Ordering:** critical path.
+- **Relevant decisions:** D-2, D-7, D-8, D-15, D-16, D-17, D-23.
+- **Acceptance signals:** no nick/text-derived attestation; complete multipart
+  evidence survives reads; missing/truncated/conflicting history or unavailable
+  acks block the affected action. Queued outbox never means proven no-send.
+  Incompatible callers fail visibly; legacy specified behavior remains valid;
+  bridge/CLI/API operate with plateia web stopped and no extra IPC daemon.
+- **Out of scope:** card revision/durable receipt storage (PLT-1), release
+  activation, a duplicate inbox core/router/identity allocator or new services.
+- **Open questions:** Q-11; Q-14 for codec/routing handoff. **Stop before
+  processing the affected framing behavior until its contract is settled.**
 
 ### PLT-13. Adapt the approved clarification inbox to shared chat
 
@@ -1683,34 +1738,6 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   new assistant credentials or expanded authority.
 - **Open questions:** Q-11; Q-14 where shared framing/routing interacts with
   existing inbox conventions. **Stop before processing unresolved behavior.**
-
-### PLT-14. Add guarded activation and state-preserving rollback
-
-- **Outcome:** separately authorized release selection reconciles interruption
-  and can revert compatible code while preserving latest private state/work.
-- **Scope:** fenced upgrade journal, target hash/link recheck, durable atomic
-  binding, staged/selected/running version evidence, safe affected-writer
-  coordination, compatibility matrix and code-only rollback. Retain all versions
-  referenced by live processes, cached skills/hooks, entry points or services.
-  Include operator contract and synthetic interruption/rollback evidence in
-  the same PR; implementing a controller never authorizes live execution.
-- **Owning repository:** `coghex/plateia`.
-- **Phase:** deployment/recovery preparation.
-- **Depends on:** PLT-10, PLT-12.
-- **Ordering:** critical path for activation; independent of offline board work.
-- **Relevant decisions:** D-2, D-6, D-7, D-10, D-12, D-15, D-16, D-17.
-- **Acceptance signals:** unknown/modified installed files block replacement;
-  concurrent upgraders cannot interleave; binding/journal crash outcomes
-  reconcile reality. Latest identity counters, settings, requests, accepted
-  messages, cursors, claims, Hold, reviews and cleanup debt survive rollback.
-  Incompatible rollback exposes repair/roll-forward; referenced releases are
-  not retired. No mid-action worker interruption or implicit account/config/
-  service/merger/schedule action occurs.
-- **Out of scope:** breaking migrations, real activation/deployment, automatic
-  recovery authority, merger cutover/start and merge actions.
-- **Open questions:** Q-11 for boundary signoff. Any live activation/recovery
-  plan needs separate explicit authorization; none is requested or implied
-  here. **Stop before processing.**
 
 ### PLT-1. Add durable logical card-move submission to shared chat
 
@@ -1957,8 +1984,10 @@ the local skills repository's `master` was pointed at reviewed commit `c572bad`
 (26 commits past `f010533`, history fetched from its task clone), with no file
 on disk changed. The live tree then matched it except one uncommitted
 `cmux-supervisor` SKILL.md paragraph, outside PLT-9/PLT-15 and left for the
-owner. Re-run the drift comparison before processing PLT-9. Next for Q-11: PLT-10 onward and the first
-browser boundary.
+owner. Re-run the drift comparison before processing PLT-9. D-23 then
+reorders release work ahead of the API (PLT-15 → PLT-11 → PLT-12 → PLT-14 →
+PLT-10). Next for Q-11: sign off PLT-11, PLT-12 and PLT-14 in their new
+positions, then PLT-10 onward and the first browser boundary.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
