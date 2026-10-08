@@ -1,0 +1,12 @@
+› Continue the existing test run.
+
+• The probe is still active. No final result is available yet.
+
+■ Conversation interrupted - use /feedback if something went wrong
+
+  2 background terminals running · /ps to view · /stop to close
+
+› Ask Codex to do anything
+
+  GPT high · ~/work/project
+  esc again to edit previous message

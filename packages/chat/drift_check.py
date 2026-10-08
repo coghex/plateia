@@ -141,8 +141,9 @@ def check(tree: Path, provenance: dict) -> dict:
             continue
         if digest != base["sha256"]:
             carried = entry.get("effective_sha256") not in (None, base["sha256"]) and digest == entry["effective_sha256"]
+            source = str(entry.get("source_commit") or "")[:7]
             drift.append({"path": rel, "kind": "changed",
-                          "detail": ("matches the carried effective source" if carried
+                          "detail": (f"matches carried commit {source}".rstrip() if carried
                                      else f"sha256 {base['sha256'][:12]} -> {digest[:12]}")})
         if mode_of(st) != base["mode"]:
             drift.append({"path": rel, "kind": "mode changed", "detail": f"{base['mode']} -> {mode_of(st)}"})

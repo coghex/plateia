@@ -41,10 +41,13 @@ jobs:
       # unittest's own exit status decides first. Then the step refuses a run
       # that tested nothing: Python 3.10 and 3.11 exit 0 on an empty
       # discovery, which would let a moved test directory pass, and a missing
-      # directory fails discovery outright. The runner exports XDG_CONFIG_HOME
-      # under its real home; the chat suite's isolation guard refuses to put
-      # such a path back into the environment when a test restores it, so
-      # the suites run with the XDG config and state variables unset.
+      # directory fails discovery outright. A suite can also name the test
+      # modules it requires: each must have run a test, by the verbose log, so
+      # a deleted or renamed module fails even when everything else passes.
+      # The runner exports XDG_CONFIG_HOME under its real home; the chat
+      # suite's isolation guard refuses to put such a path back into the
+      # environment when a test restores it, so the suites run with the XDG
+      # config and state variables unset.
       - name: Run the tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
@@ -54,6 +57,7 @@ jobs:
           set -euo pipefail
           run_suite() {
             local suite="$1" dir="$2"
+            shift 2
             local log="$RUNNER_TEMP/unittest-$suite.log" status=0
             echo "== $suite: $dir"
             env -u XDG_CONFIG_HOME -u XDG_STATE_HOME python3 -B -W error::ResourceWarning -m unittest discover -s "$dir" -v 2>&1 | tee "$log" || status=$?
@@ -68,10 +72,19 @@ jobs:
               echo "::error::$suite: unittest reported no tests run (${summary:-no summary line}); refusing an empty run."
               exit 1
             fi
-            echo "$suite: unittest ran $count tests."
+            local module
+            for module in "$@"; do
+              if ! grep -qE "^test[^ ]* \(${module}\.[^)]*\)" "$log"; then
+                echo "::error::$suite: required test module $module ran no test."
+                exit 1
+              fi
+            done
+            echo "$suite: unittest ran $count tests${*:+, including modules $*}."
           }
           run_suite inbox packages/routine_inbox/tests
-          run_suite chat packages/chat/scripts/tests
+          run_suite chat packages/chat/scripts/tests \
+            test_binding test_identities test_silence test_start_kind \
+            test_bridge test_receipt_experiment test_rotate_logs
           run_suite chat-tools packages/chat/tests
 
   # The single required CI context. A failed dependency *skips* a dependent

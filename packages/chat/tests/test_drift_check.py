@@ -93,6 +93,18 @@ class DriftTests(DriftCase):
         rc, result = self.run_check()
         self.assertEqual((rc, self.kinds(result)), (1, [("demo/scripts/core.py", "changed")]))
 
+    def test_a_file_matching_its_carried_commit_says_so(self):
+        carried = b"print('carried')\n"
+        entry = self.provenance["captured"][0]
+        entry.update(source_commit="1" * 40, effective_sha256=hashlib.sha256(carried).hexdigest())
+        self.path.write_text(json.dumps(self.provenance))
+        (self.scripts / "core.py").write_bytes(carried)
+        rc, result = self.run_check()
+        self.assertEqual((rc, self.kinds(result)), (1, [("demo/scripts/core.py", "changed")]))
+        self.assertEqual(result["drift"][0]["detail"], "matches carried commit 1111111")
+        (self.scripts / "core.py").write_bytes(b"print('other')\n")
+        self.assertTrue(self.run_check()[1]["drift"][0]["detail"].startswith("sha256 "))
+
     def test_a_missing_file_is_reported(self):
         (self.scripts / "tests" / "test_core.py").unlink()
         rc, result = self.run_check()

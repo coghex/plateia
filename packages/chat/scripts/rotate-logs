@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Rotate service logs whose service reopens its log on SIGHUP. Run hourly by
+the com.coghex.log-rotate LaunchAgent.
+
+    rotate-logs [--limit BYTES] [--keep N] [--dry-run]
+
+A log over the limit (default 5 MB) is renamed to <log>.1, its service is sent
+SIGHUP so it reopens a fresh file, and the renamed copy is gzipped. Older copies
+shift up to <log>.<keep>.gz (default 4); the oldest is dropped. These are
+service diagnostics, not the chat record, which lives in Ergo's history
+database and the bridge's channel logs and is never rotated.
+
+Only for services that open their log themselves: a file launchd holds open as
+a service's stdout would follow the rename and keep growing. The chat bridge
+rotates its own log and needs no entry here.
+"""
+import argparse
+import gzip
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+LOGS = [  # (log file, launchd label of the service that reopens it on SIGHUP)
+    (Path.home() / ".local/state/ergo/ergo.log", "com.coghex.ergo"),  # SIGHUP is Ergo's rehash
+]
+
+
+def service_pid(label):
+    out = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                         capture_output=True, text=True).stdout
+    m = re.search(r"^\s*pid = (\d+)", out, re.M)
+    return int(m.group(1)) if m else None
+
+
+def rotate(log, label, keep, *, signal_service=None, settle=2.0):
+    """Rotate one log; returns what it did."""
+    signal_service = signal_service or (lambda lbl: (pid := service_pid(lbl)) and os.kill(pid, signal.SIGHUP))
+    gz = lambda n: log.with_name(f"{log.name}.{n}.gz")
+    gz(keep).unlink(missing_ok=True)
+    for n in range(keep - 1, 0, -1):
+        if gz(n).exists():
+            os.replace(gz(n), gz(n + 1))
+    first = log.with_name(f"{log.name}.1")
+    os.replace(log, first)
+    signal_service(label)  # the service reopens a fresh log; lines written meanwhile stay in .1
+    time.sleep(settle)
+    with first.open("rb") as src, gzip.open(gz(1), "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    first.unlink()
+    return f"rotated {log} ({label} signalled), kept {keep}"
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="rotate-logs", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--limit", type=int, default=5_000_000)
+    ap.add_argument("--keep", type=int, default=4)
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args(argv)
+    for log, label in LOGS:
+        if log.exists() and log.stat().st_size > args.limit:
+            if args.dry_run:
+                print(f"would rotate {log} ({log.stat().st_size} bytes)")
+            else:
+                print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {rotate(log, label, args.keep)}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
