@@ -1477,6 +1477,12 @@ by card key and the bridge's flag for hand-typed moves. Keeping both in one PR
 was not selected: it would mix the durability core with user-facing commands
 in one review.
 
+### D-39. PLT-1 and PLT-17 entries approved as written
+
+Owner signoff in this conversation, 2026-10-08: the PLT-1 and PLT-17 delivery
+entries, as recorded under D-38, are approved. This settles Q-11 for these two
+slices.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1580,9 +1586,9 @@ evidence freshness before the affected implementation slices are processed.
 splits it into PLT-9 (core) and PLT-15 (bridge), excluding `install-identities`.
 D-21 keeps the receipt experiment in PLT-15 as is. **Q-11 is resolved for
 PLT-9 and PLT-15 (D-22, amended by D-24), PLT-11 (D-25), PLT-12 (D-26) and
-PLT-14 (D-27), PLT-10 and PLT-16 (D-28, D-29), and PLT-13 (D-30)**, in
-D-23's order. PLT-1 to PLT-7, PLT-2 and PLT-8 remain unsigned, as does the
-first browser boundary below.
+PLT-14 (D-27), PLT-10 and PLT-16 (D-28, D-29), PLT-13 (D-30), and PLT-1 and
+PLT-17 (D-38, D-39)**, in D-23's order. PLT-3 to PLT-7, PLT-2 and PLT-8 remain
+unsigned, as does the first browser boundary below.
 
 The first browser slice is proposed to cover the specified existing-approved
 issue's Solve/Hold/resume path and actual status progression. Other mid-term
@@ -2071,8 +2077,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Out of scope:** the terminal command, trace by card and hand-typed flag
   (PLT-17); manager execution changes; safe worker pause; drainer inhibition;
   plateia database and browser framework.
-- **Open questions:** Q-11 for signoff of this entry. **Stop before
-  processing.**
+- **Open questions:** None; boundary approved by D-39. **Stop before
+  processing** until the design is ready.
 
 ### PLT-17. Add card moves to the terminal and the record
 
@@ -2092,8 +2098,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   order; a hand-typed move is flagged visibly and wakes no worker; existing
   `pchat` commands are unchanged.
 - **Out of scope:** manager behavior, Hold control, the browser.
-- **Open questions:** Q-11 for signoff of this entry. **Stop before
-  processing.**
+- **Open questions:** None; boundary approved by D-39. **Stop before
+  processing** until the design is ready.
 
 ### PLT-3. Reconcile ordered card intent before manager dispatch
 
@@ -2324,8 +2330,9 @@ PLT-10). D-24 to D-27 then add the chat guidance to PLT-15 and approve
 PLT-11, PLT-12 (with its managed-target list) and PLT-14 (with the first
 activation's rollback and skills-repository commit rules). D-28/D-29 split
 the API work into PLT-10 (behavior-preserving API) and PLT-16 (attested
-evidence) and approve both; D-30 approves PLT-13. Next for Q-11: the card
-slices (PLT-1 onward) and the first browser boundary.
+evidence) and approve both; D-30 approves PLT-13. D-31 to D-37 resolve Q-14
+for issue cards; D-38/D-39 split PLT-1 (adding PLT-17) and approve both. Next
+for Q-11: PLT-3 onward and the first browser boundary.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
