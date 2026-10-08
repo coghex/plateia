@@ -82,6 +82,34 @@ class BuildTests(BuildCase):
         builder = manifest["builder"]
         self.assertEqual(sorted(builder["files"]), sorted(build_release.BUILDER_FILES))
 
+    def test_every_format_the_shipped_code_uses_is_declared(self):
+        """Markers in the shipped code, each tied to the format entry that
+        must declare it; a format the code starts using can't go unlisted."""
+        markers = {
+            r"weechat\.config_(get|set)": ("weechat-role-colors", True, True),
+            r"\[\"launchctl\", \"print\"": ("launchd-query", True, False),
+            r"\[\"ps\", ": ("process-table", True, False),
+            r"signal\.SIGHUP": ("service-signal", False, True),
+            r"CHAT_AGENT_ID=": ("agent-run-environment", True, True),
+            r"atomic_json\(chatlib\.CONFIG_PATH": ("chat-config", True, True),
+            r"CHATHISTORY": ("irc-bridge", True, True),
+            r"urlopen": ("ntfy-push", False, True),
+            r"\"identities\.json\"|'identities\.json'": ("identity-registry", True, True),
+            r"checkpoints\.json": ("checkpoints", True, True),
+            r"outbox\.jsonl": ("outbox", True, True),
+            r"childrun/2": ("child-runs", True, True),
+        }
+        manifest = build_release.verify(self.build()[0])
+        formats = {f["name"]: f for f in manifest["formats"]}
+        code = "\n".join((_support.CHECKOUT / _support.SPEC["package"]["source_dir"] / f).read_text()
+                          for f in _support.SPEC["package"]["files"])
+        for marker, (name, reads, writes) in markers.items():
+            with self.subTest(format=name):
+                self.assertRegex(code, marker, "the marker no longer matches the shipped code")
+                self.assertIn(name, formats)
+                self.assertEqual(bool(formats[name]["read"]), reads)
+                self.assertEqual(bool(formats[name]["write"]), writes)
+
     def test_payload_bytes_come_from_the_recorded_commit(self):
         target, _ = self.build()
         manifest = build_release.verify(target)
