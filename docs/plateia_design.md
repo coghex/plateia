@@ -1695,6 +1695,12 @@ records the framework choice as a decision in this design. Merging prototypes
 under a `prototypes/` folder, or one PR with all three, was not selected:
 disposable code would land in `master` and carry CI.
 
+### D-55. PLT-2 entry approved as written
+
+Owner signoff in this conversation, 2026-10-08: the PLT-2 delivery entry, as
+rewritten under D-54, is approved. This settles Q-11 for PLT-2; Q-4 stays open
+by design until the comparison.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1809,7 +1815,7 @@ PLT-9 and PLT-15 (D-22, amended by D-24), PLT-11 (D-25), PLT-12 (D-26) and
 PLT-14 (D-27), PLT-10 and PLT-16 (D-28, D-29), PLT-13 (D-30), and PLT-1 and
 PLT-17 (D-38, D-39), PLT-3 (D-40, D-41), PLT-4 (D-42, D-43), and PLT-5,
 PLT-19 and PLT-20 (D-44 to D-46), PLT-18 (D-47, D-48), PLT-6 (D-49, D-50)
-and PLT-7 (D-53)**, in D-23's order. PLT-2 and PLT-8 remain
+PLT-7 (D-53) and PLT-2 (D-54, D-55)**, in D-23's order. PLT-8 remains
 unsigned, as does the first browser boundary below.
 
 The first browser slice is proposed to cover the specified existing-approved
@@ -2622,8 +2628,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   recorded with its date.
 - **Out of scope:** choosing the framework before the comparison; production
   UI; workflow changes.
-- **Open questions:** Q-4 by design until the comparison; Q-11 for signoff of
-  this entry. **Stop before processing.**
+- **Open questions:** Q-4 by design until the comparison; boundary approved
+  by D-55. **Stop before processing** until the design is ready.
 
 ### PLT-8. Deliver the first browser card lifecycle on phone and desktop
 
