@@ -2537,28 +2537,40 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 
 ### PLT-7. Persist board intent and reconcile shared receipts in plateia
 
-- **Outcome:** the Python application persists board preferences in SQLite
-  and submits/reconciles moves through shared chat without owning execution.
-- **Scope:** board identity, requested basket/revision, owner order, receipt
-  links and cached observed facts with age; durable cross-boundary recovery
-  reconciling intent and shared receipt; read-only snapshot/change interface
-  for the eventual page. Use synthetic API clients before framework choice.
+- **Outcome:** the Python application persists board preferences in SQLite,
+  submits and reconciles moves through the shared submission API without
+  owning execution, and serves a localhost interface a page can build on.
+- **Scope:** board identity, requested basket and revision, owner order,
+  receipt links, failure acknowledgements (D-51) and cached observed facts
+  with their age from PLT-6. D-11's order: shared receipt first, then board
+  intent plus receipt in one SQLite commit, then acknowledgement; a restart
+  between them rebuilds from the shared receipt. An HTTP interface bound to
+  localhost offers a move call keyed by the client's operation ID, lookup of a
+  move by operation ID, the snapshot and change cursor (D-49), the
+  multi-device notice data (D-51) and failure acknowledgement. It shows
+  D-52's stale and unknown states as given and never upgrades them. Use
+  synthetic API clients before the framework choice. Runtime data lives
+  outside the repository; the database path and schema are reviewed
+  implementation details.
 - **Owning repository:** `coghex/plateia`.
 - **Phase:** plateia backend prerequisite for comparative prototypes.
 - **Depends on:** PLT-1, PLT-6.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11.
-- **Acceptance signals:** acknowledge only with durable board intent and
-  shared receipt, committed before the board's atomic intent/receipt commit;
-  restart at each commit/handoff boundary recovers the same
-  logical move; lost response can be queried/retried without new work; owner
-  order persists; labels contain no board preferences; cached state is aged;
-  runtime data stays outside Git; localhost binding; no skill/terminal/tracker
-  mutation by the application.
-- **Out of scope:** page framework, production browser controls, image
-  storage and new workflow logic.
-- **Open questions:** Q-6, Q-7, Q-11 (Q-14 resolved for issue cards by D-31
-  to D-37). **Stop before processing.**
+- **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11, D-33, D-37, D-49,
+  D-51, D-52.
+- **Acceptance signals:** a move is acknowledged only after the shared receipt
+  and then the board commit; a restart at each boundary recovers the same
+  logical move; a lost response is looked up by operation ID and retried
+  without new work; a move while the shared service is unreachable is
+  refused, not queued; owner order persists; tracker labels hold no board
+  preferences; acknowledged failures stay visible until resolved; cached facts
+  carry their age; the server binds only to localhost; the application never
+  runs a skill, touches a terminal or writes the tracker.
+- **Out of scope:** the page framework, production browser controls, push
+  notifications, image storage and new workflow logic.
+- **Open questions:** Q-11 for signoff of this entry (Q-6 resolved by D-51 and
+  D-52; Q-14 by D-31 to D-37; Q-7's open association rules don't apply to the
+  first coverage, D-49). **Stop before processing.**
 
 ### PLT-2. Compare page frameworks with the same recovery prototype
 
