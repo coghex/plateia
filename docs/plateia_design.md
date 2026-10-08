@@ -1340,6 +1340,22 @@ The adapter builds on PLT-16's evidence API and the inbox's existing envelope
 release (D-25); installing or scheduling the inbox needs its own owner
 authorization.
 
+### D-31. Every card move is posted in the card's issue request channel
+
+Owner decision in this conversation, 2026-10-08: every move for an issue
+card, first and later, is posted in that issue's request channel
+(`<prefix>issue-<n>`, following today's chat convention), which plateia opens
+through chat if it doesn't exist yet. That room holds the card's whole record:
+moves, manager acceptance, worker progress, review, merge and cleanup. Today's
+bridge already wakes the manager for posts there, so no delivery change is
+needed. This settles the channel-routing part of Q-14 for a card whose issue
+has its own channel; grouped request channels and PR-only cards remain open.
+
+Posting every move in the project's main channel was not selected: the card's
+history would be split from its work. First move in the main channel and later
+moves in the issue channel was not selected: two routing rules, and finding a
+card's history would depend on knowing it.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1519,6 +1535,11 @@ events, revision-conflict and duplicate responses, snapshot/history lookup and
 compatibility with human pchat posts. Solve must encode D-6's no-implicit-start
 rule. Interrupted/oversized multi-line commands must not dispatch fragments.
 No wire parser or schema is approved merely by the example in C-2.
+
+**Channel routing partly resolved by D-31, 2026-10-08:** every move for an
+issue card goes in that issue's request channel. Still open: grouped request
+channels covering several issues, PR-only cards, and the rest of the list
+above.
 
 ### Q-15. Who runs the fresh finalization step, and when?
 
