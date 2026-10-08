@@ -75,7 +75,7 @@ baseline.
 
 | Baseline path | Plateia path | Source | Capture |
 | --- | --- | --- | --- |
-| `chat/scripts/chat-bridge` | `packages/chat/scripts/chat-bridge` | `c572bad` | byte-for-byte |
+| `chat/scripts/chat-bridge` | `packages/chat/scripts/chat-bridge` | `c572bad` | changed: message-ID deduplication covers the whole channel log (deliberate deviation, below) |
 | `chat/scripts/rotate-logs` | `packages/chat/scripts/rotate-logs` | `c572bad` | byte-for-byte |
 | `chat/scripts/tests/test_bridge.py` | `packages/chat/scripts/tests/test_bridge.py` | `c572bad` | changed: invented names |
 | `chat/scripts/tests/test_receipt_experiment.py` | `packages/chat/scripts/tests/test_receipt_experiment.py` | `c572bad` | changed: invented names (first review of the bridge's receipt routing, D-69) |
@@ -88,6 +88,16 @@ The bridge tests use the owner `pat` and assistant `sam`, with projects
 `alp`, `gam`, `del`, `eps`, `zet`). They use `nova`/`nov` where the core
 tests use `beta`/`bet`. The bridge sorts the accounts it wakes, and one routing
 test's expected order needs the prefix to sort after `manager`.
+
+`chat-bridge` deviates from `c572bad` in one line, by owner decision on
+2026-10-08, relayed on PR #16's first review. The baseline built the bridge's
+message-ID deduplication set from only the newest 5,000 lines of a channel
+log. A catch-up cut short leaves the checkpoint behind, so after a restart a
+catch-up longer than that replays older messages: they were logged a second
+time, and a request already accepted was queued again. The captured bridge
+reads every line. `test_replay_dedup.py` reproduces the failure with six full
+1,000-message pages, a dropped connection and a restart. The running bridge
+keeps the baseline behavior until activation (D-23).
 
 `SKILL.md` keeps three things that point outside the capture, recorded in its
 provenance entry's `external_references`:
@@ -105,7 +115,8 @@ Plateia-only files added with PLT-15:
   that every `pchat` subcommand and option the guidance mentions exists, and
   that its list of post types is `pchat`'s;
 - `test_replay_dedup.py` shows message-ID deduplication after acceptance
-  recovery, across a crash and a restart.
+  recovery, across a crash, a restart, and a restart after a cut-short
+  catch-up of more than 5,000 messages.
 
 Not captured, by design: `install-identities` is excluded from every capture
 (D-20).
