@@ -1577,6 +1577,12 @@ gate choices:
 The drainer's narrower single-check selection, automatic CI reruns and
 merge-past-base exception were not carried over.
 
+### D-46. PLT-5, PLT-19 and PLT-20 entries approved as written
+
+Owner signoff in this conversation, 2026-10-08: the PLT-5, PLT-19 and PLT-20
+delivery entries, as recorded under D-44 and D-45, are approved. This settles
+Q-11 for those three slices. PLT-18 waits for Q-7's cleanup coverage.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1681,8 +1687,9 @@ splits it into PLT-9 (core) and PLT-15 (bridge), excluding `install-identities`.
 D-21 keeps the receipt experiment in PLT-15 as is. **Q-11 is resolved for
 PLT-9 and PLT-15 (D-22, amended by D-24), PLT-11 (D-25), PLT-12 (D-26) and
 PLT-14 (D-27), PLT-10 and PLT-16 (D-28, D-29), PLT-13 (D-30), and PLT-1 and
-PLT-17 (D-38, D-39), PLT-3 (D-40, D-41) and PLT-4 (D-42, D-43)**, in D-23's
-order. PLT-5 to PLT-7, PLT-2 and PLT-8 remain
+PLT-17 (D-38, D-39), PLT-3 (D-40, D-41), PLT-4 (D-42, D-43), and PLT-5,
+PLT-19 and PLT-20 (D-44 to D-46)**, in D-23's order. PLT-18, PLT-6, PLT-7,
+PLT-2 and PLT-8 remain
 unsigned, as does the first browser boundary below.
 
 The first browser slice is proposed to cover the specified existing-approved
@@ -2310,8 +2317,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   start/stop (PLT-19); approval carry-forward (PLT-20); porting the old
   drainer; web merging; implicit or manual-skill invocation authority;
   automatic CI reruns or branch repair.
-- **Open questions:** Q-11 for signoff of this entry (Q-16 resolved by D-45).
-  **Stop before processing.**
+- **Open questions:** None; boundary approved by D-46 (Q-16 resolved by
+  D-45). **Stop before processing** until the design is ready.
 
 ### PLT-18. Make post-merge cleanup durable and visible
 
@@ -2359,8 +2366,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   worker visibly; only one active merge authority per repository.
 - **Out of scope:** cutover from the live drainer, which needs a separate
   owner decision; installing or starting the worker on the owner's machine.
-- **Open questions:** Q-11 for signoff of this entry. **Stop before
-  processing.**
+- **Open questions:** None; boundary approved by D-46. **Stop before
+  processing** until the design is ready.
 
 ### PLT-20. Update behind PRs and carry approval across proven-equivalent updates
 
@@ -2386,8 +2393,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   is restored without a validated receipt; current-head CI is still required.
 - **Out of scope:** broader base-drift rules beyond D-18; manual conflict
   resolution; merging.
-- **Open questions:** Q-11 for signoff of this entry. **Stop before
-  processing.**
+- **Open questions:** None; boundary approved by D-46. **Stop before
+  processing** until the design is ready.
 
 ### PLT-6. Project the card's real lifecycle from shared evidence
 
@@ -2534,9 +2541,10 @@ the API work into PLT-10 (behavior-preserving API) and PLT-16 (attested
 evidence) and approve both; D-30 approves PLT-13. D-31 to D-37 resolve Q-14
 for issue cards; D-38/D-39 split PLT-1 (adding PLT-17) and approve both.
 D-40 to D-43 settle how manager and worker changes ship and approve PLT-3 and
-PLT-4 (Hold by inbox message plus a Python pre-action hook). Next for Q-11:
-PLT-5 (which also carries Q-7 and Q-16), PLT-6, PLT-7, PLT-2, PLT-8 and the
-first browser boundary.
+PLT-4 (Hold by inbox message plus a Python pre-action hook). D-44 to D-46
+split finalization into PLT-5, PLT-18, PLT-19 and PLT-20, resolve Q-16 and
+approve all but PLT-18. Next: Q-7 (cleanup coverage) for PLT-18, then PLT-6,
+PLT-7, PLT-2, PLT-8 and the first browser boundary.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
