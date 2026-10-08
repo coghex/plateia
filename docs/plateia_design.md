@@ -1407,6 +1407,19 @@ selected: with no operation ID a re-typed line can't be told from a new move,
 and late revision assignment competes with D-11's commit order. Ignoring such
 lines silently was rejected: an intended move would vanish, against V-12.
 
+### D-35. No endpoint field: Solve always means D-6's path
+
+Owner decision in this conversation, 2026-10-08: `card-move/v1` carries no
+endpoint field. A move's fields are its operation, card, revision and
+destination; `to=Solve` always means D-6's path (solve, review, merge only if
+the merge worker is already running, cleanup) and can never request starting a
+stopped drainer. Any future Solve variant is a new, deliberate format version.
+
+An endpoint field with a single legal value was not selected: parsing and
+validation cost, and a way to send a bad value, for no current benefit. A
+Solve variant ending at an open PR was not selected: a new owner-facing choice
+the vision doesn't ask for.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1592,8 +1605,9 @@ issue card goes in that issue's request channel; D-32 keeps that rule when
 the manager has grouped issues. **Request scope resolved by D-33:** one
 request per move, reused on retry. **Human-typed compatibility resolved by
 D-34:** only the submission service makes moves; a hand-typed envelope is
-flagged, never dispatched. Still open: PR-only cards (with Q-7) and the rest
-of the list above.
+flagged, never dispatched. **Endpoint resolved by D-35:** no endpoint field;
+Solve means D-6's path. Still open: PR-only cards (with Q-7) and the rest of
+the list above.
 
 ### Q-15. Who runs the fresh finalization step, and when?
 
@@ -1983,7 +1997,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Depends on:** PLT-16 (D-28), PLT-11.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11, D-15, D-16, D-17, D-28,
-  D-31, D-32, D-33, D-34.
+  D-31, D-32, D-33, D-34, D-35.
 - **Acceptance signals:** synthetic non-web submission survives bridge/service
   restart and ambiguous send success; retries preserve the same logical move
   and receipt; mismatched duplicate content is visibly rejected; queued,
