@@ -1535,7 +1535,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Phase:** source preservation prerequisite.
 - **Depends on:** none in plateia. External prerequisite (D-19): the live
   shared-chat tree's reviewed state is committed in its own local repository,
-  and that commit is named as the capture baseline. The 2026-10-08 inventory
+  and that commit is named as the capture baseline. **Met 2026-10-08:**
+  baseline `c572bad` on the skills repository's `master`. The 2026-10-08 inventory
   above identifies the fixes and their review state; coordinate any in-flight
   identity/reviewer work rather than duplicating it. Other repositories are
   evidence sources, not implicit owners of new code or a hidden second PR.
@@ -1951,9 +1952,12 @@ order when boundaries change.
 **2026-10-08 session:** D-19 to D-22 set PLT-9's committed capture baseline,
 split it into PLT-9 (core) and PLT-15 (bridge) without `install-identities`,
 keep the receipt experiment in PLT-15 for its first review, and approve both
-entries. The baseline commit in the local skills repository is the owner's
-external step and hasn't been confirmed here; re-run the inventory's drift
-comparison before processing PLT-9. Next for Q-11: PLT-10 onward and the first
+entries. **The D-19 baseline exists:** at the owner's request on 2026-10-08,
+the local skills repository's `master` was pointed at reviewed commit `c572bad`
+(26 commits past `f010533`, history fetched from its task clone), with no file
+on disk changed. The live tree then matched it except one uncommitted
+`cmux-supervisor` SKILL.md paragraph, outside PLT-9/PLT-15 and left for the
+owner. Re-run the drift comparison before processing PLT-9. Next for Q-11: PLT-10 onward and the first
 browser boundary.
 
 The owner must explicitly approve readiness after material choices and slice
