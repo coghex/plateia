@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""Talk on the owner's local project chat (IRC, served by Ergo).
+
+  pchat post <#channel> <text...> [--as ACCOUNT] [--type TYPE] [--re REQUEST-ID] [--reply-to MSGID]
+             [--authority MSGID]   a manager delegating to another project cites the
+                                   owner's or an assistant's post that authorized it
+  pchat ack <#channel> <msgid> [--as ACCOUNT]   accept a message without posting text
+  pchat unaccepted [--project P] [--json]      owner/assistant posts no manager has accepted yet
+  pchat read <#channel> [--last N] [--json]
+  pchat wait <#channel> [--re REQ] [--from ACCOUNT] [--mention ACCOUNT] [--timeout SECONDS]
+  pchat open <#channel> [--as ACCOUNT] [--topic TEXT]
+  pchat channels
+
+Who you are: the bound agent session, else --as or $CHAT_AS outside cmux.
+Unbound callers have no default. The server authenticates every account, so
+the log records which account spoke.
+  chat trace <request-id>     every chat line and delivery record for a request
+  chat search [words...] [--regex R] [--project P] [--channel C] [--from A]
+              [--type T] [--re REQ] [--since ISO] [--until ISO] [--limit N] [--json]
+                              search the whole local record (all channel logs)
+  chat status                 is the chat healthy: server, bridge, delivery queue
+  chat evidence <path|msgid>  the kept copy of a /tmp file a post cited (the bridge keeps them)
+  chat watch [--project P] [--channel C] [--json]
+                              follow new messages live (like tail -f) until interrupted
+History comes from the bridge's logs in ~/.local/state/chat/logs/.
+TYPE is one of request, question, blocked, status, decision, done, answer,
+interrupt (stop the named agent's turn now and give it this instead).
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import chatlib  # noqa: E402
+import identities  # noqa: E402
+import runstore  # noqa: E402
+
+TYPES = ("request", "question", "blocked", "status", "decision", "done", "answer", "interrupt")
+
+
+def who(args, cfg, required=True):
+    """Who is posting. Never defaulted: an omitted identity must not borrow
+    someone else's authority."""
+    name = identities.resolve(cfg, getattr(args, "as_", None), discover=required)
+    if cfg.get("agent_identities_enabled"):
+        cfg.update(chatlib.load_config())
+    if required and not name:
+        raise chatlib.ChatError("say who you are: --as <account> or CHAT_AS (there is no default)")
+    if name and name not in cfg.get("accounts", {}):
+        raise chatlib.ChatError(f"unknown account {name!r}")
+    return name
+
+
+def read_log(channel):
+    path = chatlib.channel_log(channel)
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text().splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+def show(entry):
+    return f"{entry.get('at', '')[:19]} <{entry.get('from')}> {entry.get('text')}"
+
+
+def matches(entry, args, cfg):
+    text = entry.get("text", "")
+    if args.re and args.re not in text:
+        return False
+    if args.from_ and entry.get("from") != args.from_:
+        return False
+    if args.mention and f"@{args.mention}" not in text and not text.startswith(f"{args.mention}:"):
+        return False
+    return entry.get("from") != who(args, cfg, required=False) or bool(args.from_)
+
+
+def evidence_records():
+    path = chatlib.STATE_DIR / "evidence.jsonl"
+    out = []
+    if path.exists():
+        for raw in path.read_text().splitlines():
+            try:
+                out.append(json.loads(raw))
+            except ValueError:
+                pass
+    return out
+
+
+def unaccepted(cfg, project=None):
+    """Posts from the owner or an assistant that woke a manager and have no
+    reply (--reply-to) or ack from that project's manager: still pending in the
+    bridge, or dead-lettered. Keyed by the exact message id."""
+    st = chatlib.STATE_DIR
+    try:
+        items = [dict(i, state=i.get("phase", "deliver")) for i in json.loads((st / "pending.json").read_text())]
+    except (OSError, ValueError):
+        items = []
+    if (st / "dead-letters.jsonl").exists():
+        for raw in (st / "dead-letters.jsonl").read_text().splitlines():
+            try:
+                items.append(dict(json.loads(raw), state="dead-letter"))
+            except ValueError:
+                pass
+    acked = set()
+    if (st / "acks.jsonl").exists():
+        for raw in (st / "acks.jsonl").read_text().splitlines():
+            try:
+                a = json.loads(raw)
+            except ValueError:
+                continue
+            mgr = cfg.get("projects", {}).get(a.get("project") or "", {}).get("manager")
+            if a.get("by") == mgr:
+                acked.add(a.get("reply_to"))
+    out, seen = [], set()
+    for i in items:
+        if i.get("kind") != "ring" or not i.get("needs_ack") or i["msgid"] in acked or i["msgid"] in seen:
+            continue
+        if project and i.get("project") != project:
+            continue
+        seen.add(i["msgid"])
+        at = next((e.get("at", "") for e in read_log(i["channel"]) if e.get("msgid") == i["msgid"]), "")
+        out.append({"at": at, "msgid": i["msgid"], "channel": i["channel"], "sender": i["sender"],
+                    "project": i.get("project"), "state": i["state"], "text": i["text"]})
+    return sorted(out, key=lambda u: u["at"])
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ['agents']:
+        import agentcli
+        return agentcli.main(['list', '--refresh', *argv[1:]])
+    if argv[:1] == ['agent']:
+        import agentcli
+        return agentcli.main(argv[1:])
+    ap = argparse.ArgumentParser(prog="pchat", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("post")
+    p.add_argument("channel")
+    p.add_argument("text", nargs="+")
+    p.add_argument("--as", dest="as_")
+    p.add_argument("--type", choices=TYPES)
+    p.add_argument("--re", dest="re")
+    p.add_argument("--reply-to", dest="reply_to")
+    p.add_argument("--authority")
+    ak = sub.add_parser("ack")
+    ak.add_argument("channel")
+    ak.add_argument("msgid")
+    ak.add_argument("--as", dest="as_")
+    un = sub.add_parser("unaccepted")
+    un.add_argument("--project")
+    un.add_argument("--json", action="store_true")
+    r = sub.add_parser("read")
+    r.add_argument("channel")
+    r.add_argument("--last", type=int, default=30)
+    r.add_argument("--json", action="store_true")
+    w = sub.add_parser("wait")
+    w.add_argument("channel")
+    w.add_argument("--re", dest="re")
+    w.add_argument("--from", dest="from_")
+    w.add_argument("--mention")
+    w.add_argument("--timeout", type=float, default=600)
+    w.add_argument("--as", dest="as_")
+    o = sub.add_parser("open")
+    o.add_argument("channel")
+    o.add_argument("--as", dest="as_")
+    o.add_argument("--topic")
+    sub.add_parser("channels")
+    t = sub.add_parser("trace")
+    t.add_argument("request_id")
+    se = sub.add_parser("search")
+    se.add_argument("words", nargs="*")
+    se.add_argument("--regex")
+    se.add_argument("--project")
+    se.add_argument("--channel")
+    se.add_argument("--from", dest="from_")
+    se.add_argument("--type", choices=TYPES)
+    se.add_argument("--re", dest="re")
+    se.add_argument("--since")
+    se.add_argument("--until")
+    se.add_argument("--limit", type=int, default=200)
+    se.add_argument("--json", action="store_true")
+    sub.add_parser("status")
+    ev = sub.add_parser("evidence")
+    ev.add_argument("key", help="a cited /tmp path, or a message's msgid")
+    wa = sub.add_parser("watch")
+    wa.add_argument("--project")
+    wa.add_argument("--channel")
+    wa.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+    try:
+        cfg = chatlib.load_config()
+        ch = getattr(args, "channel", None)
+        if ch and not ch.startswith("#"):
+            args.channel = "#" + ch
+        if args.cmd == "post":
+            tag = " ".join(x for x in (args.type, args.re) if x)
+            text = " ".join(args.text)
+            text = f"[{tag}] {text}" if tag else text
+            if args.authority:  # checked now, so a wrong citation fails here, not at the other end
+                original, why = chatlib.cited_authority(args.authority, cfg)
+                if not original:
+                    raise chatlib.ChatError(f"--authority {args.authority}: {why}")
+                text += f" — authority: msgid={args.authority}"
+            account = who(args, cfg)
+            refusal = runstore.silent_refusal(account, os.environ)
+            if refusal:  # never queued: the bridge would publish it later
+                print(f"pchat: {refusal}; not posted", file=sys.stderr)
+                return 4
+            identities.remember(account, args.channel, args.re)
+            cont = f"[{tag}]" if tag else ""
+            try:
+                n = chatlib.post(args.channel, text, account, cfg, cont=cont, reply_to=args.reply_to)
+                print(f"posted {n} line(s) to {args.channel} as {account}")
+            except chatlib.Refused as err:  # queuing it would only be refused again
+                print(f"pchat: {err}; not queued", file=sys.stderr)
+                return 2
+            except (chatlib.ChatError, OSError) as err:
+                # Never lose a post: queue it; the bridge posts it once chat is back.
+                chatlib.outbox_append([{"channel": args.channel, "as": account, "text": text, "cont": cont,
+                                        "reply_to": args.reply_to,
+                                        "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())}])
+                print(f"pchat: post failed ({err}); queued in the outbox for the bridge to post", file=sys.stderr)
+                return 3
+        elif args.cmd == "ack":
+            account = who(args, cfg)
+            try:
+                chatlib.ack(args.channel, args.msgid, account, cfg)
+                print(f"acknowledged {args.msgid} in {args.channel} as {account}")
+            except (chatlib.ChatError, OSError) as err:
+                chatlib.outbox_append([{"channel": args.channel, "as": account, "ack": args.msgid,
+                                        "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())}])
+                print(f"pchat: ack failed ({err}); queued in the outbox", file=sys.stderr)
+                return 3
+        elif args.cmd == "unaccepted":
+            rows = unaccepted(cfg, args.project)
+            if args.json:
+                print(json.dumps(rows, indent=2))
+            else:
+                for u in rows:
+                    print(f"{u['at'][:19]} {u['channel']} msgid={u['msgid']} <{u['sender']}> "
+                          f"[{u['state']}] {u['text'][:100]}")
+                print(f"-- {len(rows)} unaccepted")
+        elif args.cmd == "read":
+            entries = read_log(args.channel)[-args.last:]
+            for e in entries:
+                print(json.dumps(e) if args.json else show(e))
+        elif args.cmd == "wait":
+            seen = len(read_log(args.channel))
+            deadline = time.time() + args.timeout
+            while time.time() < deadline:
+                entries = read_log(args.channel)
+                for e in entries[seen:]:
+                    if matches(e, args, cfg):
+                        print(show(e))
+                        return 0
+                seen = len(entries)
+                time.sleep(2)
+            print(f"no matching message in {args.channel} within {args.timeout:g}s", file=sys.stderr)
+            return 1
+        elif args.cmd == "open":
+            conn = chatlib.login(who(args, cfg), cfg)
+            try:
+                chatlib.ensure_channel(conn, args.channel, args.topic)
+                conn.send(f"PART {args.channel}")
+            finally:
+                conn.close("opened")
+            print(f"opened {args.channel}")
+        elif args.cmd == "search":
+            import re as _re
+            rx = _re.compile(args.regex, _re.I) if args.regex else None
+            words = [w.lower() for w in args.words]
+            chans = sorted(chatlib.LOG_DIR.glob("*.jsonl"))
+            if args.channel:
+                chans = [c for c in chans if c.stem == args.channel.lstrip("#").lower()]
+            if args.project:
+                proj = cfg.get("projects", {}).get(args.project)
+                if not proj:
+                    raise chatlib.ChatError(f"unknown project {args.project!r}")
+                main_ch, prefix = proj["channel"].lstrip("#").lower(), proj["prefix"].lstrip("#").lower()
+                chans = [c for c in chans if c.stem == main_ch or c.stem.startswith(prefix)]
+            hits = []
+            for c in chans:
+                for e in read_log("#" + c.stem):
+                    text = e.get("text", "")
+                    if words and not all(w in text.lower() for w in words):
+                        continue
+                    if rx and not rx.search(text):
+                        continue
+                    if args.from_ and e.get("from") != args.from_:
+                        continue
+                    if args.type and not text.startswith(f"[{args.type}"):
+                        continue
+                    if args.re and args.re not in text:
+                        continue
+                    if args.since and e.get("at", "") < args.since:
+                        continue
+                    if args.until and e.get("at", "") > args.until:
+                        continue
+                    hits.append(e)
+            hits.sort(key=lambda e: e.get("at", ""))
+            for e in hits[-args.limit:]:
+                print(json.dumps(e) if args.json else
+                      f"{e.get('at', '')[:19]} {e.get('channel')} <{e.get('from')}> {e.get('text', '')}")
+            if not args.json:
+                print(f"-- {len(hits)} match(es){' (showing last ' + str(args.limit) + ')' if len(hits) > args.limit else ''}", file=sys.stderr)
+        elif args.cmd == "watch":
+            def selected():
+                chans = sorted(chatlib.LOG_DIR.glob("*.jsonl"))
+                if args.channel:
+                    chans = [c for c in chans if c.stem == args.channel.lstrip("#").lower()]
+                if args.project:
+                    proj = cfg.get("projects", {}).get(args.project)
+                    if not proj:
+                        raise chatlib.ChatError(f"unknown project {args.project!r}")
+                    m, pre = proj["channel"].lstrip("#").lower(), proj["prefix"].lstrip("#").lower()
+                    chans = [c for c in chans if c.stem == m or c.stem.startswith(pre)]
+                return chans
+            seen = {c: len(c.read_text().splitlines()) for c in selected()}
+            try:
+                while True:
+                    for c in selected():  # picks up request channels opened while watching
+                        rows = c.read_text().splitlines()
+                        for raw in rows[seen.get(c, 0):]:
+                            e = json.loads(raw)
+                            print(raw if args.json else
+                                  f"{e.get('at', '')[11:19]} {e.get('channel')} <{e.get('from')}> {e.get('text')}",
+                                  flush=True)
+                        seen[c] = len(rows)
+                    time.sleep(2)
+            except KeyboardInterrupt:
+                return 0
+        elif args.cmd == "status":
+            import subprocess as _sp, datetime as _dt
+            def svc(label):
+                out = _sp.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], capture_output=True, text=True).stdout
+                return "running" if "state = running" in out else "NOT running"
+            print(f"server (Ergo):  {svc('com.coghex.ergo')}")
+            print(f"bridge:         {svc('com.coghex.chat-bridge')}")
+            try:
+                pending = json.loads((chatlib.STATE_DIR / "pending.json").read_text())
+            except (OSError, ValueError):
+                pending = []
+            print(f"queued deliveries: {len(pending)}")
+            cutoff = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=1)).isoformat()
+            done, waiting, failed = 0, 0, 0
+            dpath = chatlib.STATE_DIR / "deliveries.jsonl"
+            if dpath.exists():
+                for raw in dpath.read_text().splitlines():
+                    d = json.loads(raw)
+                    if d.get("at", "") < cutoff:
+                        continue
+                    if d["ok"]:
+                        done += 1
+                    elif d["ok"] is None or str(d.get("detail", "")).startswith("queued"):
+                        waiting += 1
+                    else:
+                        failed += 1
+            dead = chatlib.STATE_DIR / "dead-letters.jsonl"
+            ndead = len(dead.read_text().splitlines()) if dead.exists() else 0
+            print(f"deliveries (24h): {done} done, {waiting} checks while queued at cmux, {failed} failed attempts")
+            print(f"dead letters: {ndead}   outbox (unposted): {chatlib.outbox_pending()}")
+            rows = unaccepted(cfg)
+            print(f"owner/assistant posts not yet accepted by their manager: {len(rows)}")
+            for u in rows:
+                print(f"   {u['at'][:19]} {u['channel']} msgid={u['msgid']} <{u['sender']}> [{u['state']}] {u['text'][:60]}")
+            print("channels:")
+            for c in sorted(chatlib.LOG_DIR.glob("*.jsonl")):
+                rows = read_log("#" + c.stem)
+                last = rows[-1].get("at", "")[:19] if rows else "-"
+                print(f"  #{c.stem:24} {len(rows):5} messages, last {last}")
+        elif args.cmd == "evidence":
+            rows = [r for r in evidence_records() if args.key in (r.get("cited"), r.get("msgid"))]
+            for r in rows:
+                print(f"{r.get('at', '')[:19]} {r.get('channel')} <{r.get('from')}> msgid={r.get('msgid')}\n"
+                      f"  cited:  {r.get('cited')}\n  kept:   {r.get('stored') or r.get('note')}")
+            if not rows:
+                print(f"no kept copy for {args.key}")
+                return 1
+        elif args.cmd == "trace":
+            lines = []
+            for path in sorted(chatlib.LOG_DIR.glob("*.jsonl")):
+                for e in read_log("#" + path.stem):
+                    if args.request_id in e.get("text", ""):
+                        lines.append(e)
+            msgids = {e.get("msgid") for e in lines if e.get("msgid")}
+            deliveries = []
+            dpath = chatlib.STATE_DIR / "deliveries.jsonl"
+            if dpath.exists():
+                for raw in dpath.read_text().splitlines():
+                    d = json.loads(raw)
+                    if d.get("msgid") in msgids:
+                        deliveries.append(d)
+            kept = {}
+            for r in evidence_records():
+                kept.setdefault(r.get("msgid"), []).append(r)
+            for e in sorted(lines, key=lambda x: x.get("at", "")):
+                print(f"{e.get('at', '')[11:19]} {e.get('channel')} <{e.get('from')}> {e.get('text', '')[:160]}")
+                for r in kept.get(e.get("msgid"), []):
+                    print(f"           ↳ evidence {r.get('cited')} kept as {r.get('stored') or r.get('note')}")
+                for d in deliveries:
+                    if d.get("msgid") == e.get("msgid"):
+                        print(f"           ↳ {d['kind']} attempt {d['attempt']}: {'ok' if d['ok'] else 'FAILED'} {d.get('detail', '')}")
+            if not lines:
+                print(f"no chat lines mention {args.request_id}")
+        elif args.cmd == "channels":
+            for path in sorted(chatlib.LOG_DIR.glob("*.jsonl")):
+                print("#" + path.stem)
+        return 0
+    except chatlib.ChatError as e:
+        print(f"pchat: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
