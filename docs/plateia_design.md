@@ -1374,6 +1374,23 @@ retry, and would block on ambiguity. Forbidding the manager to group
 board-moved cards was not selected: it constrains scheduling that V-7 leaves
 to the manager and doesn't cover earlier grouping.
 
+### D-33. One request per card move; retries keep the request ID
+
+Owner decision in this conversation, 2026-10-08: each card move is its own
+request with its own request ID, allocated by the shared submission service; a
+retry of the same move (same operation ID) reuses the original request ID.
+Each move gets its own manager acceptance and its own terminal disposition; a
+move overtaken by a later one is closed as superseded, so acceptance reminders
+cannot keep obsolete work alive. The operation ID stays the client's
+idempotency key for recovering a lost response (D-11). A card's whole history
+is read from its room (D-31) or a trace by card key, which PLT-1 adds.
+
+One long-lived request per card was not selected: its acceptance and
+disposition would cover several different instructions, and superseded moves
+would have nothing separate to close. One request per active stretch (Solve to
+Done) was not selected: it needs a stretch-boundary rule and keeps the same
+problem inside each stretch.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1556,8 +1573,9 @@ No wire parser or schema is approved merely by the example in C-2.
 
 **Channel routing partly resolved by D-31, 2026-10-08:** every move for an
 issue card goes in that issue's request channel; D-32 keeps that rule when
-the manager has grouped issues. Still open: PR-only cards (with Q-7) and the
-rest of the list above.
+the manager has grouped issues. **Request scope resolved by D-33:** one
+request per move, reused on retry. Still open: PR-only cards (with Q-7) and
+the rest of the list above.
 
 ### Q-15. Who runs the fresh finalization step, and when?
 
@@ -1935,6 +1953,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Scope:** extend the existing chat boundary with operation identity,
   versioned command publication, card revision sequencing and independently
   recoverable delivery receipts; preserve existing human pchat posts.
+  Each move is its own request, and a retry reuses its request ID (D-33);
+  add a trace by card key alongside today's trace by request.
   Include the approved contract and crash/replay evidence in this PR.
 - **Owning repository:** `coghex/plateia` (D-7); shared runtime independent
   of the plateia web process. D-15/D-16/D-17 and PLT-9, PLT-15, PLT-10 and PLT-11 establish
@@ -1943,7 +1963,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Depends on:** PLT-16 (D-28), PLT-11.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11, D-15, D-16, D-17, D-28,
-  D-31, D-32.
+  D-31, D-32, D-33.
 - **Acceptance signals:** synthetic non-web submission survives bridge/service
   restart and ambiguous send success; retries preserve the same logical move
   and receipt; mismatched duplicate content is visibly rejected; queued,
