@@ -1265,6 +1265,17 @@ Capturing it in PLT-9 was not selected because it describes the bridge, which
 arrives in PLT-15. Capturing it in PLT-11 was not selected because that would
 make the build slice copy source outside the capture slices' drift checks.
 
+### D-25. PLT-11 approved; the first release carries shared chat only
+
+Owner signoff in this conversation, 2026-10-08: the PLT-11 entry as presented
+is approved. The first release contains only the shared chat code captured by
+PLT-9 and PLT-15 with its `SKILL.md` guidance. The chat code needs only the
+Python standard library (plus the `weechat` module WeeChat itself provides to
+the color script), so its pinned dependencies amount to the interpreter. The
+inbox core already on `master` joins a release when PLT-13 gives it a live
+adapter. Packaging the inbox core in the first release was not selected: it
+would ship a package nothing runs yet.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1631,15 +1642,17 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Scope:** source/artifact hashes, Python/platform requirements, pinned
   dependencies, wire/state versions and packaged guidance; the API version
   joins the manifest from PLT-10 onward (D-23). Test built
-  artifacts outside the source checkout. Shared-chat artifacts come first;
-  an inbox release consumes the existing core merged on `master`. No
-  duplicate core or editable runtime imports.
+  artifacts outside the source checkout. The first release carries only the
+  shared chat code and its `SKILL.md` guidance (D-25); the inbox core on
+  `master` joins a release with PLT-13. The chat code is standard-library
+  only, so pinning means the interpreter. No duplicate core or editable
+  runtime imports.
 - **Owning repository:** `coghex/plateia`.
 - **Phase:** release prerequisite.
 - **Depends on:** PLT-15 (D-23). The inbox core (PR #1/issue #2) is already
   merged.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-7, D-15, D-16, D-17, D-23.
+- **Relevant decisions:** D-2, D-7, D-15, D-16, D-17, D-23, D-25.
 - **Acceptance signals:** missing/tampered/unpinned inputs refuse; manifest
   identifies exact source/artifacts and supported versions; artifacts contain
   no private settings/data; declared environments run without checkout imports;
@@ -1647,8 +1660,9 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   contracts in this PR before final review.
 - **Out of scope:** artifact publication, real installation, active selection
   or changing existing caches.
-- **Open questions:** Q-11 for boundary signoff; build names/manifest spelling
-  are reviewed implementation details. **Stop before processing.**
+- **Open questions:** None; boundary approved by D-25. Build names and
+  manifest spelling are reviewed implementation details. **Stop before
+  processing** until the design is ready.
 
 ### PLT-12. Stage releases without changing active tools or services
 
