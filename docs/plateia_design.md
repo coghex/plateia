@@ -2404,11 +2404,11 @@ PLT-11, PLT-12 (with its managed-target list) and PLT-14 (with the first
 activation's rollback and skills-repository commit rules). D-28/D-29 split
 the API work into PLT-10 (behavior-preserving API) and PLT-16 (attested
 evidence) and approve both; D-30 approves PLT-13. D-31 to D-37 resolve Q-14
-for issue cards; D-38/D-39 split PLT-1 (adding PLT-17) and approve both. Next
-for Q-11: PLT-3 onward and the first browser boundary. D-40 to D-43 then
-settle how manager and worker changes ship and approve PLT-3 and PLT-4
-(Hold by inbox message plus a Python pre-action hook). Next: PLT-5, which
-also carries Q-7 and Q-16.
+for issue cards; D-38/D-39 split PLT-1 (adding PLT-17) and approve both.
+D-40 to D-43 settle how manager and worker changes ship and approve PLT-3 and
+PLT-4 (Hold by inbox message plus a Python pre-action hook). Next for Q-11:
+PLT-5 (which also carries Q-7 and Q-16), PLT-6, PLT-7, PLT-2, PLT-8 and the
+first browser boundary.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
