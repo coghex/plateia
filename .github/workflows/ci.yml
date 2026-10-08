@@ -34,10 +34,17 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # The command skill/OPERATING.md documents, plus -v so the log names each
-      # test. unittest's own exit status decides first. Then the step refuses a
-      # run that tested nothing: Python 3.10 and 3.11 exit 0 on an empty
-      # discovery, which would let a moved test directory pass.
+      # One unittest run per suite, each the command its package documents,
+      # plus -v so the log names each test: the inbox suite
+      # (skill/OPERATING.md), the captured chat suite and the chat capture's
+      # own tooling tests (docs/chat_capture.md). For each,
+      # unittest's own exit status decides first. Then the step refuses a run
+      # that tested nothing: Python 3.10 and 3.11 exit 0 on an empty
+      # discovery, which would let a moved test directory pass, and a missing
+      # directory fails discovery outright. The runner exports XDG_CONFIG_HOME
+      # under its real home; the chat suite's isolation guard refuses to put
+      # such a path back into the environment when a test restores it, so
+      # the suites run with the XDG config and state variables unset.
       - name: Run the tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
@@ -45,20 +52,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          log="$RUNNER_TEMP/unittest.log"
-          status=0
-          python3 -B -W error::ResourceWarning -m unittest discover -s packages/routine_inbox/tests -v 2>&1 | tee "$log" || status=$?
-          if [ "$status" -ne 0 ]; then
-            echo "::error::unittest exited with status $status."
-            exit "$status"
-          fi
-          summary="$(grep -E '^Ran [0-9]+ tests? in ' "$log" | tail -n 1 || true)"
-          count="$(printf '%s\n' "$summary" | sed -nE 's/^Ran ([0-9]+) tests? in .*/\1/p')"
-          if [ -z "$count" ] || [ "$count" -eq 0 ]; then
-            echo "::error::unittest reported no tests run (${summary:-no summary line}); refusing an empty run."
-            exit 1
-          fi
-          echo "unittest ran $count tests."
+          run_suite() {
+            local suite="$1" dir="$2"
+            local log="$RUNNER_TEMP/unittest-$suite.log" status=0
+            echo "== $suite: $dir"
+            env -u XDG_CONFIG_HOME -u XDG_STATE_HOME python3 -B -W error::ResourceWarning -m unittest discover -s "$dir" -v 2>&1 | tee "$log" || status=$?
+            if [ "$status" -ne 0 ]; then
+              echo "::error::$suite: unittest exited with status $status."
+              exit "$status"
+            fi
+            local summary count
+            summary="$(grep -E '^Ran [0-9]+ tests? in ' "$log" | tail -n 1 || true)"
+            count="$(printf '%s\n' "$summary" | sed -nE 's/^Ran ([0-9]+) tests? in .*/\1/p')"
+            if [ -z "$count" ] || [ "$count" -eq 0 ]; then
+              echo "::error::$suite: unittest reported no tests run (${summary:-no summary line}); refusing an empty run."
+              exit 1
+            fi
+            echo "$suite: unittest ran $count tests."
+          }
+          run_suite inbox packages/routine_inbox/tests
+          run_suite chat packages/chat/scripts/tests
+          run_suite chat-tools packages/chat/tests
 
   # The single required CI context. A failed dependency *skips* a dependent
   # job, and a skipped check is not a failed one to the drainer, so this job
