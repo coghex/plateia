@@ -55,10 +55,15 @@ ZIP_TIME = (1980, 1, 1, 0, 0, 0)  # fixed, so the same commit always builds the 
 SHA = re.compile(r"^[0-9a-f]{40}$")
 
 # Where the live chat tools keep code, settings and state: no release is
-# ever written there (requirement 8). Relative to the home directory; the
-# chat code's own CHAT_STATE and CHAT_CONFIG locations are added at run time.
+# ever written there (requirement 8). Relative to the home directory: the
+# broad roots, then each concrete runtime location inside or beside them,
+# because each may be a symlink to somewhere else and is resolved on its
+# own. The chat code's CHAT_STATE and CHAT_CONFIG are added at run time.
 LIVE_ROOTS = (".codex/skills", ".config/chat", ".config/cmux", ".local/state", ".local/bin",
-              "Library/LaunchAgents")
+              "Library/LaunchAgents",
+              ".codex/skills/chat", ".codex/skills/chat/scripts", ".local/state/chat",
+              ".local/state/project-manager", ".local/state/ergo", ".local/share/weechat", ".config/weechat",
+              ".weechat")
 
 # Patterns no artifact may carry (requirement 5). Invented placeholders that
 # the captured code uses in docstrings and examples are allowed.
@@ -227,14 +232,27 @@ def public_version(version):
 # --- build -------------------------------------------------------------------
 
 def live_roots():
-    """(name, path) for every live location, as configured and as resolved."""
+    """(name, path) for every live location. Each named location counts, and
+    so does every symlink directly inside one: a symlinked directory's target,
+    or a symlinked file's target directory (an installed command such as
+    ~/.local/bin/pchat points into the tree it runs from)."""
     home = Path.home()
     roots = [(f"~/{rel}", home / rel) for rel in LIVE_ROOTS]
     if os.environ.get("CHAT_STATE"):
         roots.append(("CHAT_STATE", Path(os.environ["CHAT_STATE"])))
     if os.environ.get("CHAT_CONFIG"):
         roots.append(("CHAT_CONFIG's directory", Path(os.environ["CHAT_CONFIG"]).parent))
-    return roots
+    linked = []
+    for name, root in roots:
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_symlink():
+                target = Path(os.path.realpath(entry.path))
+                linked.append((f"{name}/{entry.name}'s target", target if target.is_dir() else target.parent))
+    return roots + linked
 
 
 def check_output_dir(out, top):

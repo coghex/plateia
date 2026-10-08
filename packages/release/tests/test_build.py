@@ -209,6 +209,30 @@ class RefusalTests(BuildCase):
                 self.refused(r"under ~/.codex/skills, where the live chat tools live", out=out)
         self.assertEqual(list(real.iterdir()), [])
 
+    def test_resolved_default_runtime_locations_are_refused(self):
+        """Each default location is resolved on its own, and so is a symlink
+        directly inside one; the destinations stay unchanged."""
+        home = Path.home()
+        live_state, live_scripts, live_logs = (self.where / n for n in ("live-state", "live-scripts", "live-logs"))
+        for d in (live_state, live_scripts, live_logs):
+            d.mkdir()
+        (live_scripts / "pchat").write_text("#!/bin/sh\n")
+        links = [(home / ".local/state/chat", live_state), (home / ".local/bin/pchat", live_scripts / "pchat"),
+                 (home / ".local/state/ergo", live_logs)]
+        # cleanups run last-first: the links go before their directories
+        self.addCleanup(lambda: [p.rmdir() for p in (home / ".local/state", home / ".local/bin", home / ".local")])
+        for link, target in links:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(target)
+            self.addCleanup(link.unlink)
+        before = {d: snapshot(d) for d in (live_state, live_scripts, live_logs)}
+        for out, name in ((live_state / "releases", r"~/.local/state/chat"),
+                          (live_scripts / "releases", r"~/.local/bin/pchat's target"),
+                          (live_logs / "releases", r"~/.local/state/ergo")):
+            with self.subTest(out=out.name, under=name):
+                self.refused(rf"under {name}", out=out)
+        self.assertEqual({d: snapshot(d) for d in before}, before)
+
     def test_configured_chat_state_and_config_locations_are_refused(self):
         state, config = self.where / "chat-state", self.where / "chat-config"
         state.mkdir()
