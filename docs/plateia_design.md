@@ -550,7 +550,8 @@ presence, correlated chat acceptance/progress and drainer merge/cleanup.
 Acceptance is not running; session idle is not safe Hold; issue closed is not
 cleanup complete; a worker's `done` is not card Done.
 
-**Proposal P-3:** a read-only projection with requested intent/revision,
+**Approved direction D-49 (formerly P-3), 2026-10-08:** a read-only
+projection with requested intent/revision,
 observed phase, active execution, pause/cleanup evidence, receipt disposition,
 source timestamps and unresolved failures. Publish snapshots plus a resumable
 change cursor; recover with a snapshot if a cursor cannot be replayed. Exact
@@ -1609,6 +1610,24 @@ no gain.
 Owner signoff in this conversation, 2026-10-08: the PLT-18 delivery entry, as
 updated under D-47, is approved. This settles Q-11 for PLT-18.
 
+### D-49. The shared status view: snapshots plus a change cursor, first for simple issue cards
+
+Owner decision in this conversation, 2026-10-08: approve P-3 as PLT-6's read
+model. Consumers read a snapshot of every card, then follow a resumable change
+cursor; a cursor too old to replay is told to take a fresh snapshot, never
+given a silent gap. Each card carries requested state and revision, observed
+phase, active execution, pause or cleanup evidence, its request's D-36 state,
+the source and age of each fact, unresolved failures and overtaken intent.
+GitHub is polled centrally per project with caching, backoff and rate-limit
+awareness, never per card or per browser. Polling intervals and staleness
+thresholds stay configurable and are chosen under Q-6 before PLT-7 and PLT-8.
+
+The first version covers issue cards with zero or one PR, and reopened issues
+returning to the active board. PR-only cards and replacement or multiple PRs on
+one issue show as an explicit unsupported association, never guessed, until a
+later slice. Covering every association case now was not selected: it would
+pull Q-7's open rules into PLT-6 and delay it.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -2432,30 +2451,40 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 ### PLT-6. Project the card's real lifecycle from shared evidence
 
 - **Outcome:** a read-only consumer can distinguish accepted, working,
-  pause pending/held, review, merge, cleanup and Done for one linked issue/PR.
-- **Scope:** reconcile tracker, existing claims/session correlation, chat
-  receipts, execution checkpoints and drainer observations; expose provenance,
+  pause pending or held, review, merge, cleanup and Done for an issue card
+  with zero or one PR, with the source and age of every fact.
+- **Scope:** reconcile tracker facts, claims and session correlation, chat
+  receipts and D-36 request states, execution checkpoints and hook evidence
+  (PLT-4), merge outcomes (PLT-5) and cleanup obligations (PLT-18) into the
+  D-49 read model: snapshots plus a resumable change cursor, with provenance,
   observation age, uncertainty, incomplete actions and overtaken intent.
-  Centralize bounded tracker reads for consumers; do not build a second
-  workflow engine or infer state from terminal prose.
+  Record satisfied and overtaken request states from this evidence (D-36).
+  Show V-7's closed-issue fallback as Done labelled "cleanup not tracked" only
+  where no PLT-18 record exists (D-47). Poll GitHub centrally per project with
+  caching, backoff and rate-limit awareness; intervals and staleness
+  thresholds are configurable. PR-only and replacement or multiple PR
+  associations show as unsupported. Don't build a second workflow engine or
+  infer state from terminal prose.
 - **Owning repository:** `coghex/plateia` (D-7). The workflow facts remain
   shared, independent of the web process; presentation consumes them.
-  Projection API details remain P-3.
 - **Phase:** lifecycle observation prerequisite.
 - **Depends on:** PLT-1, PLT-3, PLT-4, PLT-5, PLT-18 (D-44).
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-4, D-5, D-6, D-7, D-9, D-12, D-13, D-36
-  (satisfied and overtaken come from this projection's evidence).
-- **Acceptance signals:** owner-started work is recognized; same issue/PR
-  retains one identity; stale replay cannot overwrite newer evidence; an
-  outage is unknown/stale rather than success; closed issue with known
-  cleanup debt is not Done; issue reopening becomes active again; tracker
-  traffic does not multiply with browser/card count; approved work with a
-  intentionally stopped, incident-free drainer reports waiting rather than
-  merging or failed; an actual incident remains visible alongside that wait.
-- **Out of scope:** full agent-directory UI, unrelated PR association cases
-  unless included by Q-7, browser push and page framework choice.
-- **Open questions:** Q-6, Q-7, Q-11; deployment follows C-7/Q-12.
+  (satisfied and overtaken come from this projection's evidence), D-47, D-49.
+- **Acceptance signals:** owner-started work is recognized; one issue and its
+  PR keep one card identity; stale replay cannot overwrite newer evidence; an
+  outage reads as unknown or stale, never success; a closed issue with known
+  cleanup debt is not Done; an untracked merge shows the labelled fallback; a
+  reopened issue becomes active again; an expired cursor gets a fresh
+  snapshot, never a gap; tracker traffic doesn't grow with browser or card
+  count; approved work with an intentionally stopped, incident-free merge
+  worker reads as waiting, and a real incident stays visible beside it; an
+  unsupported association is shown, not guessed.
+- **Out of scope:** PR-only and multi-PR association rules (Q-7), the agent
+  directory UI, browser push and the page framework.
+- **Open questions:** Q-11 for signoff of this entry; Q-6 sets the default
+  intervals and thresholds before PLT-7 and PLT-8, not before this slice.
   **Stop before processing.**
 
 ### PLT-7. Persist board intent and reconcile shared receipts in plateia
@@ -2547,8 +2576,8 @@ settle Q-12's initial direction and scope. Do not re-ask them or infer approval
 of unrelated merge-gate choices. Continue with the deployment prerequisites
 listed under Q-12, plus Q-16's other gate details, Q-7 completion coverage,
 Q-14 wire/routing details, Q-6 freshness/browser behavior and Q-11 concrete
-one-PR boundaries in focused checkpoints. Only P-3 remains a proposal among
-the original P-1 through P-4. P-5's direction/boundary is accepted; its exact
+one-PR boundaries in focused checkpoints. P-3 was approved as D-49 on 2026-10-08; none of
+the original P-1 through P-4 remains a proposal. P-5's direction/boundary is accepted; its exact
 validator mechanics and P-6's build/controller details need implementation
 review under the accepted constraints.
 Preserve ongoing shared identity/color/workflow fixes and refresh the inbox
