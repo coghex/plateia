@@ -1356,6 +1356,24 @@ history would be split from its work. First move in the main channel and later
 moves in the issue channel was not selected: two routing rules, and finding a
 card's history would depend on knowing it.
 
+### D-32. Grouped issues still get moves in their own card channel
+
+Owner decision in this conversation, 2026-10-08: when the manager handles
+several issues in one grouped request channel, a move for one of those cards
+still goes in that card's own `<prefix>issue-<n>` channel, opened if needed.
+The route never depends on history, so a retried move lands in the same room.
+The manager, woken by the post, associates it with the grouped work by card
+key, and posts a one-line pointer in each card's own room linking to the
+grouped channel. Hold is enforced through shared control (D-4, D-10), not by
+the worker reading a room. The manager pointer is focused manager guidance
+for PLT-3.
+
+Routing to whichever channel currently holds the work was not selected: the
+route would be inferred from history, could change between a move and its
+retry, and would block on ambiguity. Forbidding the manager to group
+board-moved cards was not selected: it constrains scheduling that V-7 leaves
+to the manager and doesn't cover earlier grouping.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1537,9 +1555,9 @@ rule. Interrupted/oversized multi-line commands must not dispatch fragments.
 No wire parser or schema is approved merely by the example in C-2.
 
 **Channel routing partly resolved by D-31, 2026-10-08:** every move for an
-issue card goes in that issue's request channel. Still open: grouped request
-channels covering several issues, PR-only cards, and the rest of the list
-above.
+issue card goes in that issue's request channel; D-32 keeps that rule when
+the manager has grouped issues. Still open: PR-only cards (with Q-7) and the
+rest of the list above.
 
 ### Q-15. Who runs the fresh finalization step, and when?
 
@@ -1924,7 +1942,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Phase:** shared delivery prerequisite; first card-move implementation target.
 - **Depends on:** PLT-16 (D-28), PLT-11.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11, D-15, D-16, D-17, D-28.
+- **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11, D-15, D-16, D-17, D-28,
+  D-31, D-32.
 - **Acceptance signals:** synthetic non-web submission survives bridge/service
   restart and ambiguous send success; retries preserve the same logical move
   and receipt; mismatched duplicate content is visibly rejected; queued,
@@ -1949,7 +1968,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Phase:** shared orchestration prerequisite.
 - **Depends on:** PLT-1.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-3, D-4, D-5, D-6, D-7, D-8, D-10.
+- **Relevant decisions:** D-2, D-3, D-4, D-5, D-6, D-7, D-8, D-10, D-31, D-32.
 - **Acceptance signals:** repeated deliveries and manager replacement reuse
   one execution; Solve/Hold/Solve accumulated before dispatch acts only on
   the latest intent; obsolete requests get durable dispositions; a Hold
