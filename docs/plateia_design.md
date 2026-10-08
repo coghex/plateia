@@ -27,6 +27,9 @@ concrete precondition
 - [ ] PLT-3. Reconcile ordered card intent before manager dispatch
 - [ ] PLT-4. Pause and resume workers and review loops at safe boundaries
 - [ ] PLT-5. Build shared finalization from the finalize contract
+- [ ] PLT-18. Make post-merge cleanup durable and visible
+- [ ] PLT-19. Run fresh finalization in an explicit-start shared merge worker
+- [ ] PLT-20. Carry prior approval across a proven-equivalent base update
 - [ ] PLT-6. Project the card's real lifecycle from shared evidence
 - [ ] PLT-7. Persist board intent and reconcile shared receipts in plateia
 - [ ] PLT-2. Compare page frameworks with the same recovery prototype
@@ -35,10 +38,11 @@ concrete precondition
 These IDs are stable conversation and processing cursors; existing PLT-2
 retains its bake-off meaning despite appearing later in dependency order.
 The owner approved shared prerequisites before the plateia card slice (D-5).
-The seventeen proposed boundaries below are not all approved, and none is ready
+The twenty proposed boundaries below are not all approved, and none is ready
 for issue processing; PLT-15 (2026-10-08) holds the bridge half of the former
 PLT-9 (D-20), PLT-16 the evidence half of the former PLT-10 (D-28), and PLT-17 the
-terminal and record half of the former PLT-1 (D-38). New code is plateia-owned (D-7); the merger starts fresh
+terminal and record half of the former PLT-1 (D-38); PLT-18 to PLT-20 split
+finalization (D-44). New code is plateia-owned (D-7); the merger starts fresh
 from finalize (D-9), rather than porting the existing drainer. Finalizer runtime
 ownership is approved (D-12); approval continuity and its metadata-only initial
 boundary are selected (D-14/D-18). D-15/D-16/D-17 settle distribution, the
@@ -1527,6 +1531,23 @@ resume is small (the newer revision lifts PLT-3's control, the hook stops
 refusing, and the worker reads back its checkpoint) and because activating
 Hold without resume could leave a card paused with no way to continue.
 
+### D-44. Split finalization into primitive, cleanup, worker and carry-forward
+
+Owner decision in this conversation, 2026-10-08: the former PLT-5 becomes four
+slices. PLT-5 is the single-PR finalization primitive (gates, Hold recheck,
+head-bound merge, verified and journaled outcome); PLT-18 makes post-merge
+cleanup durable and visible; PLT-19 runs both in the explicit-start shared
+merge worker (D-12); PLT-20 implements approval carry-forward (D-14, D-18),
+off the critical path. Q-16's remaining gates block only PLT-5 (and PLT-20
+where they interact); Q-7's cleanup coverage blocks only PLT-18. PLT-6 depends
+on PLT-5 and PLT-18, since the status view observes merges and cleanup, not
+the worker. Cutover from the live drainer stays a separate, later owner
+decision.
+
+Folding the worker into PLT-5 was not selected: the gate questions would block
+the loop too. Keeping one PLT-5 was not selected: four reviews in one PR, all
+blocked on Q-16 and Q-7.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -2227,39 +2248,103 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 
 ### PLT-5. Build shared finalization from the finalize contract
 
-- **Outcome:** a fresh shared single-PR finalization path enforces the approved
-  gate, respects Hold, and exposes verified merge and incomplete cleanup.
-- **Scope:** start from finalize's repository/target/gate/merge-confirmation/
-  identity-safe cleanup contract (D-9), with V-12 durability and read-only
-  outcomes. Consume shared control before new actions and irreversible merge.
-  The shared worker runtime is D-12; approval continuity and the metadata-only
-  initial boundary are D-14/D-18. Exact validator and other gate details remain
-  C-6/Q-16 prerequisites.
+- **Outcome:** a fresh shared single-PR finalization primitive merges only an
+  eligible, unheld PR at its exact approved head and records a verified
+  outcome, reconciling any ambiguous result instead of retrying blindly.
+- **Scope:** start from finalize's repository/target/gate/merge-confirmation
+  contract (D-9): check the approved gates, re-read shared card control and
+  Hold immediately before the irreversible merge (D-4, D-10), merge the exact
+  reviewed head, and confirm the result against GitHub. A durable journal
+  records each attempt so a lost network response is reconciled against
+  tracker facts. Outcomes are readable by non-web consumers. Include the
+  contract and failure evidence in this PR.
 - **Owning repository:** `coghex/plateia` (D-7). No drainer-port prerequisite;
-  existing drainer is evidence/current infrastructure only.
-- **Phase:** shared finalization prerequisite after the manager's shared
-  control contract. A primitive, restartable cleanup and running-worker layer
-  may need separate approved slices; do not pack them into this child by default.
-- **Depends on:** PLT-3; refine consumer dependencies if Q-11 splits this
-  responsibility into separately reviewable outcomes.
+  the existing drainer is evidence and current infrastructure only.
+- **Phase:** shared finalization prerequisite.
+- **Depends on:** PLT-3.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-4, D-5, D-6, D-7, D-9, D-10, D-12, D-13, D-14,
-  D-15, D-16, D-18.
-- **Acceptance signals:** gate refusal mutates nothing; held/unknown-control
-  PR never begins a new merge; merge is head-bound and verified before cleanup;
-  ambiguous network results reconcile against actual tracker facts; outstanding
-  cleanup survives restart and remains visible; an already committed merge
-  reports overtaken Hold; a stopped merge worker stays stopped without an
-  explicit owner start request; a readable Hold after confirmed merge is
-  overtaken while required cleanup continues. Approval-recovery acceptance
-  signals enforce C-6's accepted metadata-only provenance/content/freshness/CI
-  constraints and fail-closed cases; exact validator and other merge gates
-  await Q-16. Runtime tests follow D-12.
-- **Out of scope:** porting the old drainer; web merging; implicit/manual-skill
-  invocation authority; unrelated repair/rerun features; board order/UI.
-- **Open questions:** Q-7, Q-11, Q-16; deployment follows C-7/Q-12.
-  **Stop before processing;
-  this is not yet a settled one-PR boundary.**
+- **Relevant decisions:** D-2, D-4, D-5, D-6, D-7, D-9, D-10, D-13, D-15, D-16,
+  D-44.
+- **Acceptance signals:** a gate refusal mutates nothing; a held or
+  unknown-control PR never begins a merge; the merge is bound to the reviewed
+  head; an ambiguous network result reconciles against actual tracker facts
+  and never repeats a merge; an already committed merge reports an overtaken
+  Hold. Exact gate acceptance follows Q-16.
+- **Out of scope:** post-merge cleanup (PLT-18); the running worker and its
+  start/stop (PLT-19); approval carry-forward (PLT-20); porting the old
+  drainer; web merging; implicit or manual-skill invocation authority;
+  automatic CI reruns or branch repair.
+- **Open questions:** Q-11 for signoff of this entry; Q-16 for the remaining
+  gate choices. **Stop before processing.**
+
+### PLT-18. Make post-merge cleanup durable and visible
+
+- **Outcome:** every confirmed merge leaves persisted cleanup obligations that
+  survive restarts and stay visible until complete.
+- **Scope:** per merge, persist obligations for the branch, worktree and claim
+  release (with issue closure as observed tracker fact), carry them out with
+  identity-safe checks from finalize's cleanup step, resume outstanding ones
+  after a restart, and expose remaining cleanup debt to non-web consumers. A
+  readable Hold after a confirmed merge is overtaken and cleanup continues
+  (D-13). Include the contract and restart evidence in this PR.
+- **Owning repository:** `coghex/plateia` (D-7).
+- **Phase:** shared finalization prerequisite.
+- **Depends on:** PLT-5.
+- **Ordering:** critical path.
+- **Relevant decisions:** D-2, D-7, D-9, D-10, D-13, D-44.
+- **Acceptance signals:** a restart resumes only outstanding obligations and
+  never re-solves; incomplete cleanup is visible debt, not success; a late
+  Hold is overtaken while cleanup continues; unreadable control blocks the
+  next managed action and leaves the cleanup visibly incomplete (D-10).
+- **Out of scope:** the running worker (PLT-19); PR-only and
+  replacement-PR completion rules and the closed-issue fallback (Q-7).
+- **Open questions:** Q-11 for signoff of this entry; Q-7 for cleanup
+  coverage and claim-release evidence. **Stop before processing.**
+
+### PLT-19. Run fresh finalization in an explicit-start shared merge worker
+
+- **Outcome:** an independent shared merge worker, started only by an
+  explicit owner request in chat, finalizes eligible PRs in number order and
+  cleans up after them until stopped.
+- **Scope:** the worker runtime (D-12) over PLT-5 and PLT-18: number-order
+  selection, Hold respected, explicit start and stop through chat requests
+  handled by shared tooling, incident records and notification facts (V-9),
+  and visible waiting when stopped. Include operator guidance and synthetic
+  runtime evidence in this PR.
+- **Owning repository:** `coghex/plateia` (D-7).
+- **Phase:** shared finalization prerequisite.
+- **Depends on:** PLT-18.
+- **Ordering:** critical path for automatic merging; not needed for the
+  status view to observe merges.
+- **Relevant decisions:** D-2, D-6, D-7, D-9, D-12, D-13, D-44.
+- **Acceptance signals:** no move, resume, approval, installation or
+  reconciliation starts the worker; a stopped worker stays stopped and
+  approved cards wait visibly; a held card is skipped; an incident stops the
+  worker visibly; only one active merge authority per repository.
+- **Out of scope:** cutover from the live drainer, which needs a separate
+  owner decision; installing or starting the worker on the owner's machine.
+- **Open questions:** Q-11 for signoff of this entry. **Stop before
+  processing.**
+
+### PLT-20. Carry prior approval across a proven-equivalent base update
+
+- **Outcome:** an approval stripped by a managed base update is restored only
+  through a canonical carry receipt that proves equivalence under C-6.
+- **Scope:** the C-6/P-5 equivalence proof over full Git objects, the
+  metadata-only per-repository allowlist (D-18), the distinct carry receipt,
+  and the canonical validator change that recognizes it. Fail closed on every
+  case C-6 lists. Include the contract and synthetic fixtures in this PR.
+- **Owning repository:** `coghex/plateia` (D-7).
+- **Phase:** shared finalization follow-up.
+- **Depends on:** PLT-5.
+- **Ordering:** not on the critical path; until it lands, a stripped approval
+  needs a fresh canonical review.
+- **Relevant decisions:** D-2, D-7, D-14, D-18, D-44.
+- **Acceptance signals:** the C-6 fixture families pass; no label is ever
+  restored without a validated receipt; current-head CI is still required.
+- **Out of scope:** broader base-drift rules beyond D-18; merging.
+- **Open questions:** Q-11 for signoff of this entry; Q-16 where gate
+  details interact. **Stop before processing.**
 
 ### PLT-6. Project the card's real lifecycle from shared evidence
 
@@ -2274,7 +2359,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   shared, independent of the web process; presentation consumes them.
   Projection API details remain P-3.
 - **Phase:** lifecycle observation prerequisite.
-- **Depends on:** PLT-1, PLT-3, PLT-4, PLT-5.
+- **Depends on:** PLT-1, PLT-3, PLT-4, PLT-5, PLT-18 (D-44).
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-4, D-5, D-6, D-7, D-9, D-12, D-13, D-36
   (satisfied and overtaken come from this projection's evidence).
