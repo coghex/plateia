@@ -1293,6 +1293,23 @@ the broader skill migration D-17 deferred, and adds drift-protected files.
 Leaving those importers on the old tree was rejected: two identity
 implementations would write one registry, the split D-23 exists to prevent.
 
+### D-27. PLT-14 approved; first rollback restores the skills tree, and the owner commits the handoff
+
+Owner signoff in this conversation, 2026-10-08: the PLT-14 entry is approved
+with two rules for the first activation. First, its rollback target is the
+pre-activation `~/.codex/skills` content of the D-26 targets, recorded by hash
+in PLT-12's inventory and backed up privately; rollback restores exactly those
+targets, and they are kept until a later plateia-to-plateia rollback has been
+demonstrated. State formats are identical because the captured code behaves
+the same. Second, the controller reports the exact expected change to the
+skills repository's working tree (the `chat/scripts` handoff layer); the owner
+commits it there afterwards, and the drift check treats it as expected. Plateia
+tooling never commits into another repository.
+
+Fix-forward only for the first activation was not selected: it would drop
+C-7's rollback guarantee at the riskiest moment. Having the controller commit
+into the skills repository was not selected.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1394,9 +1411,10 @@ evidence freshness before the affected implementation slices are processed.
 
 **Partly settled, 2026-10-08:** D-19 sets PLT-9's capture baseline and D-20
 splits it into PLT-9 (core) and PLT-15 (bridge), excluding `install-identities`.
-D-21 keeps the receipt experiment in PLT-15 as is. **Q-11 is resolved by D-22
-for PLT-9 and PLT-15**; PLT-10 through PLT-14, PLT-1 to PLT-7, PLT-2 and PLT-8
-remain unsigned, as does the first browser boundary below.
+D-21 keeps the receipt experiment in PLT-15 as is. **Q-11 is resolved for
+PLT-9 and PLT-15 (D-22, amended by D-24), PLT-11 (D-25), PLT-12 (D-26) and
+PLT-14 (D-27)**, in D-23's order. PLT-10, PLT-13, PLT-1 to PLT-7, PLT-2 and
+PLT-8 remain unsigned, as does the first browser boundary below.
 
 The first browser slice is proposed to cover the specified existing-approved
 issue's Solve/Hold/resume path and actual status progression. Other mid-term
@@ -1722,24 +1740,33 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   referenced by live processes, cached skills/hooks, entry points or services.
   Include operator contract and synthetic interruption/rollback evidence in
   the same PR; implementing a controller never authorizes live execution.
-  Its first target is the captured, behavior-identical code (D-23).
+  Its first target is the captured, behavior-identical code (D-23). The
+  first activation's rollback target is the pre-activation skills-tree content
+  of the D-26 targets, kept until a plateia-to-plateia rollback is shown; the
+  controller reports the expected skills-repository change for the owner to
+  commit, and never commits there itself (D-27).
 - **Owning repository:** `coghex/plateia`.
 - **Phase:** deployment/recovery preparation.
 - **Depends on:** PLT-12 (D-23).
 - **Ordering:** critical path for activation; independent of offline board work.
-- **Relevant decisions:** D-2, D-6, D-7, D-10, D-12, D-15, D-16, D-17, D-23.
+- **Relevant decisions:** D-2, D-6, D-7, D-10, D-12, D-15, D-16, D-17, D-23,
+  D-26, D-27.
 - **Acceptance signals:** unknown/modified installed files block replacement;
   concurrent upgraders cannot interleave; binding/journal crash outcomes
   reconcile reality. Latest identity counters, settings, requests, accepted
   messages, cursors, claims, Hold, reviews and cleanup debt survive rollback.
   Incompatible rollback exposes repair/roll-forward; referenced releases are
   not retired. No mid-action worker interruption or implicit account/config/
-  service/merger/schedule action occurs.
+  service/merger/schedule action occurs. A fixture rollback from a first
+  activation restores the recorded skills-tree targets exactly, and the
+  controller's report names the expected skills-repository change.
 - **Out of scope:** breaking migrations, real activation/deployment, automatic
-  recovery authority, merger cutover/start and merge actions.
-- **Open questions:** Q-11 for boundary signoff. Any live activation/recovery
-  plan needs separate explicit authorization; none is requested or implied
-  here. **Stop before processing.**
+  recovery authority, merger cutover/start and merge actions; committing in
+  the skills repository.
+- **Open questions:** None; boundary approved by D-27. Any live
+  activation/recovery plan needs separate explicit authorization; none is
+  requested or implied here. **Stop before processing** until the design is
+  ready.
 
 ### PLT-10. Expose one shared chat API with compatible non-web entry points
 
@@ -2041,8 +2068,10 @@ on disk changed. The live tree then matched it except one uncommitted
 `cmux-supervisor` SKILL.md paragraph, outside PLT-9/PLT-15 and left for the
 owner. Re-run the drift comparison before processing PLT-9. D-23 then
 reorders release work ahead of the API (PLT-15 → PLT-11 → PLT-12 → PLT-14 →
-PLT-10). Next for Q-11: sign off PLT-11, PLT-12 and PLT-14 in their new
-positions, then PLT-10 onward and the first browser boundary.
+PLT-10). D-24 to D-27 then add the chat guidance to PLT-15 and approve
+PLT-11, PLT-12 (with its managed-target list) and PLT-14 (with the first
+activation's rollback and skills-repository commit rules). Next for Q-11:
+PLT-10, then PLT-13, the card slices and the first browser boundary.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
