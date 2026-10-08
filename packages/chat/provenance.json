@@ -158,11 +158,15 @@
       },
       "effective_sha256": "2b0f48e1289758d5205934e87a1d6252d40748cbc67a9faebe9f78d969513e8e",
       "capture": "changed",
-      "sha256": "24f153c4bedf2b40a5edfa0b1b71d734e5bf601b342226c4aa7e17d3f378d31d",
+      "sha256": "ddcc92d61c0781b202f0d455e4ec155f67a0d4af18020205cb3f43c3d091a148",
       "changes": [
         {
-          "change": "The owner's and assistants' nicknames are read at runtime from the chat config's `owner` and `assistants` (configured_names(), cached until the config file changes), for role matching, the forced nick colors and the WeeChat author string; claude and codex stay fixed assistants. CONFIG follows CHAT_CONFIG like chatlib. The palette and prefix-only recoloring are unchanged.",
+          "change": "The owner's, the assistants' and every other configured identity's names are read at runtime from the chat config's `owner`, `assistants` and `identities.<name>.role` (cached until the config file changes), for role matching, the forced nick colors and the WeeChat author string; claude and codex stay fixed assistants. CONFIG follows CHAT_CONFIG like chatlib. The palette and prefix-only recoloring are unchanged.",
           "reason": "Remove hard-coded owner and assistant names (requirement 3, D-20) with role colors unchanged."
+        },
+        {
+          "change": "refresh() records the nick colors it forces in its own plugin option and drops a recorded entry that nothing names any more, unless it was changed since; other entries stay.",
+          "reason": "With names read at runtime a renamed identity would otherwise keep its old forced role color (first review of PLT-9)."
         }
       ]
     },
@@ -274,7 +278,7 @@
     },
     {
       "path": "packages/chat/scripts/tests/test_role_colors.py",
-      "purpose": "Runtime owner/assistant names with invented configs; palette and prefix-only recoloring."
+      "purpose": "Runtime owner, assistant and other configured identity names with invented configs; renamed identities lose their forced colors; palette and prefix-only recoloring."
     },
     {
       "path": "packages/chat/scripts/tests/test_authority.py",

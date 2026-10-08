@@ -1,7 +1,8 @@
-"""Role colors with the owner's and assistants' names read from the chat config
-at runtime: different invented configs color different names, the palette is
-the baseline's, and only a line's prefix (the nickname) is ever recolored.
-Plateia's own test; invented names only."""
+"""Role colors with the owner's, the assistants' and every other configured
+identity's names read from the chat config at runtime: different invented
+configs color different names, a renamed identity loses its forced color, the
+palette is the baseline's, and only a line's prefix (the nickname) is ever
+recolored. Plateia's own test; invented names only."""
 import json
 import re
 import sys
@@ -24,8 +25,9 @@ class FakeWeechat:
     """The few WeeChat calls the script makes; colors render as \\x19<code>\\x1c."""
     WEECHAT_RC_OK = 0
 
-    def __init__(self, forced='', prefixes=()):
+    def __init__(self, forced='', prefixes=(), plugin=None):
         self.forced = forced
+        self.plugin = {} if plugin is None else plugin
         self.lines = [{'prefix': p, 'message': f'text {i}'} for i, p in enumerate(prefixes)]
         self.updates = []
 
@@ -43,6 +45,12 @@ class FakeWeechat:
 
     def config_option_set(self, option, value, run_callback):
         self.forced = value
+
+    def config_get_plugin(self, name):
+        return self.plugin.get(name, '')
+
+    def config_set_plugin(self, name, value):
+        self.plugin[name] = value
 
     def hdata_get(self, name):
         return name
@@ -128,6 +136,21 @@ class ConfiguredNameTests(RoleColorCase):
                 self.assertIsNone(role_colors.role_for_nick('pat'))
                 self.assertEqual(role_colors.role_for_nick('codex'), 'assistant')
 
+    def test_other_configured_identities_get_their_configured_role(self):
+        identities = {'observer': {'role': 'guide', 'project': 'alpha'}, 'Lead': {'role': 'manager'},
+                      'odd': {'role': 'unknown'}, 'bare': 'guide', 'none': {}}
+        path = self.use_config('config.json', {'owner': 'pat', 'assistants': ['sam'], 'identities': identities})
+        self.assertEqual(role_colors.configured_roles(), {'observer': 'guide', 'Lead': 'manager'})
+        self.assertEqual(role_colors.role_for_nick('observer'), 'guide')
+        self.assertEqual(role_colors.role_for_nick('lead'), 'manager')
+        for name in ('odd', 'bare', 'none'):
+            self.assertIsNone(role_colors.role_for_nick(name))
+        path.write_text(json.dumps({'owner': 'pat', 'identities': {'watcher': {'role': 'guide'}}}))
+        self.assertIsNone(role_colors.role_for_nick('observer'))
+        self.assertEqual(role_colors.role_for_nick('watcher'), 'guide')
+        path.write_text(json.dumps({'owner': 'pat', 'identities': ['observer']}))
+        self.assertEqual(role_colors.configured_roles(), {})
+
     def test_agent_names_are_colored_by_their_role_whatever_the_config(self):
         for nick, role in [('alp-manager', 'manager'), ('alp-guide', 'guide'), ('alp-solver-20', 'solver'),
                            ('alp-reviewer-3', 'reviewer'), ('alp-worker', 'solver')]:
@@ -155,6 +178,37 @@ class PrefixOnlyTests(RoleColorCase):
         with mock.patch.object(role_colors, 'weechat', fake):
             self.assertEqual(role_colors.refresh(), fake.WEECHAT_RC_OK)
         self.assertEqual(fake.forced, 'alp-solver-1:208;claude:82;codex:82;pat:51;sam:82;stranger:1')
+        self.assertEqual(fake.plugin['managed'], 'alp-solver-1:208;claude:82;codex:82;pat:51;sam:82')
+
+    def test_refresh_forces_other_configured_identities(self):
+        self.use_config('config.json', {'owner': 'pat', 'identities': {'observer': {'role': 'guide'}}})
+        fake = FakeWeechat()
+        with mock.patch.object(role_colors, 'weechat', fake):
+            role_colors.refresh()
+        self.assertEqual(fake.forced, 'claude:82;codex:82;observer:75;pat:51')
+
+    def test_renamed_identities_lose_their_forced_colors_across_refreshes(self):
+        path = self.use_config('config.json', {'owner': 'pat', 'assistants': ['sam'],
+                                               'identities': {'observer': {'role': 'guide'}}})
+        fake = FakeWeechat(forced='stranger:1')
+        with mock.patch.object(role_colors, 'weechat', fake):
+            role_colors.refresh()
+            self.assertEqual(fake.forced, 'claude:82;codex:82;observer:75;pat:51;sam:82;stranger:1')
+            fake.forced = fake.forced.replace('sam:82', 'sam:99')  # the user recolors sam by hand
+            path.write_text(json.dumps({'owner': 'robin', 'assistants': ['kit'],
+                                        'identities': {'watcher': {'role': 'guide'}}}))
+            role_colors.refresh()
+            expected = 'claude:82;codex:82;kit:82;robin:51;sam:99;stranger:1;watcher:75'
+            self.assertEqual(fake.forced, expected)
+            role_colors.refresh()
+            self.assertEqual(fake.forced, expected)
+            self.assertIsNone(role_colors.role_for_nick('pat'))
+        # a restart keeps the record in the plugin option, so a later rename is still cleaned up
+        restarted = FakeWeechat(forced=fake.forced, plugin=dict(fake.plugin))
+        path.write_text(json.dumps({'owner': 'robin', 'assistants': []}))
+        with mock.patch.object(role_colors, 'weechat', restarted), mock.patch.object(role_colors, 'LAST', None):
+            role_colors.refresh()
+        self.assertEqual(restarted.forced, 'claude:82;codex:82;robin:51;sam:99;stranger:1')
 
     def test_refresh_recolors_existing_prefixes_and_never_the_text(self):
         fake = FakeWeechat(prefixes=['pat', '@sam', 'stranger'])

@@ -13,14 +13,16 @@ LAST = None
 _NAMES = {}
 
 
-def configured_names():
-    """(owner or None, assistants) from the chat config, read at runtime so no
-    account name lives here. claude and codex are always assistants. Cached
-    until the config file changes: WeeChat asks once per line."""
+def _configured():
+    """(owner or None, assistants, {name: role}) from the chat config, read at
+    runtime so no account name lives here. claude and codex are always
+    assistants; every other identity under `identities` with a known role
+    gets that role. Cached until the config file changes: WeeChat asks once
+    per line."""
     try:
         st = CONFIG.stat()
     except OSError:
-        return None, list(GENERIC_ASSISTANTS)
+        return None, list(GENERIC_ASSISTANTS), {}
     key = (st.st_ino, st.st_mtime_ns, st.st_size)
     if key not in _NAMES:
         try:
@@ -31,9 +33,22 @@ def configured_names():
         owner = cfg.get('owner') if isinstance(cfg.get('owner'), str) and cfg.get('owner') else None
         listed = cfg.get('assistants') if isinstance(cfg.get('assistants'), list) else []
         assistants = [a for a in listed if isinstance(a, str) and a]
+        identities = cfg.get('identities') if isinstance(cfg.get('identities'), dict) else {}
+        roles = {n: i['role'] for n, i in identities.items()
+                 if n and isinstance(i, dict) and i.get('role') in COLORS}
         _NAMES.clear()
-        _NAMES[key] = owner, assistants + [a for a in GENERIC_ASSISTANTS if a not in assistants]
+        _NAMES[key] = owner, assistants + [a for a in GENERIC_ASSISTANTS if a not in assistants], roles
     return _NAMES[key]
+
+
+def configured_names():
+    """(owner or None, assistants) from the chat config."""
+    return _configured()[:2]
+
+
+def configured_roles():
+    """{name: role} for the chat config's other identities."""
+    return _configured()[2]
 
 
 def role_for_nick(nick):
@@ -43,6 +58,9 @@ def role_for_nick(nick):
         return 'owner'
     if nick in {a.lower() for a in assistants}:
         return 'assistant'
+    roles = {n.lower(): r for n, r in configured_roles().items()}
+    if nick in roles:
+        return roles[nick]
     match = re.fullmatch(r'[a-z]+-(manager|guide|solver-\d+|reviewer-\d+|worker)', nick)
     if match:
         role = match[1].split('-')[0]
@@ -72,6 +90,7 @@ def refresh(data='', remaining=0):
     except (OSError, ValueError):
         agents = {}
     desired = {n: COLORS[r['role']] for n, r in agents.items() if r.get('role') in COLORS}
+    desired.update({name: COLORS[role] for name, role in configured_roles().items()})
     owner, assistants = configured_names()
     desired.update({name: COLORS['assistant'] for name in assistants})
     if owner:
@@ -79,10 +98,20 @@ def refresh(data='', remaining=0):
     option = weechat.config_get('weechat.look.nick_color_force')
     existing = weechat.config_string(option)
     pairs = dict(p.split(':', 1) for p in existing.split(';') if ':' in p)
+    # Entries this script forced before (recorded in its own plugin option, so
+    # a restart remembers them) that nothing names any more are dropped, unless
+    # someone has changed them since; every other entry is left alone.
+    recorded = weechat.config_get_plugin('managed')
+    for name, color in (p.split(':', 1) for p in recorded.split(';') if ':' in p):
+        if name not in desired and pairs.get(name) == color:
+            del pairs[name]
     pairs.update(desired)
     value = ';'.join(f'{n}:{c}' for n, c in sorted(pairs.items()))
     if value != existing:
         weechat.config_option_set(option, value, 1)
+    managed = ';'.join(f'{n}:{c}' for n, c in sorted(desired.items()))
+    if managed != recorded:
+        weechat.config_set_plugin('managed', managed)
     # Recolor existing buffer prefixes too, including logs loaded before this
     # script. This is presentation only; timestamps, tags and message text stay.
     signature = tuple(sorted(desired.items()))
