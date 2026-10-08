@@ -1714,6 +1714,12 @@ invented #41 walk. Keeping one slice was not selected: the whole board plus
 every move and recovery path in one review. Adding room posting from the
 browser was not selected: it pulls general chat into the first slice.
 
+### D-57. PLT-8 and PLT-21 entries approved as written
+
+Owner signoff in this conversation, 2026-10-08: the PLT-8 and PLT-21 delivery
+entries, as recorded under D-56, are approved. With this every slice in the
+delivery plan has an approved boundary and Q-11 is resolved.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1810,6 +1816,9 @@ post-merge Hold/cleanup remains Q-7; merger runtime/gate details are Q-15/Q-16.
 
 ### Q-11. Are the proposed child boundaries and handoff details accepted?
 
+**Resolved, 2026-10-08:** every slice boundary is approved (D-22 to D-57,
+listed below) and D-56 settles the first user-visible boundary.
+
 D-5 approves the split direction, not every new child below. D-7 and D-8
 settle ownership and core protocol direction. Approve the proposed boundaries
 with Q-12's distribution/API/migration choices now resolved and D-18's
@@ -1828,8 +1837,8 @@ PLT-9 and PLT-15 (D-22, amended by D-24), PLT-11 (D-25), PLT-12 (D-26) and
 PLT-14 (D-27), PLT-10 and PLT-16 (D-28, D-29), PLT-13 (D-30), and PLT-1 and
 PLT-17 (D-38, D-39), PLT-3 (D-40, D-41), PLT-4 (D-42, D-43), and PLT-5,
 PLT-19 and PLT-20 (D-44 to D-46), PLT-18 (D-47, D-48), PLT-6 (D-49, D-50)
-PLT-7 (D-53) and PLT-2 (D-54, D-55)**, in D-23's order. PLT-8 remains
-unsigned, as does the first browser boundary below.
+PLT-7 (D-53), PLT-2 (D-54, D-55), and PLT-8 and PLT-21 (D-56, D-57)**, in
+D-23's order. Every slice is now approved.
 
 The first browser slice is proposed to cover the specified existing-approved
 issue's Solve/Hold/resume path and actual status progression. Other mid-term
@@ -2672,8 +2681,9 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Out of scope:** card moves (PLT-21), posting in rooms, Approve and Inbox
   cancel, PR-only and complex linking, direct-address UI, full chat, push and
   setup; these remain required mid-term scope.
-- **Open questions:** Q-11 for signoff of this entry; Q-4's framework decision
-  from PLT-2. **Stop before processing.**
+- **Open questions:** None for the boundary (approved by D-57); Q-4's
+  framework decision from PLT-2 must exist first. **Stop before processing**
+  until then and until the design is ready.
 
 ### PLT-21. Move cards on the board
 
@@ -2699,8 +2709,9 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   explicitly asks for startup.
 - **Out of scope:** posting free text in rooms, Approve and Inbox cancel, push
   and setup.
-- **Open questions:** Q-11 for signoff of this entry. **Stop before
-  processing.**
+- **Open questions:** None; boundary approved by D-57. **Stop before
+  processing** until the PLT-2 framework decision exists and the design is
+  ready.
 
 ## Handoff
 
@@ -2747,8 +2758,10 @@ PLT-4 (Hold by inbox message plus a Python pre-action hook). D-44 to D-46
 split finalization into PLT-5, PLT-18, PLT-19 and PLT-20, resolve Q-16 and
 approve all but PLT-18; D-47/D-48 settle cleanup coverage and approve
 PLT-18; D-49/D-50 approve P-3 and PLT-6; D-51/D-52 resolve Q-6; D-53
-approves PLT-7. Next: PLT-2 (bake-off candidates and boundary), then PLT-8
-and the first browser boundary.
+approves PLT-7; D-54/D-55 approve the PLT-2 bake-off; D-56/D-57 make the
+first browser delivery a read-only board (PLT-8) followed by card moves
+(PLT-21) and resolve Q-11. Next: readiness, including whether the epic
+contract matches the 21 slices.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
