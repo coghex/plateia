@@ -29,7 +29,7 @@ concrete precondition
 - [ ] PLT-5. Build shared finalization from the finalize contract
 - [ ] PLT-18. Make post-merge cleanup durable and visible
 - [ ] PLT-19. Run fresh finalization in an explicit-start shared merge worker
-- [ ] PLT-20. Carry prior approval across a proven-equivalent base update
+- [ ] PLT-20. Update behind PRs and carry approval across proven-equivalent updates
 - [ ] PLT-6. Project the card's real lifecycle from shared evidence
 - [ ] PLT-7. Persist board intent and reconcile shared receipts in plateia
 - [ ] PLT-2. Compare page frameworks with the same recovery prototype
@@ -1548,6 +1548,35 @@ Folding the worker into PLT-5 was not selected: the gate questions would block
 the loop too. Keeping one PLT-5 was not selected: four reviews in one PR, all
 blocked on Q-16 and Q-7.
 
+### D-45. Finalization gates for the PLT-5 primitive and behind-base updates
+
+Owner decision in this conversation, 2026-10-08, resolving Q-16's remaining
+gate choices:
+
+1. **Checks:** every reported check is pass or skipping; an empty or
+   unreadable check set refuses; the repository's configured required check
+   (`build-test` for plateia) must be present, so CI that never ran cannot pass
+   by absence.
+2. **Merge method and permission:** a merge commit bound to the exact reviewed
+   head (`--match-head-commit`). Administrator bypass only where finalize uses
+   it: a cleanly mergeable PR still blocked by branch protection after every
+   plateia gate has passed; never past a behind base or a failing check.
+3. **Approval:** a current-head canonical opposite-brand approval with an
+   authenticated publisher and the configured approval mode, as in finalize.
+4. **Base and race:** default-branch targets only; a retargeted PR refuses.
+   Head, base, gates and Hold are re-read immediately before merging. GitHub
+   cannot bind a merge to a base commit, so GitHub's own behind and protection
+   checks are the final guard, and the journal records any last-instant race.
+5. **Behind base:** the PLT-5 primitive refuses a behind PR. A managed,
+   conflict-free forward merge of the base moves into PLT-20; afterwards the
+   PR needs current-head CI plus a carry receipt (C-6) or a fresh canonical
+   review. Conflicts are never resolved automatically and go to repair. Until
+   PLT-20 lands, behind PRs wait visibly. This implements the owner's
+   2026-10-02 clarification.
+
+The drainer's narrower single-check selection, automatic CI reruns and
+merge-past-base exception were not carried over.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1800,6 +1829,11 @@ Check selection, administrator merge
 permission, exact approval attribution, base/head race treatment and automatic
 branch-update/conflict handling remain unapproved details; the clarification
 does not silently approve the rest of the prior gate bundle.
+
+**Resolved by D-45, 2026-10-08:** the five remaining gate choices are approved
+(checks, merge method and permission, approval, base and race handling, and
+behind-base updates). Exact receipt and validator mechanics for carry-forward
+remain reviewed implementation in PLT-20.
 
 ## Verification strategy
 
@@ -2264,18 +2298,20 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Depends on:** PLT-3.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-4, D-5, D-6, D-7, D-9, D-10, D-13, D-15, D-16,
-  D-44.
+  D-44, D-45.
 - **Acceptance signals:** a gate refusal mutates nothing; a held or
   unknown-control PR never begins a merge; the merge is bound to the reviewed
   head; an ambiguous network result reconciles against actual tracker facts
   and never repeats a merge; an already committed merge reports an overtaken
-  Hold. Exact gate acceptance follows Q-16.
+  Hold. Each D-45 gate refuses on its own synthetic failure: a missing
+  required check, a failing or empty check set, a stale or wrong-brand
+  approval, a retargeted base, a behind PR, and bypass use outside rule 2.
 - **Out of scope:** post-merge cleanup (PLT-18); the running worker and its
   start/stop (PLT-19); approval carry-forward (PLT-20); porting the old
   drainer; web merging; implicit or manual-skill invocation authority;
   automatic CI reruns or branch repair.
-- **Open questions:** Q-11 for signoff of this entry; Q-16 for the remaining
-  gate choices. **Stop before processing.**
+- **Open questions:** Q-11 for signoff of this entry (Q-16 resolved by D-45).
+  **Stop before processing.**
 
 ### PLT-18. Make post-merge cleanup durable and visible
 
@@ -2326,25 +2362,32 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Open questions:** Q-11 for signoff of this entry. **Stop before
   processing.**
 
-### PLT-20. Carry prior approval across a proven-equivalent base update
+### PLT-20. Update behind PRs and carry approval across proven-equivalent updates
 
-- **Outcome:** an approval stripped by a managed base update is restored only
-  through a canonical carry receipt that proves equivalence under C-6.
-- **Scope:** the C-6/P-5 equivalence proof over full Git objects, the
-  metadata-only per-repository allowlist (D-18), the distinct carry receipt,
-  and the canonical validator change that recognizes it. Fail closed on every
-  case C-6 lists. Include the contract and synthetic fixtures in this PR.
+- **Outcome:** a PR behind its base is brought up to date by a managed,
+  conflict-free forward merge, and an approval the update strips is restored
+  only through a canonical carry receipt that proves equivalence under C-6.
+- **Scope:** the managed forward merge of the pinned base into the approved
+  head (D-45 rule 5), refusing on any conflict and routing to repair; the
+  C-6/P-5 equivalence proof over full Git objects; the metadata-only
+  per-repository allowlist (D-18); the distinct carry receipt; and the
+  canonical validator change that recognizes it. Without a valid receipt the
+  updated PR needs a fresh canonical review. Current-head CI is always
+  required. Fail closed on every case C-6 lists. Include the contract and
+  synthetic fixtures in this PR.
 - **Owning repository:** `coghex/plateia` (D-7).
 - **Phase:** shared finalization follow-up.
 - **Depends on:** PLT-5.
-- **Ordering:** not on the critical path; until it lands, a stripped approval
-  needs a fresh canonical review.
-- **Relevant decisions:** D-2, D-7, D-14, D-18, D-44.
-- **Acceptance signals:** the C-6 fixture families pass; no label is ever
-  restored without a validated receipt; current-head CI is still required.
-- **Out of scope:** broader base-drift rules beyond D-18; merging.
-- **Open questions:** Q-11 for signoff of this entry; Q-16 where gate
-  details interact. **Stop before processing.**
+- **Ordering:** not on the critical path; until it lands, behind PRs wait
+  visibly and a stripped approval needs a fresh canonical review.
+- **Relevant decisions:** D-2, D-7, D-14, D-18, D-44, D-45.
+- **Acceptance signals:** a conflict-free update produces the expected merge
+  tree and never resolves a conflict; the C-6 fixture families pass; no label
+  is restored without a validated receipt; current-head CI is still required.
+- **Out of scope:** broader base-drift rules beyond D-18; manual conflict
+  resolution; merging.
+- **Open questions:** Q-11 for signoff of this entry. **Stop before
+  processing.**
 
 ### PLT-6. Project the card's real lifecycle from shared evidence
 
