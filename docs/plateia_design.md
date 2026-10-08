@@ -1583,6 +1583,27 @@ Owner signoff in this conversation, 2026-10-08: the PLT-5, PLT-19 and PLT-20
 delivery entries, as recorded under D-44 and D-45, are approved. This settles
 Q-11 for those three slices. PLT-18 waits for Q-7's cleanup coverage.
 
+### D-47. What cleanup-complete means for Done
+
+Owner decision in this conversation, 2026-10-08, resolving Q-7's coverage
+part:
+
+1. **Done requires** the issue closed, the issue's worktree removed, and its
+   local and remote branches deleted: the obligations PLT-18 records per merge.
+   The primary checkout's fast-forward is still performed and visible but
+   does not gate Done; it belongs to the repository, not one card.
+2. **Claim release** is the issue closed, no issue worktree, and no open PR
+   for it. The assignee stays as the record of who did the work and is not
+   removed.
+3. **V-7's closed-issue fallback** applies only when no PLT-18 cleanup record
+   exists for the merge (for example, a merge by the old drainer before
+   cutover, or by hand); the card shows Done labelled "cleanup not tracked".
+   It never applies when a record exists but can't be read; then cleanup shows
+   unknown or stale, never Done.
+
+Unassigning on release was not selected: it erases the attribution record for
+no gain.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1639,8 +1660,11 @@ proof of completion. The walk's known cleanup-debt case requires visibility.
 
 **Late-Hold part resolved by D-13:** show a Hold after confirmed merge as
 overtaken and continue required cleanup. D-10's unreadable-control rule still
-blocks the next managed action until control is readable. Completion coverage
-and the other association/fallback cases above remain open.
+blocks the next managed action until control is readable.
+
+**Cleanup coverage, claim release and the fallback resolved by D-47,
+2026-10-08.** Still open: PR-only card completion, replacement or multiple PR
+associations, and reopened-issue handling details (PLT-6 and later slices).
 
 ### Q-8. Where should the shared code and its changes be owned?
 
@@ -2324,8 +2348,10 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 
 - **Outcome:** every confirmed merge leaves persisted cleanup obligations that
   survive restarts and stay visible until complete.
-- **Scope:** per merge, persist obligations for the branch, worktree and claim
-  release (with issue closure as observed tracker fact), carry them out with
+- **Scope:** per merge, persist D-47's obligations (issue closed as an
+  observed tracker fact, worktree removed, local and remote branches deleted)
+  plus the primary checkout fast-forward, which doesn't gate Done; carry them
+  out with
   identity-safe checks from finalize's cleanup step, resume outstanding ones
   after a restart, and expose remaining cleanup debt to non-web consumers. A
   readable Hold after a confirmed merge is overtaken and cleanup continues
@@ -2334,15 +2360,17 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Phase:** shared finalization prerequisite.
 - **Depends on:** PLT-5.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-7, D-9, D-10, D-13, D-44.
+- **Relevant decisions:** D-2, D-7, D-9, D-10, D-13, D-44, D-47.
 - **Acceptance signals:** a restart resumes only outstanding obligations and
   never re-solves; incomplete cleanup is visible debt, not success; a late
   Hold is overtaken while cleanup continues; unreadable control blocks the
-  next managed action and leaves the cleanup visibly incomplete (D-10).
+  next managed action and leaves the cleanup visibly incomplete (D-10);
+  claim release is reported per D-47 without removing the assignee.
 - **Out of scope:** the running worker (PLT-19); PR-only and
-  replacement-PR completion rules and the closed-issue fallback (Q-7).
-- **Open questions:** Q-11 for signoff of this entry; Q-7 for cleanup
-  coverage and claim-release evidence. **Stop before processing.**
+  replacement-PR completion rules (Q-7); displaying the closed-issue fallback,
+  which belongs to the projection (PLT-6).
+- **Open questions:** Q-11 for signoff of this entry (Q-7 coverage resolved
+  by D-47). **Stop before processing.**
 
 ### PLT-19. Run fresh finalization in an explicit-start shared merge worker
 
