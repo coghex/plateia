@@ -14,7 +14,8 @@ concrete precondition
 ## Processing status
 
 - [ ] EPIC. Make plateia the owner's trustworthy chat and work board
-- [ ] PLT-9. Capture shared chat source while preserving active workflow fixes
+- [ ] PLT-9. Capture the shared chat identity and transport core
+- [ ] PLT-15. Capture the shared chat bridge
 - [ ] PLT-10. Expose one shared chat API with compatible non-web entry points
 - [ ] PLT-11. Build immutable pinned shared-package releases
 - [ ] PLT-12. Stage releases without changing active tools or services
@@ -32,8 +33,9 @@ concrete precondition
 These IDs are stable conversation and processing cursors; existing PLT-2
 retains its bake-off meaning despite appearing later in dependency order.
 The owner approved shared prerequisites before the plateia card slice (D-5).
-The fourteen proposed boundaries below are not individually approved or ready
-for issue processing. New code is plateia-owned (D-7); the merger starts fresh
+The fifteen proposed boundaries below are not individually approved or ready
+for issue processing; PLT-15 (2026-10-08) holds the bridge half of the former
+PLT-9, split by D-20. New code is plateia-owned (D-7); the merger starts fresh
 from finalize (D-9), rather than porting the existing drainer. Finalizer runtime
 ownership is approved (D-12); approval continuity and its metadata-only initial
 boundary are selected (D-14/D-18). D-15/D-16/D-17 settle distribution, the
@@ -49,8 +51,17 @@ CLI/skill entry points and one versioned Python chat API in existing processes.
 D-17 selects focused shared-chat/inbox migration and necessary hooks first.
 Editable deployment, a new initial IPC daemon and private
 patched snapshots are rejected. This is a design direction, not installation
-or activation authority. PR #1 remains open/unmerged at its approved `f9aef08`
-head; no new slice supersedes or modifies that core by inference.
+or activation authority. PR #1 merged on 2026-10-04 as `ef86f17`, with its
+approved `f9aef08` head unchanged; the inbox core is on `master` under
+`packages/routine_inbox/`. No new slice supersedes or modifies that core by
+inference.
+
+**Status update, 2026-10-08.** Since the decisions below were recorded:
+PR #1 (issue #2) merged; CI exists (`docs/ci_design.md`, PR #6/#9), and the
+drainer now requires `build-test` and `review-approved` for plateia. No issue
+or PR is open. Decision entries keep their original wording as the record of
+what was approved; where one describes PR #1 as open, this note supersedes the
+status, not the decision. Still no tracker artifacts exist for this design.
 
 ## Epic contract
 
@@ -70,8 +81,9 @@ or session transcripts were used. All examples below are invented.
 
 | Surface | Verified evidence | What it establishes, and its limit |
 | --- | --- | --- |
-| Plateia | `AGENTS.md`, `README.md`, `docs/vision.md`; repository head `381bf6e` | Python server, localhost/private network, chat-only actions, owner authority and the accepted vision. There is no application yet. |
-| Tracker | Read-only inventory of `coghex/plateia` issues, 2026-10-01 | No existing issues or epic were returned. Repeat the overlap check at readiness. |
+| Plateia | `AGENTS.md`, `README.md`, `docs/vision.md`, `packages/routine_inbox/`; `master` head `852d1a5`, refreshed 2026-10-08 | Python server, localhost/private network, chat-only actions, owner authority and the accepted vision. The routine-inbox package (PR #1) is the only code; there is no web application yet. |
+| Tracker | Read-only inventory of `coghex/plateia`, refreshed 2026-10-08 | Issues #2, #3, #5, #8 closed; PRs #1, #4, #6, #9 merged; throwaway PR #7 closed unmerged. Nothing open; no epic for this design. Repeat the overlap check at readiness. |
+| CI and merge gate | `docs/ci_design.md`; `.github/workflows/ci.yml`; `.drain-prs.json`; PR #6, PR #9 | Every PR and `master` push reports `build-test`; `.drain-prs.json` sets `required_ci_check` to `build-test`, so the drainer requires `build-test` and `review-approved`. New slices land under that gate. |
 | Chat CLI | `~/.codex/skills/chat/SKILL.md`; `scripts/pchat`, `main`, `unaccepted` | Explicit sender identity; typed/request-tagged posts; exact-message reply/ack; search, trace and health views. A failed post is appended to the outbox and exits 3. A successful post returns a line count, not a durable card-operation receipt. |
 | IRC boundary | Chat skill's `scripts/chatlib.py`, `post`, `ack`, `outbox_append`, `outbox_claim` | IRC posting and reply tags; locked outbox appends; rename-and-recover claimed files. No card identity, card revision or caller-supplied idempotency key in this interface. |
 | Chat bridge | Chat skill's `scripts/chat-bridge`, `Record`, `HistoryPager`, `Deliveries`, `ring_manager`, `flush_outbox`, `handle`, `run` | History catch-up in pages, message-ID deduplication, durable pending wake-ups before logging, delivery polling, manager retargeting, acceptance reminders and dead letters. The source explicitly permits duplicated wake-ups after a crash. |
@@ -113,12 +125,12 @@ Reviewer completion alone is not approval: the canonical coordinator remains
 the publisher of validated review evidence. Recheck source and coordinate
 these overlaps with the owner before implementation or migration.
 
-The current pushed head of plateia PR #1 (`f9aef08`, inspected 2026-10-02) contains a bounded
-clarification-inbox core, protocol, fake adapter and offline tests; it defers
-real adapters, installation and scheduling. This supersedes the earlier empty
-tracker inventory for overlap checks. Its routing/aggregation contracts overlap
+Plateia PR #1 (`f9aef08`, inspected 2026-10-02; merged 2026-10-04 as
+`ef86f17`) contains a bounded clarification-inbox core, protocol, fake adapter
+and offline tests; it defers real adapters, installation and scheduling. That
+core is now on `master` under `packages/routine_inbox/`. Its routing/aggregation contracts overlap
 Q-14 and PLT-1/PLT-3: reconcile them instead of creating a competing codec or
-duplicate inbox. No private runtime or install choice is implied by that head.
+duplicate inbox. No private runtime or install choice is implied by that merge.
 No implementation, identity registration, install or service change was made
 in this design session.
 
@@ -141,6 +153,86 @@ these newer fixes, rather than freezing the earlier inspected source. Existing
 legacy interrupt dispatch is an integration overlap: plateia Hold and upgrade
 coordination still use D-10's safe checkpoints and never become interrupt
 commands or a new browser interrupt control.
+
+### Shared chat source inventory for PLT-9, 2026-10-08
+
+Read-only inventory; nothing was modified, run or restarted. Private backups,
+registry contents and task notes were located but not read into this document.
+
+**Where the source lives.** One live copy, in the local skills repository at
+`~/.codex/skills` (`chat/` with `SKILL.md` and `scripts/`). That repository
+has **no remote**. `~/.claude/skills/chat` is a symlink to it. `pchat` on
+PATH, the WeeChat role-color autoload scripts and the bridge and log-rotation
+LaunchAgents all point straight into that working tree, so there is no
+installed copy to drift from it. The `modelclass` launch hook imports
+`chat/scripts` to register identities before launching an agent.
+
+**Committed versus live.** The repository's `master` head is `f010533`
+(2026-10-04). The live tree carries uncommitted edits to `pchat`, `chatlib.py`,
+`identities.py`, `agentcli.py`, `chat-bridge`, `SKILL.md` and three test
+files, plus untracked `runstore.py`, `binding.py`, `receipt_experiment.py`,
+`tests/_isolation.py` and three new tests. `pchat` imports `runstore`, which
+imports `binding`: **capturing only committed files yields a `pchat` that
+fails at startup.** The live chat tree equals a reviewed commit (`c572bad`,
+26 commits past `f010533`) whose history exists only in Codex task clones and
+a detached worktree under `~/Documents/Codex/`, not on any branch of the
+skills repository. One live-only edit (a `cmux-supervisor` SKILL.md paragraph)
+matches no located commit.
+
+**Identity discovery and the live-session conflict.** Without an override,
+`pchat` resolves its sender by syncing a cmux process inventory into the
+identity registry and picking the active record for its surface.
+`CHAT_AGENT_ID` returns that registry record directly and skips discovery,
+which is why it worked around the conflict. `register()` refuses with
+"`<name>` already has a live session" when an active record's still-running
+process differs from the one being registered; in `sync()` that one refusal
+aborts the whole sync, and at launch it exits the hook. The trigger was a
+detached Codex app-server daemon on a guide's tab: the old inventory picked it
+as the tab's agent and collided with the live guide. **The fix (exclude
+processes with no terminal; prefer foreground and the tab's own process; hold
+cross-group claims) is uncommitted in the live tree**, with a regression test.
+The refusal guard itself is unchanged and correct.
+
+**Runtime drift.** The running bridge predates the latest live-tree install
+and was not restarted, so its loaded modules are older than the files on disk.
+A reviewer-start receipt experiment is enabled for all projects. When a
+solver's background reviewer posts its exact, authenticated start notice for
+the solver's own request, the bridge skips waking the manager for that one
+post; the post stays in the channel record, and anything that doesn't match
+exactly gets normal delivery. A marker file switches it on; its code and
+marker appeared together on 2026-10-05.
+
+**Fixes PLT-9 must preserve.**
+
+| Fix | State |
+| --- | --- |
+| Permanent identities, never-reused counters, empty-inventory refusal | Committed |
+| Prefix-only role colors; WeeChat FIFO framing | Committed |
+| Catch-up checkpoints, resumable catch-up, crash replay, dead-letter alerts | Committed |
+| Acceptance recovery and `pchat unaccepted` | Committed |
+| Cited-delegation provenance (`--authority`) | Committed |
+| Busy-Codex delivery; role from workspace; hook-record placement | Committed |
+| Bounded logs (`rotate-logs`) | Committed |
+| Daemon exclusion and held placements (the live-session fix) | Uncommitted; reviewed only in task clones |
+| Test isolation guard against touching live state | Uncommitted; reviewed only in task clones |
+| Silent child-run post refusal; run store and `CHAT_RUN_ID` launch evidence | Uncommitted; reviewed only in task clones |
+| Reviewer-start receipt experiment (enabled) | Uncommitted; in task-clone history only inside an "installed baseline" snapshot commit, with no located review |
+| Relayed-approval paragraph in `cmux-supervisor` | Live tree only |
+
+Manager reconcile v2, child-run, launch-worker and lifecycle changes in the
+`project-manager` skill are also uncommitted. They use the chat code but are
+broader manager migration (D-17), not PLT-9 source.
+
+**Consumers a source move would affect.** Path-bound: the `pchat` symlink,
+bridge and log-rotation LaunchAgents, WeeChat autoload symlinks, and four
+`project-manager`/`model-classes` scripts that import `chat/scripts` relative
+to their own location. PATH-bound: `pchat` callers in `project-manager`,
+`recover` and kanban's reviewer runner (`review_pr.py`, including its plugin
+caches). No private `chatlib` fork exists in kanban or plateia. The
+installed reviewer runner already carries the reviewer identity hook, so the
+identity rollout's reviewer graft is no longer needed. `role_colors.py` and
+`install-identities` hard-code the owner and assistant names; PLT-9 must
+resolve them at runtime instead.
 
 The owning checkout has no existing shared-package release builder or versioned
 installer. The current inbox developer runner is not evidence of a deployment
@@ -826,9 +918,9 @@ activation authorization must state the permitted recovery actions.
 
 #### P-6. Existing inbox and eventual merger cutover
 
-PR #1's approved `f9aef08` core remains open/unmerged and unchanged. PLT-13 is
-a proposed separate real-adapter follow-up, after that core is available
-through a separately authorized merge or pinned review fixture. Reuse its
+PR #1's approved `f9aef08` core merged unchanged on 2026-10-04 (`ef86f17`).
+PLT-13 is a proposed separate real-adapter follow-up on that `master` core.
+Reuse its
 protocol and authority ceiling, manager-only replies/acceptance, intentional
 owner escalation and uncertain-send behavior. Do not broaden its authority,
 create duplicate collection, or make release staging enable its schedule.
@@ -1082,6 +1174,62 @@ approved coordination-metadata allowlist; absence grants no imported-change
 exemption. Exact validator/receipt implementation and other Q-16 merge-gate
 choices remain review prerequisites, not permission to restore labels or merge.
 
+### D-19. PLT-9 captures from a committed baseline, not the live working tree
+
+Owner decision in this conversation, 2026-10-08: before PLT-9, the live
+shared-chat working tree's reviewed state is committed in its own local
+repository; PLT-9 then captures from that named commit and records it as
+provenance. Its drift check compares the live tree against that commit.
+
+Capturing the uncommitted live tree directly was not selected: reviewers would
+check it against history on no branch, and the drift check would have no
+fixed baseline. Capturing only the older committed head was rejected: it lacks
+modules `pchat` imports at startup and the live-session identity fix.
+
+The baseline commit is an external prerequisite outside `coghex/plateia`,
+carried out by the owner or the owner of that work, not a plateia slice or an
+action of this design. The owner also asked for PLT-9 to be split; D-20
+records the split.
+
+### D-20. Split the capture into a core slice and a bridge slice; exclude the identity rollout
+
+Owner decision in this conversation, 2026-10-08: split the former PLT-9 by
+layer into two dependency-ordered slices. PLT-9 captures the identity and
+transport core (`chatlib`, `identities`, `binding`, `runstore`, `role_colors`
+with names resolved at runtime, `pchat`, `agentcli`, the test-isolation guard
+and their tests). PLT-15 then captures the bridge (`chat-bridge`, the
+reviewer-start receipt experiment, `rotate-logs` and their tests). Both capture
+from the D-19 baseline. `install-identities` is excluded from both: it is a
+mutating identity rollout that edits server and plugin configuration and
+restarts the bridge, which C-7 already forbids reusing as installation.
+
+A three-way split (client and identity, then CLI, then bridge) was not
+selected: `pchat` and identity resolution are too tightly bound for the middle
+slice to stand alone. A sanitized verbatim copy followed by a separate
+make-it-run slice was not selected: real account names must be resolved at
+runtime in the first PR, and that PR must pass `build-test`.
+
+### D-21. Capture the receipt experiment as is; PLT-15's review is its first review
+
+Owner decision in this conversation, 2026-10-08: PLT-15 captures the
+reviewer-start receipt experiment unchanged, so the captured bridge matches the
+running one (D-19). No earlier review of it was located, so PLT-15's PR review
+is its first review and must cover it as new code, not as already-reviewed
+capture. Whether it stays switched on is the owner's operational choice,
+outside the slice; capture neither enables nor disables it.
+
+Removing it from PLT-15 was not selected: the bridge imports it, so the
+captured bridge would differ from the running one. Deciding to drop it before
+the baseline commit was not selected.
+
+### D-22. PLT-9 and PLT-15 entries approved as written
+
+Owner signoff in this conversation, 2026-10-08: the PLT-9 and PLT-15 delivery
+entries (outcome, scope, dependencies, acceptance signals and out of scope),
+as recorded under D-19/D-20/D-21, are approved. This settles Q-11 for these two
+slices only. It is not readiness signoff for the design, and neither slice can
+be processed until the D-19 baseline commit exists.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1181,6 +1329,12 @@ make an explicit external prerequisite instead of treating multiple PRs as
 one child. Finalize board/shared commit recovery, projection transport and
 evidence freshness before the affected implementation slices are processed.
 
+**Partly settled, 2026-10-08:** D-19 sets PLT-9's capture baseline and D-20
+splits it into PLT-9 (core) and PLT-15 (bridge), excluding `install-identities`.
+D-21 keeps the receipt experiment in PLT-15 as is. **Q-11 is resolved by D-22
+for PLT-9 and PLT-15**; PLT-10 through PLT-14, PLT-1 to PLT-7, PLT-2 and PLT-8
+remain unsigned, as does the first browser boundary below.
+
 The first browser slice is proposed to cover the specified existing-approved
 issue's Solve/Hold/resume path and actual status progression. Other mid-term
 features remain later delivery design. The owner must confirm that first
@@ -1213,7 +1367,8 @@ distribution route:
   installed files or duplicating existing tracker work.
 - Implement the shared API/codec and real adapter with full provenance,
   ordered complete history, multipart and acknowledgement evidence; resolve
-  Q-14 where it affects framing/routing. Keep PR #1's approved core unchanged.
+  Q-14 where it affects framing/routing. Build on the merged inbox core on
+  `master`; don't fork or duplicate it.
 - Build verified pinned artifacts and a declared interpreter/API/state/skill
   compatibility matrix; test modified-file refusals, crash recovery, referenced
   release retention and code-only rollback against latest state.
@@ -1232,7 +1387,7 @@ is authorized. A breaking state change, force-replacement of a modified file,
 service cutover or activation/scheduling request would be a later separate
 owner checkpoint, not a pending permission request here. Preserve a single
 active merge authority and outstanding cleanup obligations before any eventual
-cutover. PLT-9 through PLT-14 are proposed reviewable boundaries subject to
+cutover. PLT-9, PLT-15 and PLT-10 through PLT-14 are proposed reviewable boundaries subject to
 Q-11, not permission to implement, deploy or merge them now.
 
 ### Q-13. What is the board-to-shared commit and recovery sequence?
@@ -1340,7 +1495,7 @@ Final acceptance commands and failure thresholds wait for approved mechanisms
 and one-PR boundaries. This session has read evidence, not executed workflow
 or outage tests.
 
-For PLT-9 through PLT-14, use isolated invented home/configuration/state trees
+For PLT-9, PLT-15 and PLT-10 through PLT-14, use isolated invented home/configuration/state trees
 and fake transport/process/service boundaries. Verify source edits concurrent
 with inventory/capture, unknown ownership, changed regular files and symlink
 targets, cached incompatible consumers, missing referenced hooks, pinned
@@ -1352,7 +1507,7 @@ Rollback tests first create newer identities, requests, accepted messages,
 claims and cleanup debt, then prove all survive selection of older compatible
 code. Unsupported latest-state rollback blocks with visible repair guidance;
 it never rewinds data. Test all retained release references before retirement.
-The inbox adapter uses the pinned approved core and synthetic complete/missing/
+The inbox adapter uses the merged core on `master` and synthetic complete/missing/
 conflicting evidence; it never tests against real chat or schedules a poll.
 
 ## Delivery plan
@@ -1361,35 +1516,72 @@ The order below is dependency-valid and follows D-5. The proposed child
 boundaries are deliberately narrower than the full card walk. They remain
 subject to Q-11 signoff; no entry is ready merely because it has this shape.
 
-### PLT-9. Capture shared chat source while preserving active workflow fixes
+### PLT-9. Capture the shared chat identity and transport core
 
-- **Outcome:** reviewed public source preserves existing shared-chat behavior
-  and the owner's current identity/color/recovery fixes without replacing
-  installed files.
-- **Scope:** sanitized inventory/migration map, focused transport/bridge/
-  identity/color source capture, necessary launch/reviewer identity hooks and
-  invented compatibility fixtures. Reconcile current tracked/local fixes and
-  recheck fingerprints before capture; preserve/report concurrent edits.
-  Resolve configured identities at runtime, never by importing real names or
-  credentials. Include source provenance, contracts and migration evidence in
-  the same PR. Broader manager/worker skill migration is later work (D-17).
+- **Outcome:** reviewed public source in plateia reproduces the live chat
+  client, CLI and identity behavior, including the owner's current identity,
+  color and run-evidence fixes, without replacing or changing installed files.
+- **Scope:** capture from the D-19 baseline commit: `chatlib`, `identities`,
+  `binding`, `runstore`, `role_colors`, `pchat` and `agentcli` (the `pchat
+  agent` entry points the launch hook and kanban's reviewer runner call), the
+  test-isolation guard and their tests. Resolve the owner, assistant and every
+  other configured identity at runtime; no real names or credentials in source,
+  tests or fixtures. Record provenance (baseline commit, per-file source
+  hashes) and a migration map in the same PR; a drift check compares the live
+  tree against the baseline and reports differences instead of overwriting
+  them. Preserve existing command names, output and exit codes. Tests run in
+  plateia's `build-test` with invented home/config/state trees.
 - **Owning repository:** `coghex/plateia`.
 - **Phase:** source preservation prerequisite.
-- **Depends on:** none. External prerequisite: identify the current fixes and
-  their review disposition; coordinate any in-flight tracked identity/reviewer
-  work rather than duplicating it. Other repositories are evidence sources,
-  not implicit owners of new code or a hidden second PR for this slice.
+- **Depends on:** none in plateia. External prerequisite (D-19): the live
+  shared-chat tree's reviewed state is committed in its own local repository,
+  and that commit is named as the capture baseline. The 2026-10-08 inventory
+  above identifies the fixes and their review state; coordinate any in-flight
+  identity/reviewer work rather than duplicating it. Other repositories are
+  evidence sources, not implicit owners of new code or a hidden second PR.
+- **Ordering:** critical path; can land first.
+- **Relevant decisions:** D-2, D-7, D-9, D-15, D-16, D-17, D-19, D-20.
+- **Acceptance signals:** fixtures preserve permanent roles and resume
+  bindings, never-reused counters, empty-inventory refusal, prefix-only role
+  colors, cited-delegation provenance and silent child-run refusal; a fixture
+  with a terminal-less daemon beside a live agent registers no daemon identity
+  and keeps the live one (the live-session fix). The isolation guard fails
+  closed if a test would touch real state. Drift between the live tree and the
+  baseline is reported visibly. No private content enters the repository; no
+  installed file, registry or service is changed.
+- **Out of scope:** the bridge (PLT-15); `install-identities`; installation or
+  repointing any symlink, LaunchAgent or hook; new accounts; manager
+  scheduling and `project-manager` changes (D-17); new Hold behavior; an
+  old-drainer port.
+- **Open questions:** None; boundary approved by D-22. **Stop before
+  processing** until the D-19 baseline exists and the design is ready.
+
+### PLT-15. Capture the shared chat bridge
+
+- **Outcome:** reviewed public source in plateia reproduces the live chat
+  bridge's delivery, acceptance and recovery behavior on top of PLT-9's core,
+  without changing the running bridge.
+- **Scope:** capture `chat-bridge`, the reviewer-start receipt experiment and
+  `rotate-logs` from the same D-19 baseline, with the bridge, receipt and
+  log-rotation tests, provenance and drift check. The receipt experiment keeps
+  its opt-in marker semantics; capture doesn't change whether it is enabled.
+  It has no located prior review, so this PR's review is its first (D-21).
+  Tests use invented state and the PLT-9 isolation guard.
+- **Owning repository:** `coghex/plateia`.
+- **Phase:** source preservation prerequisite.
+- **Depends on:** PLT-9.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-7, D-9, D-15, D-16, D-17.
-- **Acceptance signals:** fixtures preserve permanent roles/resume bindings,
-  never-reused counters, prefix-only role colors, checkpoint catch-up,
-  acceptance recovery, waiting/failure distinctions and canonical reviewer
-  validation/publication. Source drift produces a visible conflict; no private
-  content enters the release and no installed file is changed.
-- **Out of scope:** installation, new accounts, changed manager scheduling,
-  new Hold behavior, wholesale skill migration or an old-drainer port.
-- **Open questions:** Q-11 for boundary signoff. Source inventory/review is a
-  prerequisite, not a reopened Q-12 choice. **Stop before processing.**
+- **Relevant decisions:** D-2, D-7, D-15, D-16, D-17, D-19, D-20, D-21.
+- **Acceptance signals:** fixtures preserve checkpointed and resumed catch-up,
+  crash replay, message-ID deduplication after acceptance recovery, queued
+  versus failed delivery, busy-session handling, manager retargeting, dead
+  letters and alerts, and bounded log rotation; the receipt experiment is inert
+  without its marker. Drift is reported visibly; the running bridge, its
+  LaunchAgent and its state are untouched.
+- **Out of scope:** restarting or repointing the bridge; the shared API
+  refactor (PLT-10); card-move framing (Q-14); `install-identities`.
+- **Open questions:** None; boundary approved by D-22. **Stop before
+  processing** until the D-19 baseline exists and the design is ready.
 
 ### PLT-10. Expose one shared chat API with compatible non-web entry points
 
@@ -1403,7 +1595,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   patching installed scripts. Card-move-specific framing still needs Q-14.
 - **Owning repository:** `coghex/plateia`.
 - **Phase:** shared API prerequisite.
-- **Depends on:** PLT-9.
+- **Depends on:** PLT-9, PLT-15.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-7, D-8, D-15, D-16, D-17.
 - **Acceptance signals:** no nick/text-derived attestation; complete multipart
@@ -1423,12 +1615,11 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Scope:** source/artifact hashes, Python/platform requirements, pinned
   dependencies, API/wire/state versions and packaged guidance. Test built
   artifacts outside the source checkout. Shared-chat artifacts come first;
-  an inbox release consumes its existing core only after that separate core
-  is normally available. No duplicate core or editable runtime imports.
+  an inbox release consumes the existing core merged on `master`. No
+  duplicate core or editable runtime imports.
 - **Owning repository:** `coghex/plateia`.
 - **Phase:** release prerequisite.
-- **Depends on:** PLT-10. Inbox artifact inclusion additionally requires the
-  existing PR #1/issue #2 core; this is not permission to merge it.
+- **Depends on:** PLT-10. The inbox core (PR #1/issue #2) is already merged.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-7, D-15, D-16, D-17.
 - **Acceptance signals:** missing/tampered/unpinned inputs refuse; manifest
@@ -1476,10 +1667,9 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   private script copies or substitute assistant identity.
 - **Owning repository:** `coghex/plateia`.
 - **Phase:** non-web consumer follow-up, separate from the already tracked core.
-- **Depends on:** PLT-10, PLT-11. External prerequisite: PR #1/issue #2's core
-  becomes available after a separately authorized normal merge. While merge is
-  held, approved `f9aef08` may be a pinned offline integration/review fixture;
-  it is not an installed runtime or an excuse to amend the approved PR.
+- **Depends on:** PLT-10, PLT-11. The former external prerequisite, PR #1/issue
+  #2's core, was met on 2026-10-04 (`ef86f17`); the adapter builds on that
+  merged core without amending its contract.
 - **Ordering:** independent of card-move implementation once the API exists.
 - **Relevant decisions:** D-2, D-7, D-15, D-16, D-17; preserve issue #2's contract.
 - **Acceptance signals:** synthetic questions collect durably once; only the
@@ -1488,7 +1678,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   manager and owner escalation is deliberate. Uncertain sends never auto-
   repost; partial/unavailable/conflicting evidence blocks visibly. Existing
   assistant identity and configuration remain intact.
-- **Out of scope:** duplicate core, editing/merging PR #1, live install/schedule,
+- **Out of scope:** duplicate core, changing the merged core's contract, live install/schedule,
   new assistant credentials or expanded authority.
 - **Open questions:** Q-11; Q-14 where shared framing/routing interacts with
   existing inbox conventions. **Stop before processing unresolved behavior.**
@@ -1530,7 +1720,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   recoverable delivery receipts; preserve existing human pchat posts.
   Include the approved contract and crash/replay evidence in this PR.
 - **Owning repository:** `coghex/plateia` (D-7); shared runtime independent
-  of the plateia web process. D-15/D-16/D-17 and PLT-9 through PLT-11 establish
+  of the plateia web process. D-15/D-16/D-17 and PLT-9, PLT-15, PLT-10 and PLT-11 establish
   source/distribution/API compatibility; Q-12 lists deployment prerequisites.
 - **Phase:** shared delivery prerequisite; first card-move implementation target.
 - **Depends on:** PLT-10, PLT-11.
@@ -1753,10 +1943,18 @@ the original P-1 through P-4. P-5's direction/boundary is accepted; its exact
 validator mechanics and P-6's build/controller details need implementation
 review under the accepted constraints.
 Preserve ongoing shared identity/color/workflow fixes and refresh the inbox
-overlap before implementing adapters. PLT-9 through PLT-14 have complete
+overlap before implementing adapters. PLT-9, PLT-15 and PLT-10 through PLT-14 have complete
 candidate delivery contracts; none authorizes live use or is globally ready
 for processing by itself. Keep ledger and delivery plan in identical dependency
 order when boundaries change.
+
+**2026-10-08 session:** D-19 to D-22 set PLT-9's committed capture baseline,
+split it into PLT-9 (core) and PLT-15 (bridge) without `install-identities`,
+keep the receipt experiment in PLT-15 for its first review, and approve both
+entries. The baseline commit in the local skills repository is the owner's
+external step and hasn't been confirmed here; re-run the inventory's drift
+comparison before processing PLT-9. Next for Q-11: PLT-10 onward and the first
+browser boundary.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
@@ -1766,4 +1964,5 @@ is migration evidence; no unapproved compatibility edit or service switch is
 authorized. Do not file a new-code child in kanban merely because its current
 implementation lives there. Keep a stopped drainer stopped absent an explicit
 owner start request.
-Leave this new document uncommitted in `docs-wip` until publication is requested.
+This document was first published at `e716052`. Edit it in the `docs-wip`
+worktree and publish updates with `docs-push` only when the owner asks.
