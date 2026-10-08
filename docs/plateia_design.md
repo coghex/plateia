@@ -1391,6 +1391,22 @@ would have nothing separate to close. One request per active stretch (Solve to
 Done) was not selected: it needs a stretch-boundary rule and keeps the same
 problem inside each stretch.
 
+### D-34. Only the shared submission service makes card moves
+
+Owner decision in this conversation, 2026-10-08: a card move exists only when
+submitted through the shared submission service, from plateia or a terminal
+command such as `pchat card move`, which assigns its revision, operation ID
+and receipt. A line typed directly into IRC that looks like a `card-move/v1`
+command is not a command: the bridge flags it visibly in the room as not
+submitted, pointing to the board or the terminal command, and nothing is
+dispatched. Plain-language requests to the manager keep working exactly as
+today, as ordinary requests rather than card moves.
+
+Accepting hand-typed moves and assigning them a revision on sight was not
+selected: with no operation ID a re-typed line can't be told from a new move,
+and late revision assignment competes with D-11's commit order. Ignoring such
+lines silently was rejected: an intended move would vanish, against V-12.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1574,8 +1590,10 @@ No wire parser or schema is approved merely by the example in C-2.
 **Channel routing partly resolved by D-31, 2026-10-08:** every move for an
 issue card goes in that issue's request channel; D-32 keeps that rule when
 the manager has grouped issues. **Request scope resolved by D-33:** one
-request per move, reused on retry. Still open: PR-only cards (with Q-7) and
-the rest of the list above.
+request per move, reused on retry. **Human-typed compatibility resolved by
+D-34:** only the submission service makes moves; a hand-typed envelope is
+flagged, never dispatched. Still open: PR-only cards (with Q-7) and the rest
+of the list above.
 
 ### Q-15. Who runs the fresh finalization step, and when?
 
@@ -1954,7 +1972,9 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   versioned command publication, card revision sequencing and independently
   recoverable delivery receipts; preserve existing human pchat posts.
   Each move is its own request, and a retry reuses its request ID (D-33);
-  add a trace by card key alongside today's trace by request.
+  add a trace by card key alongside today's trace by request. Add the
+  terminal `pchat card move` command; the bridge flags a hand-typed
+  `card-move/v1` line as not submitted and dispatches nothing (D-34).
   Include the approved contract and crash/replay evidence in this PR.
 - **Owning repository:** `coghex/plateia` (D-7); shared runtime independent
   of the plateia web process. D-15/D-16/D-17 and PLT-9, PLT-15, PLT-10 and PLT-11 establish
@@ -1963,7 +1983,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Depends on:** PLT-16 (D-28), PLT-11.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11, D-15, D-16, D-17, D-28,
-  D-31, D-32, D-33.
+  D-31, D-32, D-33, D-34.
 - **Acceptance signals:** synthetic non-web submission survives bridge/service
   restart and ambiguous send success; retries preserve the same logical move
   and receipt; mismatched duplicate content is visibly rejected; queued,
