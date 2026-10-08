@@ -60,10 +60,13 @@ A release is `plateia-chat-<package version>`. The version is the
   lands on `master` through `docs-push` ungated.
 - **A source without an `origin/master`**, and a revision that isn't a
   commit.
-- **An output directory inside the source checkout**, after resolving
-  symlinks, or under the live tools' locations: `~/.codex/skills`,
-  `~/.config/chat`, `~/.config/cmux`, `~/.local/state`, `~/.local/bin` and
-  `~/Library/LaunchAgents`.
+- **An output directory inside the source checkout, or under the live
+  tools' locations:** `~/.codex/skills`, `~/.config/chat`, `~/.config/cmux`,
+  `~/.local/state`, `~/.local/bin` and `~/Library/LaunchAgents`, plus
+  wherever `CHAT_STATE` and `CHAT_CONFIG` point when they are set. Both the
+  output path and each protected location are resolved before comparing,
+  and the unresolved spellings are checked too. So neither a symlinked
+  output path nor a symlinked live location gets through.
 - **An artifact that would carry private data:** a home-directory path other
   than the invented `/Users/someone`, a credential pattern, or a chat-state or
   configuration file.
@@ -103,7 +106,9 @@ they don't refresh the source's index.
   (none for a format it only reads). Three formats carry an embedded version:
   the identity registry (`version: 1`), child runs (`schema: childrun/2`) and
   the receipt marker (`review-start-receipts-v1` in its file name). The rest
-  get documented baseline identifiers such as `channel-log/1`. The build
+  get documented baseline identifiers such as `channel-log/1`. The chat
+  config is written as well as read: `identities.register()` adds accounts,
+  identity roles and assistants to it. The build
   changes no serialized byte.
 
 The manifest has no API version; the shared API slice (PLT-10) adds one.
