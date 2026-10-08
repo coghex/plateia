@@ -1671,6 +1671,11 @@ PLT-8.
 A stale fact still shows its last value marked with its age; an unknown fact
 is no longer shown as current. Neither ever becomes success by itself (V-12).
 
+### D-53. PLT-7 entry approved as written
+
+Owner signoff in this conversation, 2026-10-08: the PLT-7 delivery entry, as
+updated for D-49 to D-52, is approved. This settles Q-11 for PLT-7.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1784,8 +1789,8 @@ D-21 keeps the receipt experiment in PLT-15 as is. **Q-11 is resolved for
 PLT-9 and PLT-15 (D-22, amended by D-24), PLT-11 (D-25), PLT-12 (D-26) and
 PLT-14 (D-27), PLT-10 and PLT-16 (D-28, D-29), PLT-13 (D-30), and PLT-1 and
 PLT-17 (D-38, D-39), PLT-3 (D-40, D-41), PLT-4 (D-42, D-43), and PLT-5,
-PLT-19 and PLT-20 (D-44 to D-46), PLT-18 (D-47, D-48), and PLT-6 (D-49,
-D-50)**, in D-23's order. PLT-7, PLT-2 and PLT-8 remain
+PLT-19 and PLT-20 (D-44 to D-46), PLT-18 (D-47, D-48), PLT-6 (D-49, D-50)
+and PLT-7 (D-53)**, in D-23's order. PLT-2 and PLT-8 remain
 unsigned, as does the first browser boundary below.
 
 The first browser slice is proposed to cover the specified existing-approved
@@ -2568,9 +2573,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   runs a skill, touches a terminal or writes the tracker.
 - **Out of scope:** the page framework, production browser controls, push
   notifications, image storage and new workflow logic.
-- **Open questions:** Q-11 for signoff of this entry (Q-6 resolved by D-51 and
-  D-52; Q-14 by D-31 to D-37; Q-7's open association rules don't apply to the
-  first coverage, D-49). **Stop before processing.**
+- **Open questions:** None; boundary approved by D-53. **Stop before
+  processing** until the design is ready.
 
 ### PLT-2. Compare page frameworks with the same recovery prototype
 
@@ -2666,8 +2670,9 @@ D-40 to D-43 settle how manager and worker changes ship and approve PLT-3 and
 PLT-4 (Hold by inbox message plus a Python pre-action hook). D-44 to D-46
 split finalization into PLT-5, PLT-18, PLT-19 and PLT-20, resolve Q-16 and
 approve all but PLT-18; D-47/D-48 settle cleanup coverage and approve
-PLT-18; D-49/D-50 approve P-3 and PLT-6. Next: Q-6 (browser and freshness),
-then PLT-7, PLT-2, PLT-8 and the first browser boundary.
+PLT-18; D-49/D-50 approve P-3 and PLT-6; D-51/D-52 resolve Q-6; D-53
+approves PLT-7. Next: PLT-2 (bake-off candidates and boundary), then PLT-8
+and the first browser boundary.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
