@@ -10,6 +10,7 @@ import os
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import _support
 from _support import build_release, commit_file, git, make_repo, snapshot
@@ -65,6 +66,10 @@ class BuildTests(BuildCase):
         self.assertRegex(manifest["build_interpreter"]["version"], r"^3\.\d+\.\d+")
         self.assertEqual(manifest["package"]["commands"], ["chat-bridge", "pchat", "rotate-logs"])
         self.assertEqual(manifest["skill"]["compatible_packages"], {"plateia-chat": ["0.1.0"]})
+        formats = {f["name"]: f for f in manifest["formats"]}
+        # identities.register() writes the chat config, so it is declared writable
+        self.assertEqual((formats["chat-config"]["read"], formats["chat-config"]["write"]),
+                         (["chat-config/1"], "chat-config/1"))
         self.assertNotIn("api_version", json.dumps(manifest))
         for fmt in manifest["formats"]:
             with self.subTest(format=fmt["name"]):
@@ -162,6 +167,31 @@ class RefusalTests(BuildCase):
             with self.subTest(root=rel):
                 self.refused(r"where the live chat tools live", out=Path.home() / rel / "releases")
                 self.assertFalse((Path.home() / rel).exists())
+
+    def test_a_symlinked_live_location_is_refused_either_way(self):
+        real = self.where / "skills-elsewhere"
+        real.mkdir()
+        link = Path.home() / ".codex" / "skills"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(real)
+        self.addCleanup(link.parent.rmdir)
+        self.addCleanup(link.unlink)
+        for out in (link / "releases", real / "releases"):
+            with self.subTest(out=out):
+                self.refused(r"under ~/.codex/skills, where the live chat tools live", out=out)
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_configured_chat_state_and_config_locations_are_refused(self):
+        state, config = self.where / "chat-state", self.where / "chat-config"
+        state.mkdir()
+        config.mkdir()
+        (self.where / "state-link").symlink_to(state)
+        with mock.patch.dict(os.environ, {"CHAT_STATE": str(state), "CHAT_CONFIG": str(config / "config.json")}):
+            for out, name in ((state / "releases", "CHAT_STATE"), (self.where / "state-link" / "r", "CHAT_STATE"),
+                              (config / "releases", "CHAT_CONFIG's directory")):
+                with self.subTest(out=out):
+                    self.refused(rf"under {name}, where the live chat tools live", out=out)
+        self.assertEqual((list(state.iterdir()), list(config.iterdir())), ([], []))
 
     def test_private_data_in_the_payload_is_refused(self):
         for text, why in (("PATH = '/Users/realperson/work'\n", "a home-directory path"),

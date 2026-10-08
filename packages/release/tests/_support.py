@@ -61,7 +61,8 @@ def make_repo(where, name="plateia"):
     for rel in PAYLOAD:
         target = repo / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(CHECKOUT / rel, target)
+        shutil.copyfile(CHECKOUT / rel, target)  # contents only: a read-only checkout stays editable here
+        target.chmod(0o755 if os.access(CHECKOUT / rel, os.X_OK) else 0o644)
     (repo / "README.md").write_text("An invented plateia checkout for the release tests.\n")
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "invented capture")

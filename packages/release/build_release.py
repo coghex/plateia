@@ -55,7 +55,8 @@ ZIP_TIME = (1980, 1, 1, 0, 0, 0)  # fixed, so the same commit always builds the 
 SHA = re.compile(r"^[0-9a-f]{40}$")
 
 # Where the live chat tools keep code, settings and state: no release is
-# ever written there (requirement 8). Relative to the home directory.
+# ever written there (requirement 8). Relative to the home directory; the
+# chat code's own CHAT_STATE and CHAT_CONFIG locations are added at run time.
 LIVE_ROOTS = (".codex/skills", ".config/chat", ".config/cmux", ".local/state", ".local/bin",
               "Library/LaunchAgents")
 
@@ -225,16 +226,32 @@ def public_version(version):
 
 # --- build -------------------------------------------------------------------
 
+def live_roots():
+    """(name, path) for every live location, as configured and as resolved."""
+    home = Path.home()
+    roots = [(f"~/{rel}", home / rel) for rel in LIVE_ROOTS]
+    if os.environ.get("CHAT_STATE"):
+        roots.append(("CHAT_STATE", Path(os.environ["CHAT_STATE"])))
+    if os.environ.get("CHAT_CONFIG"):
+        roots.append(("CHAT_CONFIG's directory", Path(os.environ["CHAT_CONFIG"]).parent))
+    return roots
+
+
 def check_output_dir(out, top):
+    """The output directory, resolved, after refusing one inside the source
+    checkout or under a live location. Both sides of every comparison are
+    resolved, and the unresolved spellings are checked too, so neither a
+    symlinked output path nor a symlinked live location gets through."""
+    given = Path(os.path.abspath(out))
     out = Path(os.path.realpath(out))
-    top = Path(os.path.realpath(top))
-    if out == top or top in out.parents:
+    inside = lambda path, root: path == root or root in path.parents  # noqa: E731
+    top_real = Path(os.path.realpath(top))
+    if inside(out, top_real) or inside(given, Path(os.path.abspath(top))):
         raise Refused("the output directory is inside the source checkout (after resolving symlinks)")
-    home = Path(os.path.realpath(Path.home()))
-    for rel in LIVE_ROOTS:
-        root = home / rel
-        if out == root or root in out.parents:
-            raise Refused(f"the output directory is under ~/{rel}, where the live chat tools live")
+    for name, root in live_roots():
+        for path, base in ((out, Path(os.path.realpath(root))), (given, Path(os.path.abspath(root)))):
+            if inside(path, base):
+                raise Refused(f"the output directory is under {name}, where the live chat tools live")
     return out
 
 
