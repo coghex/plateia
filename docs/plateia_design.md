@@ -1252,6 +1252,19 @@ activation (four slices of growing divergence, harder after the API refactor).
 A shortcut activation after PLT-15, such as repointing symlinks, was not
 selected because it would reopen D-15.
 
+### D-24. PLT-15 also captures the chat skill's operating guidance
+
+Owner decision in this conversation, 2026-10-08: amend the approved PLT-15
+entry (D-22) to capture `chat/SKILL.md` from the D-19 baseline with the same
+provenance and drift check, so PLT-11 can ship code with its guidance as C-7
+requires. It is executed by agents, so it lands through PLT-15's PR, not
+`docs-push`, and it is sanitized like the code: no real account names,
+private paths or chat content.
+
+Capturing it in PLT-9 was not selected because it describes the bridge, which
+arrives in PLT-15. Capturing it in PLT-11 was not selected because that would
+make the build slice copy source outside the capture slices' drift checks.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1576,8 +1589,9 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   repointing any symlink, LaunchAgent or hook; new accounts; manager
   scheduling and `project-manager` changes (D-17); new Hold behavior; an
   old-drainer port.
-- **Open questions:** None; boundary approved by D-22. **Stop before
-  processing** until the D-19 baseline exists and the design is ready.
+- **Open questions:** None; boundary approved by D-22 (PLT-15 amended by
+  D-24). The D-19 baseline exists. **Stop before processing** until the design
+  is ready.
 
 ### PLT-15. Capture the shared chat bridge
 
@@ -1589,22 +1603,26 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   log-rotation tests, provenance and drift check. The receipt experiment keeps
   its opt-in marker semantics; capture doesn't change whether it is enabled.
   It has no located prior review, so this PR's review is its first (D-21).
+  Also capture the chat skill's `SKILL.md` guidance, sanitized, under the same
+  provenance and drift check (D-24).
   Tests use invented state and the PLT-9 isolation guard.
 - **Owning repository:** `coghex/plateia`.
 - **Phase:** source preservation prerequisite.
 - **Depends on:** PLT-9.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-7, D-15, D-16, D-17, D-19, D-20, D-21.
+- **Relevant decisions:** D-2, D-7, D-15, D-16, D-17, D-19, D-20, D-21, D-24.
 - **Acceptance signals:** fixtures preserve checkpointed and resumed catch-up,
   crash replay, message-ID deduplication after acceptance recovery, queued
   versus failed delivery, busy-session handling, manager retargeting, dead
   letters and alerts, and bounded log rotation; the receipt experiment is inert
-  without its marker. Drift is reported visibly; the running bridge, its
-  LaunchAgent and its state are untouched.
+  without its marker. The captured guidance matches the captured commands and
+  contains no private content. Drift is reported visibly; the running bridge,
+  its LaunchAgent and its state are untouched.
 - **Out of scope:** restarting or repointing the bridge; the shared API
   refactor (PLT-10); card-move framing (Q-14); `install-identities`.
-- **Open questions:** None; boundary approved by D-22. **Stop before
-  processing** until the D-19 baseline exists and the design is ready.
+- **Open questions:** None; boundary approved by D-22 (PLT-15 amended by
+  D-24). The D-19 baseline exists. **Stop before processing** until the design
+  is ready.
 
 ### PLT-11. Build immutable pinned shared-package releases
 
