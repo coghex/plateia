@@ -108,7 +108,12 @@ they don't refresh the source's index.
   the receipt marker (`review-start-receipts-v1` in its file name). The rest
   get documented baseline identifiers such as `channel-log/1`. The chat
   config is written as well as read: `identities.register()` adds accounts,
-  identity roles and assistants to it. The build
+  identity roles and assistants to it. The inventory also lists
+  `role_colors.py`'s WeeChat state (`weechat.look.nick_color_force` and the
+  script's `managed` plugin option), and the host interfaces the code uses:
+  `launchctl print`, `ps`, the SIGHUP `rotate-logs` sends, and the `CHAT_*`
+  environment `pchat agent run` gives its child. A test ties markers in the
+  shipped code to the entries that must declare them. The build
   changes no serialized byte.
 
 The manifest has no API version; the shared API slice (PLT-10) adds one.
@@ -186,10 +191,10 @@ arm64, CPython 3.14.8), using this PR's build step.
 
 - **Inputs:**
   - **Builder:** this PR's `packages/release/build_release.py`, at builder
-    revision `01d0d57a14fbdde5a1d0a70dc5a617d2b02a711d`, not dirty. That is
-    the PR head after its first review. The first run, with `2ab6c29`, gave
-    the same outcomes and byte-identical artifacts; only the builder's own
-    identity in the manifest differed.
+    revision `706a986f3661ab63bb67581d2c07f22e4c4f1b31`, not dirty: the PR
+    head after its second review. Earlier runs with `2ab6c29` and `01d0d57`
+    gave the same outcomes and byte-identical artifacts. Only the manifest's
+    builder identity and format inventory differed.
   - **Source:** a clean detached checkout of `origin/master` at
     `48b901ac3e81d1f0c2b249f9381cf1af4aa2524a`. That commit contains #11's
     and #12's code.
