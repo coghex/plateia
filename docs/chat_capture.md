@@ -35,7 +35,7 @@ paths relative to their own location, so nothing needed rewiring.
 | `chat/scripts/identities.py` | `packages/chat/scripts/identities.py` | byte-for-byte |
 | `chat/scripts/pchat` | `packages/chat/scripts/pchat` | byte-for-byte |
 | `chat/scripts/receipt_experiment.py` | `packages/chat/scripts/receipt_experiment.py` | byte-for-byte (first review in PLT-9, D-69) |
-| `chat/scripts/role_colors.py` | `packages/chat/scripts/role_colors.py` | changed: owner and assistant names read from the chat config at runtime |
+| `chat/scripts/role_colors.py` | `packages/chat/scripts/role_colors.py` | changed: owner, assistant and other identity names read from the chat config at runtime; stale forced colors dropped |
 | `chat/scripts/runstore.py` | `packages/chat/scripts/runstore.py` | byte-for-byte |
 | `chat/scripts/tests/_isolation.py` | `packages/chat/scripts/tests/_isolation.py` | byte-for-byte |
 | `chat/scripts/tests/test_binding.py` | `packages/chat/scripts/tests/test_binding.py` | changed: invented names and paths |
@@ -58,8 +58,8 @@ Plateia-only files, none of them in the baseline:
   on invented trees;
 - `packages/chat/scripts/tests/test_start_kind.py` is the standalone
   `start_kind()` test (D-69);
-- `test_role_colors.py` covers runtime names, the palette and prefix-only
-  recoloring;
+- `test_role_colors.py` covers runtime names, renamed identities losing
+  their forced colors, the palette and prefix-only recoloring;
 - `test_authority.py` covers cited delegation;
 - `test_isolation_guard.py` shows the guard failing closed.
 
