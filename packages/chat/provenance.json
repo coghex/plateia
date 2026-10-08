@@ -277,9 +277,14 @@
       },
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
-      "capture": "byte-for-byte",
-      "sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
-      "changes": []
+      "capture": "changed",
+      "sha256": "bc0c1802af66beff9a77c1162f1f57edec17840a33d8b07f5946970fd9949d29",
+      "changes": [
+        {
+          "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
+          "reason": "Deliberate deviation from c572bad, by owner decision on PR #16's first review: a catch-up cut short leaves the checkpoint behind, so after a restart more than 5,000 replayed messages would be logged again and an accepted request queued again (PLT-15 requirement 8). The running bridge keeps the baseline behavior until activation."
+        }
+      ]
     },
     {
       "baseline_path": "chat/scripts/rotate-logs",
@@ -447,7 +452,7 @@
     },
     {
       "path": "packages/chat/scripts/tests/test_replay_dedup.py",
-      "purpose": "Message-ID deduplication after acceptance recovery, across a crash and a restart (PLT-15 requirement 8)."
+      "purpose": "Message-ID deduplication after acceptance recovery, across a crash, a restart and a restart after a cut-short catch-up of six full pages (PLT-15 requirement 8)."
     }
   ]
 }

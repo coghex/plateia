@@ -168,7 +168,10 @@ class Record:
             ids = set()
             path = chatlib.channel_log(channel)
             if path.exists():
-                for line in path.read_text().splitlines()[-5000:]:
+                # Every line, not only the newest: a catch-up cut short leaves
+                # the checkpoint behind, so after a restart all of it is
+                # replayed, however many lines it logged.
+                for line in path.read_text().splitlines():
                     try:
                         mid = json.loads(line).get("msgid")
                     except ValueError:
