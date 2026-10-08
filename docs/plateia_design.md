@@ -1270,6 +1270,9 @@ reviewed, in PLT-9, because `agentcli` imports it; its bridge-dependent test
 `test_receipt_experiment.py` stays in PLT-15, where the bridge routing it
 exercises gets its first review.
 
+**Amended by D-70 (2026-10-08):** the captured bridge matches the running one
+except a recorded fix to its deduplication window.
+
 ### D-22. PLT-9 and PLT-15 entries approved as written
 
 Owner signoff in this conversation, 2026-10-08: the PLT-9 and PLT-15 delivery
@@ -1299,6 +1302,10 @@ missed), nor was keeping the skills repository authoritative until a later
 activation (four slices of growing divergence, harder after the API refactor).
 A shortcut activation after PLT-15, such as repointing symlinks, was not
 selected because it would reopen D-15.
+
+**Amended by D-70 (2026-10-08):** the first activation also brings PLT-15's
+recorded fix to the bridge's deduplication window; otherwise the captured code
+behaves as today's live tools.
 
 ### D-24. PLT-15 also captures the chat skill's operating guidance
 
@@ -1986,6 +1993,27 @@ imports `test_bridge` and the bridge, which arrive in PLT-15, so it couldn't be
 captured verbatim and self-contained. Moving the bridge into PLT-9, or
 splitting the test file, was not selected.
 
+### D-70. PLT-15 fixes the bridge's deduplication window as a recorded deviation
+
+Owner decision, 2026-10-08 23:00 UTC, relayed through the plateia manager
+from the owner's verified assistant (option B); amends D-21's "matches the
+running one" and D-23's "behaves as today's live tools" for this one defect.
+PLT-15's review found that the bridge at the D-19 baseline (`c572bad`)
+deduplicates replayed messages only against the last 5,000 logged message
+IDs. After a crash during a catch-up of more than 5,000 messages, replay logs
+an already-accepted request again and requeues it, which breaks V-12's
+no-duplicate-work guarantee. PLT-15 fixes it: `Record._load` reads the whole
+channel log, and a regression test reproduces six 1,000-message history pages
+followed by a restart. The provenance records the change as a deliberate
+deviation from `c572bad`, and the drift check reports the live bridge's
+difference as that known deviation rather than unexplained drift. Everything
+else in the bridge is still captured verbatim.
+
+The live bridge keeps the defect until the release and activation slices
+(PLT-11, PLT-12, PLT-14) replace it with the captured code; PLT-15 doesn't
+change the running bridge. Capturing the defect verbatim and fixing it in a
+later slice was not selected.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -2417,6 +2445,10 @@ the PR.
   this PR is the first review of the bridge's receipt routing and its test.
   The experiment keeps its opt-in marker semantics; capture doesn't change
   whether it is enabled.
+  One recorded deliberate deviation from the baseline (D-70): `Record._load`
+  reads the whole channel log instead of the last 5,000 message IDs, with a
+  regression test; the provenance records it and the drift check reports it
+  as that known deviation. Everything else is captured verbatim.
   Also capture the chat skill's `SKILL.md` guidance, sanitized, under the same
   provenance and drift check (D-24).
   Tests use invented state and the PLT-9 isolation guard.
@@ -2425,13 +2457,16 @@ the PR.
 - **Depends on:** PLT-9.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-7, D-15, D-16, D-17, D-19, D-20, D-21, D-24,
-  D-69.
+  D-69, D-70.
 - **Acceptance signals:** fixtures preserve checkpointed and resumed catch-up,
   crash replay, message-ID deduplication after acceptance recovery, queued
   versus failed delivery, busy-session handling, manager retargeting, dead
   letters and alerts, and bounded log rotation; `test_receipt_experiment.py`
   passes against the captured bridge, and the bridge's receipt routing is
-  inert without the experiment's marker. The captured guidance matches the captured commands and
+  inert without the experiment's marker. A regression test pages six
+  1,000-message history pages, restarts the bridge, and shows no accepted
+  request is logged or queued again (D-70); the provenance names this as the
+  only deliberate deviation from the baseline. The captured guidance matches the captured commands and
   contains no private content. Drift is reported visibly; the running bridge,
   its LaunchAgent and its state are untouched.
 - **Out of scope:** restarting or repointing the bridge; the shared API
@@ -2510,7 +2545,8 @@ the PR.
   referenced by live processes, cached skills/hooks, entry points or services.
   Include operator contract and synthetic interruption/rollback evidence in
   the same PR; implementing a controller never authorizes live execution.
-  Its first target is the captured, behavior-identical code (D-23). The
+  Its first target is the captured, behavior-identical code (D-23), apart
+  from PLT-15's recorded deduplication fix (D-70). The
   first activation's rollback target is the pre-activation skills-tree content
   of the D-26 targets, kept until a plateia-to-plateia rollback is shown; the
   controller reports the expected skills-repository change for the owner to
