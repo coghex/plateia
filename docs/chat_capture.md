@@ -19,7 +19,12 @@ Both slices capture from baseline `c572bad`
 (`c572bad60b06f262d11a7175f52fd62f23257241`), committed on the skills
 repository's `master` (D-19). Each slice starts with a drift check. Any newer
 skills commit that touches a captured file is carried in and recorded in
-`carried_commits`. When PLT-9 was captured on 2026-10-08, there was none.
+`carried_commits`, and each captured file's `source_commit` names the commit
+its content was taken from. When PLT-9 was captured on 2026-10-08, there was
+none. When PLT-15 was captured the same day, there was one: `8ff325e`
+(`8ff325ee307b92e53157594e570235bc9f2f5229`) adds the "Timing reservations"
+paragraph to `chat/SKILL.md`, so that file comes from `8ff325e` and every
+other file from `c572bad`.
 
 ## Migration map (PLT-9)
 
@@ -63,10 +68,47 @@ Plateia-only files, none of them in the baseline:
 - `test_authority.py` covers cited delegation;
 - `test_isolation_guard.py` shows the guard failing closed.
 
-Not captured, by design: `chat-bridge`, `rotate-logs`, `tests/test_bridge.py`,
-`tests/test_receipt_experiment.py`, `tests/test_rotate_logs.py` and
-`tests/fixtures/` arrive in PLT-15. `install-identities` is excluded from every
-capture (D-20).
+## Migration map (PLT-15)
+
+`chat/SKILL.md` becomes `packages/chat/SKILL.md`, beside `scripts/`, as in the
+baseline.
+
+| Baseline path | Plateia path | Source | Capture |
+| --- | --- | --- | --- |
+| `chat/scripts/chat-bridge` | `packages/chat/scripts/chat-bridge` | `c572bad` | byte-for-byte |
+| `chat/scripts/rotate-logs` | `packages/chat/scripts/rotate-logs` | `c572bad` | byte-for-byte |
+| `chat/scripts/tests/test_bridge.py` | `packages/chat/scripts/tests/test_bridge.py` | `c572bad` | changed: invented names |
+| `chat/scripts/tests/test_receipt_experiment.py` | `packages/chat/scripts/tests/test_receipt_experiment.py` | `c572bad` | changed: invented names (first review of the bridge's receipt routing, D-69) |
+| `chat/scripts/tests/test_rotate_logs.py` | `packages/chat/scripts/tests/test_rotate_logs.py` | `c572bad` | byte-for-byte |
+| `chat/scripts/tests/fixtures/codex-interrupted-background.txt` | `packages/chat/scripts/tests/fixtures/codex-interrupted-background.txt` | `c572bad` | byte-for-byte |
+| `chat/SKILL.md` | `packages/chat/SKILL.md` | `8ff325e` | changed: says where the owner's and assistants' accounts are configured; invented examples |
+
+The bridge tests use the owner `pat` and assistant `sam`, with projects
+`nova`, `alpha`, `gamma`, `delta`, `epsilon` and `zeta` (prefixes `nov`,
+`alp`, `gam`, `del`, `eps`, `zet`). They use `nova`/`nov` where the core
+tests use `beta`/`bet`. The bridge sorts the accounts it wakes, and one routing
+test's expected order needs the prefix to sort after `manager`.
+
+`SKILL.md` keeps three things that point outside the capture, recorded in its
+provenance entry's `external_references`:
+
+- the timing-reservation link,
+  `../project-manager/references/timing-reservation.md`, verbatim from
+  `8ff325e`;
+- the paragraph on `chat/scripts/install-identities` and its options;
+- the other skills and tools it names (`project-manager`, `modelclass`,
+  `docs-push`).
+
+Plateia-only files added with PLT-15:
+
+- `test_skill_guidance.py` reads `pchat`'s own argument parsers and checks
+  that every `pchat` subcommand and option the guidance mentions exists, and
+  that its list of post types is `pchat`'s;
+- `test_replay_dedup.py` shows message-ID deduplication after acceptance
+  recovery, across a crash and a restart.
+
+Not captured, by design: `install-identities` is excluded from every capture
+(D-20).
 
 ## Running the tests
 
@@ -78,7 +120,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -W error::ResourceWarning -m unittest disco
 ```
 
 The first command is the captured suite plus plateia's tests of captured
-behavior. The second is the capture tooling. Neither needs an IRC server,
+behavior. CI also requires, by name, that `test_binding`, `test_identities`,
+`test_silence`, `test_start_kind`, `test_bridge`, `test_receipt_experiment`
+and `test_rotate_logs` each ran. The second is the capture tooling. Neither needs an IRC server,
 cmux, the network or the real home directory. `_isolation` gives each run a
 throwaway home and refuses any access to live state.
 
@@ -94,8 +138,8 @@ partway.
 python3 -B packages/chat/drift_check.py ~/.codex/skills          # or --json
 ```
 
-It compares the skills repository's working tree under `chat/scripts/`, minus
-the listed exclusions, against the recorded baseline. It reports changed,
+It compares the skills repository's working tree under `chat/`, minus the
+listed exclusions, against the recorded baseline. It reports changed,
 missing, added and type- or mode-changed files, and changed symlink targets,
 without following links. Paths are relative to the tree. It never writes and
 never fixes anything.
@@ -104,4 +148,9 @@ Exit status: `0` means no drift, `1` means drift, `2` means the check could
 not finish. An unreadable input or a missing tree is reported as an error,
 never as "no drift".
 
-At PLT-9's capture (2026-10-08) the live tree reported no drift.
+A file that matches the commit carried in for it is still reported, as
+`changed (matches carried commit <commit>)`.
+
+At PLT-9's capture (2026-10-08) the live tree reported no drift. At PLT-15's
+capture (2026-10-08) it reported one difference, `chat/SKILL.md`, changed
+(matches carried commit `8ff325e`), and nothing else.
