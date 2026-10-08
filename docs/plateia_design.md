@@ -1483,6 +1483,20 @@ Owner signoff in this conversation, 2026-10-08: the PLT-1 and PLT-17 delivery
 entries, as recorded under D-38, are approved. This settles Q-11 for these two
 slices.
 
+### D-40. Plateia ships manager and worker mechanisms; the owner applies skill changes
+
+Owner decision in this conversation, 2026-10-08: for PLT-3 and PLT-4, plateia
+ships the shared mechanism (card control, reconcile and pause/resume commands
+and API) through the normal release path. Each PR is accompanied by a written,
+reviewed specification of the required manager or worker skill change, with no
+private content. After activation, the owner, or a session the owner chooses,
+applies that change in the local skills repository, consistent with D-27:
+plateia tooling never commits there.
+
+Capturing the manager skill into plateia first was not selected: it would
+reopen D-17 and delay every card slice. Capturing only the manager guidance
+was rejected: one skill would come from two sources, the drift D-23 removed.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -2103,31 +2117,40 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 
 ### PLT-3. Reconcile ordered card intent before manager dispatch
 
-- **Outcome:** a manager adopts the latest card intent without starting
-  duplicate work, and persists shared Hold/resume control for later stages.
-- **Scope:** correlate receipts with exact manager dispositions; reconcile
-  existing claims/worktree/PR/session before dispatch; supersede stale moves;
-  establish durable card control and execution association shared with
-  non-web callers. Keep manager scheduling and canonical claims/gates.
-- **Owning repository:** `coghex/plateia` (D-7); package/thin-entry-point route
-  is D-15/D-16/D-17. Include required focused manager guidance with this PR;
-  no wholesale skill migration is required.
+- **Outcome:** shared card control and a reconcile step let a manager adopt a
+  card's latest intent without starting duplicate work, and Hold persists as
+  control for later stages.
+- **Scope:** a durable card-control store shared with non-web callers: each
+  card's latest requested state and revision, Hold inhibition, and the link
+  from a card to its claim, worktree, PR and session. A `pchat card reconcile`
+  command and API call returns the latest intent, superseded moves (marked by
+  PLT-1), existing work to adopt, and whether a new dispatch is allowed; the
+  manager records accepted, blocked and refused through the API (D-36), and a
+  helper posts the D-32 pointer for grouped work. Unreadable control reports
+  unknown and allows no new dispatch (D-10). Manager scheduling and canonical
+  claims and gates are unchanged. Per D-40, the PR is accompanied by a written
+  specification of the manager-side change (when to reconcile, which states
+  to record, the pointer rule), with no private content, landed with
+  `docs-push` and linked from the PR before its final review; the owner
+  applies the manager change in the skills repository after activation.
+- **Owning repository:** `coghex/plateia` (D-7) for the mechanism; the
+  manager skill stays in the local skills repository (D-17, D-40).
 - **Phase:** shared orchestration prerequisite.
 - **Depends on:** PLT-1.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-3, D-4, D-5, D-6, D-7, D-8, D-10, D-31, D-32,
-  D-36 (manager records accepted, blocked and refused).
-- **Acceptance signals:** repeated deliveries and manager replacement reuse
-  one execution; Solve/Hold/Solve accumulated before dispatch acts only on
-  the latest intent; obsolete requests get durable dispositions; a Hold
-  suppresses new dispatch without releasing work or approvals; refusal and
-  never-accepted requests remain visible; Solve/merge intent, resume and
-  approval do not start a stopped drainer; only an explicit owner start request
-  permits startup through shared tooling.
-- **Out of scope:** worker safe-pause implementation, drainer merge checks,
-  board order and browser interaction.
-- **Open questions:** Q-11 (Q-14 resolved for issue cards by D-31 to D-37);
-  deployment follows C-7/Q-12. **Stop before processing.**
+  D-36 (manager records accepted, blocked and refused), D-40.
+- **Acceptance signals:** with synthetic cards and invented work, repeated
+  deliveries and a replaced manager adopt one execution; Solve, Hold, Solve
+  accumulated before dispatch acts only on the latest intent; a Hold blocks
+  new dispatch without releasing work or approvals; refused and never-accepted
+  requests stay visible; unreadable control blocks dispatch and reads as
+  unknown, not held; no move, resume or approval starts a stopped drainer; the
+  specification names every manager step it changes.
+- **Out of scope:** worker and review-loop safe pause (PLT-4), merge checks
+  (PLT-5), committing in the skills repository, board order and the browser.
+- **Open questions:** Q-11 for signoff of this entry; deployment follows
+  C-7/Q-12. **Stop before processing.**
 
 ### PLT-4. Pause and resume workers and review loops at safe boundaries
 
@@ -2137,13 +2160,13 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   loop boundaries, persist recovery context and correlated pause/resume
   evidence, and prevent the next stage while held. Retain branch, worktree,
   uncommitted work, PR, claim and review evidence; keep freshness gates.
-- **Owning repository:** `coghex/plateia` (D-7); focused skill guidance and
-  shared hooks follow D-15/D-16/D-17. Keep migration and new execution behavior
-  reviewable (Q-11) without a full skill-source migration prerequisite.
+- **Owning repository:** `coghex/plateia` (D-7) for the shared mechanism;
+  worker and review-loop skill changes follow D-40: a written specification
+  accompanies the PR, and the owner applies it in the skills repository.
 - **Phase:** shared execution prerequisite.
 - **Depends on:** PLT-3.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-4, D-5, D-7, D-10.
+- **Relevant decisions:** D-2, D-4, D-5, D-7, D-10, D-40.
 - **Acceptance signals:** Hold during an in-flight step yields pause pending
   until a safe checkpoint; no forced terminal edit/kill; replayed Hold does
   not lose work; newer Solve resumes the same execution/artifacts; a missing
