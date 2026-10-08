@@ -1497,6 +1497,11 @@ Capturing the manager skill into plateia first was not selected: it would
 reopen D-17 and delay every card slice. Capturing only the manager guidance
 was rejected: one skill would come from two sources, the drift D-23 removed.
 
+### D-41. PLT-3 entry approved as written
+
+Owner signoff in this conversation, 2026-10-08: the PLT-3 delivery entry, as
+rewritten under D-40, is approved. This settles Q-11 for PLT-3.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1601,7 +1606,8 @@ splits it into PLT-9 (core) and PLT-15 (bridge), excluding `install-identities`.
 D-21 keeps the receipt experiment in PLT-15 as is. **Q-11 is resolved for
 PLT-9 and PLT-15 (D-22, amended by D-24), PLT-11 (D-25), PLT-12 (D-26) and
 PLT-14 (D-27), PLT-10 and PLT-16 (D-28, D-29), PLT-13 (D-30), and PLT-1 and
-PLT-17 (D-38, D-39)**, in D-23's order. PLT-3 to PLT-7, PLT-2 and PLT-8 remain
+PLT-17 (D-38, D-39), and PLT-3 (D-40, D-41)**, in D-23's order. PLT-4 to
+PLT-7, PLT-2 and PLT-8 remain
 unsigned, as does the first browser boundary below.
 
 The first browser slice is proposed to cover the specified existing-approved
@@ -2149,8 +2155,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   specification names every manager step it changes.
 - **Out of scope:** worker and review-loop safe pause (PLT-4), merge checks
   (PLT-5), committing in the skills repository, board order and the browser.
-- **Open questions:** Q-11 for signoff of this entry; deployment follows
-  C-7/Q-12. **Stop before processing.**
+- **Open questions:** None; boundary approved by D-41; deployment follows
+  C-7/Q-12. **Stop before processing** until the design is ready.
 
 ### PLT-4. Pause and resume workers and review loops at safe boundaries
 
