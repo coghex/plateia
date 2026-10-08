@@ -1604,6 +1604,11 @@ part:
 Unassigning on release was not selected: it erases the attribution record for
 no gain.
 
+### D-48. PLT-18 entry approved as written
+
+Owner signoff in this conversation, 2026-10-08: the PLT-18 delivery entry, as
+updated under D-47, is approved. This settles Q-11 for PLT-18.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1712,8 +1717,8 @@ D-21 keeps the receipt experiment in PLT-15 as is. **Q-11 is resolved for
 PLT-9 and PLT-15 (D-22, amended by D-24), PLT-11 (D-25), PLT-12 (D-26) and
 PLT-14 (D-27), PLT-10 and PLT-16 (D-28, D-29), PLT-13 (D-30), and PLT-1 and
 PLT-17 (D-38, D-39), PLT-3 (D-40, D-41), PLT-4 (D-42, D-43), and PLT-5,
-PLT-19 and PLT-20 (D-44 to D-46)**, in D-23's order. PLT-18, PLT-6, PLT-7,
-PLT-2 and PLT-8 remain
+PLT-19 and PLT-20 (D-44 to D-46), and PLT-18 (D-47, D-48)**, in D-23's order.
+PLT-6, PLT-7, PLT-2 and PLT-8 remain
 unsigned, as does the first browser boundary below.
 
 The first browser slice is proposed to cover the specified existing-approved
@@ -2369,8 +2374,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Out of scope:** the running worker (PLT-19); PR-only and
   replacement-PR completion rules (Q-7); displaying the closed-issue fallback,
   which belongs to the projection (PLT-6).
-- **Open questions:** Q-11 for signoff of this entry (Q-7 coverage resolved
-  by D-47). **Stop before processing.**
+- **Open questions:** None; boundary approved by D-48 (Q-7 coverage resolved
+  by D-47). **Stop before processing** until the design is ready.
 
 ### PLT-19. Run fresh finalization in an explicit-start shared merge worker
 
@@ -2571,8 +2576,9 @@ for issue cards; D-38/D-39 split PLT-1 (adding PLT-17) and approve both.
 D-40 to D-43 settle how manager and worker changes ship and approve PLT-3 and
 PLT-4 (Hold by inbox message plus a Python pre-action hook). D-44 to D-46
 split finalization into PLT-5, PLT-18, PLT-19 and PLT-20, resolve Q-16 and
-approve all but PLT-18. Next: Q-7 (cleanup coverage) for PLT-18, then PLT-6,
-PLT-7, PLT-2, PLT-8 and the first browser boundary.
+approve all but PLT-18; D-47/D-48 settle cleanup coverage and approve
+PLT-18. Next: PLT-6 (with P-3 and the rest of Q-7), PLT-7, PLT-2, PLT-8, Q-6
+and the first browser boundary.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
