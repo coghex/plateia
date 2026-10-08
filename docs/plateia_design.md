@@ -1655,6 +1655,22 @@ nor acknowledged, and a late move could land after things changed); refusing
 moves made from an out-of-date view (friction, and clients would send the
 revision they saw); a dismiss that hides failures (against V-12).
 
+### D-52. Default freshness thresholds
+
+Owner decision in this conversation, 2026-10-08, settling the rest of Q-6. All
+values are configurable defaults applied by PLT-6 and displayed by PLT-7 and
+PLT-8.
+
+| Source | Refresh | Stale after | Unknown after |
+| --- | --- | --- | --- |
+| GitHub issues, PRs, checks, labels | polled every 60 s per project with conditional requests; backs off to 5 min on errors or rate limits | 5 min without a successful refresh | 30 min, or at once on an authentication failure |
+| Chat connection (bridge to page) | live; "reconnecting" shown at once on a drop | 1 min without the bridge heartbeat | 5 min |
+| Agent sessions and presence | shared identity and session records | 2 min | 10 min |
+| Merge worker, cleanup journal, card control | their shared records | 2 min | 10 min; unreadable control is unknown at once (D-10) |
+
+A stale fact still shows its last value marked with its age; an unknown fact
+is no longer shown as current. Neither ever becomes success by itself (V-12).
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1703,8 +1719,8 @@ settle these details before a production browser slice.
 
 **Partly resolved by D-51, 2026-10-08:** disconnected moves, concurrent
 devices, conflict presentation and failure acknowledgement. Snapshot and
-change replay are D-49. Still open: observation-age thresholds and polling
-defaults.
+change replay are D-49. **Fully resolved by D-52, 2026-10-08:** default
+observation-age thresholds and polling.
 
 ### Q-7. How are completion and late controls resolved?
 
