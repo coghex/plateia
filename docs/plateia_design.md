@@ -13,7 +13,7 @@ concrete precondition
 
 ## Processing status
 
-- [ ] EPIC. Make plateia the owner's trustworthy chat and work board
+- [ ] EPIC. Build the shared chat foundation and the first board card lifecycle
 - [ ] PLT-9. Capture the shared chat identity and transport core
 - [ ] PLT-15. Capture the shared chat bridge
 - [ ] PLT-11. Build immutable pinned shared-package releases
@@ -74,13 +74,21 @@ status, not the decision. Still no tracker artifacts exist for this design.
 
 ## Epic contract
 
-- **Goal:** the owner can direct work from a phone or desktop through chat,
-  with a board that distinguishes requested intent from verified progress.
-- **Done when:** the vision's mid-term chat, board, notification and setup
-  scope works on both devices; V-12 recovery guarantees are demonstrated;
-  workflow delivery and execution continue without plateia (V-13).
+- **Goal:** the shared chat code has one reviewed, released home in plateia,
+  and the owner can move an issue card Solve → Hold → Solve from a phone or
+  desktop board that distinguishes requested intent from verified progress,
+  through review, merge, cleanup and Done (D-58).
+- **Done when:** PLT-21's invented #41/#57 walk works on phone and desktop;
+  V-12's five guarantees are demonstrated for that walk, including separate
+  and combined plateia, bridge and browser outages; shared delivery, Hold and
+  execution keep working with the plateia web process stopped (V-13); and the
+  shared chat code runs from an activated plateia release.
 - **Users and operators:** one owner; existing managers, workers, review
-  services and the drainer carry out the work.
+  services and the shared merge worker carry out the work.
+- **Not this epic:** the rest of the vision's mid-term scope (Approve and
+  Inbox cancel, PR-only cards, direct addressing, chat posting, search,
+  reactions and images, unread and "needs you" views, browser push and the
+  setup script) stays required in the vision and is designed as later epics.
 - **Arc label:** None proposed.
 
 ## Current state and evidence
@@ -465,9 +473,9 @@ No implementation, issue drafting, workflow execution or publication.
 
 The rest of mid-term scope remains in the vision: Approve and Inbox cancel,
 PR-only cards, direct addressing, chat search/reactions/images, unread/needs-you
-views, push and setup. Whether any of these is necessary in the first delivery
-must be settled through Q-11 rather than silently included or excluded. The
-vision's out-of-scope items remain out of scope.
+views, push and setup. D-58 (2026-10-08) places all of it outside this epic,
+as later epics designed when the owner reaches them; nothing is dropped from
+the vision. The vision's out-of-scope items remain out of scope.
 
 ## Design: contracts derived from the walk
 
@@ -1720,6 +1728,22 @@ Owner signoff in this conversation, 2026-10-08: the PLT-8 and PLT-21 delivery
 entries, as recorded under D-56, are approved. With this every slice in the
 delivery plan has an approved boundary and Q-11 is resolved.
 
+### D-58. Narrow this epic to the shared foundation and first card lifecycle
+
+Owner decision in this conversation, 2026-10-08: this design's epic covers the
+21 approved slices: the shared chat foundation and release path, card-move
+submission and control, fresh finalization, the status view, plateia's board
+backend, the framework bake-off, the read-only board and card moves. Its done
+condition is PLT-21's walk on phone and desktop with V-12 demonstrated, shared
+work continuing without plateia, and the shared chat code running from an
+activated plateia release. The rest of the vision's mid-term scope stays
+required in the vision and is designed as later epics.
+
+Designing all remaining mid-term features before readiness was not selected:
+many more sessions before anything could be filed. Keeping the full epic with
+these slices as a first phase was not selected: the epic couldn't satisfy its
+own done condition for a long time.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -2760,8 +2784,8 @@ approve all but PLT-18; D-47/D-48 settle cleanup coverage and approve
 PLT-18; D-49/D-50 approve P-3 and PLT-6; D-51/D-52 resolve Q-6; D-53
 approves PLT-7; D-54/D-55 approve the PLT-2 bake-off; D-56/D-57 make the
 first browser delivery a read-only board (PLT-8) followed by card moves
-(PLT-21) and resolve Q-11. Next: readiness, including whether the epic
-contract matches the 21 slices.
+(PLT-21) and resolve Q-11. D-58 narrows the epic to these 21 slices. Next:
+explicit owner readiness signoff.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
