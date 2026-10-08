@@ -33,16 +33,18 @@ concrete precondition
 - [ ] PLT-6. Project the card's real lifecycle from shared evidence
 - [ ] PLT-7. Persist board intent and reconcile shared receipts in plateia
 - [ ] PLT-2. Compare page frameworks with the same recovery prototype
-- [ ] PLT-8. Deliver the first browser card lifecycle on phone and desktop
+- [ ] PLT-8. Deliver the read-only board on phone and desktop
+- [ ] PLT-21. Move cards on the board
 
 These IDs are stable conversation and processing cursors; existing PLT-2
 retains its bake-off meaning despite appearing later in dependency order.
 The owner approved shared prerequisites before the plateia card slice (D-5).
-The twenty proposed boundaries below are not all approved, and none is ready
+The twenty-one proposed boundaries below are not all approved, and none is ready
 for issue processing; PLT-15 (2026-10-08) holds the bridge half of the former
 PLT-9 (D-20), PLT-16 the evidence half of the former PLT-10 (D-28), and PLT-17 the
 terminal and record half of the former PLT-1 (D-38); PLT-18 to PLT-20 split
-finalization (D-44). New code is plateia-owned (D-7); the merger starts fresh
+finalization (D-44); PLT-21 splits card moves from the read-only board
+(D-56). New code is plateia-owned (D-7); the merger starts fresh
 from finalize (D-9), rather than porting the existing drainer. Finalizer runtime
 ownership is approved (D-12); approval continuity and its metadata-only initial
 boundary are selected (D-14/D-18). D-15/D-16/D-17 settle distribution, the
@@ -1701,6 +1703,17 @@ Owner signoff in this conversation, 2026-10-08: the PLT-2 delivery entry, as
 rewritten under D-54, is approved. This settles Q-11 for PLT-2; Q-4 stays open
 by design until the comparison.
 
+### D-56. The first browser delivery is a read-only board, then card moves
+
+Owner decision in this conversation, 2026-10-08, settling Q-11's first
+user-visible boundary: PLT-8 delivers the read-only board (baskets, requested
+versus observed state, stale, unknown, overtaken and failure states, links,
+owner order, reconnect, failure acknowledgement, read-only card rooms); a new
+PLT-21 then adds Solve, Hold and resume moves and demonstrates the full
+invented #41 walk. Keeping one slice was not selected: the whole board plus
+every move and recovery path in one review. Adding room posting from the
+browser was not selected: it pulls general chat into the first slice.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -2631,34 +2644,63 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Open questions:** Q-4 by design until the comparison; boundary approved
   by D-55. **Stop before processing** until the design is ready.
 
-### PLT-8. Deliver the first browser card lifecycle on phone and desktop
+### PLT-8. Deliver the read-only board on phone and desktop
 
-- **Outcome:** the owner can move the first issue card Solve → Hold → Solve
-  and see real review, merge, cleanup and Done through the chosen page stack.
-- **Scope:** display requested versus observed state, queued/delivered/accepted
-  and unresolved failures, safe Hold/resume progress, issue/PR links, owner
-  order, automatic connection recovery and receipt reconciliation. Minimal
-  main/request-room context keeps every move traceable to chat.
+- **Outcome:** the owner can see every issue card's requested place beside
+  what is actually happening, on phone and desktop, in the chosen page
+  framework.
+- **Scope:** baskets and cards over PLT-7's interface; requested versus
+  observed state with stale, unknown (D-52), overtaken and failure states;
+  issue and PR links; owner card order by drag, which is presentation only and
+  never an instruction (V-7); automatic reconnect with a visible connection
+  state; failure acknowledgement without hiding (D-51); each card's room shown
+  read-only with a link. Unsupported associations show as unsupported (D-49).
 - **Owning repository:** `coghex/plateia`.
-- **Phase:** first production browser card slice.
+- **Phase:** first production browser slice.
 - **Depends on:** PLT-2, PLT-7, PLT-12, PLT-14; these transitively require the
-  shared lifecycle and release contracts. Eventual real installation/activation
-  remains separately held.
+  shared lifecycle and release contracts. Real installation and activation
+  remain separately held.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-1 through D-18; add the framework decision after
-  the bake-off, before processing this child.
-- **Acceptance signals:** the entire invented #41/#57 walk is demonstrated
-  on phone and desktop, including separate/combined plateia, bridge and browser
-  outages; acknowledged moves survive and retries start no duplicate work;
-  pending/stale/unknown and overtaken states are explicit; known cleanup debt
-  prevents Done; shared work continues while the web application is stopped;
-  Solve/Hold/resume/approval with a stopped drainer leaves it stopped and the
-  card waiting for merge until the owner explicitly asks for startup.
-- **Out of scope:** proposed later deliveries for Approve/Inbox cancel,
-  PR-only and complex linking, direct-address UI, full chat extras, push and
-  setup; these remain required mid-term scope, not removed from the vision.
-- **Open questions:** Q-6, Q-7, Q-11 and the framework decision from
-  Q-4. **Stop before processing.**
+- **Relevant decisions:** D-2, D-49, D-51, D-52, D-56, and the framework
+  decision PLT-2 records, which must exist before processing this slice.
+- **Acceptance signals:** with invented data, phone and desktop show the same
+  cards and states; a plateia, bridge or browser outage shows stale or
+  unknown, never current; reconnect is automatic; owner order persists and
+  dispatches nothing; acknowledged failures stay visible; known cleanup debt
+  keeps a card from Done; a stopped merge worker shows waiting; the page binds
+  through localhost and Tailscale only; no gesture in this slice posts to chat.
+- **Out of scope:** card moves (PLT-21), posting in rooms, Approve and Inbox
+  cancel, PR-only and complex linking, direct-address UI, full chat, push and
+  setup; these remain required mid-term scope.
+- **Open questions:** Q-11 for signoff of this entry; Q-4's framework decision
+  from PLT-2. **Stop before processing.**
+
+### PLT-21. Move cards on the board
+
+- **Outcome:** the owner can move an issue card Solve → Hold → Solve on phone
+  and desktop and see real review, merge, cleanup and Done, with every move
+  traceable to chat.
+- **Scope:** Solve, Hold and resume gestures through PLT-7's move call;
+  pending, queued, delivered and accepted states and the D-36 request states;
+  no moves while disconnected and "not confirmed" recovery by operation ID
+  (D-51); the multi-device notice; the move visible in the card's room.
+- **Owning repository:** `coghex/plateia`.
+- **Phase:** first browser card-lifecycle slice.
+- **Depends on:** PLT-8.
+- **Ordering:** critical path.
+- **Relevant decisions:** D-2, D-6, D-11, D-31, D-33, D-36, D-51, D-56, and the
+  PLT-2 framework decision.
+- **Acceptance signals:** the entire invented #41/#57 walk is demonstrated on
+  phone and desktop, including separate and combined plateia, bridge and
+  browser outages; acknowledged moves survive and retries start no duplicate
+  work; pending, stale, unknown and overtaken states are explicit; a
+  disconnected page offers no move; Solve, Hold, resume or approval with a
+  stopped merge worker leaves it stopped and the card waiting until the owner
+  explicitly asks for startup.
+- **Out of scope:** posting free text in rooms, Approve and Inbox cancel, push
+  and setup.
+- **Open questions:** Q-11 for signoff of this entry. **Stop before
+  processing.**
 
 ## Handoff
 
