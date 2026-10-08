@@ -1676,6 +1676,25 @@ is no longer shown as current. Neither ever becomes success by itself (V-12).
 Owner signoff in this conversation, 2026-10-08: the PLT-7 delivery entry, as
 updated for D-49 to D-52, is approved. This settles Q-11 for PLT-7.
 
+### D-54. Bake-off candidates and delivery
+
+Owner decision in this conversation, 2026-10-08: PLT-2 compares three
+candidates that differ in how much lives in the browser: htmx with
+server-rendered templates (live updates over server-sent events), Svelte as a
+static single-page app, and React with Vite. Each must support touch
+drag-and-drop on the phone, Home Screen installation with web push (V-10),
+automatic reconnect and a clean boundary with the Python server, and each
+builds the same prototype against PLT-7's interface: a card move with receipt
+recovery, stale and unknown display, automatic reconnect, visible failures and
+acknowledgement, the multi-device notice, and phone and desktop parity.
+
+Each prototype lives on its own unmerged, tagged branch and is never merged
+(Q-4: synthetic and disposable). The comparison write-up, with evidence and
+links to the tags, lands with `docs-push`; the slice completes when the owner
+records the framework choice as a decision in this design. Merging prototypes
+under a `prototypes/` folder, or one PR with all three, was not selected:
+disposable code would land in `master` and carry CI.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1701,7 +1720,7 @@ mutation is authorized by this decision.
 ### Q-4. Which page framework wins the V-12 bake-off?
 
 Deliberately open for PLT-2, after the lifecycle and recovery contracts settle.
-Choose candidates later, build the same small prototype in each, and compare
+Candidates and delivery are D-54 (2026-10-08); build the same small prototype in each, and compare
 with the owner. The prototype should exercise a card move, receipt recovery,
 stale state, automatic reconnect, visible failures and phone/desktop use.
 Keep it synthetic and disposable; do not choose a framework in PLT-1 or turn
@@ -2578,24 +2597,33 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 
 ### PLT-2. Compare page frameworks with the same recovery prototype
 
-- **Outcome:** one reviewable comparison artifact with reproducible synthetic
-  prototypes, evidence and an explicit owner framework decision; candidate
-  count and work boundary need confirmation before processing.
-- **Scope:** identical lifecycle/recovery interactions on phone and desktop;
-  compare mature open-source candidates against V-12, maintainability and the
-  Python server boundary.
+- **Outcome:** three reproducible synthetic prototypes and one comparison
+  write-up let the owner choose the production page framework, recorded as a
+  decision in this design.
+- **Scope:** per D-54, build the same prototype against PLT-7's interface in
+  htmx with server-rendered templates, Svelte as a static single-page app,
+  and React with Vite: a card move with receipt recovery, stale and unknown
+  display (D-52), automatic reconnect, visible failures and acknowledgement,
+  the multi-device notice (D-51), touch drag-and-drop, Home Screen
+  installation and a web-push smoke test, on phone and desktop. Compare
+  against V-12, maintainability and the Python server boundary. Each
+  prototype stays on its own unmerged, tagged branch; the comparison
+  write-up, with evidence and links to the tags, lands with `docs-push`.
+  Invented data only; no screenshots of the live system.
 - **Owning repository:** `coghex/plateia`.
-- **Phase:** later, after the shared lifecycle and plateia backend contracts.
+- **Phase:** after the shared lifecycle and plateia backend contracts.
 - **Depends on:** PLT-7.
 - **Ordering:** critical path for choosing the production page framework.
-- **Relevant decisions:** D-2, D-5.
-- **Acceptance signals:** comparable prototype results, restart/reconnect and
-  stale/failure evidence, phone/desktop parity, owner signoff on the choice.
-- **Out of scope:** a production framework decision before the comparison;
-  unrelated workflow execution changes.
-- **Open questions:** Q-4 deliberately left open until this later slice;
-  Q-6 for the exact interactions used in the comparison; Q-11 for its
-  one-PR scope. **Stop before processing until these are approved.**
+- **Relevant decisions:** D-2, D-5, D-49, D-51, D-52, D-54.
+- **Acceptance signals:** each candidate passes or visibly fails the same
+  interaction list; restart, reconnect, stale and failure evidence is
+  reproducible from its tag; phone and desktop parity is shown for each; no
+  prototype code is merged into `master`; the owner's framework decision is
+  recorded with its date.
+- **Out of scope:** choosing the framework before the comparison; production
+  UI; workflow changes.
+- **Open questions:** Q-4 by design until the comparison; Q-11 for signoff of
+  this entry. **Stop before processing.**
 
 ### PLT-8. Deliver the first browser card lifecycle on phone and desktop
 
