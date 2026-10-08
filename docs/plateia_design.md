@@ -1518,6 +1518,15 @@ Message-only enforcement was not selected: it relies on agent compliance and
 self-reported evidence. Hook-only enforcement was not selected: the agent
 would learn of the Hold only by being blocked.
 
+### D-43. PLT-4 approved as one slice
+
+Owner signoff in this conversation, 2026-10-08: the PLT-4 entry, as rewritten
+under D-42, is approved. The owner left splitting resume into its own slice to
+the design session's judgment; it was kept in PLT-4 because the plateia side of
+resume is small (the newer revision lifts PLT-3's control, the hook stops
+refusing, and the worker reads back its checkpoint) and because activating
+Hold without resume could leave a card paused with no way to continue.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1622,8 +1631,8 @@ splits it into PLT-9 (core) and PLT-15 (bridge), excluding `install-identities`.
 D-21 keeps the receipt experiment in PLT-15 as is. **Q-11 is resolved for
 PLT-9 and PLT-15 (D-22, amended by D-24), PLT-11 (D-25), PLT-12 (D-26) and
 PLT-14 (D-27), PLT-10 and PLT-16 (D-28, D-29), PLT-13 (D-30), and PLT-1 and
-PLT-17 (D-38, D-39), and PLT-3 (D-40, D-41)**, in D-23's order. PLT-4 to
-PLT-7, PLT-2 and PLT-8 remain
+PLT-17 (D-38, D-39), PLT-3 (D-40, D-41) and PLT-4 (D-42, D-43)**, in D-23's
+order. PLT-5 to PLT-7, PLT-2 and PLT-8 remain
 unsigned, as does the first browser boundary below.
 
 The first browser slice is proposed to cover the specified existing-approved
@@ -2213,8 +2222,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Out of scope:** merge eligibility (PLT-5), the projection and UI,
   committing in the skills repository, and general mid-step interruption,
   which the vision excludes.
-- **Open questions:** Q-11 for signoff of this entry; deployment follows
-  C-7/Q-12. **Stop before processing.**
+- **Open questions:** None; boundary approved by D-43; deployment follows
+  C-7/Q-12. **Stop before processing** until the design is ready.
 
 ### PLT-5. Build shared finalization from the finalize contract
 
@@ -2396,7 +2405,10 @@ activation's rollback and skills-repository commit rules). D-28/D-29 split
 the API work into PLT-10 (behavior-preserving API) and PLT-16 (attested
 evidence) and approve both; D-30 approves PLT-13. D-31 to D-37 resolve Q-14
 for issue cards; D-38/D-39 split PLT-1 (adding PLT-17) and approve both. Next
-for Q-11: PLT-3 onward and the first browser boundary.
+for Q-11: PLT-3 onward and the first browser boundary. D-40 to D-43 then
+settle how manager and worker changes ship and approve PLT-3 and PLT-4
+(Hold by inbox message plus a Python pre-action hook). Next: PLT-5, which
+also carries Q-7 and Q-16.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
