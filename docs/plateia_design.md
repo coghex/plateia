@@ -1420,6 +1420,27 @@ validation cost, and a way to send a bad value, for no current benefit. A
 Solve variant ending at an open PR was not selected: a new owner-facing choice
 the vision doesn't ask for.
 
+### D-36. Move request states, with superseded marked by the shared service
+
+Owner decision in this conversation, 2026-10-08: each move's request shows one
+of these states in its room and on the card.
+
+| State | Terminal | Meaning | Recorded by |
+| --- | --- | --- | --- |
+| accepted | no | the manager took responsibility for this move | manager, via today's exact-message reply/acknowledgement |
+| blocked | no | owner input needed or a failure stopped it; carries a reason; notifies under V-9 | manager |
+| refused | yes | the manager declined it, with a reason | manager |
+| superseded | yes | a newer move for the same card was submitted | shared submission service, when it allocates the newer revision |
+| satisfied | yes | the card verifiably reached what was asked (Solve: Done; Hold: verified safe pause and inhibition) | shared tooling, from evidence (PLT-6) |
+| overtaken | yes | reality got there first, such as a Hold after a confirmed merge (D-13) | shared tooling, from evidence (PLT-6) |
+
+Superseded is a fact of revision order, settled when the newer move is
+numbered, even if the manager is down; reminders for the older move stop then.
+Superseding doesn't itself stop work: what happens to work an older move
+started is the manager's call, and a newer Hold acts through shared control.
+Having the manager mark superseded during reconciliation was not selected:
+superseded moves would stay open, and keep reminding, until the manager acts.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1606,8 +1627,9 @@ the manager has grouped issues. **Request scope resolved by D-33:** one
 request per move, reused on retry. **Human-typed compatibility resolved by
 D-34:** only the submission service makes moves; a hand-typed envelope is
 flagged, never dispatched. **Endpoint resolved by D-35:** no endpoint field;
-Solve means D-6's path. Still open: PR-only cards (with Q-7) and the rest of
-the list above.
+Solve means D-6's path. **Acceptance and outcome states resolved by D-36.**
+Still open: PR-only cards (with Q-7), ID formats, escaping and size bounds,
+revision-conflict and duplicate responses, and snapshot/history lookup.
 
 ### Q-15. Who runs the fresh finalization step, and when?
 
@@ -1988,7 +2010,9 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   Each move is its own request, and a retry reuses its request ID (D-33);
   add a trace by card key alongside today's trace by request. Add the
   terminal `pchat card move` command; the bridge flags a hand-typed
-  `card-move/v1` line as not submitted and dispatches nothing (D-34).
+  `card-move/v1` line as not submitted and dispatches nothing (D-34). The
+  service marks an older move superseded when it numbers a newer one, and
+  stores each request's D-36 state.
   Include the approved contract and crash/replay evidence in this PR.
 - **Owning repository:** `coghex/plateia` (D-7); shared runtime independent
   of the plateia web process. D-15/D-16/D-17 and PLT-9, PLT-15, PLT-10 and PLT-11 establish
@@ -1997,7 +2021,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Depends on:** PLT-16 (D-28), PLT-11.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11, D-15, D-16, D-17, D-28,
-  D-31, D-32, D-33, D-34, D-35.
+  D-31, D-32, D-33, D-34, D-35, D-36.
 - **Acceptance signals:** synthetic non-web submission survives bridge/service
   restart and ambiguous send success; retries preserve the same logical move
   and receipt; mismatched duplicate content is visibly rejected; queued,
@@ -2022,7 +2046,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Phase:** shared orchestration prerequisite.
 - **Depends on:** PLT-1.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-3, D-4, D-5, D-6, D-7, D-8, D-10, D-31, D-32.
+- **Relevant decisions:** D-2, D-3, D-4, D-5, D-6, D-7, D-8, D-10, D-31, D-32,
+  D-36 (manager records accepted, blocked and refused).
 - **Acceptance signals:** repeated deliveries and manager replacement reuse
   one execution; Solve/Hold/Solve accumulated before dispatch acts only on
   the latest intent; obsolete requests get durable dispositions; a Hold
@@ -2109,7 +2134,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Phase:** lifecycle observation prerequisite.
 - **Depends on:** PLT-1, PLT-3, PLT-4, PLT-5.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-4, D-5, D-6, D-7, D-9, D-12, D-13.
+- **Relevant decisions:** D-2, D-4, D-5, D-6, D-7, D-9, D-12, D-13, D-36
+  (satisfied and overtaken come from this projection's evidence).
 - **Acceptance signals:** owner-started work is recognized; same issue/PR
   retains one identity; stale replay cannot overwrite newer evidence; an
   outage is unknown/stale rather than success; closed issue with known
