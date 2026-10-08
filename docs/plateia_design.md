@@ -477,6 +477,17 @@ views, push and setup. D-58 (2026-10-08) places all of it outside this epic,
 as later epics designed when the owner reaches them; nothing is dropped from
 the vision. The vision's out-of-scope items remain out of scope.
 
+**Map of later epics (non-binding, D-65):**
+
+| Later epic | Builds on |
+| --- | --- |
+| Approve and Inbox cancel moves | PLT-1 submission, PLT-3 control, PLT-4 pause, PLT-18 cleanup |
+| PR-only cards, replacement and multiple PRs | PLT-6 status view; Q-7's open rules |
+| Chat in the browser: posting, direct addressing (V-6), search, unread and "needs you", reactions, images | PLT-16 evidence, PLT-17 trace, PLT-8 room view, D-64 trust boundary |
+| Browser push replacing ntfy (V-9) | PLT-6 failure facts; Q-18's interim choice |
+| Setup script for projects and machines (V-1) | PLT-11, PLT-12 and PLT-14 release path |
+| Cutover from the live drainer | PLT-19; a separate owner decision |
+
 ## Design: contracts derived from the walk
 
 These are required semantics, approved directions or explicitly labelled
@@ -1744,6 +1755,161 @@ many more sessions before anything could be filed. Keeping the full epic with
 these slices as a first phase was not selected: the epic couldn't satisfy its
 own done condition for a long time.
 
+### D-59. The submission receipt governs intent; inhibition takes effect at submission
+
+Design-session decision under the owner's 2026-10-08 delegation (the owner
+asked this session to verify an external review and decide the revisions);
+the owner may revise it. Review item 1.
+
+The shared submission receipt (PLT-1) is the authority for owner intent, and
+its revision order decides the latest intent. **Permission to inhibit and
+permission to start differ.** When the service numbers a move away from Solve
+(Hold, and later Inbox), it writes the card's inhibition in the same durable
+step, before chat publication, so new managed work stops at once even if
+chat or the manager is down. A newer Solve never lifts inhibition or permits a
+start by itself: starting work needs the manager's acceptance and a PLT-3
+dispatch. Chat publication follows from the receipt and retries until posted;
+until then the card shows "Hold in effect, not yet in chat", and a publication
+that keeps failing is a visible failure. The record stays complete because the
+receipt is always eventually posted, never dropped.
+
+Every execution boundary reads the shared card control and nothing else:
+manager dispatch (PLT-3), the pre-action hook (PLT-4), the finalizer (PLT-5)
+and cleanup gating (PLT-18). Plateia's board database never governs execution.
+Example: Solve r1 is published and Hold r2 is durably submitted but not yet in
+chat; inhibition is already active, so nothing new is dispatched under r1, and
+an action already running finishes as D-10 allows.
+
+### D-60. One live execution per card, fenced by generation
+
+Design-session decision under the owner's 2026-10-08 delegation (the owner
+asked this session to verify an external review and decide the revisions);
+the owner may revise it. Review items 3 and 5.
+
+The shared card control holds at most one live execution per card, numbered by
+an execution generation. Dispatch is a single compare-and-set ("start
+generation g+1 for card C at revision R"), which succeeds only if no live
+execution exists, R is the latest intent, and the card isn't inhibited; a
+second manager's attempt fails and adopts the existing execution. Manager
+exclusivity reuses the identity registry's existing guard against a second
+live manager session; a replacement manager takes over only once the old
+session is confirmed gone. Launch intent (generation and run ID) is recorded
+before a worker is launched; after a crash between launch and recording its
+result, reconciliation uses the run store, session inventory and canonical
+claims (assignee or `wip` label, issue worktree, PR) to adopt the launch or
+mark it failed, and never launches again while the outcome is unknown.
+Canonical claims stay the GitHub-visible claim; the execution record links to
+them rather than replacing them.
+
+Every checkpoint, pause, merge and cleanup event carries card and generation.
+Events from an older generation are kept as history but never change current
+control, and the hook refuses a session bound to an older generation. A
+satisfied Solve is terminal (D-36), so a reopened issue carries no live
+authorization; new work needs a new move or an ordinary request.
+**No control record** means the card isn't board-governed and work proceeds
+under existing rules (owner-started work, chat requests); an **unreadable**
+control store blocks and reads as unknown (D-10).
+
+### D-61. What the Hold hook covers and when a pause is confirmed
+
+Design-session decision under the owner's 2026-10-08 delegation (the owner
+asked this session to verify an external review and decide the revisions);
+the owner may revise it. Review item 4; refines D-42.
+
+An action is one tool call in a Claude Code or Codex session. The hook runs
+before every tool call in a session bound to the card's current generation,
+including nested sub-agents in that session; PLT-4 verifies this per runtime,
+and a runtime that can't enforce it for nested agents is not used for
+board-governed work until it can (stop and ask). Child sessions launched by a
+bound worker inherit the binding through the launch path. A background job
+started before the Hold continues as part of its current action; the worker
+reports it in its checkpoint, the card shows "held, background job still
+running" until it ends, and its completion can't start a new stage because
+every next step is a checked tool call or dispatch.
+
+A Hold is **confirmed** when every bound session has checkpointed or ended,
+no tool call has been allowed since inhibition, and no reported background job
+is still running. Any later allowed activity reverts it to pause pending.
+**Stuck:** pause pending older than 30 minutes (configurable) becomes an
+unresolved failure on the card, "no safe checkpoint yet"; how the owner is
+told is Q-18.
+
+### D-62. Board recovery details for PLT-7
+
+Design-session decision under the owner's 2026-10-08 delegation (the owner
+asked this session to verify an external review and decide the revisions);
+the owner may revise it. Review item 2; clarifies D-11, D-37 and D-51.
+
+On startup PLT-7 lists shared receipts for each card newer than its stored
+revision (lookup by card key, D-37), so a submission whose web handler died is
+found without its operation ID. Board writes are revision-conditional: a write
+applies only if its revision is newer than the stored one, so a slow older
+handler changes nothing. A move call returns **rejected** (nothing submitted;
+safe to retry) or **uncertain** (a submission may exist; look it up); the page
+shows "not confirmed" only for uncertain. The page keeps the operation ID in
+memory and session storage; if it is lost, the card's server state is
+authoritative and no blind retry is offered. Retention follows D-37.
+
+### D-63. Card display rules and evidence ordering
+
+Design-session decision under the owner's 2026-10-08 delegation (the owner
+asked this session to verify an external review and decide the revisions);
+the owner may revise it. Review item 6; derived from V-7, V-8, D-13, D-36, D-47 and D-49.
+
+| Situation | Basket shown | Pending or failure shown | What changes it |
+| --- | --- | --- | --- |
+| Solve requested, manager refuses | Solve | refused, with reason, until the owner moves it | a new move |
+| Solve accepted, PR open, review running | In review | none | approval, or a new move |
+| Hold requested, review still running | Hold | pause pending; "review running" | D-61 confirmation |
+| Hold requested, merge confirmed, cleanup pending | Merge | "merged, cleanup pending"; Hold overtaken | PLT-18 obligations complete |
+| Approved, merge worker stopped | Merge | "waiting for the merge worker" | an explicit start (D-6) |
+| Solve satisfied (Done), issue later reopened | Inbox | "reopened"; previous history kept | a new move |
+| No board instruction, work started by hand | the observed phase | none | observed evidence |
+| Tracker unavailable, known cleanup debt | Merge | "cleanup pending" marked stale or unknown (D-52) | a fresh read |
+| Unsupported association (D-49) | Inbox | "unsupported association" | a later slice |
+
+The rule: while the latest request is Hold, the card sits in Hold until the
+Hold is satisfied or overtaken; while it is Solve, the card follows its
+observed phase (Solve, In review, Merge, Done); with no live request it
+follows the observed phase alone. Refused and blocked requests stay in their
+requested basket with the failure shown. Evidence is ordered within each
+source by that source's own sequence (revisions for intent, server order for
+chat, journal sequence for merges and cleanup, head commit and event IDs for
+GitHub), never across sources by wall-clock time. Terminal facts (merged,
+closed, cleanup complete) outrank earlier-phase observations; any other
+contradiction shows as "inconsistent evidence", never a guess.
+
+### D-64. The browser trust boundary
+
+Design-session decision under the owner's 2026-10-08 delegation (the owner
+asked this session to verify an external review and decide the revisions);
+the owner may revise it. Review item 11.
+
+The plateia server is reached only through localhost or `tailscale serve`,
+with a Host allowlist. A mutating call or a streaming connection needs either
+a localhost connection or the Tailscale identity headers that `tailscale
+serve` adds, matching the owner's tailnet login held in private configuration;
+the Origin must be plateia's own; mutating calls also need a custom request
+header and a JSON body, which ordinary cross-site forms can't send. Chat
+content is untrusted: it renders as text, links allow only http and https and
+open with `noopener noreferrer`, and nothing displayed can trigger a move.
+Synthetic tests prove that a cross-origin page and displayed message content
+cannot submit owner commands.
+
+### D-65. Bake-off covers room viewing; documentation lands with docs-push
+
+Design-session decision under the owner's 2026-10-08 delegation (the owner
+asked this session to verify an external review and decide the revisions);
+the owner may revise it. Review item 12.
+
+PLT-2's prototypes also render a card's room read-only with live messages and
+a long history scroll on the phone, since chat is the next major surface; no
+posting. Throughout the delivery plan, contracts, guidance and evidence
+documents land with `docs-push` and are linked from the PR before final review
+(AGENTS.md); tests, fixtures, and Markdown that code reads or agents execute
+(such as `SKILL.md`) stay in the PR. A lightweight map of later epics sits
+under "Scope and vision traceability".
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -2014,11 +2180,50 @@ does not silently approve the rest of the prior gate bundle.
 behind-base updates). Exact receipt and validator mechanics for carry-forward
 remain reviewed implementation in PLT-20.
 
+### Q-17. Is a request room the card's room? (V-2)
+
+Review item 7. V-2 gives each request its own room. D-31 puts every move for a
+card in that issue's channel, and D-33 makes each move its own request, so
+several requests share one room per card. Today's chat convention already
+names request channels by issue. The design needs the owner to confirm reading
+V-2's "request" as the card's work, the reopened-issue rule (same room,
+unarchived), and when the room is archived. **Blocks PLT-1 and PLT-17.**
+
+### Q-18. What does this epic notify, and how?
+
+Review item 10. The walk says an undeliverable Hold notifies (V-9), but browser
+push is outside this epic (D-58). The first slices produce new failure facts
+(undeliverable or never-accepted moves, stuck pauses, merge-worker incidents).
+Decide whether they reach the owner through the existing ntfy path until the
+push epic, or are board-only. A notifier must not depend on the failed
+component to report its own failure. **Blocks PLT-6 and PLT-21.**
+
+### Q-19. Does an explicit merge-worker start survive a crash or reboot?
+
+Review item 9. D-6 and D-12 allow the worker to run only after an explicit
+start, "until stopped". Decide whether a crash or reboot counts as stopped
+(another explicit start needed) or the supervisor restarts it because the
+owner's start still stands, and whether a blocked PR holds back later eligible
+PRs or is skipped visibly. Start and stop requests are deduplicated by request
+ID either way. **Blocks PLT-19.**
+
+### Q-20. Who records review baselines for approval carry-forward? (deliberately open)
+
+Review item 8. C-6 needs the original review to bind the approved spec and
+policy fingerprints; today's reviews don't, so every current approval is a
+legacy approval that requires a fresh review. The review producer lives in
+kanban's review tooling, and the validator is each repository's review-gate
+workflow. Changing kanban tooling needs an owner exception to D-7, or carry
+waits until plateia owns review publication. Until settled, carry never
+applies and a stripped approval needs a fresh review. **Blocks PLT-20 only,
+which is off the critical path.**
+
 ## Verification strategy
 
-Use invented projects, accounts, messages and tracker fixtures. Required
-evidence belongs in each implementation's own PR alongside code and contracts;
-no real dashboard captures or data in public artifacts.
+Use invented projects, accounts, messages and tracker fixtures. Tests and
+fixtures belong in each implementation's PR; contract and evidence documents
+land with `docs-push` and are linked from it (D-65). No real dashboard
+captures or data in public artifacts.
 
 Demonstrate the normal lifecycle and its failures at the observable receipt,
 chat, manager, worker, review, drainer and card boundaries. Inject process or
@@ -2060,9 +2265,12 @@ conflicting evidence; it never tests against real chat or schedules a poll.
 
 ## Delivery plan
 
-The order below is dependency-valid and follows D-5. The proposed child
-boundaries are deliberately narrower than the full card walk. They remain
-subject to Q-11 signoff; no entry is ready merely because it has this shape.
+The order below is dependency-valid and follows D-5. Every boundary is
+approved (Q-11). **Documentation landing (D-65):** wherever an entry says to
+include contracts, guidance or evidence in its PR, prose documents land with
+`docs-push` and are linked from the PR before final review; tests, fixtures,
+and Markdown that code reads or agents execute (such as `SKILL.md`) stay in
+the PR.
 
 ### PLT-9. Capture the shared chat identity and transport core
 
@@ -2337,26 +2545,30 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   D-37's constraints. It posts each move as one `card-move/v1` line in the
   card's issue channel (D-31, D-32), opening it through chat if needed, with
   no endpoint field (D-35); only this service makes moves (D-34). Callers use
-  the shared API. Include the contract and crash/replay evidence in this PR.
+  the shared API. It holds each card's latest intent and writes inhibition in
+  the same durable step that numbers a move away from Solve, before chat
+  publication (D-59); PLT-3 extends this record with execution ownership. Include the contract and crash/replay evidence in this PR.
 - **Owning repository:** `coghex/plateia` (D-7); shared runtime independent
   of the plateia web process.
 - **Phase:** shared delivery prerequisite; first card-move implementation target.
 - **Depends on:** PLT-16 (D-28), PLT-11.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11, D-15, D-16, D-17, D-28,
-  D-31, D-32, D-33, D-34, D-35, D-36, D-37, D-38.
+  D-31, D-32, D-33, D-34, D-35, D-36, D-37, D-38, D-59.
 - **Acceptance signals:** a synthetic move survives bridge or service restart
   and an uncertain send; a retry returns the same operation, request,
   revision and receipt; mismatched duplicates are visibly rejected and a move
   that would split is refused; a newer move marks the older one superseded
-  with the manager down; queued, delivered and exact-message accepted stay
+  with the manager down; a Hold inhibits new work at submission even while
+  chat is down, and shows "not yet in chat" until posted; queued, delivered
+  and exact-message accepted stay
   distinguishable; everything works with the plateia web process stopped;
   rollback to a pre-PLT-1 release leaves the receipt store intact, never
   deleted or rewound.
 - **Out of scope:** the terminal command, trace by card and hand-typed flag
   (PLT-17); manager execution changes; safe worker pause; drainer inhibition;
   plateia database and browser framework.
-- **Open questions:** None; boundary approved by D-39. **Stop before
+- **Open questions:** Q-17 (room semantics); boundary approved by D-39. **Stop before
   processing** until the design is ready.
 
 ### PLT-17. Add card moves to the terminal and the record
@@ -2377,7 +2589,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   order; a hand-typed move is flagged visibly and wakes no worker; existing
   `pchat` commands are unchanged.
 - **Out of scope:** manager behavior, Hold control, the browser.
-- **Open questions:** None; boundary approved by D-39. **Stop before
+- **Open questions:** Q-17 (room semantics); boundary approved by D-39. **Stop before
   processing** until the design is ready.
 
 ### PLT-3. Reconcile ordered card intent before manager dispatch
@@ -2392,7 +2604,11 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   PLT-1), existing work to adopt, and whether a new dispatch is allowed; the
   manager records accepted, blocked and refused through the API (D-36), and a
   helper posts the D-32 pointer for grouped work. Unreadable control reports
-  unknown and allows no new dispatch (D-10). Manager scheduling and canonical
+  unknown and allows no new dispatch (D-10). Execution ownership follows D-60:
+  one live execution per card, a compare-and-set dispatch by generation,
+  launch intent recorded before launch, and old-generation events kept as
+  history only; no control record means the card isn't board-governed.
+  Manager scheduling and canonical
   claims and gates are unchanged. Per D-40, the PR is accompanied by a written
   specification of the manager-side change (when to reconcile, which states
   to record, the pointer rule), with no private content, landed with
@@ -2404,14 +2620,18 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Depends on:** PLT-1.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-3, D-4, D-5, D-6, D-7, D-8, D-10, D-31, D-32,
-  D-36 (manager records accepted, blocked and refused), D-40.
+  D-36 (manager records accepted, blocked and refused), D-40, D-59, D-60.
 - **Acceptance signals:** with synthetic cards and invented work, repeated
   deliveries and a replaced manager adopt one execution; Solve, Hold, Solve
   accumulated before dispatch acts only on the latest intent; a Hold blocks
   new dispatch without releasing work or approvals; refused and never-accepted
   requests stay visible; unreadable control blocks dispatch and reads as
   unknown, not held; no move, resume or approval starts a stopped drainer; the
-  specification names every manager step it changes.
+  specification names every manager step it changes; two managers racing to
+  dispatch produce one execution; a crash between launch and recording is
+  adopted or marked failed, never relaunched blindly; an old-generation
+  event can't change control; work on a card with no control record is
+  unaffected.
 - **Out of scope:** worker and review-loop safe pause (PLT-4), merge checks
   (PLT-5), committing in the skills repository, board order and the browser.
 - **Open questions:** None; boundary approved by D-41; deployment follows
@@ -2443,7 +2663,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Phase:** shared execution prerequisite.
 - **Depends on:** PLT-3.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-4, D-5, D-7, D-10, D-40, D-42.
+- **Relevant decisions:** D-2, D-4, D-5, D-7, D-10, D-40, D-42, D-59, D-60, D-61.
 - **Acceptance signals:** with invented sessions, a Hold during an in-flight
   action lets it finish and refuses the next one; the checkpoint and pause
   report are still allowed; an agent that ignores the message is still
@@ -2452,7 +2672,11 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   unknown, not safely held; a newer Solve resumes the same execution and
   artifacts with no new claim, branch or PR; no terminal kill or forced prompt
   edit; it works with the plateia web process stopped; the hook is a Python
-  executable, not prompt or Markdown text.
+  executable, not prompt or Markdown text; nested sub-agents and child
+  sessions are covered or the runtime is refused (D-61); a pause reaches
+  confirmed only per D-61, and reverts on later allowed activity; a pause
+  pending past 30 minutes becomes a visible failure; a session bound to an
+  old generation is refused.
 - **Out of scope:** merge eligibility (PLT-5), the projection and UI,
   committing in the skills repository, and general mid-step interruption,
   which the vision excludes.
@@ -2477,7 +2701,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Depends on:** PLT-3.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-4, D-5, D-6, D-7, D-9, D-10, D-13, D-15, D-16,
-  D-44, D-45.
+  D-44, D-45, D-59, D-60 (reads only shared card control; events carry the
+  execution generation).
 - **Acceptance signals:** a gate refusal mutates nothing; a held or
   unknown-control PR never begins a merge; the merge is bound to the reviewed
   head; an ambiguous network result reconciles against actual tracker facts
@@ -2508,7 +2733,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Phase:** shared finalization prerequisite.
 - **Depends on:** PLT-5.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-7, D-9, D-10, D-13, D-44, D-47.
+- **Relevant decisions:** D-2, D-7, D-9, D-10, D-13, D-44, D-59, D-60, D-47.
 - **Acceptance signals:** a restart resumes only outstanding obligations and
   never re-solves; incomplete cleanup is visible debt, not success; a late
   Hold is overtaken while cleanup continues; unreadable control blocks the
@@ -2542,7 +2767,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   worker visibly; only one active merge authority per repository.
 - **Out of scope:** cutover from the live drainer, which needs a separate
   owner decision; installing or starting the worker on the owner's machine.
-- **Open questions:** None; boundary approved by D-46. **Stop before
+- **Open questions:** Q-19 (restart after crash or reboot; blocked PRs);
+  boundary approved by D-46. **Stop before
   processing** until the design is ready.
 
 ### PLT-20. Update behind PRs and carry approval across proven-equivalent updates
@@ -2567,9 +2793,14 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Acceptance signals:** a conflict-free update produces the expected merge
   tree and never resolves a conflict; the C-6 fixture families pass; no label
   is restored without a validated receipt; current-head CI is still required.
+- **External dependencies:** the review producer must bind spec and policy
+  fingerprints at review time, and each repository's review-gate workflow
+  must recognize carry receipts; repositories without that support get no
+  carry (Q-20).
 - **Out of scope:** broader base-drift rules beyond D-18; manual conflict
   resolution; merging.
-- **Open questions:** None; boundary approved by D-46. **Stop before
+- **Open questions:** Q-20 (deliberately open; who records review baselines);
+  boundary approved by D-46. **Stop before
   processing** until the design is ready.
 
 ### PLT-6. Project the card's real lifecycle from shared evidence
@@ -2588,14 +2819,16 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   caching, backoff and rate-limit awareness; intervals and staleness
   thresholds are configurable. PR-only and replacement or multiple PR
   associations show as unsupported. Don't build a second workflow engine or
-  infer state from terminal prose.
+  infer state from terminal prose. Display and evidence ordering follow D-63's
+  table and rules.
 - **Owning repository:** `coghex/plateia` (D-7). The workflow facts remain
   shared, independent of the web process; presentation consumes them.
 - **Phase:** lifecycle observation prerequisite.
 - **Depends on:** PLT-1, PLT-3, PLT-4, PLT-5, PLT-18 (D-44).
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-4, D-5, D-6, D-7, D-9, D-12, D-13, D-36
-  (satisfied and overtaken come from this projection's evidence), D-47, D-49.
+  (satisfied and overtaken come from this projection's evidence), D-47, D-49,
+  D-60, D-63.
 - **Acceptance signals:** owner-started work is recognized; one issue and its
   PR keep one card identity; stale replay cannot overwrite newer evidence; an
   outage reads as unknown or stale, never success; a closed issue with known
@@ -2604,10 +2837,12 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   snapshot, never a gap; tracker traffic doesn't grow with browser or card
   count; approved work with an intentionally stopped, incident-free merge
   worker reads as waiting, and a real incident stays visible beside it; an
-  unsupported association is shown, not guessed.
+  unsupported association is shown, not guessed; every D-63 row is a
+  synthetic test; contradictory evidence shows "inconsistent evidence".
 - **Out of scope:** PR-only and multi-PR association rules (Q-7), the agent
   directory UI, browser push and the page framework.
-- **Open questions:** None; boundary approved by D-50. Default intervals and
+- **Open questions:** Q-18 (how failures reach the owner); boundary approved by
+  D-50. Default intervals and
   thresholds are D-52. **Stop before processing** until the design is ready.
 
 ### PLT-7. Persist board intent and reconcile shared receipts in plateia
@@ -2624,7 +2859,9 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   move by operation ID, the snapshot and change cursor (D-49), the
   multi-device notice data (D-51) and failure acknowledgement. It shows
   D-52's stale and unknown states as given and never upgrades them. Use
-  synthetic API clients before the framework choice. Runtime data lives
+  synthetic API clients before the framework choice. Recovery follows D-62
+  (receipt listing by card, revision-conditional writes, rejected versus
+  uncertain) and the HTTP boundary follows D-64. Runtime data lives
   outside the repository; the database path and schema are reviewed
   implementation details.
 - **Owning repository:** `coghex/plateia`.
@@ -2632,7 +2869,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Depends on:** PLT-1, PLT-6.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11, D-33, D-37, D-49,
-  D-51, D-52.
+  D-51, D-52, D-62, D-64.
 - **Acceptance signals:** a move is acknowledged only after the shared receipt
   and then the board commit; a restart at each boundary recovers the same
   logical move; a lost response is looked up by operation ID and retried
@@ -2640,7 +2877,10 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   refused, not queued; owner order persists; tracker labels hold no board
   preferences; acknowledged failures stay visible until resolved; cached facts
   carry their age; the server binds only to localhost; the application never
-  runs a skill, touches a terminal or writes the tracker.
+  runs a skill, touches a terminal or writes the tracker; an orphaned
+  submission is found by card after a restart; a slow older write changes
+  nothing; a cross-origin page, a request without the custom header, or one
+  without owner identity can't mutate or stream.
 - **Out of scope:** the page framework, production browser controls, push
   notifications, image storage and new workflow logic.
 - **Open questions:** None; boundary approved by D-53. **Stop before
@@ -2656,7 +2896,9 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   and React with Vite: a card move with receipt recovery, stale and unknown
   display (D-52), automatic reconnect, visible failures and acknowledgement,
   the multi-device notice (D-51), touch drag-and-drop, Home Screen
-  installation and a web-push smoke test, on phone and desktop. Compare
+  installation and a web-push smoke test, on phone and desktop, plus a
+  card's room rendered read-only with live messages and a long history scroll
+  (D-65). Compare
   against V-12, maintainability and the Python server boundary. Each
   prototype stays on its own unmerged, tagged branch; the comparison
   write-up, with evidence and links to the tags, lands with `docs-push`.
@@ -2665,7 +2907,7 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Phase:** after the shared lifecycle and plateia backend contracts.
 - **Depends on:** PLT-7.
 - **Ordering:** critical path for choosing the production page framework.
-- **Relevant decisions:** D-2, D-5, D-49, D-51, D-52, D-54.
+- **Relevant decisions:** D-2, D-5, D-49, D-51, D-52, D-54, D-64, D-65.
 - **Acceptance signals:** each candidate passes or visibly fails the same
   interaction list; restart, reconnect, stale and failure evidence is
   reproducible from its tag; phone and desktop parity is shown for each; no
@@ -2686,14 +2928,15 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   issue and PR links; owner card order by drag, which is presentation only and
   never an instruction (V-7); automatic reconnect with a visible connection
   state; failure acknowledgement without hiding (D-51); each card's room shown
-  read-only with a link. Unsupported associations show as unsupported (D-49).
+  read-only with a link, rendered as untrusted content (D-64). Unsupported
+  associations show as unsupported (D-49). Baskets and indicators follow D-63.
 - **Owning repository:** `coghex/plateia`.
 - **Phase:** first production browser slice.
 - **Depends on:** PLT-2, PLT-7, PLT-12, PLT-14; these transitively require the
   shared lifecycle and release contracts. Real installation and activation
   remain separately held.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-49, D-51, D-52, D-56, and the framework
+- **Relevant decisions:** D-2, D-49, D-51, D-52, D-56, D-63, D-64, and the framework
   decision PLT-2 records, which must exist before processing this slice.
 - **Acceptance signals:** with invented data, phone and desktop show the same
   cards and states; a plateia, bridge or browser outage shows stale or
@@ -2721,7 +2964,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 - **Phase:** first browser card-lifecycle slice.
 - **Depends on:** PLT-8.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-6, D-11, D-31, D-33, D-36, D-51, D-56, and the
+- **Relevant decisions:** D-2, D-6, D-11, D-31, D-33, D-36, D-51, D-56, D-59,
+  D-62, D-63, D-64, and the
   PLT-2 framework decision.
 - **Acceptance signals:** the entire invented #41/#57 walk is demonstrated on
   phone and desktop, including separate and combined plateia, bridge and
@@ -2732,7 +2976,8 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
   explicitly asks for startup.
 - **Out of scope:** posting free text in rooms, Approve and Inbox cancel, push
   and setup.
-- **Open questions:** None; boundary approved by D-57. **Stop before
+- **Open questions:** Q-18 (how failures reach the owner); boundary approved by
+  D-57. **Stop before
   processing** until the PLT-2 framework decision exists and the design is
   ready.
 
@@ -2783,8 +3028,13 @@ approve all but PLT-18; D-47/D-48 settle cleanup coverage and approve
 PLT-18; D-49/D-50 approve P-3 and PLT-6; D-51/D-52 resolve Q-6; D-53
 approves PLT-7; D-54/D-55 approve the PLT-2 bake-off; D-56/D-57 make the
 first browser delivery a read-only board (PLT-8) followed by card moves
-(PLT-21) and resolve Q-11. D-58 narrows the epic to these 21 slices. Next:
-explicit owner readiness signoff.
+(PLT-21) and resolve Q-11. D-58 narrows the epic to these 21 slices. An
+external review was verified the same day: D-59 to D-65 (decided by this
+session under the owner's delegation) close its gaps in authority, execution
+ownership, Hold confirmation, board recovery, display rules, the browser trust
+boundary and documentation landing. Q-17 (rooms and V-2), Q-18 (notifications
+in this epic) and Q-19 (merge-worker restart) need the owner before
+readiness; Q-20 is deliberately open and blocks only PLT-20.
 
 The owner must explicitly approve readiness after material choices and slice
 boundaries are settled. `process-design-doc` then processes the epic first
