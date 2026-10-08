@@ -27,7 +27,7 @@ concrete precondition
 - [x] PLT-9. Capture the shared chat identity and transport core — [#11]
 - [x] PLT-15. Capture the shared chat bridge — [#12]
 - [x] PLT-11. Build immutable pinned shared-package releases — [#13]
-- [ ] PLT-12. Stage releases without changing active tools or services
+- [x] PLT-12. Stage releases without changing active tools or services — [#14]
 - [ ] PLT-14. Add guarded activation and state-preserving rollback
 - [ ] PLT-10. Expose one shared chat API with compatible non-web entry points
 - [ ] PLT-16. Add normalized, attested chat evidence to the shared API
