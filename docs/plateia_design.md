@@ -1243,6 +1243,8 @@ reviewer-start receipt experiment, `rotate-logs` and their tests). Both capture
 from the D-19 baseline. `install-identities` is excluded from both: it is a
 mutating identity rollout that edits server and plugin configuration and
 restarts the bridge, which C-7 already forbids reusing as installation.
+**Amended by D-69:** the `receipt_experiment` module itself moves into PLT-9;
+its bridge-dependent test stays in PLT-15.
 
 A three-way split (client and identity, then CLI, then bridge) was not
 selected: `pchat` and identity resolution are too tightly bound for the middle
@@ -1262,6 +1264,11 @@ outside the slice; capture neither enables nor disables it.
 Removing it from PLT-15 was not selected: the bridge imports it, so the
 captured bridge would differ from the running one. Deciding to drop it before
 the baseline commit was not selected.
+
+**Placement amended by D-69 (2026-10-08):** the module is captured, and first
+reviewed, in PLT-9, because `agentcli` imports it; its bridge-dependent test
+`test_receipt_experiment.py` stays in PLT-15, where the bridge routing it
+exercises gets its first review.
 
 ### D-22. PLT-9 and PLT-15 entries approved as written
 
@@ -1957,6 +1964,28 @@ reason visible, and later eligible PRs still merge in number order; each pass
 rechecks the blocked one. Treating a crash as a stop was not selected: merging
 would halt quietly after every reboot.
 
+### D-69. The receipt-experiment module moves into PLT-9; its bridge tests stay in PLT-15
+
+Owner decision, 2026-10-08 18:40 UTC, relayed through the plateia manager
+from the owner's verified assistant (the owner's words: "yes, i approve");
+amends D-20 and D-21. At the D-19 baseline, `agentcli` (PLT-9) imports
+`receipt_experiment` and calls `receipt_experiment.start_kind()`, and PLT-9's
+`test_identities` and `test_silence` import `agentcli`, so PLT-9 can't stand
+alone without the module. `chat/scripts/receipt_experiment.py` therefore moves
+from PLT-15 into PLT-9, captured verbatim, and PLT-9's PR review is the
+module's first review (replacing D-21's placement in PLT-15). PLT-9 adds a
+small standalone unit test of `start_kind()` and its opt-in behavior. The
+existing bridge-dependent `chat/scripts/tests/test_receipt_experiment.py`,
+which imports from `test_bridge` and drives the bridge, stays in PLT-15 with
+`test_bridge` and the bridge, where its first review happens. The D-20
+core/bridge split is preserved: the bridge doesn't move earlier and the
+integration test isn't split.
+
+Moving the integration test into PLT-9 as first relayed was not selected: it
+imports `test_bridge` and the bridge, which arrive in PLT-15, so it couldn't be
+captured verbatim and self-contained. Moving the bridge into PLT-9, or
+splitting the test file, was not selected.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -2332,8 +2361,11 @@ the PR.
   color and run-evidence fixes, without replacing or changing installed files.
 - **Scope:** capture from the D-19 baseline commit: `chatlib`, `identities`,
   `binding`, `runstore`, `role_colors`, `pchat` and `agentcli` (the `pchat
-  agent` entry points the launch hook and kanban's reviewer runner call), the
-  test-isolation guard and their tests. Resolve the owner, assistant and every
+  agent` entry points the launch hook and kanban's reviewer runner call),
+  `receipt_experiment` (which `agentcli` imports; captured verbatim, with its
+  first review in this PR, D-69), the test-isolation guard and their tests,
+  plus a small new standalone unit test of `start_kind()` and its opt-in
+  behavior. The bridge-dependent `test_receipt_experiment.py` stays in PLT-15. Resolve the owner, assistant and every
   other configured identity at runtime; no real names or credentials in source,
   tests or fixtures. Record provenance (baseline commit, per-file source
   hashes) and a migration map in the same PR; a drift check compares the live
@@ -2350,16 +2382,22 @@ the PR.
   identity/reviewer work rather than duplicating it. Other repositories are
   evidence sources, not implicit owners of new code or a hidden second PR.
 - **Ordering:** critical path; can land first.
-- **Relevant decisions:** D-2, D-7, D-9, D-15, D-16, D-17, D-19, D-20.
+- **Relevant decisions:** D-2, D-7, D-9, D-15, D-16, D-17, D-19, D-20, D-21,
+  D-69.
 - **Acceptance signals:** fixtures preserve permanent roles and resume
   bindings, never-reused counters, empty-inventory refusal, prefix-only role
   colors, cited-delegation provenance and silent child-run refusal; a fixture
   with a terminal-less daemon beside a live agent registers no daemon identity
   and keeps the live one (the live-session fix). The isolation guard fails
-  closed if a test would touch real state. Drift between the live tree and the
+  closed if a test would touch real state. `start_kind()` returns the
+  explicit receipt type only for the exact reviewer-start record with the
+  experiment's marker present, and the ordinary status type otherwise (a
+  missing or malformed marker changes nothing); `agentcli` and its tests run
+  without the bridge. Drift between the live tree and the
   baseline is reported visibly. No private content enters the repository; no
   installed file, registry or service is changed.
-- **Out of scope:** the bridge (PLT-15); `install-identities`; installation or
+- **Out of scope:** the bridge and the bridge-dependent
+  `test_receipt_experiment.py` (PLT-15); `install-identities`; installation or
   repointing any symlink, LaunchAgent or hook; new accounts; manager
   scheduling and `project-manager` changes (D-17); new Hold behavior; an
   old-drainer port.
@@ -2372,11 +2410,13 @@ the PR.
 - **Outcome:** reviewed public source in plateia reproduces the live chat
   bridge's delivery, acceptance and recovery behavior on top of PLT-9's core,
   without changing the running bridge.
-- **Scope:** capture `chat-bridge`, the reviewer-start receipt experiment and
-  `rotate-logs` from the same D-19 baseline, with the bridge, receipt and
-  log-rotation tests, provenance and drift check. The receipt experiment keeps
-  its opt-in marker semantics; capture doesn't change whether it is enabled.
-  It has no located prior review, so this PR's review is its first (D-21).
+- **Scope:** capture `chat-bridge` and `rotate-logs` from the same D-19
+  baseline, with the bridge tests, the bridge-dependent
+  `test_receipt_experiment.py` and the log-rotation tests, provenance and
+  drift check. The `receipt_experiment` module itself arrives in PLT-9 (D-69);
+  this PR is the first review of the bridge's receipt routing and its test.
+  The experiment keeps its opt-in marker semantics; capture doesn't change
+  whether it is enabled.
   Also capture the chat skill's `SKILL.md` guidance, sanitized, under the same
   provenance and drift check (D-24).
   Tests use invented state and the PLT-9 isolation guard.
@@ -2384,12 +2424,14 @@ the PR.
 - **Phase:** source preservation prerequisite.
 - **Depends on:** PLT-9.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-7, D-15, D-16, D-17, D-19, D-20, D-21, D-24.
+- **Relevant decisions:** D-2, D-7, D-15, D-16, D-17, D-19, D-20, D-21, D-24,
+  D-69.
 - **Acceptance signals:** fixtures preserve checkpointed and resumed catch-up,
   crash replay, message-ID deduplication after acceptance recovery, queued
   versus failed delivery, busy-session handling, manager retargeting, dead
-  letters and alerts, and bounded log rotation; the receipt experiment is inert
-  without its marker. The captured guidance matches the captured commands and
+  letters and alerts, and bounded log rotation; `test_receipt_experiment.py`
+  passes against the captured bridge, and the bridge's receipt routing is
+  inert without the experiment's marker. The captured guidance matches the captured commands and
   contains no private content. Drift is reported visibly; the running bridge,
   its LaunchAgent and its state are untouched.
 - **Out of scope:** restarting or repointing the bridge; the shared API
