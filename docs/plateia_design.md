@@ -23,6 +23,7 @@ concrete precondition
 - [ ] PLT-16. Add normalized, attested chat evidence to the shared API
 - [ ] PLT-13. Adapt the approved clarification inbox to shared chat
 - [ ] PLT-1. Add durable logical card-move submission to shared chat
+- [ ] PLT-17. Add card moves to the terminal and the record
 - [ ] PLT-3. Reconcile ordered card intent before manager dispatch
 - [ ] PLT-4. Pause and resume workers and review loops at safe boundaries
 - [ ] PLT-5. Build shared finalization from the finalize contract
@@ -34,9 +35,10 @@ concrete precondition
 These IDs are stable conversation and processing cursors; existing PLT-2
 retains its bake-off meaning despite appearing later in dependency order.
 The owner approved shared prerequisites before the plateia card slice (D-5).
-The sixteen proposed boundaries below are not all approved, and none is ready
+The seventeen proposed boundaries below are not all approved, and none is ready
 for issue processing; PLT-15 (2026-10-08) holds the bridge half of the former
-PLT-9 (D-20), and PLT-16 the evidence half of the former PLT-10 (D-28). New code is plateia-owned (D-7); the merger starts fresh
+PLT-9 (D-20), PLT-16 the evidence half of the former PLT-10 (D-28), and PLT-17 the
+terminal and record half of the former PLT-1 (D-38). New code is plateia-owned (D-7); the merger starts fresh
 from finalize (D-9), rather than porting the existing drainer. Finalizer runtime
 ownership is approved (D-12); approval continuity and its metadata-only initial
 boundary are selected (D-14/D-18). D-15/D-16/D-17 settle distribution, the
@@ -1466,6 +1468,15 @@ With D-31 to D-36 this resolves Q-14 for issue cards. Whether the browser
 warns about near-simultaneous moves from two devices is Q-6; PR-only cards
 stay with Q-7.
 
+### D-38. Split card-move submission from its terminal and record surface
+
+Owner decision in this conversation, 2026-10-08: PLT-1 carries the durable
+submission service, receipt store and posting into the card's room; a new
+PLT-17, after it and off the critical path, carries `pchat card move`, trace
+by card key and the bridge's flag for hand-typed moves. Keeping both in one PR
+was not selected: it would mix the durability core with user-facing commands
+in one review.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -2031,36 +2042,58 @@ subject to Q-11 signoff; no entry is ready merely because it has this shape.
 
 ### PLT-1. Add durable logical card-move submission to shared chat
 
-- **Outcome:** a non-web caller can submit a logical card move, recover its
-  durable receipt and retry it without creating another logical request.
-- **Scope:** extend the existing chat boundary with operation identity,
-  versioned command publication, card revision sequencing and independently
-  recoverable delivery receipts; preserve existing human pchat posts.
-  Each move is its own request, and a retry reuses its request ID (D-33);
-  add a trace by card key alongside today's trace by request. Add the
-  terminal `pchat card move` command; the bridge flags a hand-typed
-  `card-move/v1` line as not submitted and dispatches nothing (D-34). The
-  service marks an older move superseded when it numbers a newer one, and
-  stores each request's D-36 state.
-  Include the approved contract and crash/replay evidence in this PR.
+- **Outcome:** a non-web caller can submit a logical card move through the
+  shared API, recover its durable receipt and retry it without creating
+  another logical request.
+- **Scope:** the shared submission service and its receipt store: operation
+  IDs, request allocation (one request per move, reused on retry; D-33),
+  per-card revision numbering, duplicate handling, superseded marking and the
+  D-36 request states, and lookup by operation, request or card key, under
+  D-37's constraints. It posts each move as one `card-move/v1` line in the
+  card's issue channel (D-31, D-32), opening it through chat if needed, with
+  no endpoint field (D-35); only this service makes moves (D-34). Callers use
+  the shared API. Include the contract and crash/replay evidence in this PR.
 - **Owning repository:** `coghex/plateia` (D-7); shared runtime independent
-  of the plateia web process. D-15/D-16/D-17 and PLT-9, PLT-15, PLT-10 and PLT-11 establish
-  source/distribution/API compatibility; Q-12 lists deployment prerequisites.
+  of the plateia web process.
 - **Phase:** shared delivery prerequisite; first card-move implementation target.
 - **Depends on:** PLT-16 (D-28), PLT-11.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-2, D-3, D-5, D-7, D-8, D-11, D-15, D-16, D-17, D-28,
-  D-31, D-32, D-33, D-34, D-35, D-36, D-37.
-- **Acceptance signals:** synthetic non-web submission survives bridge/service
-  restart and ambiguous send success; retries preserve the same logical move
-  and receipt; mismatched duplicate content is visibly rejected; queued,
-  delivered and exact-message accepted remain distinguishable; publication
-  and receipt recovery work with plateia stopped.
-- **Out of scope:** manager execution changes, safe worker pause, drainer
-  inhibition, plateia database and browser framework.
-- **Open questions:** Q-11 (Q-14 resolved for issue cards by D-31 to D-37);
-  Q-12 supplies deployment prerequisites, not an unresolved installation
-  choice. **Stop before processing.**
+  D-31, D-32, D-33, D-34, D-35, D-36, D-37, D-38.
+- **Acceptance signals:** a synthetic move survives bridge or service restart
+  and an uncertain send; a retry returns the same operation, request,
+  revision and receipt; mismatched duplicates are visibly rejected and a move
+  that would split is refused; a newer move marks the older one superseded
+  with the manager down; queued, delivered and exact-message accepted stay
+  distinguishable; everything works with the plateia web process stopped;
+  rollback to a pre-PLT-1 release leaves the receipt store intact, never
+  deleted or rewound.
+- **Out of scope:** the terminal command, trace by card and hand-typed flag
+  (PLT-17); manager execution changes; safe worker pause; drainer inhibition;
+  plateia database and browser framework.
+- **Open questions:** Q-11 for signoff of this entry. **Stop before
+  processing.**
+
+### PLT-17. Add card moves to the terminal and the record
+
+- **Outcome:** the owner can move a card and follow its history from a
+  terminal, and a hand-typed move can never be mistaken for a submitted one.
+- **Scope:** the `pchat card move` command over PLT-1's API; `pchat trace` by
+  card key; the bridge flags a hand-typed `card-move/v1` line in its room as
+  not submitted, pointing to the board or the command, and dispatches nothing
+  (D-34). Update the packaged `SKILL.md` guidance.
+- **Owning repository:** `coghex/plateia`.
+- **Phase:** shared delivery follow-up.
+- **Depends on:** PLT-1.
+- **Ordering:** not on the critical path; later card slices need only PLT-1.
+- **Relevant decisions:** D-2, D-7, D-33, D-34, D-36, D-37, D-38.
+- **Acceptance signals:** the command produces the same receipts as the API
+  and its retries reuse them; the card trace shows every move and its state in
+  order; a hand-typed move is flagged visibly and wakes no worker; existing
+  `pchat` commands are unchanged.
+- **Out of scope:** manager behavior, Hold control, the browser.
+- **Open questions:** Q-11 for signoff of this entry. **Stop before
+  processing.**
 
 ### PLT-3. Reconcile ordered card intent before manager dispatch
 
