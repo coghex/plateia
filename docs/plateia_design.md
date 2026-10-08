@@ -1633,6 +1633,28 @@ pull Q-7's open rules into PLT-6 and delay it.
 Owner signoff in this conversation, 2026-10-08: the PLT-6 delivery entry, as
 rewritten under D-49, is approved. This settles Q-11 for PLT-6.
 
+### D-51. Browser behavior: no offline moves, after-the-fact multi-device notice, acknowledge without hiding
+
+Owner decision in this conversation, 2026-10-08, settling part of Q-6:
+
+1. **Disconnected:** no offline move queue. While disconnected, cards can't be
+   moved and the page shows it is offline. A move sent as the connection
+   dropped shows "not confirmed"; on reconnect the page looks it up by
+   operation ID and offers a retry, with the same ID, only if the server never
+   received it.
+2. **Phone and desktop at once:** the later submission wins (D-37) with no
+   confirmation beforehand; if another device's move landed between what the
+   owner saw and the owner's move, a notice says so afterwards and shows the
+   card's current place.
+3. **Failures:** the owner can acknowledge a failure, which stops repeat
+   notifications and marks it seen, but it stays on the card until evidence
+   resolves it. Nothing hides an unresolved failure (V-12).
+
+Not selected: a browser-side offline queue (phone storage is neither durable
+nor acknowledged, and a late move could land after things changed); refusing
+moves made from an out-of-date view (friction, and clients would send the
+revision they saw); a dismiss that hides failures (against V-12).
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -1678,6 +1700,11 @@ age thresholds, conflict presentation, failure dismissal/resolution and
 snapshot/change replay need owner choices. An acknowledged request survives;
 an unsent gesture is not acknowledged. D-3 establishes the durable direction;
 settle these details before a production browser slice.
+
+**Partly resolved by D-51, 2026-10-08:** disconnected moves, concurrent
+devices, conflict presentation and failure acknowledgement. Snapshot and
+change replay are D-49. Still open: observation-age thresholds and polling
+defaults.
 
 ### Q-7. How are completion and late controls resolved?
 
