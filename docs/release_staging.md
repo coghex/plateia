@@ -120,7 +120,9 @@ The plan searches two declared roots: the skills tree (`~/.codex/skills`) and
   not read and is named as unreadable.
 - **Expressions over several lines are matched.** Each search covers the
   last 16 lines together, so a `sys.path.insert(...)` with `/ "chat"` and
-  `/ "scripts"` on lines of their own is found.
+  `/ "scripts"` on lines of their own is found. The same lines are searched
+  again with trailing `#` comments dropped (outside quotes), so a comment
+  between `/ "chat"` and `/ "scripts"` doesn't hide an importer.
 - **Scripts are read whole, line by line.** Only a script over 64 MiB is
   named as unsearched, which marks the inventory incomplete.
 - **Which files are searched.** Only scripts are opened: a `.py`, `.sh`,
@@ -144,6 +146,15 @@ The plan searches two declared roots: the skills tree (`~/.codex/skills`) and
 
 The plan reads no configuration, credentials, messages or chat state, and
 prints none. Paths under the home directory are printed as `~/...`.
+
+A managed or captured file is read only when it is a regular file with a
+single link, and, for a file in the skills tree, only when it is reached
+from the tree's root with no alias on the way. A hard link or an alias may
+be private data under another name, and a path can't show which, so such a
+file is never opened. Its target blocks, naming the file and why it wasn't
+read. The file opened must still be the one checked, with one link, before
+anything is read. That covers the drift check's hashing, the content checks
+behind each link and LaunchAgent, and the folder inventory.
 
 ## Preflight
 
@@ -375,9 +386,14 @@ its inode. Every temporary file gets a `creating` record before it exists.
     environment it finds on disk. It removes it, without following links
     inside, and builds it again.
 - **Completion means verified.** `complete` is recorded only after
-  `verify-environment` succeeds. `staged.json` is written by the `complete`
-  step just before its outcome. The journal's `complete` outcome, not that
-  file, is what makes an operation complete, and `status` reports it so.
+  `verify-environment` succeeds. Before it writes `staged.json`, the
+  `complete` step checks again: the environment's path against the pinned
+  directories, and the artifacts and environment against the trusted
+  evidence. A change since verification (the environment swapped for a link,
+  say, or a hook added) is refused, naming it, and the operation stays
+  unfinished. `staged.json` is written just before the step's outcome. The
+  journal's `complete` outcome, not that file, is what makes an operation
+  complete, and `status` reports it so.
 - **Verification is static first.** Every check reads through pinned
   descriptors: the artifacts read back, the journaled inventory, and one
   snapshot of the environment that every other check is derived from.
@@ -393,6 +409,13 @@ its inode. Every temporary file gets a `creating` record before it exists.
   - each command is executable, calls the wheel's entry point, and runs the
     staged interpreter, read from its shebang or from the `/bin/sh` launcher
     pip writes for long paths;
+  - each command is the launcher pip writes, judged by its structure, never
+    by its `RECORD` hash. It's parsed (nothing runs): after the shebang, or
+    the `/bin/sh` preamble, only `import re` and `import sys`, the one
+    import of the wheel's entry point, and an `if __name__ == "__main__":`
+    block that at most rewrites `sys.argv[0]` from itself and then exits
+    with the entry point's result. This is checked at install, and again
+    whenever the environment is verified;
   - what the environment's own startup would establish, from the same
     snapshot: `bin/python` leads, through links inside the environment, to
     the operation's chosen interpreter; `pyvenv.cfg` names that
@@ -481,6 +504,12 @@ The tests cover:
 - **Blocking**, each staging nothing:
   - unknown ownership: a foreign label, a file where a link belongs, an
     unknown file in the folder;
+  - round 8's fixture: the captured `chat/scripts/chatlib.py` replaced by a
+    hard link to the invented chat config, and, separately, the whole
+    `chat/scripts` folder moved into the invented private state with a link
+    left in its place. With `open` and `os.open` set to fail on the private
+    inodes, the full plan never opens them, blocks with the reason named,
+    and prints no private value;
   - a changed file;
   - a retargeted link or program;
   - a missing target;
@@ -507,7 +536,9 @@ The tests cover:
   fixture is covered too: the invented chat config hard-linked to
   `<skills root>/unrelated/scripts/settings.py`. With `open` and `os.open`
   set to fail on the config's inode, plan and discovery never open it, name
-  the candidate as excluded, and report the inventory incomplete. A sixth
+  the candidate as excluded, and report the inventory incomplete. Round 8's
+  importer, with a comment after `/ "chat"` and `/ "scripts"` on the next
+  line, is named. A sixth
   importer in each root is named, including one using
   `sys.path` assignment and ones reached through a symlinked folder or
   script. A cycle ends. An alias of a known importer isn't duplicated. A
@@ -576,6 +607,16 @@ The tests cover:
     calls, the operation is unfinished, and the home is unchanged.
   - **During pip:** an unlisted hook added, or a file `venv` built changed.
     Neither is recorded as installed.
+  - **A rewritten command (round 8):** right after pip returns, `pchat`
+    keeps pip's launcher lines but its body is replaced, either by the entry
+    point's import and a `raise`, or by the original with a statement
+    appended, and its `RECORD` row updated to match. The install is refused,
+    naming the command, and nothing is recorded installed.
+  - **A change after verification (round 8):** right after
+    `verify-environment` records `ok`, the environment is swapped for a
+    link into the invented private state, or a `.pth` hook is added. The
+    `complete` step refuses, naming the change, with no `staged.json`, the
+    operation unfinished and the home unchanged.
   - **After pip, with `RECORD` rewritten (round 7):** right after pip
     returns, a `.pth` hook, a `sitecustomize` or a module inside the package
     is added, each with a matching row appended to the installed `RECORD`,
@@ -604,7 +645,7 @@ The tests cover:
   record no call. Every recorded command is the chosen interpreter or the
   staged environment's.
 
-### Crash recovery (invented fixtures, stager at `8d8bc6a`)
+### Crash recovery (invented fixtures, stager at `411401e`)
 
 Each row is a fresh invented home. The run was stopped right after the
 journal record in the first column, then run again with the same inputs.
@@ -626,13 +667,13 @@ macOS arm64, CPython 3.14.8:
 | intent copy-artifacts | unfinished | (empty) | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.manifest.json.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
-| created <release>/artifacts/.manifest.json.90f03391de6e.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.manifest.json.d822c26716ec.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/manifest.json | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
-| created <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.6b05cabf8782.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.2efd6510ecde.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/plateia-skill-chat-0.1.0+g04cab9561a11.zip | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
-| created <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.5b8f57208704.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.34a31c54a814.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | outcome copy-artifacts | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | intent create-environment | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
@@ -640,14 +681,14 @@ macOS arm64, CPython 3.14.8:
 | outcome create-environment | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
 | intent install-package | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
 | creating <release>/.env-inventory.json.<random>.tmp | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
-| created <release>/.env-inventory.json.709dfb02a7f9.tmp | unfinished | .env-inventory.json.709dfb02a7f9.tmp, artifacts, env | resumed and staged | 1 | 1 | yes |
+| created <release>/.env-inventory.json.39ae1211ffe5.tmp | unfinished | .env-inventory.json.39ae1211ffe5.tmp, artifacts, env | resumed and staged | 1 | 1 | yes |
 | created <release>/env-inventory.json | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | outcome install-package | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | intent verify-environment | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | outcome verify-environment | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | intent complete | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | creating <release>/.staged.json.<random>.tmp | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
-| created <release>/.staged.json.1a3814c50a65.tmp | unfinished | .staged.json.1a3814c50a65.tmp, artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
+| created <release>/.staged.json.a8b7cb239566.tmp | unfinished | .staged.json.a8b7cb239566.tmp, artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | created <release>/staged.json | unfinished | artifacts, env, env-inventory.json, staged.json | resumed and staged | 1 | 1 | yes |
 | outcome complete | complete | artifacts, env, env-inventory.json, staged.json | already staged, verified | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.<random>.tmp (and the manifest copy cut short) | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
