@@ -100,7 +100,7 @@ TMP_PATH = re.compile(r"(?<![\w/])((?:/private)?/tmp/[^\s`'\"()<>\[\]{}|]+)")
 ACKS = chatlib.STATE_DIR / "acks.jsonl"
 COVERAGE = chatlib.STATE_DIR / "record-coverage.json"
 ATTRIBUTED = chatlib.STATE_DIR / "outbox-attributed.jsonl"  # msgids already counted as an outbox part's delivery
-RESERVED = chatlib.STATE_DIR / "outbox-reserved.jsonl"      # retired parts the server confirmed, msgid unknown
+RESERVED = chatlib.STATE_DIR / chatlib.RESERVED_NAME       # parts the server confirmed, msgid unknown, by key
 CLOCK_ALLOWANCE = 5      # seconds of clock difference allowed when matching a written part in the record
 SETTLE = 600             # a part is ruled absent only once the record is complete this long after it was written
 UNDECIDED_MAX = 86400    # a part neither found nor ruled absent for this long is dead-lettered
@@ -264,6 +264,10 @@ class HistoryPager:
 
     def start(self, ref, target):
         self.batches[ref] = {"target": target, "count": 0, "last": None}
+
+    def abandon_ref(self, ref):
+        if ref in self.batches:
+            self.batches[ref]["stale"] = True
 
     def abandon(self, target):
         """The bridge left `target`: a catch-up still open for it belongs to a
@@ -921,61 +925,88 @@ def reconcile(entry, coverage, attributed, others=()):
                     part["state"] = "confirmed"
         return "delivered"
     uncertain = [p for p in own if p["state"] == "uncertain"]
-    if len(uncertain) == 1 and coverage.covers(entry["channel"], start, (target.get("written_at") or 0) + SETTLE):
-        # The record is complete: every confirmed obligation's own message is in
-        # it, so if they can't all be matched with this one too, it never arrived.
+    end = (target.get("written_at") or 0) + SETTLE
+    for _, (low, high) in obligations:  # each confirmed one's message must be inside the complete span too
+        end = max(end, high if high != float("inf") else low + CLOCK_ALLOWANCE + SETTLE)
+    if len(uncertain) == 1 and coverage.covers(entry["channel"], start, end):
+        # The record is complete over every window: each confirmed obligation's own
+        # message is in it, so if they can't all be matched with this one too, it never arrived.
         return "absent"
     return "undecided"
 
 
+def _part_key(row, i, part):
+    return part.get("key") or f"{row.get('id')}:{i}"
+
+
 def _reserved():
-    """Windows of retired confirmed parts whose msgid is unknown, keyed by
-    (account, channel, text); ones too old to compete with any part still owed
-    are dropped from the file."""
-    keep, found = [], {}
+    """Every reservation still young enough to compete with a part that is owed,
+    one per key; older ones are dropped from the file (under the outbox lock,
+    so a concurrent pchat append is never lost)."""
+    found = {}
     horizon = _now() - UNDECIDED_MAX - SETTLE - 3600
-    if RESERVED.exists():
-        for line in RESERVED.read_text().splitlines():
+    with chatlib._outbox_locked():
+        if not RESERVED.exists():
+            return found
+        lines = RESERVED.read_text().splitlines()
+        keep = []
+        for line in lines:
             try:
                 r = json.loads(line)
-                key, window = (r["as"], r["channel"].lower(), r["text"]), _window(r)
+                window = _window(r)
+                r["key"], r["as"], r["channel"], r["text"]
             except (ValueError, KeyError, TypeError, AttributeError):
                 continue
             if window[1] < horizon:
                 continue
             keep.append(line)
-            found.setdefault(key, []).append(window)
-        if len(keep) != len(RESERVED.read_text().splitlines()):
+            found[r["key"]] = r
+        if len(keep) != len(lines):
             tmp = RESERVED.with_suffix(".tmp")
             tmp.write_text("".join(line + "\n" for line in keep))
             os.replace(tmp, RESERVED)
     return found
 
 
-def _confirmed_elsewhere(files, entry, reserved):
-    """The windows of every confirmed part with this entry's channel, account and
-    uncertain text, msgid unknown, outside this entry: pending ones, and retired ones."""
+def _confirmed_elsewhere(files, entry, satisfied):
+    """The windows of every other confirmed part with this entry's channel,
+    account and uncertain text whose msgid is unknown, once per stable key:
+    reserved by whoever posted it (pchat, a notice, an announcement, a flush;
+    retired, dead-lettered or not) and still pending in the outbox. The
+    reservations are read afresh, so a part retired earlier in this very flush
+    counts too. Keys already matched to a msgid are satisfied."""
     text = next(p for p in entry["parts"] if p["state"] == "uncertain")["text"]
     key = (entry["as"], entry["channel"].lower(), text)
-    windows = list(reserved.get(key, []))
+    own = {_part_key(entry, i, p) for i, p in enumerate(entry["parts"])}
+    done = set(satisfied) | {_part_key(r, i, p) for f in files for r in f.rows if isinstance(r, dict)
+                             for i, p in enumerate(r.get("parts") or []) if p.get("msgid")}
+    windows = {}
+    for k, r in _reserved().items():
+        if (r["as"], r["channel"].lower(), r["text"]) == key:
+            windows[k] = _window(r)
     for f in files:
         for r in f.rows:
             if isinstance(r, dict) and r is not entry and (r.get("as"), r.get("channel", "").lower()) == key[:2]:
-                windows += [_window(p) for p in r.get("parts") or []
-                            if p.get("text") == text and p.get("state") == "confirmed" and not p.get("msgid")]
-    return windows
+                for i, p in enumerate(r.get("parts") or []):
+                    if p.get("text") == text and p.get("state") == "confirmed" and not p.get("msgid"):
+                        windows[_part_key(r, i, p)] = _window(p)
+    return [w for k, w in windows.items() if k not in own and k not in done]
 
 
 def _attributed():
-    """Every msgid already counted as some outbox part's delivery, including entries since retired."""
-    found = set()
+    """Every msgid already counted as some outbox part's delivery, including
+    entries since retired, and the keys of the parts they were counted for."""
+    msgids, keys = set(), set()
     if ATTRIBUTED.exists():
         for line in ATTRIBUTED.read_text().splitlines():
             try:
-                found.add(json.loads(line)["msgid"])
+                a = json.loads(line)
+                msgids.add(a["msgid"])
             except (ValueError, KeyError, TypeError):
                 continue
-    return found
+            if a.get("key"):
+                keys.add(a["key"])
+    return msgids, keys
 
 
 class _Claimed:
@@ -1011,14 +1042,10 @@ class _Claimed:
         with ATTRIBUTED.open("a") as f:
             for i, part in enumerate(row.get("parts") or []):
                 if part.get("msgid"):
-                    f.write(json.dumps({"msgid": part["msgid"], "entry": row.get("id"), "part": i}) + "\n")
-        with RESERVED.open("a") as f:
-            for i, part in enumerate(row.get("parts") or []):
-                if part.get("state") == "confirmed" and not part.get("msgid"):
-                    f.write(json.dumps({"as": row["as"], "channel": row["channel"], "text": part["text"],
-                                        "state": "confirmed", "written_at": part.get("written_at"),
-                                        "confirmed_at": part.get("confirmed_at"), "entry": row.get("id"),
-                                        "part": i}) + "\n")
+                    f.write(json.dumps({"msgid": part["msgid"], "key": _part_key(row, i, part)}) + "\n")
+        for i, part in enumerate(row.get("parts") or []):
+            if part.get("state") == "confirmed" and not part.get("msgid"):  # keyed: a repeat after a crash is one
+                chatlib.reserve(row["channel"], row["as"], {**part, "key": _part_key(row, i, part)})
         self.rows.remove(row)
         self.save()
 
@@ -1074,10 +1101,10 @@ def flush_outbox(cfg, post=None, ack=None, coverage=None, deliveries=None):
             log("outbox: another flush is running; skipped")
             return
         files = [_Claimed(path) for path in chatlib.outbox_claim()]
-        attributed = _attributed() | {p["msgid"] for f in files for r in f.rows if isinstance(r, dict)
-                                      for p in r.get("parts") or [] if p.get("msgid")}
-        reserved = _reserved()
-        others = lambda entry: _confirmed_elsewhere(files, entry, reserved)  # noqa: E731
+        attributed, satisfied = _attributed()
+        attributed |= {p["msgid"] for f in files for r in f.rows if isinstance(r, dict)
+                       for p in r.get("parts") or [] if p.get("msgid")}
+        others = lambda entry: _confirmed_elsewhere(files, entry, satisfied)  # noqa: E731
         for claimed in files:
             for e in list(claimed.rows):
                 if isinstance(e, str):
@@ -1291,6 +1318,21 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
     joined, caught_up, pager = set(), set(), HistoryPager()
     complete = set()  # channels whose catch-up has finished on this connection
     started = {}      # channel -> the checkpoint its catch-up on this connection started from
+    asked = {}        # channel -> CHATHISTORY requests sent and not yet answered
+    stale = {}        # channel -> how many of those were asked by a membership since lost
+
+    def ask(ch, command):
+        conn.send(command)
+        asked[ch.lower()] = asked.get(ch.lower(), 0) + 1
+
+    def answered(ch):
+        """A reply (a batch, or a FAIL) to the oldest open request for `ch`: True if it is stale."""
+        k = ch.lower()
+        asked[k] = max(0, asked.get(k, 0) - 1)
+        if stale.get(k):
+            stale[k] -= 1
+            return True
+        return False
     multiline = {}    # open draft/multiline batches: ref -> (opening line, lines so far)
     sync = None       # (token, sent at) of the PING that precedes the next outbox flush
     flush_due = False
@@ -1300,6 +1342,7 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
             seen.discard(ch.lower())
         started.pop(ch.lower(), None)
         pager.abandon(ch)  # a catch-up still open belongs to the lost membership
+        stale[ch.lower()] = asked.get(ch.lower(), 0)  # and so does any reply still to come
         coverage.lost(ch)
         log(f"left {ch}; its record is incomplete until a catch-up after rejoining")
 
@@ -1341,7 +1384,7 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
                         cur = checkpoints.get(ch)
                         if cur:
                             started[ch.lower()] = cur
-                            conn.send(f"CHATHISTORY AFTER {ch} {cur} {HISTORY_PAGE}")
+                            ask(ch, f"CHATHISTORY AFTER {ch} {cur} {HISTORY_PAGE}")
                         else:
                             complete.add(ch.lower())  # a new channel: nothing to catch up
                             coverage.begin(ch, None, None)
@@ -1350,6 +1393,8 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
                     ref = msg["params"][0]
                     if ref.startswith("+") and msg["params"][1:2] == ["chathistory"]:
                         pager.start(ref[1:], msg["params"][2])
+                        if answered(msg["params"][2]):  # asked before the bridge lost the channel
+                            pager.abandon_ref(ref[1:])
                     elif ref.startswith("+") and msg["params"][1:2] == ["draft/multiline"]:
                         multiline[ref[1:]] = (msg, [])
                     elif ref.startswith("-") and ref[1:] in multiline:
@@ -1361,7 +1406,7 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
                         target = pager.target(ref[1:])
                         nxt = pager.end(ref[1:])
                         if nxt:
-                            conn.send(nxt)
+                            ask(target, nxt)
                             log(f"catch-up page full; next: {nxt[:60]}")
                         elif target:  # the last page: the log is complete through its newest message
                             complete.add(target.lower())
@@ -1374,6 +1419,11 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
                     privmsg(msg, pager.is_history(batch))
                 elif cmd == "TAGMSG" and msg["params"][0].startswith("#"):
                     handle_tagmsg(msg, cfg, deliveries, acks)
+                elif cmd == "FAIL" and msg["params"][:1] == ["CHATHISTORY"]:  # a request answered without a batch
+                    for p in msg["params"][1:]:
+                        if p.startswith("#"):
+                            answered(p)
+                            break
                 elif cmd == "KICK" and msg["params"][1:2] and msg["params"][1].lower() == "chatbridge":
                     lost(msg["params"][0])
                 elif (cmd == "PART" and msg["prefix"].split("!")[0].lower() == "chatbridge"

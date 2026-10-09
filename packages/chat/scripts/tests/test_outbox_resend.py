@@ -765,6 +765,85 @@ class RoundThreeTests(OutboxCase):
         self.assertEqual(self.states(self.entries()[1]), ["uncertain"])
 
 
+class RoundFourTests(OutboxCase):
+    """Review round 4 of #20: every confirmed part keeps its message whoever
+    posted it, once per part, and absence needs the record over every window."""
+    S = "[status alpha-1] same"
+
+    def confirmed_entry(self, entry_id, at, *, key=None, tail=None):
+        part = {"kind": "line", "lines": [[self.S, False]], "text": self.S, "state": "confirmed",
+                "written_at": at, "confirmed_at": at + 0.5}
+        if key:
+            part["key"] = key
+        entry = {"channel": "#alpha", "as": "alp-solver-2", "text": self.S, "id": entry_id, "at": "t", "parts": [part]}
+        if tail:
+            entry["parts"].append({"kind": "line", "lines": [[tail, False]], "text": tail, "state": "uncertain",
+                                   "written_at": at + 1})
+        return entry
+
+    def claimed(self, *entries):
+        (chatlib.STATE_DIR / "outbox.claimed-1.jsonl").write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+    def recorded(self, at, msgid, text=None):
+        self.log_record({"account": "alp-solver-2", "channel": "#alpha", "text": text or self.S, "at": at,
+                         "msgid": msgid})
+
+    def test_an_entry_retired_earlier_in_the_same_flush_keeps_its_message(self):
+        self.claimed(self.confirmed_entry("a", T0), uncertain_entry("b", self.S, T0 + 2))
+        self.recorded(T0 + 0.2, "srv1")
+        self.clock.t += 30
+        self.flush()
+        self.assertEqual([e["id"] for e in self.entries()], ["b"])
+        self.assertEqual(self.states(), ["uncertain"])
+
+    def test_a_part_both_reserved_and_pending_after_a_crash_counts_once(self):
+        a = self.confirmed_entry("a", T0, key="k-a", tail="… other")
+        chatlib.reserve("#alpha", "alp-solver-2", a["parts"][0])  # appended before the crash removed nothing
+        self.claimed(a, uncertain_entry("b", self.S, T0 + 2))
+        self.recorded(T0 + 0.2, "srv1")
+        self.recorded(T0 + 2.2, "srv2")  # b's message is there too
+        self.clock.t += bridge.SETTLE + 60
+        self.covered(T0 - 3600, self.clock.t)
+        self.flush()
+        self.assertNotIn("b", [e["id"] for e in self.entries()], "b is delivered")
+        self.assertNotIn(self.S, self.server.texts(), "and never judged absent and resent")
+
+    def test_absence_needs_the_record_over_a_later_obligation_too(self):
+        self.claimed(uncertain_entry("b", self.S, T0))
+        later = {"key": "k-later", "kind": "line", "lines": [[self.S, False]], "text": self.S,
+                 "state": "confirmed", "written_at": T0 + 1000, "confirmed_at": T0 + 1000.5}
+        chatlib.reserve("#alpha", "alp-solver-2", later)  # its message isn't logged
+        self.recorded(T0 + 0.2, "srv1")  # b's own message
+        self.clock.t += 1200
+        self.covered(T0 - 3600, T0 + 900)  # complete, but not through the later obligation's window
+        self.flush()
+        self.assertEqual(self.server.writes, [], "never judged absent and resent")
+        self.assertEqual(self.states(), ["uncertain"])
+
+    def test_a_direct_post_keeps_its_message_from_an_identical_queued_one(self):
+        self.serve("ok")
+        self.assertEqual(self.pchat_post("#alpha", self.S)[0], 0)
+        first = self.server.published[0]
+        self.clock.t += 1
+        self.serve("write-error")  # the identical second post is written but never committed
+        self.assertEqual(self.pchat_post("#alpha", self.S)[0], 3)
+        self.log_record(first)
+        self.clock.t += 30
+        self.flush()
+        self.assertEqual(self.states(), ["uncertain"], "the first post's message is not the second's")
+        self.clock.t += bridge.SETTLE
+        self.covered(T0 - 3600, self.clock.t)
+        self.flush()
+        self.assertEqual((self.entries(), len(self.server.published)), ([], 2))
+
+    def test_a_dead_lettered_confirmed_part_keeps_its_message(self):
+        self.serve("ok", "fail")
+        self.assertEqual(self.pchat_post("#alpha", LONG)[0], 2)
+        [dead] = self.dead()
+        reserved = [json.loads(line) for line in (chatlib.STATE_DIR / chatlib.RESERVED_NAME).read_text().splitlines()]
+        self.assertEqual([r["key"] for r in reserved], [dead["parts"][0]["key"]])
+
+
 class CoverageTests(unittest.TestCase):
     """The record is complete over an interval only through a finished catch-up and a sync."""
 
@@ -847,6 +926,27 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(writes, [])
         [left] = [json.loads(line) for line in (chatlib.STATE_DIR / "outbox.claimed-1.jsonl").read_text().splitlines()]
         self.assertEqual([p["state"] for p in left["parts"]], ["uncertain"])
+
+    def test_a_history_reply_that_opens_after_the_channel_is_lost_completes_nothing(self):
+        from test_bridge import batch, join
+        kick = {"tags": {}, "prefix": "op!u@h", "command": "KICK", "params": ["#alpha", "chatbridge", "out"]}
+        self.connect([join("#alpha"), batch("b1", "#alpha"), batch("b1", None)])
+        since = self.coverage.spans["#alpha"]["since"]
+        self.coverage.sync(since + 10)
+        self.connect([join("#alpha"), kick, batch("b2", "#alpha"), batch("b2", None)])  # asked before, answered after
+        self.assertNotIn("#alpha", self.coverage.live)
+        self.coverage.sync(since + 2000)
+        self.assertFalse(self.coverage.covers("#alpha", since, since + 2000))
+        entry = uncertain_entry("e1", "committed while out", since + 100)
+        (chatlib.STATE_DIR / "outbox.claimed-1.jsonl").write_text(json.dumps(entry) + "\n")
+        writes = []
+        with mock.patch.object(chatlib, "login", lambda *a, **k: writes.append(a) or None):
+            bridge.flush_outbox(CFG, coverage=self.coverage)
+        self.assertEqual(writes, [])
+        # Rejoining asks again; only that newer reply completes the channel.
+        self.connect([join("#alpha"), kick, batch("b3", "#alpha"), batch("b3", None),
+                      join("#alpha"), batch("b4", "#alpha"), batch("b4", None)])
+        self.assertIn("#alpha", self.coverage.live)
 
     def test_a_resumed_catch_up_keeps_the_interval_and_a_seeded_one_does_not(self):
         from test_bridge import batch, join

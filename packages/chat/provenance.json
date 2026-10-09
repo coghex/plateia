@@ -99,14 +99,14 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "d5fd3bca06e139c3f61dfb6d34ef56947255c0b723fb9778c6da3afea874e8d0",
       "capture": "changed",
-      "sha256": "619ca10dd5ffd562813d47e7d82619f9de263005319c4d7bc828b2be6a57f790",
+      "sha256": "f8d6414585f829982e8ff86f67d69c9d85e09b174aa837e94c101e59d307a650",
       "changes": [
         {
           "change": "The config example in the module docstring shows placeholder owner and assistant names.",
           "reason": "Remove real account names (requirement 3); docstring only, no behaviour change."
         },
         {
-          "change": "post() writes a post one part at a time (a draft/multiline batch, or a line) and confirms each against an absolute per-part deadline before the next; an error reply never counts as confirmation and a refusal outranks channel recreation; each confirmed part records its confirmation time; a failure raises PostIncomplete (or Refused) carrying every part's state (confirmed, uncertain or unsent); parts are fixed on the first write and a retry resends exactly those that are not confirmed, never re-split; queued_entry() keeps only the unconfirmed remainder; outbox_summary(), outbox_flushing() and dead_letter_post() support the bridge and pchat status.",
+          "change": "post() writes a post one part at a time (a draft/multiline batch, or a line) and confirms each against an absolute per-part deadline before the next; an error reply never counts as confirmation and a refusal outranks channel recreation; each part has a stable key, and each confirmed part records its confirmation time and is reserved (reserve()) before anything else, whoever called; a failure raises PostIncomplete (or Refused) carrying every part's state (confirmed, uncertain or unsent); parts are fixed on the first write and a retry resends exactly those that are not confirmed, never re-split; queued_entry() keeps only the unconfirmed remainder; outbox_summary(), outbox_flushing() and dead_letter_post() support the bridge and pchat status.",
           "reason": "A long post whose completion timed out after the server had committed it was queued whole and reposted on every outbox flush, each copy with new msgids (#19). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
@@ -291,14 +291,14 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
       "capture": "changed",
-      "sha256": "b8abbb9e331d6e5d8e35caeafdb7165b56e4854961b9d1a66e98a0a2c13d8be9",
+      "sha256": "9f5ba56cfb72ccf0fffbea5481ccfaa3a25567ac4b22bb527ae91cdc0e713a4c",
       "changes": [
         {
           "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
           "reason": "Deliberate deviation from c572bad, by owner decision on PR #16's first review: a catch-up cut short leaves the checkpoint behind, so after a restart more than 5,000 replayed messages would be logged again and an accepted request queued again (PLT-15 requirement 8). The running bridge keeps the baseline behavior until activation."
         },
         {
-          "change": "flush_outbox rewrites each claimed file after every change and removes it only when empty, so a crash leaves exactly what is still owed; a part caught mid-write is uncertain and is reconciled against the channel record (delivered, absent only over a record known complete through a sync well after the write, else undecided, dead-lettered with a content-free owner alert after a day) instead of being resent; each part needs its own logged message written no earlier than the part, and a msgid once counted (kept in outbox-attributed.jsonl) is never counted again; a part the server confirmed without our learning its msgid, pending or retired (kept in outbox-reserved.jsonl), keeps a message of its own within its write-to-confirmation window, so one message never satisfies two parts; giving up on an entry is marked durably before it is dead-lettered and retired, so a crash can neither make it retryable nor strand it, and a server refusal is always terminal; announce() queues only the unconfirmed remainder; run() tracks where each channel's record is complete (record-coverage.json) and syncs with a PING before each flush; leaving a channel (KICK or PART) stops its interval until a catch-up after rejoining, and a catch-up still open when it was left completes nothing.",
+          "change": "flush_outbox rewrites each claimed file after every change and removes it only when empty, so a crash leaves exactly what is still owed; a part caught mid-write is uncertain and is reconciled against the channel record (delivered, absent only over a record known complete through a sync well after the write, else undecided, dead-lettered with a content-free owner alert after a day) instead of being resent; each part needs its own logged message written no earlier than the part, and a msgid once counted (kept in outbox-attributed.jsonl) is never counted again; every part the server confirmed without our learning its msgid -- reserved by key by whoever posted it (outbox-reserved.jsonl, read afresh for each check and pruned once too old to compete) or still pending -- keeps a message of its own within its write-to-confirmation window, counted once per key, so one message never satisfies two parts; absence needs the record complete over every such window; giving up on an entry is marked durably before it is dead-lettered and retired, so a crash can neither make it retryable nor strand it, and a server refusal is always terminal; announce() queues only the unconfirmed remainder; run() tracks where each channel's record is complete (record-coverage.json) and syncs with a PING before each flush; leaving a channel (KICK or PART) stops its interval until a catch-up after rejoining, and a catch-up still open, or still to be answered, when it was left completes nothing.",
           "reason": "Stop the outbox reposting committed parts of a long post on every flush, and never resend a part that may already be in the channel without proof of absence (#19). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
         }
       ]

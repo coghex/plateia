@@ -59,6 +59,20 @@ def _wallclock() -> float:
     return time.time()
 
 
+RESERVED_NAME = "outbox-reserved.jsonl"
+
+
+def reserve(channel: str, account: str, part: dict) -> None:
+    """Durably record that the server confirmed `part`, whose msgid this client
+    never learns, so the bridge never counts that message for another part.
+    Keyed by the part's stable identity: a repeat of the same key is one."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with _outbox_locked(), (STATE_DIR / RESERVED_NAME).open("a") as f:
+        f.write(json.dumps({"key": part["key"], "as": account, "channel": channel, "text": part["text"],
+                            "state": "confirmed", "written_at": part.get("written_at"),
+                            "confirmed_at": part.get("confirmed_at")}) + "\n")
+
+
 def load_config() -> dict:
     try:
         return json.loads(CONFIG_PATH.read_text())
@@ -439,6 +453,9 @@ def post(channel: str, text: str, account: str, cfg: dict | None = None, cont: s
     try:
         if parts is None:
             parts = fix_parts(text, cont, conn)
+        post_id = uuid.uuid4().hex
+        for n, part in enumerate(parts):  # each part's stable identity, kept across retries
+            part.setdefault("key", f"{post_id}:{n}")
         pre = _tag_prefix({"+draft/reply": reply_to} if reply_to else None)
 
         def progress():
@@ -497,6 +514,7 @@ def post(channel: str, text: str, account: str, cfg: dict | None = None, cont: s
                 report(progress())
                 raise stop(PostIncomplete(f"part {n + 1} of {len(parts)}: server replied {errors}", None))
             part.update(state="confirmed", confirmed_at=_wallclock())
+            reserve(channel, account, part)  # before anything else: whoever called, this message is taken
             report(progress())
             sent += sum(1 for line in lines if " PRIVMSG " in line or line.startswith("PRIVMSG "))
         return sent
