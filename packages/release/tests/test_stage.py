@@ -544,9 +544,9 @@ class ImporterTests(StageCase):
     def opened_by_discovery(self):
         opened, real = [], stage_release.imports_chat_scripts
 
-        def spy(path):
+        def spy(path, *args):
             opened.append(Path(path))
-            return real(path)
+            return real(path, *args)
         with mock.patch.object(stage_release, "imports_chat_scripts", spy):
             importers = stage_release.find_importers(json.loads(self.spec.read_text()), self.skills)
         return importers, opened
@@ -638,6 +638,42 @@ class ImporterTests(StageCase):
                 self.assertRegex(root["excluded"][0], r"^~/\.codex/skills \(a declared root that resolves to "
                                                       r".*private data; not searched")
                 self.assertNotIn(_staging.SECRETS[0], json.dumps(importers))
+
+    def test_a_hard_link_to_private_data_is_never_opened(self):
+        """Round 7's fixture: the private chat config hard-linked to a script
+        name inside the skills root. A path can't show a hard link, so a file
+        with more than one is named as excluded, never opened, and the
+        inventory is incomplete."""
+        config = self.home / ".config/chat/config.json"
+        os.link(config, self.skills / "unrelated/scripts/settings.py")
+        private = (config.stat().st_dev, config.stat().st_ino)
+        real_open, real_os_open = open, os.open
+
+        def refuse(path, dir_fd=None):
+            with contextlib.suppress(OSError, TypeError):
+                st = os.stat(path, dir_fd=dir_fd) if dir_fd is not None else os.stat(path)
+                if (st.st_dev, st.st_ino) == private:
+                    raise AssertionError(f"discovery opened the private inode as {path}")
+
+        def guarded_open(file, *args, **kw):
+            if not isinstance(file, int):
+                refuse(file)
+            return real_open(file, *args, **kw)
+
+        def guarded_os_open(path, *args, dir_fd=None, **kw):
+            refuse(path, dir_fd)
+            return real_os_open(path, *args, dir_fd=dir_fd, **kw)
+        with mock.patch("builtins.open", guarded_open), mock.patch("os.open", guarded_os_open):
+            importers = stage_release.find_importers(json.loads(self.spec.read_text()), self.skills)
+            plan = self.plan()
+        for found in (importers, plan["importers"]):
+            self.assertFalse(found["complete"])
+            self.assertEqual(found["roots"][0]["status"], "incomplete")
+            self.assertEqual(found["roots"][0]["excluded"],
+                             ["~/.codex/skills/unrelated/scripts/settings.py (a file with 2 hard links, which may be "
+                              "private data under another name; not opened)"])
+            self.assertNotIn(_staging.SECRETS[0], json.dumps(found))
+        self.assertNotIn(_staging.SECRETS[0], stage_release.render_plan(plan))
 
     def test_a_large_script_is_searched_and_one_over_the_cap_is_named(self):
         big = self.skills / "bulk/scripts/generated.py"
@@ -1004,13 +1040,54 @@ class EnvironmentIntegrityTests(StageCase):
                         plant()
                     return result
                 with mock.patch.object(stage_release, "run", boundary):
-                    with self.assertRaisesRegex(Refused, r"install-package failed: (the environment holds .*RECORD "
-                                                         r"doesn't list|pip changed or removed pyvenv\.cfg)"):
+                    with self.assertRaisesRegex(Refused, r"install-package failed: (the environment holds .*, which "
+                                                         r"the verified wheel doesn't account for|pip changed or "
+                                                         r"removed pyvenv\.cfg)"):
                         self.stage()
                 records = self.journal()
                 self.assertFalse(any(r["kind"] == "outcome" and r.get("step") == "install-package"
                                      and r["result"] == "ok" for r in records))
                 self.assertFalse((self.env().parent / "env-inventory.json").exists())
+
+    def test_a_rewritten_record_never_authorises_what_pip_left(self):
+        """Round 7's fixture: right after pip returns, a startup hook (or a
+        module) appears with a matching row added to the installed RECORD.
+        What pip may add is derived from the verified wheel, so the stage is
+        refused before any staged code runs: the hook never executes (its
+        marker is never written), the operation stays unfinished and the
+        protected files are byte-identical."""
+        real = stage_release.run
+        marker = self.where / "hook-ran"
+        hook = f"import os; open({str(marker)!r}, 'w').close(); " + self.payload()
+        for name, rel, text in (("a .pth hook", "zz-hook.pth", hook),
+                                ("sitecustomize", "sitecustomize.py", hook.replace("import os; ", "")),
+                                ("a module in the package", "plateia_chat/extra.py", hook.replace("import os; ", ""))):
+            with self.subTest(added=name):
+                if self.dest.exists():
+                    shutil.rmtree(self.dest)
+                stage_release.CALLS.clear()
+
+                def boundary(argv, rel=rel, text=text, **kw):
+                    result = real(argv, **kw)
+                    if "pip" in [str(a) for a in argv]:
+                        data = text.encode()
+                        (self.site() / rel).write_bytes(data)
+                        record = next(self.site().glob("plateia_chat-*.dist-info/RECORD"))
+                        with record.open("a") as rows:
+                            rows.write(f"{rel},{build_release.record_hash(data)},{len(data)}\n")
+                    return result
+                with mock.patch.object(stage_release, "run", boundary):
+                    with self.assertRaisesRegex(Refused, rf"install-package failed: the environment holds "
+                                                         rf"lib/python[^/]+/site-packages/{re.escape(rel)}, which "
+                                                         r"the verified wheel doesn't account for"):
+                        self.stage()
+                self.assertEqual([c for c in stage_release.CALLS if c[0].endswith("/env/bin/python") and "-c" in c], [],
+                                 "the environment probe ran")
+                self.assertFalse(marker.exists(), "the planted hook ran")
+                self.assertEqual(stage_release.status(self.dest)[0]["state"],
+                                 "unfinished (last: outcome install-package: failed)")
+                self.assertFalse((self.env().parent / "env-inventory.json").exists())
+                self.assertHomeUnchanged()
 
     def test_the_probe_runs_only_between_static_checks(self):
         """A change to the environment, or a swapped directory, around the

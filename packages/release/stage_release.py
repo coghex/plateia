@@ -375,16 +375,22 @@ def private_target(path, bases):
 IMPORTER_WINDOW = 16  # physical lines searched together, so an expression split over lines is matched
 
 
-def imports_chat_scripts(path):
+def imports_chat_scripts(path, checked=None):
     """Whether a script both changes the import path and names chat/scripts.
     It is read line by line, so a large script is searched whole, and each
     search covers the last IMPORTER_WINDOW lines joined, so an expression
     spread over several lines (a parenthesized sys.path.insert(...) with
     / "chat" and / "scripts" on lines of their own) still matches. None for
-    a file that turns out to be binary."""
+    a file that turns out to be binary. With `checked` (the stat discovery
+    checked), nothing is read unless the opened file is that same file and
+    still has a single link."""
     path_change = names_location = False
     window = collections.deque(maxlen=IMPORTER_WINDOW)
     with open(path, "rb") as stream:
+        if checked is not None:
+            now = os.fstat(stream.fileno())
+            if (now.st_dev, now.st_ino) != (checked.st_dev, checked.st_ino) or now.st_nlink > 1:
+                raise OSError(f"{shown(path)} changed or gained a hard link after it was checked; not read")
         head = stream.read(8192)
         if b"\0" in head:
             return None
@@ -408,10 +414,12 @@ def find_importers(spec, skills):
     Python or shell suffix, or the executable bit), never data files, and
     nothing that resolves into private data (private_bases): such an alias
     is named as excluded, as is a declared root aliased into private data,
-    which is not searched at all. The managed chat folder is skipped, however it is
-    reached. A root, folder or script that can't be read, a script over the
-    size cap, an excluded alias, or more entries than the walk allows makes
-    the inventory incomplete rather than clean."""
+    which is not searched at all, and a file with more than one hard link,
+    which may be private data under another name (a path can't show it).
+    The managed chat folder is skipped, however it is reached. A root,
+    folder or script that can't be read, a script over the size cap, an
+    excluded alias, or more entries than the walk allows makes the
+    inventory incomplete rather than clean."""
     cfg = spec["importers"]
     managed = os.path.realpath(skills / "chat")
     private = private_bases(skills)
@@ -469,10 +477,14 @@ def find_importers(spec, skills):
                     if private_target(path, private):
                         entry["excluded"].append(f"{shown(path)} (resolves into private data; not opened)")
                         continue
+                    if st.st_nlink > 1:
+                        entry["excluded"].append(f"{shown(path)} (a file with {st.st_nlink} hard links, which may be "
+                                                 "private data under another name; not opened)")
+                        continue
                     if st.st_size > IMPORTER_LIMIT:
                         entry["unreadable"].append(f"{shown(path)} (over {IMPORTER_LIMIT >> 20} MiB; not searched)")
                         continue
-                    hit = imports_chat_scripts(path)
+                    hit = imports_chat_scripts(path, st)
                 except OSError:
                     entry["unreadable"].append(shown(path))
                     continue
@@ -1486,6 +1498,33 @@ def wheel_contents(wheel):
     return files, entry_points, record.rsplit("/", 1)[0]
 
 
+def pip_additions(site, wheel):
+    """{path: kind} for every entry pip may add to the environment when it
+    installs the verified wheel, derived from the wheel alone and never from
+    what pip leaves (its RECORD included): each member at its place in
+    site-packages, the dist-info files pip writes itself (INSTALLER,
+    REQUESTED, direct_url.json and the rewritten RECORD), a command in bin/
+    for each console script the wheel declares, and each directory holding
+    one. pip runs with --no-compile, so no bytecode is expected."""
+    _, entry_points, dist_info = wheel_contents(io.BytesIO(wheel))
+    with zipfile.ZipFile(io.BytesIO(wheel)) as z:
+        members = [n for n in z.namelist() if not n.endswith("/")]
+    files = [f"bin/{command}" for command in entry_points]
+    for member in members + [f"{dist_info}/{n}" for n in ("INSTALLER", "REQUESTED", "direct_url.json", "RECORD")]:
+        located = os.path.normpath(os.path.join(site, member))
+        if located.startswith("..") or os.path.isabs(located) or ".data/" in member:
+            raise Refused(f"the verified wheel holds {member}, which pip would place outside site-packages")
+        files.append(located)
+    permitted = {}
+    for rel in files:
+        permitted[rel] = "file"
+        parent = os.path.dirname(rel)
+        while parent:
+            permitted.setdefault(parent, "dir")
+            parent = os.path.dirname(parent)
+    return permitted
+
+
 def hex_to_record(hexdigest):
     """A file's sha256 hex digest as a RECORD hash."""
     return "sha256=" + base64.urlsafe_b64encode(bytes.fromhex(hexdigest)).rstrip(b"=").decode()
@@ -1836,25 +1875,31 @@ def run_operation(journal, writer, release, manifest, plan, report, python, spec
             raise Refused(f"the environment changed after venv built it ({changed}); pip was not run")
         try:
             r = run([env / "bin" / "python", "-m", "pip", "install", "--no-index", "--no-deps", "--no-cache-dir",
-                     "--disable-pip-version-check", release_dir / "artifacts" / wheel_name],
+                     "--no-compile", "--disable-pip-version-check", release_dir / "artifacts" / wheel_name],
                     env=child_env(), cwd=os.sep)
         finally:
             writer.path_intact(env_rel, "pip", after=True)
         if r.returncode:
             raise Refused(f"pip exited {r.returncode}")
         # What pip left becomes the trusted inventory only if it is what venv
-        # built plus exactly the files the installed package's RECORD lists,
-        # each matching it and the verified wheel.
+        # built plus entries the verified wheel accounts for (pip_additions),
+        # each matching the wheel. The installed RECORD is checked, but never
+        # authorises an entry: pip's output could have been rewritten.
         with writer.pinned(env_rel) as fd:
             after = inventory_at(fd)
+            before = evidence["venv"]
+            permitted = pip_additions(site_packages(after), wheel_bytes)
+            for rel in sorted(set(before) | set(after)):
+                if rel in before and after.get(rel) != before[rel]:
+                    raise Refused(f"pip changed or removed {rel}, which venv built; not recorded as installed")
+                if rel not in before and (rel not in permitted or after[rel][0] != permitted[rel]):
+                    raise Refused(f"the environment holds {rel}, which the verified wheel doesn't account for; "
+                                  "not recorded as installed")
             listed = check_installed(after, fd, env, wheel_bytes, manifest["package"])
-        before = evidence["venv"]
-        for rel in sorted(set(before) | set(after)):
-            if rel in before and after.get(rel) != before[rel]:
-                raise Refused(f"pip changed or removed {rel}, which venv built; not recorded as installed")
-            if rel not in before and rel not in listed and not any(x.startswith(rel + "/") for x in listed):
-                raise Refused(f"the environment holds {rel}, which the installed package's RECORD doesn't list; "
-                              "not recorded as installed")
+        beyond = sorted(set(listed) - set(permitted))
+        if beyond:
+            raise Refused(f"the installed RECORD names {beyond[0]}, which the verified wheel doesn't account for; "
+                          "not recorded as installed")
         data = (json.dumps(after, indent=1, sort_keys=True) + "\n").encode()
         writer.write(f"{rel_dir}/{INVENTORY}", data)
         return (f"{manifest['package']['name']} {manifest['package']['version']} installed offline; "
