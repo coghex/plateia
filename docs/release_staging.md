@@ -62,9 +62,15 @@ hash from a carried commit. Nothing observed on disk becomes its own baseline.
 - **The two folder targets** are checked with #11's drift check. Excluded
   entries (`__pycache__`, `*.pyc`, `.DS_Store`, `install-identities`) are
   skipped. Any other entry the provenance doesn't list is an unknown file.
-- **A LaunchAgent** is parsed only for its `Label` and `ProgramArguments`. Its
-  environment, log paths and other keys are never examined, printed or
-  recorded.
+- **A LaunchAgent** is parsed only for its `Label`, `Program` and
+  `ProgramArguments`. Its environment, log paths and other keys are never
+  examined, printed or recorded.
+- **A LaunchAgent must run the script itself.** launchd executes `Program`
+  when it is set, and otherwise the first of `ProgramArguments`. That must be
+  either the expected script alone, or a Python interpreter (`python`,
+  `python3` or `python3.N`) whose only argument is the expected script.
+  Anything else counts as retargeted: a wrapper such as `/bin/echo`, a
+  `Program` override, an extra argument, or the script passed as code.
 
 ### What blocks staging
 
@@ -91,6 +97,9 @@ The plan searches two declared roots: the skills tree (`~/.codex/skills`) and
 - **Unlisted importers.** Any other file that both changes the import path
   (`sys.path` or `PYTHONPATH`) and names `chat/scripts` is listed by name as
   unlisted. It would otherwise stay on the old code.
+- **What counts as changing the import path:** assigning, extending or
+  inserting into `sys.path` (including `sys.path = [...] + sys.path`),
+  `site.addsitedir`, or `PYTHONPATH`.
 - **Which files are searched.** Only scripts are opened: a `.py`, `.sh`,
   `.bash` or `.zsh` suffix, or the executable bit. Data files are never
   opened.
@@ -130,6 +139,13 @@ Preflight refuses a release, naming the check, in these cases:
   - each child run's `state.json` `schema`;
   - receipt-experiment marker names.
 - **The chat config is missing or doesn't parse.**
+- **An inventory can't be listed.** A child-runs or experiments directory
+  that can't be listed is refused as unreadable evidence, never read as an
+  empty inventory.
+- **The release identity can't name a directory.** The identity must be the
+  package's name and version as one plain path component, and artifact
+  names must be plain and distinct. An absolute or traversing identity is
+  refused before anything is written.
 
 Privacy:
 
@@ -163,6 +179,12 @@ now, because no consumer compatibility matrix exists to check it against.
 - **What the guard covers.** The live locations are the skills tree and all of
   `~/.codex` and `~/.claude`, the chat config and state, `~/.local/bin`,
   LaunchAgents, WeeChat's directories, and every symlink target inside them.
+- **Links under the destination are never followed.** Every path staging
+  writes, reads back or removes under the root is checked component by
+  component right before each step: the journal, lock, marker, artifacts,
+  environment, `staged.json` and their temporary files. A symlink anywhere
+  among them is refused. Files are opened with `O_NOFOLLOW`, and replaced
+  by renaming, so nothing is ever written through a link.
 - **Unrelated content is refused, not adopted.** A destination holding
   anything staging didn't create is refused, as is a release directory no
   journaled operation created.
@@ -218,13 +240,24 @@ Each step then journals an `intent` before it runs and an `outcome` after:
   `verify-environment` succeeds.
 - **The verification checks** that the artifacts match the manifest. The
   environment must load `plateia_chat` from itself at the manifest's version,
-  with this checkout off its import path. Its commands run its own
-  interpreter, and that interpreter is the operation's and meets the manifest.
+  with this checkout off its import path, and its interpreter must be the
+  operation's and meet the manifest.
+- **The installed payload must match too:**
+  - every file the verified wheel hashes is installed with the same bytes;
+  - every file the installed `RECORD` hashes, including the generated
+    commands, still matches;
+  - the package directory holds nothing `RECORD` doesn't list;
+  - each command is executable, calls the wheel's entry point, and runs the
+    staged interpreter, read from its shebang or from the `/bin/sh` launcher
+    pip writes for long paths.
 - **Different inputs are a conflict.** While an operation is unfinished, a run
   with different inputs (another interpreter, a changed target, another
   release) is refused, naming the inputs that differ. Repeating the run with
   the operation's own inputs finishes it.
-- **A torn last journal line** from a crash mid-write is ignored. Any other
+- **A torn last journal line** from a crash mid-write is truncated under the
+  lock, durably, before the next record. A complete last record that only
+  lacks its newline gets one. The `resume` record notes the bytes dropped.
+  `status`, which never writes, ignores a torn last line. Any other
   unreadable line is a refusal.
 - **Nothing is ever selected.** `status` reports each operation `complete` or
   `unfinished (last: …)`, always with `selected: no`.
@@ -292,7 +325,7 @@ The tests cover:
   record no call. Every recorded command is the chosen interpreter or the
   staged environment's.
 
-### Crash recovery (invented fixtures, stager at `bc015cc`)
+### Crash recovery (invented fixtures, stager at `5de31b0`)
 
 Each row is a fresh invented home. The run was stopped right after the
 journal record named in the first column, then run again with the same
