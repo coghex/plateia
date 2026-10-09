@@ -73,13 +73,18 @@ A release is `plateia-chat-<package version>`. The version is the
     tree is walked without following links, and each symlink's target
     counts: a directory's target, or a file's target directory, as with
     `~/.local/bin/pchat` or a project's `manager.json`.
-  - **A symlinked directory's target is walked too**, once, so links
-    inside it count as well (a project directory linked elsewhere whose
-    `manager.json` links into live state). A cycle of links ends the
-    walk rather than looping.
+  - **Each protected target is walked too**, once: a linked directory, or
+    a linked file's directory. So links inside it count as well: a project
+    directory linked elsewhere whose `manager.json` links into live state,
+    or a linked `pchat` whose `chatlib.py` beside it links to another
+    directory. A cycle of links ends the walk rather than looping.
   - **The walk fails closed:** a tree it can't read completely, or more
     than a million entries, is a refusal rather than a guess. On the
     owner's machine the walk takes about a second.
+  - **Every directory the build would write is checked:** the output
+    directory, and the release and staging directories inside it, before
+    anything is created. So a live location (say, `CHAT_STATE`) that is the
+    release's own directory inside an allowed output directory is refused.
   - **Both sides of every comparison are resolved**, and the unresolved
     spellings are checked too. So neither a symlinked output path nor a
     symlinked live location gets through.
@@ -127,7 +132,8 @@ they don't refresh the source's index.
   identity roles and assistants to it. The inventory also lists
   `role_colors.py`'s WeeChat state (`weechat.look.nick_color_force` and the
   script's `managed` plugin option), and the host interfaces the code uses:
-  `launchctl print`, `ps`, the SIGHUP `rotate-logs` sends, and the `CHAT_*`
+  `launchctl print`, `ps`, the `lsof -Ffn` field records
+  `identities.py` reads for a process's working directory and session, the SIGHUP `rotate-logs` sends, and the `CHAT_*`
   environment `pchat agent run` gives its child. A test ties markers in the
   shipped code to the entries that must declare them. The build
   changes no serialized byte.
@@ -207,9 +213,9 @@ arm64, CPython 3.14.8), using this PR's build step.
 
 - **Inputs:**
   - **Builder:** this PR's `packages/release/build_release.py`, at builder
-    revision `dd026d22eaf91490399c677a6b1c13015562db9a`, not dirty: the PR
-    head after its fifth review. Earlier runs with `2ab6c29`, `01d0d57`,
-    `706a986`, `f5b268b` and `4b78ea9` gave the same outcomes and byte-identical artifacts. Only the manifest's
+    revision `7bc3374b63c1da23f825cdd2daf85bf58e1e96c7`, not dirty: the PR
+    head after its sixth review. Earlier runs with `2ab6c29`, `01d0d57`,
+    `706a986`, `f5b268b`, `4b78ea9` and `dd026d2` gave the same outcomes and byte-identical artifacts. Only the manifest's
     builder identity and format inventory differed.
   - **Source:** a clean detached checkout of `origin/master` at
     `48b901ac3e81d1f0c2b249f9381cf1af4aa2524a`. That commit contains #11's
