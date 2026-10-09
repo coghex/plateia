@@ -7,6 +7,7 @@ identity with different bytes."""
 import io
 import json
 import os
+import re
 import unittest
 import zipfile
 from pathlib import Path
@@ -89,6 +90,8 @@ class BuildTests(BuildCase):
             r"weechat\.config_(get|set)": ("weechat-role-colors", True, True),
             r"\[\"launchctl\", \"print\"": ("launchd-query", True, False),
             r"\[\"ps\", ": ("process-table", True, False),
+            r"\['lsof', .*'-Ffn'\]": ("open-files", True, False),
+            r"line\.startswith\('f'\)": ("open-files", True, False),
             r"signal\.SIGHUP": ("service-signal", False, True),
             r"CHAT_AGENT_ID=": ("agent-run-environment", True, True),
             r"atomic_json\(chatlib\.CONFIG_PATH": ("chat-config", True, True),
@@ -276,6 +279,39 @@ class RefusalTests(BuildCase):
         self.refused(r"under ~/.local/state/project-manager/alpha's target/manager.json's target",
                      out=live / "releases")
         self.assertEqual(snapshot(live), before)
+
+    def test_links_inside_a_linked_files_directory_are_handled(self):
+        """A file link's target directory is walked too: a command linked
+        into a scripts directory whose module links elsewhere protects that
+        module's directory."""
+        home = Path.home()
+        scripts, modules = self.where / "runtime-scripts", self.where / "runtime-modules"
+        scripts.mkdir()
+        modules.mkdir()
+        (scripts / "pchat").write_text("#!/usr/bin/env python3\n")
+        (modules / "chatlib.py").write_text("# invented\n")
+        (scripts / "chatlib.py").symlink_to(modules / "chatlib.py")
+        bin_dir = home / ".local/bin"
+        bin_dir.mkdir(parents=True)
+        self.addCleanup(lambda: [p.rmdir() for p in (bin_dir, bin_dir.parent)])
+        (bin_dir / "pchat").symlink_to(scripts / "pchat")
+        self.addCleanup((bin_dir / "pchat").unlink)
+        before = snapshot(modules)
+        self.refused(r"under ~/.local/bin/pchat's target/chatlib.py's target", out=modules / "releases")
+        self.assertEqual(snapshot(modules), before)
+
+    def test_a_live_location_inside_the_output_directory_is_refused(self):
+        """The release and staging directories the build would create are
+        checked, not only --out: configured chat state can be one of them."""
+        head = git(self.repo, "rev-parse", "HEAD").strip()
+        identity = f"plateia-chat-0.1.0+g{head[:12]}"
+        for name in (identity, f".{identity}.partial-{os.getpid()}"):
+            with self.subTest(directory=name):
+                state = self.out / name
+                with mock.patch.dict(os.environ, {"CHAT_STATE": str(state)}):
+                    self.refused(rf"the release directory {re.escape(name)} is under CHAT_STATE")
+                self.assertFalse(state.exists())
+                self.assertIsNone(snapshot(self.out))
 
     def test_adversarial_symlink_variants_are_refused(self):
         """A chain of links, a relative link, a hook under ~/.claude, and an

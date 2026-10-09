@@ -247,9 +247,9 @@ def live_roots():
     if os.environ.get("CHAT_CONFIG"):
         roots.append(("CHAT_CONFIG's directory", Path(os.environ["CHAT_CONFIG"]).parent))
     linked, walked, seen = [], set(), 0
-    # Every root, then every symlinked directory's target, is walked once:
-    # links inside a linked directory count too. `walked` holds resolved
-    # paths, so a cycle of links ends.
+    # Every root, then every protected link target (a directory, or a file's
+    # directory), is walked once: links inside a target count too. `walked`
+    # holds resolved paths, so a cycle of links ends.
     pending = [(name, os.path.realpath(root)) for name, root in roots]
     while pending:
         name, real = pending.pop(0)
@@ -270,15 +270,17 @@ def live_roots():
                 if os.path.islink(path):
                     target = Path(os.path.realpath(path))
                     label = f"{name}/{os.path.relpath(path, real)}'s target"
-                    linked.append((label, target if target.is_dir() else target.parent))
-                    if target.is_dir():
-                        pending.append((label, str(target)))
+                    protected = target if target.is_dir() else target.parent
+                    linked.append((label, protected))
+                    pending.append((label, str(protected)))
     return roots + linked
 
 
-def check_output_dir(out, top):
+def check_output_dir(out, top, names=()):
     """The output directory, resolved, after refusing one inside the source
-    checkout or under a live location. Both sides of every comparison are
+    checkout or under a live location. Each directory the build would write
+    (the output directory, and `names` inside it: the release and its
+    staging directory) is checked. Both sides of every comparison are
     resolved, and the unresolved spellings are checked too, so neither a
     symlinked output path nor a symlinked live location gets through."""
     given = Path(os.path.abspath(out))
@@ -288,9 +290,10 @@ def check_output_dir(out, top):
     if inside(out, top_real) or inside(given, Path(os.path.abspath(top))):
         raise Refused("the output directory is inside the source checkout (after resolving symlinks)")
     for name, root in live_roots():
-        for path, base in ((out, Path(os.path.realpath(root))), (given, Path(os.path.abspath(root)))):
-            if inside(path, base):
-                raise Refused(f"the output directory is under {name}, where the live chat tools live")
+        for what, extra in [("the output directory", None)] + [(f"the release directory {n}", n) for n in names]:
+            for path, base in ((out, Path(os.path.realpath(root))), (given, Path(os.path.abspath(root)))):
+                if inside(path / extra if extra else path, base):
+                    raise Refused(f"{what} is under {name}, where the live chat tools live")
     return out
 
 
@@ -340,8 +343,11 @@ def build(source, out, rev="HEAD", spec_path=SPEC_PATH):
     """Build one release; returns (release directory, whether it was new)."""
     spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     top, commit = source_state(source, rev)
-    out = check_output_dir(out, top)
-    identity, files = assemble(top, commit, spec)
+    identity, files = assemble(top, commit, spec)  # writes nothing
+    staging_name = f".{identity}.partial-{os.getpid()}"
+    # The release and staging directories are checked too: a live location
+    # can sit inside an allowed output directory, not only above it.
+    out = check_output_dir(out, top, (identity, staging_name))
     target = out / identity
     if target.exists() or target.is_symlink():
         if not target.is_dir() or target.is_symlink():
@@ -352,7 +358,7 @@ def build(source, out, rev="HEAD", spec_path=SPEC_PATH):
                           "a release identity is never rebound, and the existing one was left unchanged")
         return target, False
     out.mkdir(parents=True, exist_ok=True)
-    staging = out / f".{identity}.partial-{os.getpid()}"
+    staging = out / staging_name
     staging.mkdir()
     try:
         for name, data in files.items():
