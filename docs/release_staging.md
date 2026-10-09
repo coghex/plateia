@@ -101,6 +101,14 @@ The plan searches two declared roots: the skills tree (`~/.codex/skills`) and
 - **What counts as changing the import path:** assigning, extending or
   inserting into `sys.path` (including `sys.path = [...] + sys.path`),
   `site.addsitedir`, or `PYTHONPATH`.
+- **Private data is never opened.** Nothing that resolves into private data
+  is opened or walked into, even through an alias: chat state and config,
+  `~/.config`, `~/.local/state`, `~/.local/share`, `~/Library`, `~/.ssh`,
+  `~/.gnupg`, `~/.aws`, and `~/.codex` and `~/.claude` outside their skills
+  folders (sessions, history, settings). Such an alias is named as excluded,
+  and the inventory is marked incomplete.
+- **Scripts are read whole, line by line.** Only a script over 64 MiB is
+  named as unsearched, which marks the inventory incomplete.
 - **Which files are searched.** Only scripts are opened: a `.py`, `.sh`,
   `.bash` or `.zsh` suffix, or the executable bit. Data files are never
   opened.
@@ -143,7 +151,8 @@ Preflight refuses a release, naming the check, in these cases:
 - **The existing state holds an embedded version the release doesn't read, or
   that evidence can't be read.** The embedded versions are:
   - the identity registry's `version`;
-  - each child run's `state.json` `schema`;
+  - each child run's `state.json` `schema`, following symlinked projects and
+    runs;
   - receipt-experiment marker names.
 - **The chat config is missing or doesn't parse.**
 - **An inventory can't be listed.** A child-runs or experiments directory
@@ -206,9 +215,10 @@ Every write staging makes goes through one layer (`Writer`), including
   the root, and both must sit outside this checkout and every protected
   location.
 - **New files only.** A file is created with `O_CREAT|O_EXCL|O_NOFOLLOW`
-  under a fresh temporary name, which is journaled before it exists, then
-  renamed into place. Nothing is ever opened through a link or written into
-  an existing file.
+  under a fresh temporary name, which is journaled before it exists. Its
+  inode is journaled right after the create, and it is then renamed into
+  place. Nothing is ever opened through a link or written into an existing
+  file.
 - **Nothing it didn't create.** An entry is replaced, truncated or deleted
   only if the journal records that this operation created it and it is still
   that entry: the same inode, singly linked, this owner. Anything else is
@@ -275,9 +285,11 @@ its inode. Every temporary file gets a `creating` record before it exists.
   - **An unfinished one** is resumed: a `resume` record, then every step
     again.
 - **The steps are safe to repeat.**
-  - Artifacts this operation copied are replaced. Its journaled temporary
-    files are removed. Anything else in the directory is refused, never
-    deleted.
+  - Artifacts this operation copied are replaced, and its temporary files
+    are removed, each only by its recorded inode. A journaled intent to
+    create a name is not evidence: a file at such a name without a creation
+    record, like anything else in the directory, is refused and left
+    untouched, and the operation stays unfinished.
   - A partial environment, a directory this operation created, is removed and
     created again.
 - **Completion means verified.** `complete` is recorded only after
@@ -359,14 +371,20 @@ The tests cover:
   - an undeclared, malformed or extra format, and no platform systems;
   - a tampered or missing artifact, or an unpinned manifest.
 - **API:** "not applicable", never "pass". A declared API version is refused.
-- **Importers:** a sixth importer in each root is named, including one using
+- **Importers:** an alias into the invented chat config, state or `~/.claude`
+  is never opened and is named as excluded. A 2.4 MB importer is found, and
+  one over the cap is named as unsearched. A sixth importer in each root is
+  named, including one using
   `sys.path` assignment and ones reached through a symlinked folder or
   script. A cycle ends. An alias of a known importer isn't duplicated. A
   missing known importer is reported, an unreadable root makes the inventory
   incomplete, and data files are never opened.
 - **Recovery:** the table below, plus a conflicting retry, a torn journal line
   and a damaged completed release. Also: a stray file in the artifacts
-  directory is refused, never deleted.
+  directory, or a file at a journaled temporary name with no creation
+  record, is refused and left untouched.
+- **Child runs behind symlinks:** an unsupported schema in a symlinked
+  project or run is refused.
 - **Alias matrix:** at every write site (journal, lock, `releases`, the
   release directory, `artifacts`, an artifact, a temporary file, `env`,
   `env-inventory.json`, `staged.json`), a symlink to protected state, a
@@ -396,7 +414,7 @@ The tests cover:
   record no call. Every recorded command is the chosen interpreter or the
   staged environment's.
 
-### Crash recovery (invented fixtures, stager at `eda4336`)
+### Crash recovery (invented fixtures, stager at `eee4625`)
 
 Each row is a fresh invented home. The run was stopped right after the
 journal record in the first column, then run again with the same inputs.
@@ -418,10 +436,13 @@ macOS arm64, CPython 3.14.8:
 | intent copy-artifacts | unfinished | (empty) | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.manifest.json.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.manifest.json.3e6dabefb84e.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/manifest.json | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.27c8320e58ea.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/plateia-skill-chat-0.1.0+g04cab9561a11.zip | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.d26c9a99f625.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | outcome copy-artifacts | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | intent create-environment | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
@@ -429,12 +450,14 @@ macOS arm64, CPython 3.14.8:
 | outcome create-environment | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
 | intent install-package | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
 | creating <release>/.env-inventory.json.<random>.tmp | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
+| created <release>/.env-inventory.json.61fa95255a2e.tmp | unfinished | .env-inventory.json.61fa95255a2e.tmp, artifacts, env | resumed and staged | 1 | 1 | yes |
 | created <release>/env-inventory.json | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | outcome install-package | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | intent verify-environment | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | outcome verify-environment | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | intent complete | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | creating <release>/.staged.json.<random>.tmp | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
+| created <release>/.staged.json.35acf7bc66ca.tmp | unfinished | .staged.json.35acf7bc66ca.tmp, artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | created <release>/staged.json | unfinished | artifacts, env, env-inventory.json, staged.json | resumed and staged | 1 | 1 | yes |
 | outcome complete | complete | artifacts, env, env-inventory.json, staged.json | already staged, verified | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.<random>.tmp (and the manifest copy cut short) | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
