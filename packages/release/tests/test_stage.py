@@ -175,6 +175,8 @@ class HappyPathTests(StageCase):
         self.assertEqual(stage_release.interpreter_of([f"#!{env_python}", "import sys"]), env_python)
         self.assertEqual(stage_release.interpreter_of(
             ["#!/bin/sh", f"'''exec' \"{env_python}\" \"$0\" \"$@\"", "' '''", "import sys"]), env_python)
+        self.assertEqual(stage_release.interpreter_of(  # pip quotes the path only when it holds a space
+            ["#!/bin/sh", f"'''exec' {env_python} \"$0\" \"$@\"", "' '''", "import sys"]), env_python)
         for lines in (["import sys"], ["#!/bin/sh", "exec python3"], []):
             with self.subTest(lines=lines):
                 self.assertIsNone(stage_release.interpreter_of(lines))

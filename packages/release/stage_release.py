@@ -694,7 +694,7 @@ def check_destination(dest, identity):
     return root
 
 
-LAUNCHER = re.compile(r"""^'''exec' "([^"]+)" "\$0" "\$@"$""")
+LAUNCHER = re.compile(r"""^'''exec' (?:"([^"]+)"|(\S+)) "\$0" "\$@"$""")  # quoted only with spaces
 
 
 def interpreter_of(lines):
@@ -706,7 +706,7 @@ def interpreter_of(lines):
     words = lines[0][2:].split()
     if words == ["/bin/sh"]:
         m = LAUNCHER.match(lines[1]) if len(lines) > 1 else None
-        return m.group(1) if m else None
+        return (m.group(1) or m.group(2)) if m else None
     return words[0] if words else None
 
 
