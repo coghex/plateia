@@ -127,6 +127,14 @@ class FakeConn:
         elif answer == "fail-then-timeout":
             yield {"command": "FAIL", "params": ["BATCH", "MULTILINE_MAX_BYTES", "too long"], "tags": {}, "prefix": "irc"}
             raise TimeoutError("timed out")
+        elif answer == "error":  # an error reply, then the PING's answer: order, not acceptance
+            yield {"command": "479", "params": ["alp-solver-2", "#alpha", "Illegal channel name"], "tags": {},
+                   "prefix": "irc"}
+            yield pong
+        elif answer == "403-and-fail":
+            yield {"command": "403", "params": ["alp-solver-2", "#alpha", "No such channel"], "tags": {}, "prefix": "irc"}
+            yield {"command": "FAIL", "params": ["BATCH", "MULTILINE_INVALID", "refused"], "tags": {}, "prefix": "irc"}
+            yield pong
         elif answer == "crash":
             raise Crash()
         else:  # timeout
@@ -691,6 +699,23 @@ class RoundOneTests(OutboxCase):
         self.assertEqual(len(self.server.writes), writes, "nothing is sent again")
 
 
+class RoundTwoTests(OutboxCase):
+    """Review round 2 of #20: no error reply confirms a part, and a refusal outranks channel recreation."""
+
+    def test_an_error_reply_outside_the_known_three_is_not_confirmation(self):
+        self.serve("ok", "error")
+        with self.assertRaises(chatlib.PostIncomplete) as err:
+            chatlib.post("#alpha", LONG, "alp-solver-2", CFG, cont=TAG)
+        self.assertEqual([p["state"] for p in err.exception.parts], ["confirmed", "uncertain", "unsent"])
+
+    def test_a_refusal_with_no_such_channel_is_never_retried(self):
+        self.serve("403-and-fail")
+        with self.assertRaises(chatlib.Refused) as err:
+            chatlib.post("#alpha", "[status alpha-1] short", "alp-solver-2", CFG)
+        self.assertEqual([p["state"] for p in err.exception.parts], ["refused"])
+        self.assertEqual(sum(1 for w in self.server.writes if " PRIVMSG " in w), 1, "written once, not again")
+
+
 class CoverageTests(unittest.TestCase):
     """The record is complete over an interval only through a finished catch-up and a sync."""
 
@@ -728,20 +753,37 @@ class CoverageTests(unittest.TestCase):
                       in_batch("b1", self.privmsg("pat", "gap 1", "m1", channel="#alpha", t="2026-10-09T10:00:00Z")),
                       in_batch("b1", self.privmsg("pat", "gap 2", "m2", channel="#alpha", t="2026-10-09T10:01:00Z")),
                       batch("b1", None)])  # a full page, then the connection drops
-        self.coverage.sync({"#alpha"}, T0)
+        self.coverage.sync(T0)
         self.assertFalse(self.coverage.covers("#alpha", 0, 0))
         self.connect([join("#alpha"), batch("b2", "#alpha"), batch("b2", None)])  # finished
         since = self.coverage.spans["#alpha"]["since"]
         self.assertIsNone(self.coverage.spans["#alpha"]["through"], "complete, but not through any time yet")
-        self.coverage.sync({"#alpha"}, since + 100)
+        self.coverage.sync(since + 100)
         self.assertTrue(self.coverage.covers("#alpha", since, since + 100))
         self.assertFalse(self.coverage.covers("#alpha", since - 1, since + 100))
+
+    def test_losing_the_channel_stops_the_interval_until_a_catch_up_after_rejoining(self):
+        from test_bridge import batch, join
+        kick = {"tags": {}, "prefix": "op!u@h", "command": "KICK", "params": ["#alpha", "chatbridge", "out"]}
+        live = self.privmsg("pat", "live", "m5", channel="#alpha", t="2026-10-09T11:00:00Z")
+        sent = []
+        from test_bridge import FakeServer as ScriptedServer
+        server = ScriptedServer([join("#alpha"), batch("b1", "#alpha"), batch("b1", None), live, kick, join("#alpha")])
+        with mock.patch.object(chatlib, "login", lambda *a, **k: server):
+            with self.assertRaises(chatlib.ChatError):
+                bridge.run(CFG, *self.state, self.coverage)
+        sent = [line for line in server.sent if line.startswith("CHATHISTORY")]
+        self.assertEqual(sent[-1], "CHATHISTORY AFTER #alpha msgid=m5 2", "the gap is caught up after rejoining")
+        since = self.coverage.spans["#alpha"]["since"]
+        self.coverage.sync(since + 700)  # a sync while out of the channel, or before the catch-up ends
+        self.assertIsNone(self.coverage.spans["#alpha"]["through"])
+        self.assertFalse(self.coverage.covers("#alpha", since, since + 700))
 
     def test_a_resumed_catch_up_keeps_the_interval_and_a_seeded_one_does_not(self):
         from test_bridge import batch, join
         self.connect([join("#alpha"), batch("b1", "#alpha"), batch("b1", None)])
         since = self.coverage.spans["#alpha"]["since"]
-        self.coverage.sync({"#alpha"}, since + 10)
+        self.coverage.sync(since + 10)
         self.connect([join("#alpha"), batch("b2", "#alpha"), batch("b2", None)])  # from the same checkpoint
         self.assertEqual(self.coverage.spans["#alpha"]["since"], since)
         bridge.CHECKPOINTS.unlink()  # lost: the next catch-up starts from a seeded checkpoint

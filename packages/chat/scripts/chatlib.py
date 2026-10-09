@@ -471,7 +471,8 @@ def post(channel: str, text: str, account: str, cfg: dict | None = None, cont: s
                 except (OSError, ChatError) as err:
                     part["state"] = "uncertain"
                     raise stop(PostIncomplete(f"part {n + 1} of {len(parts)} unconfirmed ({err!r:.80})", None)) from None
-                if "403" in replies and attempt == 0 and not joined:
+                refused = any(r.startswith("FAIL") for r in replies)  # a refusal outranks everything else
+                if not refused and "403" in replies and attempt == 0 and not joined:
                     # no such channel: nothing was accepted; create it with the bridge inside, then resend
                     part["state"] = "unsent"
                     report(progress())
@@ -490,6 +491,11 @@ def post(channel: str, text: str, account: str, cfg: dict | None = None, cont: s
                 part["state"] = "unsent"  # the server answered with an error: nothing was accepted
                 report(progress())
                 raise stop(PostIncomplete(f"cannot post to {channel} (server replied {sorted(replies)})", None))
+            errors = sorted(r for r in replies if r.isdigit() and 400 <= int(r) <= 599)
+            if errors:  # an error reply is never confirmation; whether anything was accepted is unknown
+                part["state"] = "uncertain"
+                report(progress())
+                raise stop(PostIncomplete(f"part {n + 1} of {len(parts)}: server replied {errors}", None))
             part.update(state="confirmed")
             report(progress())
             sent += sum(1 for line in lines if " PRIVMSG " in line or line.startswith("PRIVMSG "))

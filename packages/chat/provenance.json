@@ -99,14 +99,14 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "d5fd3bca06e139c3f61dfb6d34ef56947255c0b723fb9778c6da3afea874e8d0",
       "capture": "changed",
-      "sha256": "792de47fa5e5bd6e9c250eb89a53541aac07969fbff5fd3351cced712e2cb8b8",
+      "sha256": "f6441397ed0c4680c67c1ec54fcb3131b7ba124328467931bdd7766cc7a23e04",
       "changes": [
         {
           "change": "The config example in the module docstring shows placeholder owner and assistant names.",
           "reason": "Remove real account names (requirement 3); docstring only, no behaviour change."
         },
         {
-          "change": "post() writes a post one part at a time (a draft/multiline batch, or a line) and confirms each against an absolute per-part deadline before the next; a failure raises PostIncomplete (or Refused) carrying every part's state (confirmed, uncertain or unsent); parts are fixed on the first write and a retry resends exactly those that are not confirmed, never re-split; queued_entry() keeps only the unconfirmed remainder; outbox_summary(), outbox_flushing() and dead_letter_post() support the bridge and pchat status.",
+          "change": "post() writes a post one part at a time (a draft/multiline batch, or a line) and confirms each against an absolute per-part deadline before the next; an error reply never counts as confirmation and a refusal outranks channel recreation; a failure raises PostIncomplete (or Refused) carrying every part's state (confirmed, uncertain or unsent); parts are fixed on the first write and a retry resends exactly those that are not confirmed, never re-split; queued_entry() keeps only the unconfirmed remainder; outbox_summary(), outbox_flushing() and dead_letter_post() support the bridge and pchat status.",
           "reason": "A long post whose completion timed out after the server had committed it was queued whole and reposted on every outbox flush, each copy with new msgids (#19). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
@@ -291,14 +291,14 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
       "capture": "changed",
-      "sha256": "5eb6d17e4b317249aa3faf5a0b0f67fc83f2fa56f6214a2a88f49a6c87f8e4ca",
+      "sha256": "4731202d9a6407dac7cd534b90eed6e92d15a6274950a5ff5494e627bdef79a6",
       "changes": [
         {
           "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
           "reason": "Deliberate deviation from c572bad, by owner decision on PR #16's first review: a catch-up cut short leaves the checkpoint behind, so after a restart more than 5,000 replayed messages would be logged again and an accepted request queued again (PLT-15 requirement 8). The running bridge keeps the baseline behavior until activation."
         },
         {
-          "change": "flush_outbox rewrites each claimed file after every change and removes it only when empty, so a crash leaves exactly what is still owed; a part caught mid-write is uncertain and is reconciled against the channel record (delivered, absent only over a record known complete through a sync well after the write, else undecided, dead-lettered with a content-free owner alert after a day) instead of being resent; each part needs its own logged message written no earlier than the part, and a msgid once counted (kept in outbox-attributed.jsonl) is never counted again; giving up on an entry is marked durably before it is dead-lettered and retired, so a crash can neither make it retryable nor strand it, and a server refusal is always terminal; announce() queues only the unconfirmed remainder; run() tracks where each channel's record is complete (record-coverage.json) and syncs with a PING before each flush.",
+          "change": "flush_outbox rewrites each claimed file after every change and removes it only when empty, so a crash leaves exactly what is still owed; a part caught mid-write is uncertain and is reconciled against the channel record (delivered, absent only over a record known complete through a sync well after the write, else undecided, dead-lettered with a content-free owner alert after a day) instead of being resent; each part needs its own logged message written no earlier than the part, and a msgid once counted (kept in outbox-attributed.jsonl) is never counted again; giving up on an entry is marked durably before it is dead-lettered and retired, so a crash can neither make it retryable nor strand it, and a server refusal is always terminal; announce() queues only the unconfirmed remainder; run() tracks where each channel's record is complete (record-coverage.json) and syncs with a PING before each flush; leaving a channel (KICK or PART) stops its interval until a catch-up after rejoining.",
           "reason": "Stop the outbox reposting committed parts of a long post on every flush, and never resend a part that may already be in the channel without proof of absence (#19). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
         }
       ]

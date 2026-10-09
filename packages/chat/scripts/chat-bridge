@@ -791,6 +791,16 @@ class Coverage:
             self.spans = json.loads(COVERAGE.read_text())
         except (OSError, ValueError):
             self.spans = {}
+        self.live = set()  # channels whose log is complete on the current connection, right now
+
+    def connected(self):
+        """A new connection: nothing is complete on it until its catch-up finishes."""
+        self.live = set()
+
+    def lost(self, channel):
+        """The bridge left the channel (kicked, or parted): it hears nothing there
+        until it rejoins and catches up, so no sync may extend the interval."""
+        self.live.discard(channel.lower())
 
     def _save(self):
         tmp = COVERAGE.with_suffix(".tmp")
@@ -806,6 +816,7 @@ class Coverage:
             span = {"since": _now(), "through": None}
         span["mark"] = mark
         self.spans[ch] = span
+        self.live.add(ch)
         self._save()
 
     def mark(self, channel, mark):
@@ -815,10 +826,11 @@ class Coverage:
             span["mark"] = mark
             self._save()
 
-    def sync(self, channels, sent_at):
-        """The server answered a PING sent at `sent_at` while `channels` were complete on this connection."""
+    def sync(self, sent_at):
+        """The server answered a PING sent at `sent_at`: every channel still complete
+        on this connection has its log complete through then."""
         changed = False
-        for ch in channels:
+        for ch in self.live:
             span = self.spans.get(ch.lower())
             if span is not None and (span.get("through") or 0) < sent_at:
                 span["through"] = sent_at
@@ -1198,6 +1210,7 @@ def handle_tagmsg(msg, cfg, deliveries, acks):
 
 def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
     coverage = coverage if coverage is not None else Coverage()
+    coverage.connected()
     conn = chatlib.login("chatbridge", cfg, caps=CAPS)
     log("connected")
     joined, caught_up, pager = set(), set(), HistoryPager()
@@ -1206,6 +1219,12 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
     multiline = {}    # open draft/multiline batches: ref -> (opening line, lines so far)
     sync = None       # (token, sent at) of the PING that precedes the next outbox flush
     flush_due = False
+
+    def lost(ch):  # out of the channel: rejoin through LIST, and catch up again before it counts as complete
+        for seen in (complete, joined, caught_up):
+            seen.discard(ch.lower())
+        coverage.lost(ch)
+        log(f"left {ch}; its record is incomplete until a catch-up after rejoining")
 
     def privmsg(m, history):
         handle(m, cfg, record, deliveries, acks, replayed=history)
@@ -1278,8 +1297,13 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
                     privmsg(msg, pager.is_history(batch))
                 elif cmd == "TAGMSG" and msg["params"][0].startswith("#"):
                     handle_tagmsg(msg, cfg, deliveries, acks)
+                elif cmd == "KICK" and msg["params"][1:2] and msg["params"][1].lower() == "chatbridge":
+                    lost(msg["params"][0])
+                elif (cmd == "PART" and msg["prefix"].split("!")[0].lower() == "chatbridge"
+                      and msg["params"][:1] and not batch):
+                    lost(msg["params"][0])
                 elif cmd == "PONG" and sync and msg["params"][-1:] == [sync[0]]:
-                    coverage.sync(complete, sync[1])  # everything published before the PING is logged
+                    coverage.sync(sync[1])  # everything published before the PING is logged
                     flush_due = True
                     break
                 if time.time() > next_list:
