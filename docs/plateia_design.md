@@ -2104,6 +2104,56 @@ D-23 makes plateia the single source of. Capturing the defect verbatim and
 fixing it in a later slice was not selected either: the reposting wakes
 managers on every flush.
 
+### D-73. #19's outbox state: one SQLite authority, designated senders, conservative finality
+
+Owner decision, 2026-10-09, relayed by the plateia manager. It refines D-72's
+repair after PR #20's review found four defects. All four came from outbox
+state split across several files and processes. The design is in
+[chat_outbox_state.md](chat_outbox_state.md); its section 11 gives the same
+decisions.
+
+- **One SQLite authority.** All outbox delivery state of plateia's copy lives
+  in one SQLite database, used through Python's standard `sqlite3`. That
+  covers entries, parts, attempts, attributions, evidence and coverage.
+  - The JSONL outbox files are only an import boundary.
+  - The dead letters and the owner alert are only exports.
+  - Every transport caller records its intent before sending anything.
+- **Designated senders (D2).** Delivery is confirmed from a matching message
+  in the record only for designated sender accounts. Which accounts are
+  designated is configured only at a separately approved activation, and
+  nothing is configured now. For any other account, such a part stays
+  unknown.
+- **Conservative finality (N6, N7).**
+  - Absence is proved only by finality specific to the attempt: the server's
+    in-order reply on the attempt's own connection.
+  - A crash, a broken connection, or no response by the end of a bounded
+    drain leaves the part unknown. So does a refusal whose durable record
+    failed. A timeout never proves a message was not sent.
+  - An unknown part is kept, never resent, and after 24 hours it is
+    dead-lettered, keeping its progress, with a content-free owner alert.
+  - Confirmed parts are never resent, and independent posts keep flowing.
+- **Not adopted (D1).** A dead direct writer's unsent remainder is not taken
+  over.
+- **#19's acceptance.**
+  - Acceptance 7 recovers the SQLite crash state rather than a claimed file,
+    with the same behavioral assertions (AD-1).
+  - Acceptance 3's absence fixture needs finality specific to the attempt,
+    not a bare timeout (AD-2).
+
+  #19 carries the owner's amendment saying so.
+
+Delivery stays at-least-once with the record check, and nothing claims
+exactly-once. These decisions approve the design only: implementing it needs
+a separate owner decision, and so does activation.
+
+Rejected alternatives:
+
+- **More local patches to the file-based state.** Each review round found a
+  new interleaving.
+- **Confirming delivery from text for every account.** An untracked identical
+  message could retire a part that was never posted.
+- **A settling time as proof of absence.** It is not proved.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
