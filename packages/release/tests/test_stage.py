@@ -180,7 +180,7 @@ class HappyPathTests(StageCase):
 
     def test_a_changed_environment_is_refused_before_any_of_its_code_runs(self):
         """On a completed retry, a modified initializer, an added startup
-        hook, a replaced command, a cleared executable bit or an edited
+        hook (.pth or sitecustomize), a replaced command, a cleared executable bit or an edited
         pyvenv.cfg is refused by the static check, before the environment's
         interpreter runs: the registry the planted code would write stays
         byte-identical."""
@@ -190,8 +190,10 @@ class HappyPathTests(StageCase):
         registry = self.home / ".local/state/chat/identities.json"
         payload = f"open({str(registry)!r}, 'w').write('overwritten')\n"
         init, pth, pchat = site / "plateia_chat/__init__.py", site / "zz-hook.pth", env / "bin/pchat"
+        custom = site / "sitecustomize.py"
         cases = ((lambda: init.write_text(init.read_text() + payload), "lib/python"),
                  (lambda: pth.write_text("import os; " + payload), "lib/python"),
+                 (lambda: custom.write_text(payload), "lib/python"),
                  (lambda: pchat.write_text(pchat.read_text() + payload), "bin/pchat"),
                  (lambda: pchat.chmod(0o644), "bin/pchat"),
                  (lambda: (env / "pyvenv.cfg").write_text("home = /invented\n"), "pyvenv.cfg"))
@@ -210,6 +212,7 @@ class HappyPathTests(StageCase):
                         p.write_bytes(data)
                         p.chmod(mode)
                     pth.unlink(missing_ok=True)
+                    custom.unlink(missing_ok=True)
                 self.assertHomeUnchanged()
         self.assertEqual(self.stage()[0]["state"], "already staged, verified")
 
@@ -600,6 +603,32 @@ class ImporterTests(StageCase):
                 self.assertEqual([t["name"] for t in plan["targets"] if t["problems"]], [])
                 self.assertNotIn(_staging.SECRETS[0], stage_release.render_plan(plan))
 
+    def test_the_skills_root_itself_aliased_to_claude_or_the_home_exempts_nothing(self):
+        """The declared skills root ({skills}) resolving to ~/.claude, then to
+        the invented home, each with an executable-looking alias to the
+        private settings file beside it: the settings file is never opened,
+        the root is named as excluded, and the inventory is incomplete."""
+        claude = self.home / ".claude"
+        settings = _staging.write(claude / "settings.json",
+                                  f'{{"token": "{_staging.SECRETS[0]}", "sys.path.insert": "chat/scripts"}}\n')
+        settings.chmod(0o755)
+        self.skills.rename(self.where / "skills-elsewhere")
+        for target in (claude, self.home):
+            with self.subTest(alias=target.name):
+                if os.path.lexists(self.skills):
+                    self.skills.unlink()
+                self.skills.symlink_to(target)
+                if not os.path.lexists(target / "settings.py"):
+                    (target / "settings.py").symlink_to(settings)
+                importers, opened = self.opened_by_discovery()
+                self.assertNotIn(os.path.realpath(settings), {os.path.realpath(p) for p in opened})
+                self.assertFalse(importers["complete"])
+                root = next(r for r in importers["roots"] if r["path"] == "~/.codex/skills")
+                self.assertEqual(root["status"], "incomplete")
+                self.assertRegex(root["excluded"][0], r"^~/\.codex/skills \(a declared root that resolves to "
+                                                      r".*private data; not searched")
+                self.assertNotIn(_staging.SECRETS[0], json.dumps(importers))
+
     def test_a_large_script_is_searched_and_one_over_the_cap_is_named(self):
         big = self.skills / "bulk/scripts/generated.py"
         _staging.write(big, "# generated\n" + ("x = 1\n" * 400_000) +
@@ -677,6 +706,41 @@ class RecoveryTests(StageCase):
                                  else "resumed and staged" if begun else "staged")
                 self.assertOneOperationStaged()
         self.assertGreater(n, 25, "fewer journal records than expected")
+
+    def test_recovery_never_runs_an_environment_it_finds_changed(self):
+        """Interrupted after the install, or after verification, then the
+        environment tampered with: altered package code, a .pth startup hook,
+        a sitecustomize hook, or a changed pyvenv.cfg, each planted to
+        overwrite the invented identity registry. Recovery never runs the
+        environment it finds: it removes the directory this operation
+        created and builds it again, and the registry stays byte-identical."""
+        registry = self.home / ".local/state/chat/identities.json"
+        payload = f"open({str(registry)!r}, 'w').write('overwritten')\n"
+        env = self.dest / "releases" / self.manifest["release"] / "env"
+
+        def site():
+            return next(env.glob("lib/python*/site-packages"))
+        damage = {"package code": lambda: (site() / "plateia_chat/__init__.py").write_text(payload),
+                  ".pth hook": lambda: (site() / "zz-hook.pth").write_text("import os; " + payload),
+                  "sitecustomize": lambda: (site() / "sitecustomize.py").write_text(payload),
+                  "pyvenv.cfg": lambda: (env / "pyvenv.cfg").write_text("home = /invented\n")}
+        for after in ("install-package", "verify-environment"):
+            for name, plant in damage.items():
+                with self.subTest(after=after, damage=name):
+                    if self.dest.exists():
+                        shutil.rmtree(self.dest)
+                    with self.assertRaises(stage_release.Crash):
+                        self.stage(crash=self.crash_when(lambda r, after=after: r["kind"] == "outcome"
+                                                         and r.get("step") == after))
+                    plant()
+                    stage_release.CALLS.clear()
+                    summary, _, _ = self.stage()
+                    self.assertEqual(summary["state"], "resumed and staged")
+                    venv_at = next(i for i, c in enumerate(stage_release.CALLS) if "venv" in c)
+                    self.assertFalse(any(Path(c[0]).parent.parent == env for c in stage_release.CALLS[:venv_at]),
+                                     "the environment found on disk ran before it was rebuilt")
+                    self.assertFalse((site() / "zz-hook.pth").exists() or (site() / "sitecustomize.py").exists())
+                    self.assertHomeUnchanged()
 
     def test_a_partial_copy_and_a_partial_environment_are_redone_in_place(self):
         """Interrupted mid-copy (one artifact written and recorded, the next
@@ -1011,35 +1075,60 @@ class ProcessSwapTests(StageCase):
             return real(argv, **kw)
         return mock.patch.object(stage_release, "run", boundary)
 
-    def test_a_directory_swapped_while_venv_or_pip_runs_is_named_and_the_step_never_completes(self):
+    def check_swap_during(self, process, step):
+        """For each directory on the environment's path, swapped while
+        `process` runs and still swapped at the check after it: refused,
+        naming that directory; the step recorded failed and no step at or
+        after it recorded complete; no later step started (for venv, pip
+        never ran); the operation left unfinished. A retry refuses the
+        conflicting directory without writing: the journal keeps its one
+        operation byte for byte, and nothing in the home changes."""
         rel_dir = self.dest / "releases" / self.manifest["release"]
-        for process, step in (("venv", "create-environment"), ("pip", "install-package")):
-            for swapped in (self.dest, rel_dir, rel_dir / "env"):
-                with self.subTest(process=process, swapped=swapped.name):
-                    for leftover in (self.dest, Path(f"{self.dest}-moved")):
-                        if os.path.lexists(leftover):
-                            leftover.unlink() if leftover.is_symlink() else shutil.rmtree(leftover)
-                    with self.swap_during(process, swapped):
-                        with self.assertRaises(Refused) as caught:
-                            self.stage()
-                    message = str(caught.exception)
-                    self.assertIn(f"{step} failed: {stage_release.shown(swapped)} changed while {process} ran",
-                                  message)
-                    self.assertIn("may have landed elsewhere (D-71)", message)
-                    journal_dir = Path(f"{self.dest}-moved") if swapped == self.dest else self.dest
-                    records = stage_release.read_journal(journal_dir / "journal.jsonl")
-                    outcomes = [r for r in records if r["kind"] == "outcome"]
-                    self.assertEqual([r["result"] for r in outcomes if r["step"] == step], ["failed"])
-                    late = [r for r in outcomes
-                            if r["result"] == "ok" and STEP_ORDER[r["step"]] >= STEP_ORDER[step]]
-                    self.assertEqual(late, [], "a step at or after the swap was recorded complete")
-                    self.assertEqual(stage_release.status(journal_dir)[0]["state"],
-                                     f"unfinished (last: outcome {step}: failed)")
-                    self.assertFalse(os.path.lexists(rel_dir / "staged.json"))
-                    # Nothing here asserts that no write landed: during the swap D-71 doesn't require that.
-                    os.unlink(swapped)
-                    if swapped != self.dest:
-                        shutil.rmtree(self.dest)
+        for swapped in (self.dest, rel_dir, rel_dir / "env"):
+            with self.subTest(process=process, swapped=swapped.name):
+                for leftover in (self.dest, Path(f"{self.dest}-moved")):
+                    if os.path.lexists(leftover):
+                        leftover.unlink() if leftover.is_symlink() else shutil.rmtree(leftover)
+                stage_release.CALLS.clear()
+                with self.swap_during(process, swapped):
+                    with self.assertRaises(Refused) as caught:
+                        self.stage()
+                message = str(caught.exception)
+                self.assertIn(f"{step} failed: {stage_release.shown(swapped)} changed while {process} ran",
+                              message)
+                self.assertIn("may have landed elsewhere (D-71)", message)
+                journal = (Path(f"{self.dest}-moved") if swapped == self.dest else self.dest) / "journal.jsonl"
+                records = stage_release.read_journal(journal)
+                outcomes = [r for r in records if r["kind"] == "outcome"]
+                self.assertEqual([r["result"] for r in outcomes if r["step"] == step], ["failed"])
+                late = [r for r in outcomes if r["result"] == "ok" and STEP_ORDER[r["step"]] >= STEP_ORDER[step]]
+                self.assertEqual(late, [], "a step at or after the swap was recorded complete")
+                started = [r["step"] for r in records if r["kind"] == "intent"]
+                self.assertEqual(started[-1], step, "a later step started")
+                if process == "venv":
+                    self.assertFalse(any("pip" in call for call in stage_release.CALLS), "pip ran after the swap")
+                ops = stage_release.status(journal.parent)
+                self.assertEqual([o["state"] for o in ops], [f"unfinished (last: outcome {step}: failed)"])
+                self.assertFalse(os.path.lexists(rel_dir / "staged.json"))
+                # Nothing here asserts that no write landed: during the swap D-71 doesn't require that.
+
+                journal_bytes, home_now = journal.read_bytes(), _staging.snapshot_tree(self.home)
+                with self.assertRaises(Refused) as retry:
+                    self.stage()
+                self.assertIn(stage_release.shown(swapped), str(retry.exception))  # the conflicting directory
+                self.assertEqual(journal.read_bytes(), journal_bytes, "the retry wrote to the journal")
+                self.assertEqual([o["operation"] for o in stage_release.status(journal.parent)],
+                                 [o["operation"] for o in ops])
+                self.assertEqual(_staging.snapshot_tree(self.home), home_now, "the retry changed the home")
+                os.unlink(swapped)
+                if swapped != self.dest:
+                    shutil.rmtree(self.dest)
+
+    def test_a_directory_swapped_while_venv_runs_is_named_and_the_step_never_completes(self):
+        self.check_swap_during("venv", "create-environment")
+
+    def test_a_directory_swapped_while_pip_runs_is_named_and_the_step_never_completes(self):
+        self.check_swap_during("pip", "install-package")
 
 
 STEP_ORDER = {name: i for i, name in enumerate(stage_release.STEPS)}

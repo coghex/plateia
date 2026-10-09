@@ -1283,8 +1283,9 @@ def check_destination(dest, identity):
     try:
         root = build_release.check_output_dir(dest, CHECKOUT, names)
     except Refused as e:
-        raise Refused(str(e).replace("output directory", "staging destination")
-                      .replace("release directory", "staging path")) from None
+        text = str(e).replace("release directory", "staging path")
+        named = f"the staging destination {shown(dest)}"
+        raise Refused(text.replace("the output directory", named).replace("output directory", named)) from None
     if os.path.lexists(root) and not root.is_dir():
         raise Refused(f"the staging destination {shown(root)} exists and is not a directory; left unchanged")
     if root.is_dir():
