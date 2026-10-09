@@ -30,7 +30,7 @@ def notify(record, text, kind='status'):
     try:
         chatlib.post(channel, message, record['name'], cfg, cont=tag)
     except chatlib.Refused as err:
-        if chatlib.part_counts(err.parts or [])['confirmed']:  # partly published: never repost those parts
+        if err.parts:  # the server refused it: retrying can't help, and its record keeps what went out
             chatlib.dead_letter_post({**entry, 'parts': err.parts}, str(err))
         else:
             chatlib.outbox_append([entry])

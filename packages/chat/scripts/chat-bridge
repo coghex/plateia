@@ -99,6 +99,7 @@ EVIDENCE_MAX = 20_000_000  # bytes; a larger cited file is recorded but not copi
 TMP_PATH = re.compile(r"(?<![\w/])((?:/private)?/tmp/[^\s`'\"()<>\[\]{}|]+)")
 ACKS = chatlib.STATE_DIR / "acks.jsonl"
 COVERAGE = chatlib.STATE_DIR / "record-coverage.json"
+ATTRIBUTED = chatlib.STATE_DIR / "outbox-attributed.jsonl"  # msgids already counted as an outbox part's delivery
 CLOCK_ALLOWANCE = 5      # seconds of clock difference allowed when matching a written part in the record
 SETTLE = 600             # a part is ruled absent only once the record is complete this long after it was written
 UNDECIDED_MAX = 86400    # a part neither found nor ruled absent for this long is dead-lettered
@@ -667,7 +668,7 @@ def announce(cfg, item, text):
     try:
         chatlib.post(item["channel"], f"[status] chatbridge: {text}", "chatbridge", cfg, reply_to=item["msgid"])
     except chatlib.Refused as err:
-        if chatlib.part_counts(err.parts or [])["confirmed"]:  # partly published: never repost those parts
+        if err.parts:  # the server refused it: retrying can't help, and its record keeps what went out
             chatlib.dead_letter_post({**entry, "parts": err.parts}, str(err))
         else:
             chatlib.outbox_append([entry])
@@ -833,7 +834,8 @@ class Coverage:
 
 def _record_matches(channel, account, text, since):
     """Logged messages in `channel` from the server-verified `account` with exactly
-    `text`, at or after `since` (seconds since the epoch), oldest first."""
+    `text`, at or after `since` (seconds since the epoch), oldest first, as
+    (time, msgid) pairs."""
     path = chatlib.channel_log(channel)
     found = []
     if path.exists():
@@ -846,34 +848,57 @@ def _record_matches(channel, account, text, since):
                     and e.get("channel", "").lower() == channel.lower() and e.get("at")
                     and parse_time(e["at"]).timestamp() >= since):
                 found.append((parse_time(e["at"]).timestamp(), e["msgid"]))
-    return [mid for _, mid in sorted(found)]
+    return sorted(found)
 
 
 def reconcile(entry, coverage, attributed):
-    """Decide the entry's uncertain parts from the record. A part is delivered
-    when distinct logged messages account for it and for every other part of
-    this post with the same text; it is absent when the record is complete over
-    the whole interval and holds no message left for it. Anything less leaves it
-    undecided. A message already attributed to another part is never reused.
+    """Decide the entry's uncertain part from the record. Every part of this
+    post with the same text needs a distinct logged message, written no earlier
+    than that part itself (less the clock allowance): the part is delivered when
+    all of them can be matched so. A msgid already counted for any outbox part,
+    in this flush or an earlier one, is never used again. It is absent when the
+    record is complete over the whole interval and no such matching leaves a
+    message for it; otherwise it is undecided.
     Returns 'delivered', 'absent' or 'undecided' for the earliest uncertain part."""
     parts = entry["parts"]
     first = next(i for i, p in enumerate(parts) if p["state"] == "uncertain")
     text = parts[first]["text"]
-    same = [p for p in parts if p["text"] == text and not p.get("msgid") and p["state"] in ("confirmed", "uncertain")]
-    start = min(p.get("written_at") or 0 for p in same) - CLOCK_ALLOWANCE
-    found = [m for m in _record_matches(entry["channel"], entry["as"], text, start) if m not in attributed]
-    if len(found) >= len(same):
-        for part, mid in zip(sorted(same, key=lambda p: p.get("written_at") or 0), found):
+    same = sorted((p for p in parts if p["text"] == text and not p.get("msgid")
+                   and p["state"] in ("confirmed", "uncertain")), key=lambda p: p.get("written_at") or 0)
+    start = (same[0].get("written_at") or 0) - CLOCK_ALLOWANCE
+    found = [(at, mid) for at, mid in _record_matches(entry["channel"], entry["as"], text, start)
+             if mid not in attributed]
+    matched, used = [], set()
+    for part in same:  # by write time, each takes the earliest message it could be: optimal for lower bounds
+        bound = (part.get("written_at") or 0) - CLOCK_ALLOWANCE
+        pick = next((mid for at, mid in found if mid not in used and at >= bound), None)
+        if pick is None:
+            break
+        used.add(pick)
+        matched.append((part, pick))
+    if len(matched) == len(same):
+        for part, mid in matched:
             part["msgid"] = mid
             attributed.add(mid)
             if part["state"] == "uncertain":
                 part["state"] = "confirmed"
         return "delivered"
-    confirmed = sum(1 for p in same if p["state"] == "confirmed")
-    latest = max(p.get("written_at") or 0 for p in same if p["state"] == "uncertain")
-    if len(found) <= confirmed and coverage.covers(entry["channel"], start, latest + SETTLE):
-        return "absent"
+    uncertain = [p for p in same if p["state"] == "uncertain"]
+    if len(uncertain) == 1 and coverage.covers(entry["channel"], start, (uncertain[0].get("written_at") or 0) + SETTLE):
+        return "absent"  # the record is complete: every confirmed part's message is in it, and none is left for this one
     return "undecided"
+
+
+def _attributed():
+    """Every msgid already counted as some outbox part's delivery, including entries since retired."""
+    found = set()
+    if ATTRIBUTED.exists():
+        for line in ATTRIBUTED.read_text().splitlines():
+            try:
+                found.add(json.loads(line)["msgid"])
+            except (ValueError, KeyError, TypeError):
+                continue
+    return found
 
 
 class _Claimed:
@@ -903,16 +928,50 @@ class _Claimed:
         os.replace(tmp, self.path)
 
     def done(self, row):
+        """Nothing more is owed for `row`. The msgids it was matched to are kept
+        first, so no later check can count them for another part."""
+        with ATTRIBUTED.open("a") as f:
+            for i, part in enumerate(row.get("parts") or []):
+                if part.get("msgid"):
+                    f.write(json.dumps({"msgid": part["msgid"], "entry": row.get("id"), "part": i}) + "\n")
         self.rows.remove(row)
         self.save()
 
 
-def _dead_post(e, detail, deliveries, alert):
-    _append_jsonl(DEAD_LETTERS, {**e, "kind": "post", "dead_at": now_iso(), "last_detail": detail})
-    if alert and deliveries is not None:  # content-free: who and where, never the text
-        deliveries.add_all([{"kind": "push", "msgid": e.get("id"), "channel": e["channel"], "sender": "chatbridge",
-                             "project": None, "attempt": 0, "next_at": 0,
-                             "text": f"an outbox post from {e['as']} {alert}; dead-lettered"}])
+def _dead_lettered(entry_id):
+    if not DEAD_LETTERS.exists():
+        return False
+    for line in DEAD_LETTERS.read_text().splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("kind") == "post" and d.get("id") == entry_id:
+            return True
+    return False
+
+
+def _end(e, claimed, detail, deliveries, alert=None):
+    """Give up on an entry for good: marked terminal durably first, so a crash
+    anywhere after can only finish the job, never make it retryable again."""
+    e.setdefault("id", uuid.uuid4().hex)
+    e["terminal"] = {"detail": detail, "alert": alert}
+    claimed.save()
+    _finish(e, claimed, deliveries)
+
+
+def _finish(e, claimed, deliveries):
+    """Complete a terminal entry: dead-letter it once, with its parts, then
+    retire it. The owner's alert goes first: a crash may repeat it, never lose it."""
+    end = e["terminal"]
+    if not _dead_lettered(e["id"]):
+        if end.get("alert") and deliveries is not None:  # content-free: who and where, never the text
+            deliveries.add_all([{"kind": "push", "msgid": e["id"], "channel": e["channel"], "sender": "chatbridge",
+                                 "project": None, "attempt": 0, "next_at": 0,
+                                 "text": f"an outbox post from {e['as']} {end['alert']}; dead-lettered"}])
+        record = {k: v for k, v in e.items() if k != "terminal"}
+        _append_jsonl(DEAD_LETTERS, {**record, "kind": "post", "dead_at": now_iso(), "last_detail": end["detail"]})
+    claimed.done(e)
 
 
 def flush_outbox(cfg, post=None, ack=None, coverage=None, deliveries=None):
@@ -930,15 +989,19 @@ def flush_outbox(cfg, post=None, ack=None, coverage=None, deliveries=None):
             log("outbox: another flush is running; skipped")
             return
         files = [_Claimed(path) for path in chatlib.outbox_claim()]
-        attributed = {p["msgid"] for f in files for r in f.rows if isinstance(r, dict)
-                      for p in r.get("parts") or [] if p.get("msgid")}
+        attributed = _attributed() | {p["msgid"] for f in files for r in f.rows if isinstance(r, dict)
+                                      for p in r.get("parts") or [] if p.get("msgid")}
         for claimed in files:
             for e in list(claimed.rows):
                 if isinstance(e, str):
                     log(f"outbox: unreadable entry kept in {claimed.path.name}")
                     continue
                 try:
-                    if _flush_entry(e, claimed, cfg, post, ack, coverage, deliveries, attributed):
+                    if e.get("terminal"):  # given up on before a crash: finish that, never retry
+                        _finish(e, claimed, deliveries)
+                    elif any(p.get("state") == "refused" for p in e.get("parts") or []):
+                        _end(e, claimed, "refused by the server", deliveries)
+                    elif _flush_entry(e, claimed, cfg, post, ack, coverage, deliveries, attributed):
                         claimed.done(e)
                 except Exception as err:  # still failing: it stays owed, as recorded
                     claimed.save()
@@ -969,10 +1032,10 @@ def _flush_entry(e, claimed, cfg, post, ack, coverage, deliveries, attributed):
         elif verdict == "undecided":
             written = max(p.get("written_at") or 0 for p in parts if p["state"] == "uncertain")
             if _now() - written > UNDECIDED_MAX:
-                _dead_post(e, f"a part's delivery could not be confirmed or ruled out for {UNDECIDED_MAX // 3600} h",
-                           deliveries, f"to {e['channel']} could not be confirmed for {UNDECIDED_MAX // 3600} h")
                 log(f"outbox: DEAD-LETTERED a post to {e['channel']} as {e['as']}: delivery undecided")
-                return True
+                _end(e, claimed, f"a part's delivery could not be confirmed or ruled out for {UNDECIDED_MAX // 3600} h",
+                     deliveries, f"to {e['channel']} could not be confirmed for {UNDECIDED_MAX // 3600} h")
+                return False  # retired by _end
             log(f"outbox: a part of a post to {e['channel']} as {e['as']} awaits a delivery check")
             return False
     if parts and all(p["state"] == "confirmed" for p in parts):
@@ -994,9 +1057,9 @@ def _flush_entry(e, claimed, cfg, post, ack, coverage, deliveries, attributed):
     except chatlib.Refused as err:  # retrying can't help: keep it where pchat status shows it
         if err.parts:
             e["parts"] = err.parts
-        _dead_post(e, str(err), deliveries, None)
         log(f"outbox: refused by the server; dead-lettered ({err!r:.100})")
-        return True
+        _end(e, claimed, str(err), deliveries)
+        return False  # retired by _end
     except chatlib.PostIncomplete as err:
         e["parts"] = err.parts
         e.setdefault("id", uuid.uuid4().hex)

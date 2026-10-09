@@ -591,6 +591,106 @@ class UndecidedForADayTests(OutboxCase):
         self.assertIn("alp-solver-2", push["text"])
 
 
+def uncertain_entry(entry_id, text, written_at, *, before=()):
+    """A queued entry whose last part (`text`) was written at `written_at` and never
+    confirmed, after confirmed parts `before`: (text, written_at) pairs."""
+    parts = [{"kind": "line", "lines": [[x, False]], "text": x, "state": "confirmed", "written_at": w}
+             for x, w in before]
+    parts.append({"kind": "line", "lines": [[text, False]], "text": text, "state": "uncertain",
+                  "written_at": written_at})
+    return {"channel": "#alpha", "as": "alp-solver-2", "text": text, "id": entry_id, "at": "t", "parts": parts}
+
+
+class RoundOneTests(OutboxCase):
+    """Review round 1 of #20: evidence is never reused, repeated parts are matched
+    by their own write times, and giving up on an entry survives a crash."""
+
+    def claimed(self, *entries):
+        path = chatlib.STATE_DIR / "outbox.claimed-1.jsonl"
+        path.write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+    def recorded(self, text, at, msgid):
+        self.log_record({"account": "alp-solver-2", "channel": "#alpha", "text": text, "at": at, "msgid": msgid})
+
+    def test_a_msgid_counted_for_a_retired_entry_is_never_counted_again(self):
+        self.claimed(uncertain_entry("e1", "… [status alpha-1] same", T0),
+                     uncertain_entry("e2", "… [status alpha-1] same", T0))
+        self.recorded("… [status alpha-1] same", T0 + 1, "srv1")
+        self.clock.t += 60
+        self.flush()
+        self.assertEqual([e["id"] for e in self.entries()], ["e2"], "one message retires one entry")
+        for _ in range(2):
+            self.flush()
+        self.assertEqual([e["id"] for e in self.entries()], ["e2"], "not by the same msgid in a later flush")
+        loader = importlib.machinery.SourceFileLoader("chat_bridge_restarted_r1", str(SCRIPTS / "chat-bridge"))
+        fresh = importlib.util.module_from_spec(importlib.util.spec_from_loader("chat_bridge_restarted_r1", loader))
+        loader.exec_module(fresh)
+        with mock.patch.object(fresh, "_now", self.clock):
+            self.flush(module=fresh)
+        self.assertEqual([e["id"] for e in self.entries()], ["e2"], "nor after a restart")
+        self.assertEqual(self.server.writes, [])
+
+    def test_repeated_parts_are_matched_by_their_own_write_times(self):
+        text = "… [status alpha-1] same"
+        self.claimed(uncertain_entry("e1", text, T0 + 60, before=[("first", T0 - 1), (text, T0)]))
+        self.recorded(text, T0, "srv1")
+        self.recorded(text, T0 + 1, "srv2")  # both before the uncertain part was written
+        self.clock.t += 120
+        self.flush()
+        self.assertEqual(self.states(), ["confirmed", "confirmed", "uncertain"])
+        self.recorded(text, T0 + 61, "srv3")
+        self.flush()
+        self.assertEqual(self.entries(), [])
+
+    def test_a_crash_after_dead_lettering_never_makes_the_entry_retryable(self):
+        chatlib.outbox_append([{"channel": "#alpha", "as": "alp-solver-2", "text": LONG, "cont": TAG, "at": "t"}])
+        self.serve("ok", "fail")
+        done = bridge._Claimed.done
+        with mock.patch.object(bridge._Claimed, "done", side_effect=Crash()):
+            with self.assertRaises(Crash):
+                self.flush()
+        self.assertEqual(len(self.dead()), 1)
+        writes = len(self.server.writes)
+        self.clock.t += bridge.SETTLE + 60
+        self.covered(T0 - 3600, self.clock.t)  # absence could now be shown: still never resent
+        with mock.patch.object(bridge._Claimed, "done", done):
+            self.flush()
+            self.flush()
+        self.assertEqual((self.entries(), len(self.dead()), len(self.server.writes)), ([], 1, writes))
+
+    def test_a_refused_part_left_by_a_crash_is_dead_lettered_once(self):
+        entry = uncertain_entry("e1", "second", T0, before=[("first", T0 - 1)])
+        entry["parts"][-1]["state"] = "refused"
+        self.claimed(entry)
+        self.flush()
+        self.flush()
+        self.assertEqual((self.entries(), len(self.dead()), self.server.writes), ([], 1, []))
+        self.assertEqual([p["state"] for p in self.dead()[0]["parts"]], ["confirmed", "refused"])
+
+    def test_a_day_undecided_crash_before_retiring_alerts_once_and_dead_letters_once(self):
+        self.claimed(uncertain_entry("e1", "only", T0))
+        self.clock.t += bridge.UNDECIDED_MAX + 60
+        deliveries = bridge.Deliveries()
+        with mock.patch.object(bridge._Claimed, "done", side_effect=Crash()):
+            with self.assertRaises(Crash):
+                self.flush(deliveries=deliveries)
+        self.flush(deliveries=deliveries)
+        self.assertEqual((self.entries(), len(self.dead())), ([], 1))
+        self.assertEqual(len([i for i in deliveries.items if i["kind"] == "push"]), 1)
+
+    def test_first_part_refusals_are_terminal_for_agent_notices_and_announcements(self):
+        self.serve("fail")
+        with mock.patch.object(agentcli.runstore, "silent_refusal", lambda *a: None):
+            agentcli.notify({"channel": "#alpha", "name": "alp-solver-2", "request": "alpha-20261009-1"}, "short")
+        self.serve("fail")
+        bridge.announce(CFG, {"channel": "#alpha", "msgid": "srv1"}, "interrupt delivered")
+        self.assertEqual(self.entries(), [])
+        self.assertEqual([[p["state"] for p in d["parts"]] for d in self.dead()], [["refused"], ["refused"]])
+        writes = len(self.server.writes)
+        self.flush()
+        self.assertEqual(len(self.server.writes), writes, "nothing is sent again")
+
+
 class CoverageTests(unittest.TestCase):
     """The record is complete over an interval only through a finished catch-up and a sync."""
 

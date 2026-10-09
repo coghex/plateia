@@ -55,14 +55,14 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "262d42bf09af99eac65e19ef4e50ec6fea7d7072969c8308d3ff58848c94e272",
       "capture": "changed",
-      "sha256": "3eb8622bcbc331280b3806e78464d54d2cbb847f43c1ab4c731b327da30d8ec6",
+      "sha256": "664eda3e8f06735d0fe8eda6fb1a5438242a3f87b903c53be46df9d332482288",
       "changes": [
         {
           "change": "`pchat agent who`'s 'outside cmux use --as ... explicitly' hint names the chat config's assistant identity (the identity whose role is assistant), or ACCOUNT if none, instead of a fixed account name.",
           "reason": "Resolve the assistant's name at runtime (requirement 3); the message is unchanged for a config whose assistant identity is the account the baseline named."
         },
         {
-          "change": "notify() queues only the unconfirmed remainder of a notice that failed partway, and dead-letters, rather than requeues, one refused after some parts were published.",
+          "change": "notify() queues only the unconfirmed remainder of a notice that failed partway, and dead-letters, with its parts, any notice the server refused instead of queueing it again.",
           "reason": "Every caller that feeds the outbox must keep partial progress (#19 review amendment). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
@@ -291,14 +291,14 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
       "capture": "changed",
-      "sha256": "c13df7fd5995164a89f02817d549e73343f498096a9c5e8c23105a5dd4c00cea",
+      "sha256": "5eb6d17e4b317249aa3faf5a0b0f67fc83f2fa56f6214a2a88f49a6c87f8e4ca",
       "changes": [
         {
           "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
           "reason": "Deliberate deviation from c572bad, by owner decision on PR #16's first review: a catch-up cut short leaves the checkpoint behind, so after a restart more than 5,000 replayed messages would be logged again and an accepted request queued again (PLT-15 requirement 8). The running bridge keeps the baseline behavior until activation."
         },
         {
-          "change": "flush_outbox rewrites each claimed file after every change and removes it only when empty, so a crash leaves exactly what is still owed; a part caught mid-write is uncertain and is reconciled against the channel record (delivered, absent only over a record known complete through a sync well after the write, else undecided, dead-lettered with a content-free owner alert after a day) instead of being resent; announce() queues only the unconfirmed remainder; run() tracks where each channel's record is complete (record-coverage.json) and syncs with a PING before each flush.",
+          "change": "flush_outbox rewrites each claimed file after every change and removes it only when empty, so a crash leaves exactly what is still owed; a part caught mid-write is uncertain and is reconciled against the channel record (delivered, absent only over a record known complete through a sync well after the write, else undecided, dead-lettered with a content-free owner alert after a day) instead of being resent; each part needs its own logged message written no earlier than the part, and a msgid once counted (kept in outbox-attributed.jsonl) is never counted again; giving up on an entry is marked durably before it is dead-lettered and retired, so a crash can neither make it retryable nor strand it, and a server refusal is always terminal; announce() queues only the unconfirmed remainder; run() tracks where each channel's record is complete (record-coverage.json) and syncs with a PING before each flush.",
           "reason": "Stop the outbox reposting committed parts of a long post on every flush, and never resend a part that may already be in the channel without proof of absence (#19). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
