@@ -694,6 +694,22 @@ def check_destination(dest, identity):
     return root
 
 
+LAUNCHER = re.compile(r"""^'''exec' "([^"]+)" "\$0" "\$@"$""")
+
+
+def interpreter_of(lines):
+    """The interpreter a console script runs: its shebang's, or, when pip
+    wrote the /bin/sh launcher it uses for a path too long for a shebang
+    (Linux allows 127 bytes), the one that launcher execs."""
+    if not lines or not lines[0].startswith("#!"):
+        return None
+    words = lines[0][2:].split()
+    if words == ["/bin/sh"]:
+        m = LAUNCHER.match(lines[1]) if len(lines) > 1 else None
+        return m.group(1) if m else None
+    return words[0] if words else None
+
+
 def verify_staged(release_dir, manifest_sha, manifest, interpreter):
     """Check a staged release directory's artifacts and environment; returns
     the environment probe or raises Refused naming the problem."""
@@ -730,10 +746,13 @@ def verify_staged(release_dir, manifest_sha, manifest, interpreter):
     for command in staged["package"]["commands"]:
         script = env / "bin" / command
         try:
-            first = script.read_text(encoding="utf-8").splitlines()[0]
-        except (OSError, IndexError, UnicodeDecodeError):
-            raise Refused(f"the staged environment has no {command} command") from None
-        if not first.startswith("#!") or not inside(first[2:].strip().split()[0]):
+            lines = script.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            lines = []
+        if not lines:
+            raise Refused(f"the staged environment has no {command} command")
+        runs = interpreter_of(lines)
+        if not runs or not inside(runs):
             raise Refused(f"the staged {command} command doesn't run the staged interpreter")
     result = interpreter_result(manifest, found, str(python))
     if result[0] != "pass":

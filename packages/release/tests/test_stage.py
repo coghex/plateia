@@ -168,6 +168,17 @@ class HappyPathTests(StageCase):
                                              r"\(the staged environment has no pchat command\)"):
             self.stage()
 
+    def test_both_console_script_forms_name_their_interpreter(self):
+        """A shebang, or the /bin/sh launcher pip writes when the path is too
+        long for one (as on Linux runners)."""
+        env_python = "/invented/staging/releases/r/env/bin/python"
+        self.assertEqual(stage_release.interpreter_of([f"#!{env_python}", "import sys"]), env_python)
+        self.assertEqual(stage_release.interpreter_of(
+            ["#!/bin/sh", f"'''exec' \"{env_python}\" \"$0\" \"$@\"", "' '''", "import sys"]), env_python)
+        for lines in (["import sys"], ["#!/bin/sh", "exec python3"], []):
+            with self.subTest(lines=lines):
+                self.assertIsNone(stage_release.interpreter_of(lines))
+
     def test_the_api_check_is_not_applicable_never_a_pass(self):
         report = self.preflight()
         self.assertIn(["not applicable", "api",
