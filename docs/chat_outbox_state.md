@@ -4,6 +4,11 @@ This is the design note for #19 and pull request #20. It is design only:
 nothing here is implemented, and implementing it needs a separate owner
 decision.
 
+This is revision 2. It answers design review round 1, and section 11 lists
+what changed and why.
+
+## Background
+
 PR #20 (head `e658bb8`) repairs a long post that was reposted on every outbox
 flush. Its fifth review found four remaining defects. All four come from one
 cause: outbox state is split across several files and processes.
@@ -13,20 +18,26 @@ cause: outbox state is split across several files and processes.
 - Msgids already counted live in `outbox-attributed.jsonl`.
 - Record completeness lives in `record-coverage.json`.
 
-`pchat`, `agentcli.notify`, the bridge's `announce` and the bridge's flush
-each write part of that state, under different locks. The flush reads it as
-snapshots taken when it starts, and prunes it by wall-clock age.
+Several processes write that state, under different locks, and the bridge's
+flush reads it as start-of-flush snapshots and prunes it by wall-clock age.
 
-This note replaces the split state with one SQLite database. Every transport
-caller records its intent there before it sends anything. Reconciliation
-decides delivery inside a single transaction, from the current state. Evidence
-is kept for as long as anything still depends on it.
+This note replaces the split state with one SQLite database:
 
-The delivery contract is #19's and does not change: confirmed parts are never
-resent, unsent parts stay durable, and an uncertain part is checked against
-the record and resent only when its absence is proved. Delivery is
-at-least-once with that check. Nothing here claims exactly-once delivery, and
-nothing can: no transaction spans both the database and the chat server.
+- Every transport caller records its intent there before sending any byte.
+- Reconciliation decides inside one transaction, from the current state.
+- Evidence is kept while anything depends on it.
+
+The delivery contract is #19's:
+
+- confirmed parts are never resent;
+- unsent parts stay durable;
+- an uncertain part is resent only when its absence is proved.
+
+Delivery is at-least-once with that check. Nothing claims exactly-once: no
+transaction spans both the database and the chat server.
+
+Where this note proposes a change to #19's contract or acceptance, section 8
+names it as a proposal. None is approved by this note.
 
 Every example uses invented data: projects `alpha` and `beta`, the owner
 `pat`, the assistant `sam`, and the agent `alp-solver-2`.
@@ -37,44 +48,56 @@ Every example uses invented data: projects `alpha` and `beta`, the owner
 2. [The authority](#2-the-authority)
 3. [State and transition tables](#3-state-and-transition-tables)
 4. [Invariants and proofs](#4-invariants-and-proofs)
-5. [Crashes and interleavings](#5-crashes-and-interleavings)
+5. [Connections, finality, assumptions and crashes](#5-connections-finality-assumptions-and-crashes)
 6. [Importing the old outbox](#6-importing-the-old-outbox)
 7. [Reconciliation rules](#7-reconciliation-rules)
-8. [Mapping to #19](#8-mapping-to-19)
+8. [Mapping to #19, and proposed differences](#8-mapping-to-19-and-proposed-differences)
 9. [Future tests](#9-future-tests)
 10. [Feasibility and risks](#10-feasibility-and-risks)
+11. [Revisions](#11-revisions)
 
 ## 1. Terms and constants
-
-These constants keep the values PR #20 already uses.
 
 | Name | Value | Meaning |
 |---|---|---|
 | `A` (`CLOCK_ALLOWANCE`) | 5 s | The allowed difference between the writer's wall clock and the server's message time. |
-| `SETTLE` | 600 s | How long after an attempt ends the server may still publish bytes that attempt sent (section 5.3). |
-| `UNDECIDED_MAX` | 24 h | How long an uncertain part may stay undecided, counted from its attempt's write. After that it is dead-lettered. |
-| `PART_WAIT` | 30 s | The absolute deadline for the server to confirm one part. |
-| `GC_MARGIN` | 1 h | Extra age before evidence may be collected (invariant I-7). |
+| `PART_WAIT` | 30 s | The absolute deadline for the server to confirm one part (as in PR #20). |
+| `DRAIN_WAIT` | 30 s | After `PART_WAIT` passes, how much longer the writer keeps reading for the server's late in-order reply before closing (section 5.2). |
+| `UNDECIDED_MAX` | 24 h | How long a part may stay undecided, counted from its attempt's write. Then it is dead-lettered. |
+| `GC_MARGIN` | 1 h | Extra age before evidence may be collected (I-7). |
 
-- **Entry.** One logical post, or an acknowledgement, that the transport owes.
-  It is created by `pchat post`, `pchat ack`, `agentcli.notify` or
-  `announce`, or imported from the old outbox (section 6).
-- **Part.** A fixed piece of an entry's text that the server publishes as one
-  message with one msgid: one `draft/multiline` batch, or one line. Each part
-  has an index `n` and its exact *server-visible text*: the text the bridge
-  records for that message.
-- **Attempt.** One try at sending one part over one connection. A part may
-  have several attempts, numbered by a per-part *generation*. Only an attempt
-  can produce a message.
-- **Text key.** The triple (account, channel case-folded, exact text). Only
-  attempts and messages with the same text key can be confused with each
-  other.
-- **Writer.** The process and flow that holds an attempt's connection. It is
-  identified by (boot id, pid, process start time) plus a per-connection id.
-- **Window.** The interval of server times in which an attempt's message, if
-  it has one, must carry its time (section 7.1).
-- **Message.** A verified message from the bridge's record: msgid, channel,
+PR #20's `SETTLE` bound is **not used**: absence now needs proved finality
+(section 5.2), not a settling time.
+
+- **Entry.** One logical post or acknowledgement that the transport owes. It
+  is created by `pchat post`, `pchat ack`, `agentcli.notify`, `announce`, or
+  by import (section 6).
+- **Part.** A fixed piece of a post that the server publishes as one message:
+  one `draft/multiline` batch or one line. A part has an index `n`, its
+  *lines*, and its exact *server-visible text*, which is what the bridge
+  records. A part is **multi-line** if its batch has more than one line.
+
+  An acknowledgement has one pseudo-part, the TAGMSG.
+- **Attempt.** One try at sending one part over one connection, numbered by a
+  per-part generation. Only an attempt can produce a message.
+- **Text key.** The triple (account, channel case-folded, exact text).
+- **Writer.** The flow holding an attempt's connection. It is identified by
+  the boot id, the pid, the process start time, and a connection id. The
+  connection id includes the connection's local TCP port and the server's
+  address.
+- **Finality.** The writer received, on that connection, the server's in-order
+  reply to a line sent after the part. The reply is the PONG to `PING :round`.
+  Section 5.2 explains what finality proves.
+- **Message.** A verified message in the bridge's record: msgid, channel,
   account, exact text and server time.
+- **Fragment test.** A message's text *t* passes the fragment test against a
+  part's text *p* when:
+  - *t* is not exactly *p*; and
+  - every newline-separated segment of *t* is a non-empty substring of *p*.
+
+  It is a superset of every text a partial publication of a multi-line part
+  could show, in any order, whether its pieces were joined or not (section
+  5.3, C-4).
 
 ## 2. The authority
 
@@ -88,517 +111,658 @@ chat state directory. It replaces:
 - `outbox-attributed.jsonl`;
 - `record-coverage.json`.
 
-**Settings:** WAL journal mode, `synchronous=FULL` so that a committed
-transaction survives a power loss, and a bounded busy timeout. Every write is a
-`BEGIN IMMEDIATE` transaction, which takes the database's single write lock
-when it begins. Writes are therefore serialized, and every decision is read and
-written inside one transaction.
+**Settings:**
 
-**No network I/O inside a transaction.** Every transaction reads and writes
-local state only. Logging in, sending, waiting for confirmation and closing
-all happen between transactions.
+- WAL journal mode;
+- `synchronous=FULL`, so a commit survives a power loss;
+- a bounded busy timeout;
+- every write in a `BEGIN IMMEDIATE` transaction. That takes the single write
+  lock at its start, so each decision is read and applied in one serialized
+  transaction.
 
-**Not a second authority.** These files remain, but none of them is a source of
-truth:
+**No network I/O inside a transaction.** Logging in, sending, waiting,
+draining and closing all happen between transactions.
 
-- `outbox.jsonl` and `outbox.claimed-*.jsonl` are an **import** boundary only
-  (section 6).
-- `dead-letters.jsonl` and the owner alert, a `push` delivery in
-  `deliveries.jsonl`, are **exports**. Each is written after the terminal
-  state commits, and is idempotent by entry id.
-- The channel logs remain the chat record, which other readers use. For the
-  outbox, the bridge indexes verified messages into the database as it records
-  them (the `messages` table below). Evidence and coverage are therefore
-  ordered with the outbox state.
+**Not a second authority.** These are boundaries, not sources of truth:
+
+- **Imports.** `outbox.jsonl` and `outbox.claimed-*.jsonl` (section 6).
+- **Exports.** `dead-letters.jsonl`, and the owner alert, which goes on the
+  bridge's pending-delivery queue (`pending.json`). The delivery ledger
+  (`deliveries.jsonl`) records outcomes only. Each export is written after
+  its terminal state commits, and the export protocol is X1 (section 3.5).
+- **The chat record.** The channel logs stay the chat record that other
+  readers use. For the outbox, the bridge also indexes verified messages into
+  the database (V1), so evidence and coverage are ordered with outbox state.
 
 ### 2.2 Tables
 
-The column lists are the minimum the proofs rely on. The exact schema is the
-implementation's choice.
+The columns listed are the minimum the proofs rely on.
 
 | Table | Key | Holds |
 |---|---|---|
 | `meta` | name | The schema version and the cutover marker (section 6.1). |
-| `entries` | `id` | The origin (`pchat`, `notify`, `announce`, `ack` or `import`); account, channel, original text, `cont`, `reply_to`, written-at; `owner_kind` (`direct` or `outbox`) and, for `direct`, the owner writer's identity; `state` (`open`, `done`, `terminal`, `abandoned`); the terminal reason and alert; export marks (`alert_exported`, `dead_letter_exported`); and import identity (claim file, line ordinal, row sha256). |
-| `parts` | (`entry_id`, `n`) | The kind, the lines, the exact server-visible text, `state` (`unsent`, `inflight`, `uncertain`, `confirmed`, `refused`), the current `generation`, and the msgid once attributed. |
-| `attempts` | `id` | `entry_id`, `n`, `generation`, the text key, the writer identity, `conn_id`, `state` (`writing`, `confirmed`, `refused`, `rejected`, `ended`, `delivered`, `absent`, `dead`), `written_at`, `confirmed_at`, `ended_at`, `end_kind` (`closed` or `writer_gone`), and a detail. UNIQUE (`entry_id`, `n`, `generation`). |
-| `attributions` | `msgid` | `attempt_id` (UNIQUE), and when it was attributed. |
+| `accounts` | account | `designated_at`, `suspended_at`, and the suspension reason (R1 and section 7.4). |
+| `entries` | `id` | The origin and kind (`post` or `ack`); account, channel, original text, `cont`, `reply_to` and written-at; `owner_kind` (`direct` or `outbox`) and the owner's writer identity; `state` (`open`, `done`, `terminal` or `abandoned`); the terminal reason and its alert flag; the export marks `dead_letter_exported` and `alert_exported`; and its import occurrence (claim file, line ordinal, row sha256). The handoff reference is UNIQUE when present. |
+| `parts` | (`entry_id`, `n`) | The kind, the lines, the server-visible text, `multi_line`; `state` (`unsent`, `inflight`, `uncertain`, `confirmed` or `refused`); the current generation; and the msgid once attributed. |
+| `attempts` | `id` | `entry_id`, `n`, `generation`, the text key, `multi_line`, the writer identity, `conn_id`; `state` (`writing`, `confirmed`, `refused`, `rejected`, `ended`, `delivered`, `absent` or `dead`); `written_at`, `final_at` (when finality was reached, else NULL) and `ended_at`; `end_kind` (`closed`, `writer_gone` or `connection_closed`); and a detail. UNIQUE (`entry_id`, `n`, `generation`). |
+| `attributions` | `msgid` | `attempt_id` (UNIQUE), and when it was made. |
 | `messages` | `msgid` | Channel, account, exact text and server time, for verified messages only. |
-| `coverage` | channel | `since`, `through` and `mark`, as PR #20's `Coverage` keeps them. |
+| `coverage` | channel | `since`, `through` and `mark`, as PR #20 keeps them. |
 | `imports` | claim file name | The line count, the content sha256, and when it was imported. |
-| `held` | (file name, ordinal) | The raw row and why it was held: unreadable, an id collision, or a changed file hash. |
+| `held` | (file name, ordinal), or the file name alone | The raw row, or a reference to the file, and why it was held. |
 
 ### 2.3 Actors and guards
 
 | Actor | Who | May do |
 |---|---|---|
-| **P** (direct writer) | a `pchat post` or `agentcli.notify` process, or the bridge running `announce` | Create its own entry. Write its own entry's parts. Hand its entry to the outbox. |
-| **B** (bridge) | the single `chatbridge` service process | Index evidence and advance coverage. Import. Flush outbox-owned entries. Reconcile. Abandon attempts whose writer is gone. Make entries terminal, export, and collect evidence. |
+| **P** (direct writer) | a `pchat post` or `pchat ack` process; the `agentcli.notify` flow inside its host process; the bridge flow running `announce` | Create its entry. Write its own attempts. Hand its entry to the outbox. Export a dead letter. |
+| **B** (bridge) | the single `chatbridge` service process | Index messages and advance coverage. Import and apply handoffs. Flush outbox entries. Reconcile. End attempts of a gone writer or a closed connection. Make entries terminal. Export. Collect evidence. Suspend designations. |
 | **S** (status) | `pchat status` | Read only. |
+| **O** (owner) | the owner, by an explicit decision | Designate an account (`designated_at`), or lift a suspension. This is a future, separately authorized action. |
 
 | Guard | What it is |
 |---|---|
-| `TX` | A `BEGIN IMMEDIATE` transaction. Every row condition below is checked inside the transaction that performs the change. |
-| `L_flush` | The existing non-blocking flock `outbox.flush.lock`. One flusher at a time; held for a whole flush. |
-| `L_outbox` | The existing flock `outbox.lock`. It orders claim, import and any legacy append to `outbox.jsonl`. |
-| **owner** | The row's writer identity equals the acting flow's own (boot id, pid, start time, `conn_id`). |
-| **gone** | The writer is proven gone (section 5.2). |
+| `TX` | A `BEGIN IMMEDIATE` transaction. Every row condition is checked inside the transaction that changes the row. |
+| `L_flush` | The existing non-blocking flock `outbox.flush.lock`. One flusher at a time, held for the whole flush, including import and export. |
+| `L_outbox` | The existing blocking flock `outbox.lock`. It orders claims, imports, legacy appends, handoff rows and dead-letter exports. |
+| **owner** | The acting flow's writer identity equals the row's. |
+| **gone** | Section 5.4. |
+| **conn-closed** | Section 5.4. |
 
 ## 3. State and transition tables
 
-A transition happens only inside a `TX`, conditioned on the row's current
-state and, for attempts, on its `generation`: `UPDATE … WHERE id = ? AND state
-= ? AND generation = ?`. A change that matches no row does nothing. The actor
-then stops all work on that attempt or entry.
+Every transition is a conditional update inside one `TX`:
+`UPDATE … WHERE id = ? AND state = ? [AND generation = ?]`. A change that
+matches no row has no effect, and the actor then stops all work on that
+attempt or entry.
 
 ### 3.1 Entry
 
 | # | From | To | Actor | Guard | Durable write (one `TX`) | After commit |
 |---|---|---|---|---|---|---|
-| E1 | (none) | `open`, `direct` | P | none; silent-run refusal checked first | The entry, plus its parts as `unsent` with generation 0. The parts are fixed now, after logging in, from the connection's capabilities. | Send part 0 (A1). |
-| E2 | (none) | `open`, `outbox` | B (import) | `L_flush` + `L_outbox` | The entry with its import identity, plus its parts if the row has them; else the parts are fixed at the first attempt (E4). Committed together with the `imports` row. | Unlink the claim file. |
-| E3 | `open`, `direct` | `open`, `outbox` | P, owner | `owner_kind = 'direct'` and the owner matches | `owner_kind = 'outbox'` (the handoff). | Exit status 3, as today. |
-| E4 | `open`, `outbox`, parts not yet fixed | the same, with parts | B | `L_flush`; no parts exist | The fixed parts, `unsent`. A legacy entry's "(delayed; written …)" marker is fixed into the text here, once. | Attempt part 0 (A1). |
-| E5 | `open` | `done` | P, owner; or B | every part is `confirmed` | `state = 'done'`. | none |
-| E6 | `open` | `terminal` (refused) | the actor that recorded A3 | A part is `refused` | The terminal reason, the parts and their attempts, all kept. | X1 export. |
-| E7 | `open`, `outbox` | `terminal` (undecided) | B | A part has an `ended` attempt older than `UNDECIDED_MAX` that rule R3 leaves undecided | Terminal with a content-free alert; that attempt becomes `dead` (A10). | X1 export. |
-| E8 | `open`, `direct` | `abandoned` | B | The owner is **gone**, and none of its attempts is `writing` (A8 first) | `state = 'abandoned'`: the entry is kept as evidence and is not sent (section 8, difference D1). | none |
-| E9 | `open`, `outbox` (ack) | `done` | B | `L_flush` | `done`, after the TAGMSG round trip. | none |
-| E10 | (none) | `open`, `outbox` (ack) | P | after a failed `pchat ack`, as today's queueing | The ack entry: no parts, and no text obligation. | Exit status 3, as today. |
-| E11 | `abandoned` | `abandoned` | B | An `ended` attempt of the entry is still undecided more than `UNDECIDED_MAX` after its `written_at` | That attempt becomes `dead` (A10). There is no export and no alert, as today for a killed `pchat` (D1). | none |
+| E1 | (none) | `open`, `direct` | P | Silent-run refusal is checked first, and commits nothing (as today). | The entry, and its parts as `unsent`. A post's parts are fixed now, after logging in, from the connection's capabilities. An ack has one pseudo-part. | A1 for part 0. |
+| E2 | (none) | `open`, `outbox` | B, by import | `L_flush` + `L_outbox` | The entry with its occurrence identity, committed with the file's `imports` row. | I3 |
+| E3 | `open`, `direct` | `open`, `outbox` | P, owner | — | `owner_kind = 'outbox'`: the handoff. | exit 3, as today |
+| H1 | `open`, `direct`, or `abandoned` | `open`, `outbox` | B, by import of a handoff row | `L_flush` + `L_outbox`. The row's entry id **and** writer identity equal the entry's; the entry is neither `done` nor `terminal`. | `owner_kind = 'outbox'`, and `state = 'open'` again if it was `abandoned`. | none |
+| E4 | `open`, `outbox`, parts not yet fixed | the same, with parts | B | `L_flush`; no parts exist | The fixed parts, `unsent`. A legacy post's "(delayed; written …)" marker is fixed into its text here, once. | A1 |
+| E5 | `open` | `done` | P, owner; or B | Every part is `confirmed` | `done` | none |
+| E6 | `open` | `terminal` (refused) | the writer that records A3 | — | The terminal reason. In the same `TX` as A3. | X1 |
+| E7 | `open` or `abandoned` | `terminal` (undecided) | B | Some part has an attempt in `writing`, or `ended`, that R1 and R2 leave undecided more than `UNDECIDED_MAX` after its `written_at`. That includes a live writer's `writing` attempt. | Terminal, with the content-free alert. An `ended` attempt becomes `dead` (A10). A `writing` attempt is **left** `writing`: it is neither ended nor retried (I-2). | X1 |
+| E8 | `open`, `direct` | `abandoned` | B | The owner is **gone**, and none of its attempts is `writing` (A8 first). | `abandoned`. The unsent remainder is not adopted (D1). Unknown parts still go to E7. | none |
 
-`done`, `terminal` and `abandoned` are final. No transition leaves them except
-evidence collection (G1), which deletes rows only.
+`done` and `terminal` are final. `abandoned` leaves only by H1, which needs the
+writer's own durable handoff, or by E7.
 
 ### 3.2 Part
 
 | # | From | To | Caused by |
 |---|---|---|---|
-| P1 | `unsent` | `inflight` | A1, which creates the attempt; generation + 1 |
+| P1 | `unsent` | `inflight` | A1 (generation + 1) |
 | P2 | `inflight` | `confirmed` | A2 |
 | P3 | `inflight` | `refused` | A3 |
-| P4 | `inflight` | `unsent` | A4: the server rejected it before accepting anything |
-| P5 | `inflight` | `uncertain` | A5 (`ended`) or A8 (writer gone) |
-| P6 | `uncertain` | `confirmed` (msgid set) | A6 (`delivered`) |
-| P7 | `uncertain` | `unsent` | A7 (`absent`): proved never published |
-| P8 | `confirmed` | `confirmed` (msgid set) | R1 attributes the msgid of a part confirmed without one |
+| P4 | `inflight` | `unsent` | A4: the server rejected it before accepting anything; or A11, an ack's retry |
+| P5 | `inflight` | `uncertain` | A5, A8 or A8c |
+| P6 | `uncertain` | `confirmed`, msgid set | A6 |
+| P7 | `uncertain` | `unsent` | A7: absence proved |
+| P8 | `confirmed` | `confirmed`, msgid set | A9 |
 
-**`confirmed` never leaves `confirmed`**, and `refused` is final. A part
-becomes `unsent` again only by P4 or P7, each of which proves that no message
-was published.
+`confirmed` and `refused` are final. A post's part returns to `unsent` only by
+P4 (the server's own rejection) or P7 (proved absence).
 
 ### 3.3 Attempt
 
-The writer column marks who may make each change. Only the writer itself may
-end a `writing` attempt (A2–A5), unless the writer is proven gone (A8).
-
 | # | From | To | Actor | Guard | Durable write (one `TX`) | Network outside the `TX` |
 |---|---|---|---|---|---|---|
-| A1 | (none) | `writing` | the entry's owner: P for `direct`, or B (holding `L_flush`) for `outbox` | The part is `unsent`. No attempt of this part is `writing` or `ended`. Every earlier part is `confirmed`. The entry is `open`. | The attempt row (writer, `conn_id`, generation, text key, `written_at = now`), and the part becomes `inflight`. | **After** commit: write the part's lines, then `PING :round`. |
-| A2 | `writing` | `confirmed` | writer | owner; `state = 'writing'`; generation matches | `confirmed_at`, and the part becomes `confirmed`. | **Before:** the matching PONG arrived, with no FAIL and no 4xx/5xx reply. |
-| A3 | `writing` | `refused` | writer | as A2 | The part becomes `refused`, and E6 runs in the same transaction. | **Before:** a FAIL was seen. |
-| A4 | `writing` | `rejected` | writer | as A2 | The part goes back to `unsent` (403, 404 or 482 with no FAIL: nothing was accepted). | **Before:** that reply. The existing one channel recreation on 403 then repeats A1. |
-| A5 | `writing` | `ended` (`closed`) | writer | as A2 | `ended_at = now`, `end_kind = 'closed'`, and the part becomes `uncertain`. | **Before:** the connection was **closed first** (section 5.1). |
-| A6 | `ended` | `delivered` | B | Inside the reconciliation `TX`, rule R1 | An attribution row with msgid UNIQUE and `attempt_id` UNIQUE; the part becomes `confirmed` with that msgid. | none |
-| A7 | `ended` | `absent` | B | Inside the reconciliation `TX`, rule R2 | The part goes back to `unsent`. The next A1 uses generation + 1. | none |
-| A8 | `writing` | `ended` (`writer_gone`) | B | The writer is **gone** (section 5.2) | `ended_at` = when the writer was observed gone; `end_kind = 'writer_gone'`; the part becomes `uncertain`. | none |
-| A9 | `confirmed` | `confirmed` + attribution | B | Rule R1, for a confirmed attempt without a msgid | An attribution row (msgid UNIQUE). | none |
-| A10 | `ended` | `dead` | B | E7 or E11 | none beyond E7 or E11 | none |
+| A1 | (none) | `writing` | The entry's owner: P for a `direct` entry, B holding `L_flush` for an `outbox` one | The entry is `open` and the part `unsent`. No attempt of this part is `writing` or `ended`. Every earlier part is `confirmed`. | The attempt (writer, `conn_id`, generation, text key, `written_at = now`), and the part becomes `inflight`. | **After** the commit: the part's lines, then `PING :round`. |
+| A2 | `writing` | `confirmed` | writer | owner; the state and generation match | `final_at` = when the PONG arrived; the part becomes `confirmed`. | Before: the PONG arrived, within `PART_WAIT` or the drain, with no FAIL and no 4xx/5xx reply. Then the connection may carry the next part, unless the drain was used: then the call stops, and hands any remaining parts off as incomplete. |
+| A3 | `writing` | `refused` | writer | as A2 | The part becomes `refused`, and E6 runs in the same `TX`. | Before: a FAIL was seen. |
+| A4 | `writing` | `rejected` | writer | as A2 | The part goes back to `unsent`. | Before: 403, 404 or 482 with no FAIL. The existing single channel recreation on 403 then repeats A1. |
+| A5 | `writing` | `ended` (`closed`) | writer | as A2 | `ended_at`, and `final_at` if a PONG with another 4xx/5xx reply arrived; else `final_at` is NULL. The part becomes `uncertain`. | Before: the connection was **closed first** (section 5.1). |
+| A6 | `ended` | `delivered` | B | R1, inside its `TX` | An attribution (msgid UNIQUE, `attempt_id` UNIQUE); the part becomes `confirmed` with that msgid. | none |
+| A7 | `ended` | `absent` | B | R2, inside its `TX` | The part goes back to `unsent`. | none |
+| A8 | `writing` | `ended` (`writer_gone`) | B | **gone** | `ended_at` = when the writer was observed gone; `final_at` NULL; the part becomes `uncertain`. | none |
+| A8c | `writing` | `ended` (`connection_closed`) | B | **conn-closed** | `ended_at` = when the closure was observed; `final_at` NULL; the part becomes `uncertain`. | none |
+| A9 | `confirmed` | `confirmed` + attribution | B | R1, inside its `TX` | An attribution. | none |
+| A10 | `ended` | `dead` | B | E7 | — | none |
+| A11 | `ended` (an ack) | `ended`, part `unsent` | P owner, or B | The pseudo-part is an ack | The part goes back to `unsent`. | none. Acks are retried as today (section 8). |
 
 `delivered`, `absent`, `refused`, `rejected` and `dead` are final. A `dead`
-attempt still counts as evidence: it may own a message (section 7).
+attempt remains evidence (section 7).
 
-### 3.4 Evidence, coverage, import and exports
+### 3.4 Evidence and coverage
 
 | # | Change | Actor | Guard | Durable write | Notes |
 |---|---|---|---|---|---|
-| V1 | Index a message | B, as it records a verified PRIVMSG or multiline message (live or replayed) | `TX` | `INSERT OR IGNORE` into `messages`, keyed by msgid | The checkpoint and the coverage `mark` advance past a message only **after** this commits. |
-| V2 | A channel's coverage begins | B, when a catch-up finishes or a new channel is joined | `TX` | `since` and `mark`. `since` carries over only when the catch-up started from the stored `mark` (as in PR #20). | none |
-| V3 | Coverage advances | B, on the PONG for the sync PING sent just before a flush | `TX`; the channel is live on this connection; every earlier V1 for the channel committed | `through = max(through, ping_sent_at)` | none |
-| V4 | Coverage stops | B, on KICK or PART, a disconnect, or a failed V1 for the channel | in memory; nothing to commit | The channel leaves the live set. The checkpoint stays behind the failed message, so the next catch-up replays it. | none |
-| I1 | Claim | B | `L_flush` + `L_outbox` | `rename(outbox.jsonl, outbox.claimed-<ns>-<rand>.jsonl)`, never onto an existing name | A filesystem step, not a database one. |
-| I2 | Import | B | `L_flush` + `L_outbox`; `TX` | The entries, parts and held rows, and the `imports` row (name, line count, sha256), in **one** transaction | Section 6 |
-| I3 | Unlink | B | after I2 commits | `unlink(claim file)` | Section 6 |
-| X1 | Export a terminal entry | B (P too, for E6) | after E6 or E7 commits | 1. If an alert is set and `alert_exported` is unset: add the content-free `push` delivery, then set `alert_exported`. 2. If `dead_letter_exported` is unset: append the dead letter unless one with this id is already there, then set `dead_letter_exported`. | A crash may repeat the alert, but never loses it; the dead letter is written once. The order matches PR #20's `_finish`. |
-| G1 | Collect evidence | B | `TX` | Delete the rows that invariant I-7 allows | none |
+| V1 | Index a message | B, on recording a verified PRIVMSG or multiline message, live or replayed | `TX` | `INSERT OR IGNORE` into `messages`, by msgid. In the same `TX`, the designation check of section 7.4. | The channel's checkpoint and coverage `mark` advance past a message only after this commits. |
+| V2 | Coverage begins | B, when a catch-up finishes or a new channel is joined | `TX` | `since` and `mark`. `since` carries over only when the catch-up started from the stored `mark` (as in PR #20). | none |
+| V3 | Coverage advances | B, on the PONG for the sync PING sent before each flush | `TX`; the channel is live on this connection; every earlier V1 for it committed | `through = max(through, ping_sent_at)` | none |
+| V4 | Coverage stops | B, on KICK or PART, a disconnect, a stale catch-up reply, or a failed V1 | in memory | The channel leaves the live set; the checkpoint stays before the failed message, so the catch-up replays it. | none |
+
+### 3.5 Import, export and collection
+
+| # | Change | Actor | Guard | Durable write or effect |
+|---|---|---|---|---|
+| I1 | Claim | B | `L_flush` + `L_outbox` | Rename `outbox.jsonl` to `outbox.claimed-<ns>-<random>.jsonl`, never onto a name that exists. |
+| I2 | Import | B | `L_flush` + `L_outbox`; `TX` | The occurrences, held rows, handoffs (H1) and the `imports` row, in **one** `TX` (section 6). |
+| I3 | Unlink | B | after I2 commits | Unlink the claim file. |
+| X1 | Export a dead letter | P or B | `L_outbox`; a `TX` reads and later sets the mark | Section 3.6. |
+| X2 | Export an alert | B only, through its live `Deliveries` object, which alone writes `pending.json` | `L_flush`; `TX` for the mark | Section 3.6. |
+| G1 | Collect evidence | B | `L_flush`; `TX` | The deletions I-7 allows. |
+
+### 3.6 The export protocol
+
+**X1, the dead letter.** The exporter holds `L_outbox`, so P and B are
+serialized:
+
+1. In a `TX`, read the entry. If `dead_letter_exported` is set, stop.
+2. If `dead-letters.jsonl` does not end in a newline, append one. A torn
+   last line then becomes an unreadable line, which readers already skip.
+3. If a parseable line with this entry id already exists, skip to step 5.
+4. Otherwise append the record. It holds:
+   - the entry, with every part's text and state;
+   - every attempt's state, write time, `final_at` and msgid;
+   - the terminal reason.
+
+   Then `fsync` the file, and the directory if the file was just created.
+5. In a `TX`, set `dead_letter_exported`.
+
+A crash at any step repeats the steps, and the record is written once.
+
+**X2, the alert.** Only B runs this, because the bridge's `Deliveries` object
+rewrites `pending.json` from memory:
+
+1. If `alert_exported` is set, stop.
+2. If a pending item, or a ledger line, already carries the alert key
+   `outbox:<entry id>`, skip to step 4.
+3. Otherwise add the content-free `push` item under that key. Write
+   `pending.json` durably: write the temporary file, `fsync` it, rename it
+   over `pending.json`, and `fsync` the directory.
+4. In a `TX`, set `alert_exported`.
+
+The alert is therefore enqueued exactly once. Its delivery is then
+at-least-once, under the existing delivery rules.
+
+The alert text names the account and channel only. For example: "an outbox
+post from alp-solver-2 to #alpha could not be confirmed for 24 h;
+dead-lettered".
 
 ## 4. Invariants and proofs
 
 ### I-1. Intent before bytes
 
-Every byte of a part is preceded by a committed `writing` attempt that names
-its writer, its connection and its write time.
+Every transport caller commits a `writing` attempt (A1) before any byte of a
+part or an ack is sent. The attempt names its writer, its connection and its
+write time.
 
-**Why it holds.** A1 is the only way to obtain an attempt, and the writer
-sends only after A1 commits. This holds for every caller, because `post()` is
-the only sending path, and it runs A1 itself, whoever called it.
+**Why it holds.**
 
-**Corollary.** Any message an attempt produced carries a server time of at
-least `written_at − A` (assumption C-1).
+- Posting and acknowledging both go through the attempt protocol:
+  `post()` for parts, and the ack path for its pseudo-part. Today's separate
+  `chatlib.ack` send gains the same E1 and A1 steps.
+- A1 is the only way to obtain an attempt, and its writer sends only after the
+  commit.
+
+**Consequence.** Any message an attempt produces carries a time of at least
+`written_at − A` (C-1).
 
 ### I-2. Fencing
 
-Only the attempt's own writer, or B once the writer is gone, moves an attempt
-out of `writing`. No actor creates a new attempt for a part while any attempt
-of that part is `writing` or `ended`.
+Only an attempt's own writer moves it out of `writing`, except that B may do
+so (A8 or A8c) once the writer is proven gone or the attempt's connection is
+proven closed. No attempt is created for a part that has a `writing` or
+`ended` attempt.
 
-**Why it holds.** A2–A5 require the owner. A8 requires gone. A1's guard
-excludes a part with an unresolved attempt. A writer that has passed A1 and is
-paused before sending still owns a `writing` attempt, which no one else may
-end or retry.
+**Why it holds.** A2–A5 require the owner. A8 and A8c require their proofs.
+A1's guard does the rest.
 
-Database leases and checks made before sending cannot close the gap between
-the check and the send. The fence therefore rests on two things. While the
-writer may still send, no one else acts on its attempt. Afterwards, either the
-writer closed its connection (A5), or it is dead (A8).
+A writer paused after A1 still holds an open socket. It is not gone, and its
+connection is not closed, so no one ends it or retries it. E7 can make its
+entry terminal after 24 hours, but leaves its attempt `writing`.
+
+Checks before sending, and database leases, cannot close the gap between a
+check and the send. The fence therefore relies only on two facts:
+
+- a closed socket cannot send;
+- a dead process cannot send.
 
 ### I-3. Confirmed parts are never resent
 
 **Why it holds.**
 
 - A1 requires `unsent`.
-- A part reaches `unsent` again only by A4 or A7. A4 means the server rejected
-  it with nothing accepted. A7 means its absence was proved.
-- `confirmed` is final (section 3.2).
-- A part is fixed once (E1 or E4) and never re-split. A retry therefore writes
-  the same text, and only for a part whose earlier attempt is proved to have
-  published nothing.
+- A post's part becomes `unsent` again only by P4 (the server's rejection:
+  nothing accepted) or P7 (proved absence).
+- `confirmed` is final.
+- A part is fixed once and never re-split.
 
 ### I-4. No message satisfies two obligations
 
-A message satisfies an obligation only by an attribution row. `msgid` is the
-primary key of `attributions`, and `attempt_id` is UNIQUE.
+Attribution rows are the only way a message satisfies an obligation, and
+`msgid` and `attempt_id` are each UNIQUE.
 
-Rule R1 attributes inside a single transaction, and only by a perfect
-matching between the attempts and the messages of one component (section 7).
+R1 attributes all members of a component at once, by one perfect matching in
+one `TX`. R2 never attributes.
 
-A confirmed attempt without a msgid also needs a message of its own, which
-rules R1 and R2 count. One message therefore never counts for two attempts.
-That includes an attempt confirmed earlier in the same flush, or by another
-process.
+A confirmed attempt without a msgid also needs its own message, and both R1
+and R2 count it. Attributed messages are excluded from every later candidate
+set.
 
-### I-5. Stored progress survives storage errors
+### I-5. Storage errors preserve outcomes
 
 A storage failure never turns a written part into an `unsent` one, and never
-discards a remaining obligation that has already been committed.
+discards a committed obligation.
 
 **Why it holds.**
 
-- If A1 fails, nothing of that part is written.
-- If A2–A5 fail, the attempt stays `writing` under its writer. The writer
-  closes the connection and stops. Then:
-  - a live bridge retries its own pending A5 or A2 on each flush (section
-    5.1);
-  - any other writer leaves, is then proved gone, and the attempt reaches A8,
-    which makes it `uncertain` and reconciled. It is never `unsent`.
-- If the E3 handoff fails, the caller falls back to section 6.4, which
-  transfers ownership by entry id only.
+- If A1 fails, nothing of the part is written.
+- If A2, A3, A4 or A5 fails, the writer closes the connection if it is still
+  open, keeps the observed outcome in memory, and stops. That outcome may be
+  confirmed, refused, rejected, or ended with or without finality. The writer
+  retries the commit:
+  - within the call, up to `PART_WAIT`;
+  - after that:
+    - the bridge retries at the start of each flush;
+    - `pchat` and `agentcli` retry at each later `chatlib` call and at
+      process exit.
 
-The caller never re-queues the original whole text after anything was
-written. That is round-5 finding 2.
+  If the commit never lands, the attempt stays `writing`. A8 (writer gone) or
+  A8c (connection closed, for example in a long-lived `agentcli` host) then
+  ends it **without finality**: it is `uncertain`, R2 can never call it
+  absent, and only R1 or E7 resolve it.
+
+  A refusal whose A3 never committed is therefore never retried (#19 R7). It
+  is dead-lettered after 24 hours (narrowing N6).
+- If the E3 handoff fails, P appends a handoff row (section 6.4), which B
+  applies by H1, guarded by the entry id and the writer identity.
+- Nothing ever requeues a post's original whole text after a byte was written.
+  That is round-5 finding 2.
 
 ### I-6. Ownership is visible before a competing flush can use a message
 
-**Why it holds.** By I-1, a direct post's attempt row commits before its
-bytes. The bridge can index that message (V1) only after it was published,
-which follows the send, which follows A1's commit.
+**Why it holds.**
 
-Reconciliation runs in a `BEGIN IMMEDIATE` transaction that starts after V1.
-It therefore sees the attempt as `writing`, or as whatever came after. A
-`writing` member keeps its component from resolving by R1 (section 7.3). That
-is round-5 finding 3.
+- A direct post's A1 commits before its bytes are sent.
+- The bridge can index the message (V1) only after the server publishes it.
+- Reconciliation's `TX` starts after V1, so it sees that attempt as `writing`,
+  or in a later state.
+- R1 refuses a component with a `writing` member.
+- R2's forcing argument cannot be broken by a member that only adds a
+  message (section 7.3).
+
+That is round-5 finding 3.
 
 ### I-7. Evidence is collected only when nothing depends on it
 
-A row of text key *k* may be deleted only when both hold:
+A row may be deleted only when every condition below holds.
 
-- no attempt of *k* is `writing` or `ended`;
-- the row's window, or for a message its time, ends before `now − A −
-  GC_MARGIN`.
+1. **Messages.** No attempt of the same account and channel is `writing` or
+   `ended`, or is `dead` with an open window, whose window contains the
+   message's time. This covers both exact and fragment dependencies, because
+   fragments are always from the same account and channel. The message's time
+   is also before `now − A − GC_MARGIN`.
+2. **Attributions.** The row is deleted only in the same `TX` as its message
+   row, so a message never loses its attribution while it can still be a
+   candidate.
+3. **Attempts and parts:**
+   - their entry is `done`, `terminal` or `abandoned`;
+   - a terminal entry's exports are marked done;
+   - no attempt of the same account and channel that is `writing`, `ended`,
+     or `dead` with an open window has a window overlapping theirs;
+   - their window has ended before `now − A − GC_MARGIN`.
 
-The rows are a confirmed or `dead` attempt, an attribution, or a message.
+   A `dead` attempt with an open window is never collected.
+4. **Coverage** spans and `imports` rows are never collected.
 
-Any later attempt of *k* has `written_at ≥ now`, so its window starts at or
-after `now − A`. It cannot overlap a collected row. Coverage spans are never
-collected.
-
-This holds whatever the outage length. After a 26-hour outage, an `ended`
-attempt still pins every row of its text key. That is round-5 finding 4.
+Any later attempt has `written_at ≥ now`, so its window starts at or after
+`now − A`, and it cannot depend on a collected row. A 26-hour outage therefore
+removes nothing that an unresolved attempt needs. That is round-5 finding 4,
+and the round-1 cross-key and export findings.
 
 ### I-8. Decisions read current state
 
-Every verdict is computed and applied inside one transaction, from the rows
-current at that moment: attempts, attributions, messages and coverage. No
-snapshot from the start of the flush is reused. That is round-5 finding 1.
+Every verdict is computed and applied inside one `TX`, from the current
+attempts, attributions, messages, coverage and designations. There is no
+snapshot taken at the start of a flush. That is round-5 finding 1.
 
-### I-9. Import keeps duplicates and is idempotent
+### I-9. Import keeps occurrences and is idempotent
 
 See section 6.3.
 
 ### I-10. Independent flow
 
-An entry's work touches only its own rows. It interacts with other entries
-only through components of the same text key (section 7). An undecided or
-failing entry therefore never blocks another one, including another entry for
-the same account.
+An entry interacts with others only through same-account, same-channel
+evidence (section 7). An undecided, failing or refused entry never stops the
+flush from attempting every other open outbox entry. Each entry's work is
+isolated: its failure is logged, and the flush moves on.
 
-Every open outbox entry still gets its attempt in each flush, as in PR #20.
-Each entry's work is wrapped so that its failure is logged and the flush moves
-on.
+Each attempt's wait is bounded by `PART_WAIT + DRAIN_WAIT`.
 
 ### How each round-5 finding is closed
 
-| Round-5 finding | What goes wrong at `e658bb8` | What closes it |
-|---|---|---|
-| 1. Satisfied keys are stale within a flush (`chat-bridge:1104-1107`) | A key matched earlier in the flush is counted again later. | I-8. Matching and attribution happen in one `TX` per component, with no satisfied-key snapshot. |
-| 2. A reservation-write failure loses part outcomes (`chatlib.py:517`) | `queued_entry` requeues the whole text. | I-5. There is no separate reservation write: A2 *is* the confirmation record. A failure leaves the attempt `writing`, which becomes `uncertain`. |
-| 3. Ownership is written after the commit (`chatlib.py:516`) | A flush uses a direct post's message before the direct post's reservation exists. | I-1 and I-6. The `writing` row precedes the bytes, and R1 refuses a component with a `writing` member. |
-| 4. Reservations are pruned by wall-clock time (`chat-bridge:947`) | After an outage, the evidence an older uncertain entry depends on is gone. | I-7. Evidence is collected by dependency, not age alone. |
+| Round-5 finding at `e658bb8` | Closed by |
+|---|---|
+| 1. Satisfied keys are loaded once per flush (`chat-bridge:1104-1107`). | I-8: one `TX` per component, with no satisfied-key snapshot. |
+| 2. A `reserve()` failure escapes without parts, and the whole text is requeued (`chatlib.py:517`, `539-546`). | I-5: A2 is the confirmation record, a failure keeps the outcome or leaves the part uncertain, and nothing requeues the whole text. |
+| 3. The reservation is written after the server commit (`chatlib.py:516`). | I-1 and I-6. |
+| 4. Reservations are pruned by wall-clock time (`chat-bridge:947`). | I-7: collection by dependency. |
 
-## 5. Crashes and interleavings
+## 5. Connections, finality, assumptions and crashes
 
 ### 5.1 Connections
 
-- **One flow per connection.** A connection belongs to the single flow that
-  opened it, inside one `post()` call. No other code path sends on it. It
-  carries at most one unresolved attempt at a time; after A2, the next part
-  may use it.
-- **Close before `ended`.** For a timeout, a write error, an error numeric, or
-  any exception escaping the send or wait:
-  1. the writer closes the socket, with `shutdown` followed by `close`, whose
-     return is the "torn down" point;
-  2. only then does it commit A5.
+- **One flow per connection.** A connection belongs to the one flow that
+  opened it, inside one `post()` or ack call, and no other code path sends on
+  it. It carries at most one unresolved attempt at a time.
+- **Close before `ended`.** The writer closes the socket (shutdown, then
+  close), and only then commits A5.
+- **After closing.** The process cannot send on that socket again. Bytes
+  already in the kernel's buffer may still reach the server, so an attempt
+  without finality has an open window (section 7.1).
 
-  After a close, this process sends no further bytes on that socket. Bytes
-  already in the kernel's send buffer may still reach the server. That is
-  server-delayed delivery, which `SETTLE` covers (C-2).
-- **Live bridge, own attempts.** If B's A5 (or A2) commit fails, B keeps an
-  in-memory list of its own closed attempts, with their outcome. It retries
-  each commit at the start of every flush. It is still the owner, and it has
-  closed the socket, so the commit is valid.
+### 5.2 Finality: what proves an attempt can produce nothing more
 
-  After a bridge restart, the old process is gone, and A8 applies instead.
-  Either way, a persistent live bridge recovers its own ended attempts, and
-  automatic absence recovery is kept.
+The proof uses the transport boundary PR #20 already relies on to confirm a
+part. The server processes one client's lines in order, and answers the PING
+sent after a part only once it has processed the part's lines (C-3). So when
+the PONG to `PING :round` arrives at time `f`:
 
-### 5.2 Writer gone
+- every line of the part has been processed;
+- any message they produced was published before the PONG, with a time of at
+  most `f + A`;
+- nothing published later can come from that attempt.
 
-A writer is **gone** when any of these holds:
+That is **finality**.
 
-- the machine's boot id differs from the recorded one;
-- no process with the recorded pid exists;
-- the process with that pid has a different start time.
+**How the writer obtains it:**
 
-If the start time cannot be read, the writer is not proved gone.
+- **Within `PART_WAIT`:** the PONG gives A2, A3, A4, or A5 with finality when
+  another 4xx/5xx reply came with it.
+- **After `PART_WAIT`:** the writer stops writing, and keeps reading the same
+  connection for up to `DRAIN_WAIT`:
+  - a PONG that arrives then gives the same outcomes, with finality, and the
+    call stops as incomplete, because the deadline was missed;
+  - if no PONG arrives, the writer closes, and A5 commits without finality.
 
-A8 records `ended_at` as the moment of that observation. This is an upper
-bound on when the dead writer could have sent its last byte.
+  A FAIL is a refusal whenever it arrives (as in PR #20).
 
-A live writer that is paused or hung is never gone. Its attempt stays
-`writing`, and its part stays undecided until the writer resumes or exits:
-never resent and never ended by B. If the writer is a dead direct post, its
-entry is handled by E8.
+**Without finality:**
+
+- a write error;
+- a broken connection;
+- no PONG through the drain;
+- a gone writer (A8);
+- a closed connection (A8c).
+
+The attempt then has no proved end of publication, and **R2 never applies**.
+
+**How automatic absence recovery works.** An attempt with finality and no
+message in its closed window, with complete coverage over it and no other
+candidate (R2), is proved absent and resent, by its owner or by a live
+bridge. The cases where this applies:
+
+- a part whose PONG came back with an error reply;
+- a part whose PONG came only during the drain.
+
+A part without finality is decided only by R1, under designation, or
+dead-lettered after 24 hours. This is narrowing N7.
 
 ### 5.3 Assumptions
 
-Anything these do not prove stays undecided.
+Anything these do not establish stays undecided.
 
-- **C-1, clocks.** The writer, the bridge and the chat server run on the same
-  machine and read the same wall clock. The server's message time and the
-  writer's clock differ by at most `A`. The clock does not step by more than
-  `A` within a window.
-- **C-2, server-delayed delivery.** The server publishes any message an
-  attempt's bytes produce within `SETTLE` after the attempt's `ended_at`.
-  - For a closed attempt: after the close.
-  - For a gone writer: after it was observed gone. The kernel finishes or
-    resets the socket when the process dies, which is before it was observed
-    gone.
-- **C-3, confirmation.** A PONG for the `PING :round` sent after a part, with
-  no FAIL and no 4xx or 5xx reply in between, means the server published that
-  part as exactly one message. That message's time is at most the PONG's
-  arrival time plus `A`. A FAIL, or a 403, 404 or 482 reply with no FAIL,
-  means the part was not published. These are the rules PR #20 already uses.
-- **C-4, atomic parts.** A `draft/multiline` batch is published whole, as one
-  message, or not at all, and an unterminated line is not published.
+- **C-1, clocks.** The writer, the bridge and the chat server run on one
+  machine. The server's message time and the writer's wall clock differ by at
+  most `A`, and the clock does not step by more than `A` during a window.
+- **C-3, in-order processing and replies.** This is the boundary PR #20
+  already uses.
+  - The server processes one connection's lines in order.
+  - A PONG for a PING sent after a part follows the processing of the
+    part's lines.
+  - A PONG with no FAIL and no 4xx/5xx reply means the part was published as
+    exactly one message, of its exact text.
+  - A FAIL, or a 403, 404 or 482 reply with no FAIL, means nothing of the
+    part was published.
+- **C-4, partial publication: not assumed.** This note does not assume that
+  a multi-line batch is published whole or not at all. Any text a partial
+  publication could show passes the fragment test, so fragment candidates
+  block R2 (section 7.3) and are excluded from R1.
 
-  This note does not prove C-4. A same-account message in the window whose
-  text is a strict prefix of the part's text therefore blocks absence (rule
-  R2). A partly published part stays undecided, rather than being resent.
-- **C-5, complete record.** Coverage `[since, through]` for a channel means
-  that every message the server published there with a time in that interval
-  is in `messages`.
+  A single line is published whole or not at all: IRC processes complete
+  lines only. A single-line part therefore has no fragments other than its
+  exact text.
+- **C-5, a complete record.** Coverage `[since, through]` for a channel means
+  every verified message the server published there with a time in that
+  interval is in `messages` (V1–V4; PR #20's coverage model).
+- **C-6, identity.** The `account` tag is the server-verified sender, and only
+  verified messages are evidence.
 
-  Coverage begins only after a finished catch-up, or when a new channel is
-  joined, and advances only through a sync PING answered while the channel is
-  live. Coverage stops on any lost membership or any failed index write. This
-  is PR #20's coverage model, now committed in order with the evidence.
-- **C-6, identity.** The `account` tag on a message is the server-verified
-  sender. Only verified messages are evidence.
+  Untracked producers are possible, and are not assumed away. They include:
+  - the old live tools before activation;
+  - a person using an agent's account;
+  - another client.
 
-  Untracked producers are possible: the old live tools before activation, a
-  person using the same account, or another client. They are handled in rule
-  R1 and in section 7.4, not assumed away.
+  Section 7 shows how each rule treats them.
+- **C-7, designated accounts.** This is the owner's attestation, and applies
+  only to accounts the owner designates. From `designated_at` on, every
+  message of a designated account is produced by a tracked attempt.
 
-### 5.4 A crash at every transition
+  R1 uses it, and nothing else does. It is monitored, and suspended on the
+  first message the record can show is unexplained (section 7.4). It cannot
+  be proved, so it is never assumed for an account the owner has not
+  designated.
 
-"Gone" below means B observes the writer's death on its next flush (A8).
+### 5.4 Gone writers and closed connections
 
-| Crash point | What survives | Recovery | Why nothing is lost or resent |
-|---|---|---|---|
-| P, before E1 commits | nothing | none (as today, a killed `pchat` queued nothing) | Nothing was written. |
-| P, after E1, before A1 | `open`, `direct`, all parts `unsent` | gone, then E8 | Nothing was written. |
-| P, after A1, before any byte | `writing` | gone → A8 → `uncertain` → R2 proves absence once coverage allows | Never resent unproved (I-3). |
-| P, during the send or the wait | `writing` | as above; R1 or R2 decide | as above |
-| P, after the PONG, before A2 | `writing` | gone → A8 → R1, delivered when the match is unique | The confirmed part is never blindly resent (I-5). |
-| P, after A2 | `confirmed` | none needed | final (section 3.2) |
-| P, after the close, before A5 | `writing` | gone → A8 | `ended_at` is later than the real close: a wider, safe window. |
-| P, after A5, before E3 | `ended`; entry `direct` | gone → E8; the `ended` attempt is still reconciled for evidence | Same as today: a crash before queueing loses the queueing (D1). |
-| P, after E3 | `outbox` | B flushes it | none |
-| B, mid-claim (I1) | the renamed file | imported next flush | The rename is atomic. |
-| B, during I2 | the claim file, no `imports` row | re-imported to the same ids | The transaction rolled back (section 6.3). |
-| B, after I2, before I3 | the `imports` row and the file | the hash matches, so only unlink | idempotent |
-| B, after A1 (outbox entry) | `writing` (B's) | the restarted B sees the writer gone → A8 | as for P |
-| B, after A5 | `ended` | R1 or R2 next flush | none |
-| B, during reconciliation | the `TX` rolled back | decided again next flush | atomic |
-| B, after E6 or E7, before X1 | terminal, export marks unset | X1 finishes | The alert may repeat; the dead letter is written once. |
-| B, after X1, before its mark | the export written, the mark unset | X1 again | The dead letter is deduplicated by id; the alert repeats harmlessly (as today). |
-| B, after V1, before the checkpoint advances | the message indexed | catch-up replays it; `INSERT OR IGNORE` | Coverage never passes an unindexed message. |
-| B, during V3 | the old `through` | the next sync | Coverage only grows. |
-| B, during G1 | rolled back, or done | none | I-7 is checked inside the `TX`. |
+**A writer is gone** when either holds:
 
-### 5.5 Interleavings
+- the boot id differs from the recorded one;
+- no process with the recorded pid exists, or that pid's process has a
+  different start time.
+
+**A connection is closed** when the writer's process exists with the
+recorded start time, but holds no TCP socket with the recorded local port to
+the recorded server address. The bridge reads the process's open sockets with
+the operating system's process tools.
+
+This lets B end the attempt of a closed flow inside a long-lived host, such as
+`agentcli`, without the host having to exit. A reused local port can only make
+a closed connection look open, which is the safe direction.
+
+If either probe cannot be read, nothing is proved, and the attempt stays
+`writing`. A paused writer still holds its socket open, so neither proof
+applies to it.
+
+### 5.5 A crash at every boundary
+
+Each transition and external step is listed with the state that survives a
+crash just before it (or before its commit) and just after it. "→" names the
+recovery.
+
+#### Writer side (P, or B as a flusher)
+
+| Boundary | Crash just before | Crash just after |
+|---|---|---|
+| E1 | nothing durable, nothing sent | `open`, `direct`, all parts `unsent` → gone → E8, nothing unknown, retired as today |
+| A1 | the previous state | `writing` → A8 → `uncertain`, no finality → R1, or E7 |
+| sending lines, PING (external) | `writing` → A8 | same |
+| `PART_WAIT`, drain (external) | `writing` → A8 | same |
+| close (external) | `writing` → A8 | `writing` → A8 (B), or A8c while the host lives |
+| A2 | `writing` → A8 → uncertain, never `unsent` | `confirmed` |
+| A3 + E6 | `writing` → A8 → uncertain, never retried → E7 | `terminal` → X1 by P's retry or B's next flush |
+| A4 | `writing` → A8 → uncertain → E7 (narrowing N6) | `unsent` → retried by the owner, or E8 for a gone direct owner |
+| A5 | `writing` → A8, no finality | `ended`, with `final_at` as observed |
+| A11 (ack) | `ended` ack → A11 next time | `unsent` ack → retried |
+| E3 | `direct` → gone → E8, and the handoff row if one was written → H1 | `outbox` |
+| handoff row append (external) | E8 → the remainder is not adopted, as for any crash before queueing today | H1 at the next import |
+| E5 | all parts confirmed, `open` → B sets `done` | `done` |
+
+#### Bridge side
+
+| Boundary | Crash just before | Crash just after |
+|---|---|---|
+| E4 | no parts → E4 again | parts `unsent` → A1 |
+| A8, A8c | `writing` → again next flush | `ended` |
+| R1, R2 `TX` | nothing changed → again | delivered or absent, atomically |
+| E7 | as before → again | `terminal` → X1, X2 |
+| E8 | as before | `abandoned` |
+| H1 (inside I2) | rolled back with I2 | applied with I2 |
+| I1 rename | `outbox.jsonl` intact | the claim file → I2 |
+| I2 | no rows, no `imports` row → the same occurrence ids again | rows and `imports` row → I3 |
+| I3 unlink | `imports` hash matches → unlink only | done |
+| V1 | not indexed; checkpoint not advanced → replayed, `INSERT OR IGNORE` | indexed |
+| the checkpoint file write | the stored `mark` and the checkpoint disagree → V2 starts a new span (safe) | consistent |
+| V2, V3 | the old span | the new span |
+| a bridge restart | the live set is empty → coverage advances only after a catch-up | — |
+| X1 steps 2–5 | repeated → written once (section 3.6) | — |
+| X2 steps 2–4 | repeated → enqueued once | — |
+| G1 | rolled back | the allowed deletions |
+
+### 5.6 Interleavings
 
 1. **A direct post and a flush (round-5 finding 3).** `alp-solver-2` has an
-   uncertain outbox part U with the text `[status] build green`, which it
-   never published. It then posts the same text directly as D.
+   uncertain outbox part U with the text "[status] build green". U ended with
+   finality, and never published. The account then posts the same text
+   directly as D:
+   - D's A1 commits, the server publishes D's message `m`, and B indexes `m`;
+   - B's flush runs while D still waits for its PONG.
 
-   D's A1 commits, D's message `m` is published, and B indexes `m`. B's flush
-   then runs while D waits for its PONG.
+   R1 refuses, because D is a `writing` member. R2 cannot rule U absent,
+   because `m` is not forced to a confirmed attempt. U stays undecided.
 
-   R1 refuses: the component {U, D} has a `writing` member. R2 cannot rule U
-   absent: `m` is not forced to a confirmed attempt, because D is not
-   confirmed yet. U stays undecided.
+   After D's A2, the component is {U, D}, with `m` only. `m` is forced to D,
+   and R2 rules U absent once coverage covers U's window. U is resent. `m`
+   never counted for both.
+2. **Two flushers.** `L_flush` makes the second skip. A1's guard would allow
+   only one attempt per part anyway.
+3. **A paused writer.** P stops after A1. No one ends or retries its attempt.
+   After 24 hours E7 makes the entry terminal, with an alert, and leaves the
+   attempt `writing`.
 
-   After D's A2, the component {U (`ended`), D (`confirmed`)} has one
-   message. That is enough for D alone, so `m` is forced to D. R2 rules U
-   absent once coverage covers its window, and U is resent. One message never
-   counted for both.
-2. **Two flushers.** `L_flush` makes the second one skip. Even without it,
-   A1's guard lets only one attempt per part exist, inside a `TX`.
-3. **A paused direct writer.** P passes A1, then stops before sending. B never
-   ends that attempt (I-2), and no retry exists. If P resumes and sends, the
-   message lands in its open window, and A2 or A5 follows.
-
-   Meanwhile another part of the same text key is decided only by R2's
-   forcing argument, which a `writing` attempt cannot break. Section 7.3
-   shows why.
-4. **A hung bridge.** A second bridge started while the first holds `L_flush`
-   skips the flush and logs it. The first bridge's attempts stay `writing`
-   until it exits; then A8 applies.
-5. **`pchat status` during a flush.** It runs a read transaction and sees a
-   consistent snapshot.
-6. **`pchat` queues during a flush.** New entries are database rows (E1 and
-   E3). A legacy append goes to `outbox.jsonl` under `L_outbox`, after or
-   before a claim, and is never lost (as today).
+   If P resumes, its message falls inside its open window, and its own
+   commit records the outcome. A late confirmation does not reopen the
+   terminal entry, which keeps its dead letter.
+4. **A hung bridge.** A second bridge skips the flush while the first holds
+   `L_flush`. When the first exits, A8 applies.
+5. **Handoff versus abandonment.** P's E3 fails, P appends the handoff row
+   and exits, and B commits E8 before importing that row. The import's H1
+   then reopens the entry as `outbox`, because the row's entry id and writer
+   identity match. An unrelated killed post never wrote such a row, so it is
+   never adopted.
+6. **`pchat status` during a flush.** It reads one snapshot.
+7. **P exports while B does.** `L_outbox` serializes X1, and the second
+   exporter sees the mark set.
 
 ## 6. Importing the old outbox
 
 ### 6.1 A new rule: frozen snapshots
 
 Today `_Claimed.save()` (`chat-bridge:1030-1036`) rewrites claimed files, so a
-claimed file is **not** immutable. Immutability is a new rule, which this
-design creates:
+claimed file is **not** immutable. Immutability is a new rule:
 
 - **The cutover marker.** A `meta` row, written when the schema is created.
-  Once it exists, no code path writes a claimed file. `_Claimed.save()` and
-  its callers are removed, and all progress lives in the database.
-- **Old writers.** Quiescing the old writers (the running bridge and the old
-  tools' flush) happens **only** at the separately authorized future
-  activation, before the new bridge first imports live state. Before then,
-  plateia's copy touches no live state. A claimed file the old code may have
-  rewritten is imported once, as it stands under the locks.
+  Once it exists, no code path writes a claimed file: `_Claimed.save()` and
+  its callers are removed.
+- **Old writers.** Quiescing the old writers (the running bridge, and the
+  old tools' flush) happens **only** at the separately authorized future
+  activation, before the first import of live state. Until then, plateia's
+  copy touches no live state.
 
-### 6.2 The fenced import
+A claim file that old code may have rewritten is imported once, as it stands
+under the locks.
 
-The import runs only inside B's flush, while holding both `L_flush` and
-`L_outbox`. It does local disk work only.
+### 6.2 Supported formats and the hold policy
 
-1. **Claim (I1).** If `outbox.jsonl` is not empty, rename it to a fresh unique
-   name. Then list every `outbox.claimed-*.jsonl`.
-2. **Read** each claim file whole and compute its sha256 and line count.
-3. **Check** for an existing `imports` row with the file's name:
-   - the same hash: the rows are already in, so go to step 6;
-   - a different hash: **hold** the file, recording it once, and alert once
-     with no content. Do not import it and do not unlink it.
-4. **Import (I2).** In one `TX`, take each row with its line ordinal `i`:
-   - **The entry id.** The row's own `id` when it has one. Otherwise it is
-     derived from `(claim file name, i)`, for example as
-     `sha256(name + ":" + i)`. Two identical lines therefore become two
-     entries.
-   - **The row's sha256** is stored with the entry.
-   - **An id that already exists with a different row sha256** is a
-     collision. The row goes to `held` (raw text kept), and is not merged.
-     The other rows proceed.
-   - **An id that exists with the same row sha256** is a replay, and is
-     ignored.
-   - **An unreadable line** goes to `held` with its raw text.
-   - **A text-only row** becomes an `open`, `outbox` entry with no parts yet
-     (E4 fixes them).
-   - **A handoff row** (section 6.4) for an existing `direct` entry changes
-     only its ownership (E3). No part state is taken from the row.
-   - **A row carrying PR #20-style `parts`** (only in test or development
-     state; that format never ran live):
-     - a `confirmed` part becomes a confirmed attempt with its recorded
-       times;
-     - a `writing` or `uncertain` part becomes an `ended` attempt with
-       `end_kind = 'writer_gone'` and `ended_at` set to the import time.
-       The old writer is stopped by then.
-     - an `unsent` part stays `unsent`.
-   - **The `imports` row** (name, line count, sha256) is inserted in the same
-     `TX`.
+Import supports exactly the formats the running tools write:
+
+- a text post row: `channel`, `as`, `text`, and optionally `cont`,
+  `reply_to` and `at`;
+- an ack row: `channel`, `as`, `ack` and `at`;
+- the new handoff row (section 6.4), which only this design writes.
+
+**Anything else is held, never imported.** That includes:
+
+- a row with `parts`, `terminal` or a non-handoff `id`. Those are PR #20
+  formats, which never ran on live state;
+- an unreadable line.
+
+A held row is kept raw in `held`, reported in `pchat status`, and alerted
+once, with no content.
+
+**PR #20's side files** (`outbox-reserved.jsonl`, `outbox-attributed.jsonl`,
+`record-coverage.json`) are never imported. If any exists at cutover, it is
+left untouched and reported.
+
+None of that state ever existed live, so no imported obligation can be
+reconciled against evidence that was not migrated. Coverage starts fresh,
+from the first catch-up after cutover.
+
+**Legacy text rows carry no attempt history.** Whatever the old tools may
+already have published of them is outside this design's evidence. They are
+delivered as #19 R3 requires ("delivered as today").
+
+### 6.3 The fenced import
+
+Import runs only in B's flush, holding both `L_flush` and `L_outbox`, and does
+local work only.
+
+1. **Claim (I1).** Rename a non-empty `outbox.jsonl` to a new unique name.
+   List every `outbox.claimed-*.jsonl`.
+2. **Read** each claim file whole, with its sha256 and line count.
+3. **Check** for an `imports` row with the file's name:
+   - the same hash: go to step 6;
+   - a different hash: hold the **file** (one `held` row), alert once, and do
+     not import or unlink it.
+4. **Import (I2), in one `TX`.** For each line ordinal `i`:
+   - **The occurrence id is always derived** from (claim file name, `i`),
+     for example `sha256(name + ":" + i)`. It is UNIQUE. Explicit ids never
+     replace it. Two identical lines, with or without the same explicit id,
+     are therefore two occurrences.
+   - **A text or ack row** becomes an `open`, `outbox` entry (E2). A post
+     gets its parts at E4.
+   - **A handoff row** is an instruction, not an obligation.
+     - If its referenced entry exists, apply H1 when its guard holds;
+       otherwise hold the row.
+     - If no such entry exists, E1 never committed, and nothing was sent.
+       The row becomes a legacy occurrence carrying the reference as its
+       UNIQUE `handoff_ref`.
+     - A second row with the same reference is a no-op once H1 has applied.
+       Without an entry, it is held.
+   - **Any other row** is held.
+   - Insert the `imports` row (name, line count, sha256).
 5. Commit.
 6. **Unlink (I3)** the file, only after the commit.
 
-### 6.3 Why the import is idempotent and keeps duplicates
-
-- **A crash before the commit** leaves no rows and no `imports` row. The next
-  import derives the same ids from the same name and ordinals.
-- **A crash after the commit** leaves the `imports` row with a matching hash,
-  so step 3 only unlinks.
-- **A file whose hash changed** after its import is never merged; it is held
-  and reported.
-- **Two identical lines** have different ordinals, so they are two
-  obligations.
-- **A claim** renames only onto a name that does not exist, so two claims never
-  share a name.
-
 ### 6.4 The handoff fallback
 
-If E3 cannot commit, P appends one compatibility row to `outbox.jsonl` under
-`L_outbox`. The row carries the entry id and the post's legacy fields, plus
-`handoff: true`. Import then decides how to treat it:
-
-- **The entry exists** (E1 committed): import applies only the ownership
-  change. The database's attempts remain the authority, and any `writing`
-  attempt reaches A8 once P exits.
-- **The entry does not exist** (E1 never committed, so nothing was sent): the
-  row is a whole legacy post, exactly as today.
+If E3 cannot commit, P appends one row under `L_outbox`. It holds the post's
+legacy fields, `handoff: true`, the entry id, and P's writer identity.
 
 If that append fails too, P fails as it does today when the outbox cannot be
 written. Whatever already committed still prevents a blind resend.
+
+### 6.5 Why the import is idempotent and keeps occurrences
+
+- **A crash before the commit** leaves no rows. The next import derives the
+  same occurrence ids from the same name and ordinals.
+- **A crash after the commit** leaves an `imports` row whose hash matches, so
+  only the unlink remains.
+- **A changed hash** is held, never merged.
+- **Every line** is its own occurrence, so a duplicate is never dropped as a
+  replay.
+- **Claim names** never collide.
 
 ## 7. Reconciliation rules
 
 ### 7.1 Windows
 
-| Attempt state | Window `[low, high]` |
+| Attempt | Window |
 |---|---|
-| `writing` | `[written_at − A, +∞)`: still open |
-| `confirmed` (no msgid) | `[written_at − A, confirmed_at + A]` (C-3) |
-| `ended`, `dead` | `[written_at − A, ended_at + SETTLE + A]` (C-2) |
+| `writing` | `[written_at − A, +∞)`, open |
+| `confirmed`, no msgid | `[written_at − A, final_at + A]`, closed |
+| `ended` or `dead` with finality | `[written_at − A, final_at + A]`, closed |
+| `ended` or `dead` without finality | `[written_at − A, +∞)`, open |
 
-A window is **final** once the attempt has left `writing`. A final window never
-changes.
+A closed window never changes.
 
 ### 7.2 Components
 
@@ -607,305 +771,413 @@ For a text key *k*, the **members** are its attempts that are:
 - `writing`, `ended` or `dead`;
 - or `confirmed` without a msgid.
 
-Members are connected when their windows overlap. A **component** is a
+Members whose windows overlap are connected, and a **component** is a
 connected set of members.
 
-A message can be produced only by an attempt whose window contains its time
-(I-1, C-2, C-3), so all candidates for a component's messages are inside it.
-
-- **`K`** is the confirmed members without a msgid. Each produced exactly one
-  message in its window (C-3).
-- **`G`** is the `ended` members: each produced zero or one message.
-- **`D`** is the `dead` members: each produced zero or one message, and they
-  are never decided again.
-- **`W`** is the `writing` members.
-- **`M`** is the unattributed messages of key *k* whose time lies in some
+- **`K`**: confirmed members. Each published exactly one message, of its
+  exact text, inside its window (C-3).
+- **`G`**: `ended` members. Each published at most one message of its exact
+  text. A multi-line member without finality may also have published
+  fragments.
+- **`D`**: `dead` members.
+- **`W`**: `writing` members.
+- **`M`**: the unattributed messages of key *k* whose time lies in some
   member's window.
 
-### 7.3 The three verdicts
+### 7.3 Verdicts
 
-Each verdict is decided per component, inside one `TX` (I-8).
+Each verdict is decided per component, inside one `TX`.
 
-**R1, DELIVERED (the whole component at once).** All of these must hold:
+#### R1, DELIVERED (the whole component at once)
 
-- `W` and `D` are empty, so every window is final and every member decidable;
-- `|M| = |K| + |G|`, with no message left unexplained;
-- a perfect matching of `K ∪ G` onto `M` exists, with each member's message
-  inside its window.
+All of these must hold:
+
+1. The account is designated, with `designated_at` no later than the
+   component's earliest window start, and it is not suspended.
+2. `W` and `D` are empty.
+3. `|M| = |K| + |G|`, and a perfect matching of `K ∪ G` onto `M` respects
+   every window.
+4. There is no fragment hazard. No unconfirmed multi-line attempt X of the
+   same account and channel, from another text key, has a window containing a
+   message of `M` whose text passes the fragment test against X's text.
+   "Unconfirmed" means `writing`, `ended` or `dead`.
 
 Then every `G` member becomes `delivered` (A6), and every `K` member gets its
-matched msgid (A9). Each one is an attribution row.
+matched msgid (A9).
 
-*Argument.* C-6 allows untracked producers. An untracked same-text message
-inside these windows is indistinguishable from ours, and this rule admits
-that one residual (section 7.4). Otherwise, every message in `M` came from a
-member of the component:
+**Argument.** By C-7, every message in `M` came from a tracked attempt. By
+condition 4 and the fragment test, none is a fragment of another key's
+multi-line attempt. So each came from an attempt of key *k* whose window
+contains it, which by definition is a member.
 
-- `K` produced `|K|` of them;
-- so `|M| = |K| + |G|` means every `G` member produced one.
+Each member published at most one message of text *k*, and `K` published
+exactly `|K|`. So `|M| = |K| + |G|` means every member published exactly one,
+and all of them are in `M`. No member can publish another one later, even one
+with an open window.
 
-Swapping msgids inside the component is harmless:
+All members are attributed together, so any matching is a valid assignment.
+Any attempt created later sends after its A1, which is after these messages
+were indexed (I-1), so it cannot be their producer.
 
-- all of its messages become attributed together;
-- every later attempt is created after they were indexed, so none of them is
-  a later attempt's message (I-1).
+`W` must be empty because B may not decide a live writer's attempt. `D` must
+be empty because a dead member's outcome is never decided.
 
-Requiring `W` to be empty is what makes this sound. A window that is still
-open could later need a message the matching gave to someone else. Round-5
-finding 3 is that case.
+Without designation, R1 never fires. A single identical message from an
+untracked producer therefore cannot retire an unpublished part. That is the
+round-1 finding, and the reason for difference D2.
 
-**R2, ABSENT (one `ended` member `Y`).** All of these must hold:
+#### R2, ABSENT (one `ended` member `Y`)
 
-- coverage is complete over the hull of `Y`'s window and every `K` window in
-  `Y`'s component, computed over `K ∪ G ∪ D` (final windows only);
-- no unattributed same-account, same-channel message in `Y`'s window has text
-  that is a strict, non-empty prefix of `Y`'s text (C-4);
-- `K` can be fully matched into `M`. If not, the record contradicts a
-  confirmation: undecided, logged as an anomaly;
-- **every** message of `M` inside `Y`'s window is *forced*: without it, `K`
-  can no longer be fully matched.
+All of these must hold:
 
-Then `Y` becomes `absent` (A7), and its part goes back to `unsent` for the
-owner's next attempt.
+1. `Y` has finality: its window is closed (section 5.2).
+2. Coverage is complete over the hull of `Y`'s window and the windows of `K_c`.
+   `K_c` is the confirmed members connected to `Y` through closed windows.
+3. `K_c` can be fully matched into `M`. If not, the record contradicts a
+   confirmation: the verdict is undecided, and an anomaly is logged.
+4. **Every** message of `M` inside `Y`'s window is forced: without it, `K_c`
+   cannot be fully matched.
+5. No unattributed message of the same account and channel inside `Y`'s
+   window passes the fragment test against `Y`'s text.
 
-*Argument.* Suppose `Y` did publish a message `m_Y`.
+Then `Y` becomes `absent` (A7). Its part becomes `unsent`, for its owner's
+next attempt.
 
-- By C-1 and C-2 its time is in `Y`'s window. By C-5 it is in `messages`.
-- It is unattributed:
-  - R1 never resolves a component with `Y` open;
-  - every attributed message predates every attempt created after its
-    attribution (I-1).
-- `K`'s own messages are distinct from `m_Y`, and they are all in `M`
-  (coverage), so `K` can be fully matched without `m_Y`. `m_Y` is not
-  forced, and R2 does not hold. This is a contradiction.
+**Argument.** Suppose `Y` published something:
 
-The argument uses no assumption about untracked producers. An extra message
-is never forced, so it blocks absence. `W`, `G` and `D` members do not affect
-it. A `writing` attempt could only add messages, never remove one of `K`'s.
+- either its exact message `m_Y`;
+- or, if it is multi-line, a fragment `g`.
 
-**R3, UNDECIDED** is everything else. The part stays `uncertain`, is shown in
-`pchat status` as awaiting a delivery check, and is checked again each flush.
+**It is in `messages`.** By finality and C-1, its time lies in `Y`'s closed
+window. By C-5, it is indexed.
 
-When an `ended` attempt of an outbox entry is still undecided more than
-`UNDECIDED_MAX` after its `written_at`, E7 runs in the same `TX`:
+**It is unattributed.**
 
-- the entry becomes terminal, and the attempt becomes `dead`;
-- the dead-letter export keeps the entry's unconfirmed part texts and its
-  per-part records (states, write times, msgids);
-- the owner gets the content-free alert, for example "an outbox post from
-  alp-solver-2 to #alpha could not be confirmed for 24 h; dead-lettered".
+- Attributions are made only by R1, and `Y` existed before anything it
+  published (I-1).
+- An R1 whose `M` held `m_Y` would have had `Y` as a member, because `m_Y` is
+  in `Y`'s window. It would then have decided `Y`, but `Y` is still `ended`.
+- An R1 whose `M` held `g` would have failed its fragment condition, because
+  `Y` was unconfirmed.
 
-It is never resent.
+**So the rule fails.**
+
+- If `Y` published `m_Y`: `K_c`'s own messages are distinct from `m_Y` and in
+  the record, so `K_c` can be matched without `m_Y`. `m_Y` is not forced, and
+  condition 4 fails.
+- If `Y` published `g`: condition 5 fails.
+
+The argument needs no assumption about untracked producers. An extra message
+is never forced, so it only blocks absence. `W`, `G` and `D` members, other
+than `Y`, can only add messages, never remove one of `K_c`'s.
+
+#### R3, UNDECIDED: everything else
+
+The part stays `uncertain`, is shown in `pchat status` as awaiting a delivery
+check, and is checked again each flush.
+
+E7 applies at `UNDECIDED_MAX`, to any entry:
+
+- direct, outbox or abandoned;
+- with a `writing` or `ended` attempt;
+- live writer or not.
+
+It dead-letters the entry (X1) with its unconfirmed part texts and per-part
+records, and raises the content-free alert (X2). The part is never resent.
 
 ### 7.4 Conservatism, in brief
 
 - **Identity.** Same verified account, same case-folded channel, exact
-  server-visible text, a time inside the window, an msgid not already
-  attributed.
-- **Competing or untracked producers.**
-  - Any message that is not needed makes `|M| > |K| + |G|`, so R1 fails, and
-    it is never forced, so R2 fails.
-  - The one residual: an untracked identical message from the same account,
-    in exactly the window of one of our `G` attempts that published nothing,
-    makes R1 count that attempt delivered. The channel then does show that
-    exact text from that account at that time. Nothing is duplicated.
-- **Complete joined-membership coverage.** C-5. Absence needs coverage through
-  `ended_at + SETTLE + A`, so it waits for the attempt to end and settle.
-- **Automatic absence recovery is kept.** R2 needs no tags, no history
-  capability beyond today's, and no exact-once mechanism. A live bridge
-  decides its own closed attempts (section 5.1).
-- **Ambiguity stays UNKNOWN.** For example: two `ended` attempts with one
-  message both could own; or a `writing` member; or a prefix candidate; or
-  incomplete coverage. Each is undecided, visible, never resent, and
-  dead-lettered with its text after 24 hours.
-- **Unrelated obligations keep flowing.** Components are per text key. Other
-  entries, including the same account's, are attempted every flush.
-- **A 26-hour outage keeps the evidence.** I-7 pins every row of a text key
-  while any attempt of that key is unresolved. Coverage across the outage
-  exists only if the catch-up resumed from the stored mark. Otherwise R2
-  waits, and the 24-hour rule applies.
-- **No protocol experiments.** Nothing assumes client tags, echo-message,
-  labeled-response or a CHATHISTORY capability beyond what PR #20 already
-  uses.
+  server-visible text, a time inside the window, an msgid not yet attributed.
+- **Competing and untracked producers.**
+  - R2 never relies on their absence.
+  - R1 relies on it only for a designated account (C-7).
+  - At V1, a message of a designated account with a time after
+    `designated_at` is *unexplained* when no tracked attempt can explain it:
+    no attempt of its exact text key has a window containing it, and no
+    unconfirmed multi-line attempt of that account and channel has a window
+    containing it and a text it passes the fragment test against.
+  - An unexplained message suspends the designation in the same `TX`, with
+    a content-free alert (X2). R1 is then off for that account until the
+    owner lifts the suspension.
+
+  An identical message from an untracked producer, inside a tracked window, is
+  indistinguishable from ours. C-7 covers it only where the owner has
+  designated the account. Elsewhere it leaves the part UNKNOWN.
+- **Complete joined-membership coverage.** C-5. Absence needs coverage
+  through `final_at + A`, after the attempt has ended.
+- **Automatic absence recovery is kept** where finality proves it (section
+  5.2). This uses no tags, no echo, no labeled responses, and no CHATHISTORY
+  capability beyond PR #20's.
+- **Ambiguity stays UNKNOWN.** That includes:
+  - indistinguishable identical text;
+  - a fragment candidate;
+  - missing finality;
+  - a live writer;
+  - incomplete coverage.
+
+  Each is visible, never resent, and dead-lettered with its text after 24
+  hours.
+- **Unrelated obligations keep flowing** (I-10).
+- **A 26-hour outage keeps the evidence** (I-7). Coverage across an outage
+  exists only if the catch-up resumed from the stored mark.
+- **No protocol experiments.**
 
 ### 7.5 Worked example
 
-All data is invented. `alp-solver-2` posts a three-part question to
-`#alpha`.
+`alp-solver-2` posts a three-part question to `#alpha`. Parts 0 and 1 are
+confirmed (A2).
 
-1. Parts 0 and 1 get A2. Part 2's PONG never arrives. The writer closes the
-   connection and commits A5 (`ended_at = t`). It hands the entry to the
-   outbox (E3), and `pchat` exits 3, saying "2 of 3 parts posted".
-2. At `t + 40 s`, B indexes part 2's message `m2` (the server was slow). On
-   the next flush, the component for part 2's text holds part 2 only (`G`),
-   with `M = {m2}`. R1 holds: it is delivered, and `m2` is attributed.
-3. Alternatively, `m2` never appears. Once coverage reaches `t + 605 s`, and
-   no message or prefix is in the window, R2 holds: the part is absent, and
-   B sends it again (generation 1, A1). Parts 0 and 1 are never touched.
-4. Alternatively, coverage never completes, because the bridge was kicked from
-   `#alpha` and rejoined without a resumable catch-up. Then the part is
-   undecided. At `written_at + 24 h` it is dead-lettered with part 2's text,
-   and `pat` gets the alert.
+- **Case 1, a late PONG.** Part 2's PONG comes during the drain, with no
+  error. The outcome is A2, confirmed. No part remains, so the post has
+  succeeded and the entry is `done` (E5). Nothing is queued or resent. Had a
+  part remained, the call would have stopped there and handed it off.
+- **Case 2, an error reply.** Part 2's PONG comes with a 5xx reply. The
+  outcome is A5 with finality, and the entry is handed off.
+  - If coverage reaches `final_at + 5 s` with no message and no fragment, R2
+    holds: part 2 is absent and is resent once.
+  - If its message is there instead, the part is delivered by R1 when the
+    account is designated. Otherwise it is undecided, and dead-lettered at 24
+    hours.
+- **Case 3, a broken connection.** The connection breaks: A5, no finality.
+  - Its message is logged, the account is designated, and R1 holds: it is
+    delivered.
+  - Otherwise it is undecided, and at 24 hours dead-lettered with part 2's
+    text, with `pat` alerted. It is never resent.
 
-## 8. Mapping to #19
+## 8. Mapping to #19, and proposed differences
 
-#19's requirements and acceptance are **unchanged**. The table maps each one to
-this design.
+### 8.1 Mapping
 
 | #19 | Where it is met |
 |---|---|
-| R1, the per-part outcome | Part states (section 3.2); A2, A5 and A4 give confirmed, uncertain and unsent. `PART_WAIT` is absolute. |
-| R2, never resend a confirmed part | I-3; E3 hands off the remainder, and no whole-text requeue remains. |
-| R3, fixed parts | E1 and E4 fix the parts once. A legacy entry's marker is fixed into its text then. A part the server can no longer carry stays unsent and visible (as in PR #20). |
-| R4, durable progress | A1 before bytes; A2 or A5 before the next part; A8 makes a crashed part `uncertain`. Every caller is covered, not only the bridge. |
-| R5, reconcile and never resend blindly | R1, R2, R3 and E7, with the dead-letter content kept by X1. |
-| R6, independent flow | I-10. |
-| R7, refusals | A3 and E6; the dead letter lists the confirmed parts. |
-| R8, visibility | `pchat status` reads the database for its counts: waiting to post, awaiting a delivery check, held rows. |
-| R9, no exactly-once | Stated here; the guidance and provenance must keep saying it. |
-| R10–R12, capture, guidance, docs | Unchanged. The implementation updates provenance, `SKILL.md`, D-72 and the `docs/chat_capture.md` rows. |
-| R13, privacy | All examples and future tests use invented data. |
-| Acceptance 1–10 | Each one stays. The tests observe outcomes through `pchat`'s output and exit status, the outbox summary and status, the dead letters, and the fake server's write log, rather than the contents of claimed files. |
+| R1, the per-part outcome | A2, A5 and A4, and the part states. `PART_WAIT` is absolute; the drain is bounded. |
+| R2, no resend of a confirmed part | I-3; E3 and H1 hand off the remainder only. |
+| R3, fixed parts, and legacy entries delivered as today | E1 and E4; section 6.2. |
+| R4, durable progress | A1 before bytes, A2 or A5 before the next part, A8 and A8c; I-5. |
+| R5, reconciliation | R1, R2, R3, E7, X1 and X2, subject to D2 and N7. |
+| R6, independent flow | I-10 |
+| R7, refusals | A3 and E6, with the confirmed parts in the dead letter. N6 covers an unrecorded refusal. |
+| R8, visibility | `pchat status`, from the database: waiting to post, awaiting a check, held rows, suspended designations. |
+| R9, no exactly-once | Stated here; the guidance and provenance keep saying it. |
+| R10–R12, capture, guidance, docs | Unchanged; the implementation updates them. |
+| R13, privacy | Invented data only. |
+| Acceptance 1, 2, 4–6, 8–10 | The behavioral assertions are unchanged. Acceptance 2 needs the fake account designated (D2). |
+| Acceptance 3 | Changed fixture (AD-2). |
+| Acceptance 7 | Changed fixture (AD-1). |
 
-### Contract and acceptance differences
+### 8.2 Proposed differences: none is approved by this note
 
-**Proposed, not adopted:**
+- **D1, adopting a dead direct writer's remainder: not adopted.** A killed
+  `pchat` queues nothing today. E8 keeps that: the unsent remainder is not
+  sent.
 
-- **D1. Adopting a dead direct writer's remainder.** Today a `pchat` killed
-  mid-post queues nothing. This design keeps that: E8 retires the entry as
-  evidence only, with no send and no alert.
+  Its unknown parts still follow #19 R5's 24-hour dead letter, through E7.
+  Adoption needs an owner decision.
+- **D2, Delivered needs a designated account.** Approval item 5 says
+  unexplained identical text stays UNKNOWN. Text evidence cannot exclude an
+  untracked producer, so R1 fires only for owner-designated accounts (C-7),
+  and is monitored by the suspension rule.
 
-  Adopting the unsent remainder instead would deliver more posts. It would
-  also be a new behavior, and it needs an owner decision.
+  #19 R5's "Delivered" carries no such condition. This is therefore a
+  narrowing of #19 R5, and needs the owner's decision.
+  - **If the owner designates the transport accounts at activation**,
+    delivery behaves as #19 R5 under an attested, monitored assumption.
+  - **If not**, uncertain parts with a visible message are dead-lettered
+    after 24 hours instead of retired.
+- **AD-1, acceptance 7's fixture.** "The left-over claimed file is recovered"
+  becomes "the database state left by the crash is recovered". Its assertions
+  stay the same: no earlier part rewritten, part *k* uncertain and not
+  resent, no entry lost.
+- **AD-2, acceptance 3's fixture.** Absence needs finality (N7), so the test's
+  uncertain part 3 must end with a server reply, an error reply or a late
+  PONG, rather than a bare timeout. Its assertions stay the same.
 
-**Not differences, but observable narrowings inside #19's "Unknown" outcome.**
-These are listed for the owner's awareness:
+### 8.3 Narrowings inside #19's UNKNOWN outcome
 
-- **N1.** Delivery needs a complete count (R1). A matching message alongside
-  an unexplained extra one, or alongside a live same-text writer, now leaves
-  the part undecided. #19's literal "Delivered" reading would have accepted
-  it. The issue review's amendment ("leave indistinguishable evidence Unknown
-  unless distinct messages establish delivery") asks for this.
-- **N2.** A same-account message in the window that is a strict prefix of the
-  part's text blocks absence (C-4).
-- **N3.** A live but hung writer keeps its own part undecided indefinitely.
-  The writer is not the bridge, so no dead letter is produced for it. Same-key
-  parts of other entries may then be dead-lettered after 24 hours rather than
-  resent.
+These are listed for awareness. Each one ends as UNKNOWN, never as a resend.
 
-**Owner decision needed at implementation.** Adopting SQLite as the outbox
-store of plateia's copy. It would be recorded as a new design decision next
-to D-72. Migrating live state belongs to activation, which is separately
-authorized.
+- **N1.** R1 needs an exact count, with no live writer and no dead member.
+- **N2.** A fragment candidate blocks R2 and R1.
+- **N4.** A timed-out call returns up to `DRAIN_WAIT` later.
+- **N5.** A `dead` member, or one without finality, keeps an open window, so
+  later same-key parts of that account and channel may stay UNKNOWN until 24
+  hours.
+- **N6.** A refusal or rejection whose commit failed becomes UNKNOWN, and is
+  dead-lettered after 24 hours rather than at once.
+- **N7.** Absence needs finality. A part ended by a crash, a broken
+  connection, or no reply through the drain is never ruled absent.
+
+**Acknowledgements are not text obligations.** They gain E1 and A1 before
+their bytes, and are retried after an uncertain outcome exactly as today
+(A11). A repeated acknowledgement is harmless. This is not an exemption from
+approval item 1: their intent is still committed before any byte.
+
+**Owner decision at implementation.** Adopting SQLite as the outbox store of
+plateia's copy, to be recorded as a design decision next to D-72. Migrating
+live state, quiescing the old writers, and any designation belong to the
+separately authorized activation.
 
 ## 9. Future tests
 
-These are deterministic tests to write later. They are not written or run as
-part of this note.
+These tests are to be written later. None is written or run as part of this
+note.
 
-**Common setup.** Each test uses:
+**Setup.** `FakeServer`/`FakeConn`; injected wall and monotonic clocks; a fake
+process and socket table for the gone and conn-closed proofs; `_isolation`
+with a temporary state directory; invented data only. There is no network,
+home directory or real data.
 
-- the existing `FakeServer`/`FakeConn` transport;
-- an injected wall clock and monotonic clock;
-- a fake process table for gone checks (boot id, pid, start time);
-- `_isolation` with a temporary state directory;
-- invented data only.
-
-None of them uses the network, the home directory or real incident data.
+**Transports.** Every scenario runs on both transports, `line` and
+`multiline`, wherever parts differ.
 
 1. **The round-5 regressions.**
-   1. **Same flush.** Entry A has a confirmed part with no msgid and an
-      uncertain part of the same text; entry B has a delivered part of that
-      text. With three messages and complete coverage, one flush retires
-      both, and resends nothing.
-   2. **Storage failure at confirmation.** A2 fails after part 1 of 3 is
-      confirmed, through `pchat`, `notify` and `announce`. No whole-text
-      requeue. Part 1 is never rewritten. The remainder is handed off, or
-      falls back to section 6.4.
-   3. **A direct post during a flush.** An uncertain U and a direct D share a
-      text. The flush runs after D's message is indexed and before D's A2. U
-      stays undecided. After D's A2, U is ruled absent and resent once.
-   4. **A 26-hour outage.** A confirmed direct post, then an identical
-      uncertain post with only the first message logged. After the clock
-      advances 26 hours, the evidence is still there, and U is not retired as
+   1. **Same flush.** Entry A has a confirmed part and an uncertain part of the
+      same text; entry B has the same text, delivered; the account is
+      designated. One flush resolves both. Nothing is resent.
+   2. **Storage failure at confirmation**, through `pchat`, `notify` and
+      `announce`. A2 fails after part 1 of 3 is confirmed. Nothing is
+      requeued whole. Part 1 is never rewritten. The outcome is retried, or
+      ends uncertain.
+   3. **A direct post during a flush.** As in section 5.6, item 1.
+   4. **A 26-hour outage.** The evidence survives, and U is not retired as
       delivered.
-2. **Unique attribution.** A msgid is never attributed twice. This covers
-   identical part texts in one entry and across entries, the `attributions`
-   uniqueness constraint, and a crash between two components' transactions.
-3. **Every crash boundary.** Inject a kill at each row of section 5.4 for
-   `pchat`, and for the bridge's flush. Check that:
-   - no confirmed part is rewritten;
-   - no entry is lost;
-   - each recovery verdict is as listed.
-4. **Storage failure and part preservation.** Inject a database error at A1,
-   A2, A5, E3 and the X1 marks. In every case:
-   - no part becomes `unsent` without A4 or A7;
-   - no whole-text requeue happens;
-   - a live bridge recovers its own pending A5.
-5. **Direct post plus flush, and a paused writer.**
-   - A writer paused after A1 is never ended or retried by B. It resumes and
-     confirms.
-   - A writer proved gone (pid missing, start time changed, boot id changed)
-     is ended by A8.
-   - An unreadable start time is not treated as gone.
-6. **Import.**
-   - Two identical lines import as two entries.
-   - A crash before the commit, and after the commit but before the unlink,
-     both replay idempotently.
+2. **Untracked substitution.**
+   - Undesignated: U published nothing, an identical untracked message falls
+     in U's window, and U stays UNKNOWN until its 24-hour dead letter.
+   - Designated: an unexplained message suspends the designation, and alerts
+     once.
+3. **Unique attribution.** A msgid is never attributed twice: identical part
+   texts in one entry and across entries, the UNIQUE constraints, and a crash
+   between two components' transactions.
+4. **Finality.**
+   - A PONG with an error reply gives finality, and R2 resends.
+   - A late PONG in the drain gives A2.
+   - No PONG, a write error, a gone writer and a closed connection each give
+     no finality, and R2 never applies.
+   - A FAIL in the drain is a refusal.
+5. **Fragments.** For a multi-line part with lines "north" and "south", each
+   of these blocks R2 and R1:
+   - "north";
+   - "south";
+   - "south\nnorth";
+   - "north" with a concatenated piece.
+
+   An attributed fragment is never reused.
+6. **Crash at every boundary.** One case per row of the tables in section
+   5.5, for P and for B, asserting the surviving state and the listed
+   recovery.
+7. **Storage failure at each commit.**
+   - At A1: nothing is sent.
+   - At A2, A3, A4 and A5: the outcome is retried. A refusal is never
+     retried.
+   - At E3: the fallback row, then H1.
+   - At E6 and E7, and at the X1 and X2 marks.
+   - A live non-bridge host (`agentcli`): the closed flow is ended by A8c
+     while the host keeps running.
+8. **A paused writer and gone proofs.**
+   - A writer paused after A1 is never ended or retried.
+   - At 24 hours E7 makes it terminal and leaves the attempt `writing`.
+   - A missing pid, a changed start time and a changed boot id each prove
+     the writer gone.
+   - Unreadable probes prove nothing.
+9. **Import.**
+   - Identical lines, with or without the same explicit id, give distinct
+     occurrences.
+   - A crash before the commit, and one after it, replay idempotently.
    - A changed hash is held.
-   - An id collision is held and not merged, while the other rows proceed.
-   - Unreadable lines are kept.
-   - A handoff row for an existing entry changes ownership only.
+   - Rows with `parts`, `terminal` or another id, and unreadable lines, are
+     held.
+   - A handoff applies once.
+   - Handoff versus E8: adopted by H1.
    - Claim names never collide.
-7. **Membership loss.** A KICK or PART, a disconnect, a failed index write,
-   and a stale catch-up reply each stop coverage. R2 waits; R1 is unaffected.
-8. **Retention.** I-7 keeps evidence while an attempt of the same text key is
-   `writing` or `ended`, and collects it afterwards.
-9. **Ambiguity and the 24-hour dead letter.** These stay undecided until 24
-   hours, then are dead-lettered with their texts and per-part records, with
-   one content-free alert even across a crash during X1:
-   - two `ended` attempts with one shared message;
-   - an extra untracked message;
-   - a prefix message.
-10. **Independent flow.** While another entry is undecided, refused or
-    failing, entries for another account, and for the same account with
-    another text, are delivered in the same flush.
-11. **Unchanged paths.**
-    - Old-format and ack entries.
-    - A failure before any write queues the whole post.
-    - A slow but confirmed post succeeds with no queueing.
-    - Silent-run suppression still applies.
-    - `pchat` exit codes and messages are the same.
-    - All of #19's existing acceptance tests pass.
+10. **Collection.**
+    - Exact and fragment dependencies keep messages.
+    - An attribution is deleted only with its message.
+    - Terminal rows are kept until their exports are marked done.
+    - Open-window dead attempts are kept.
+11. **Exports.**
+    - X1 writes once across a crash at each step, with a torn last line
+      repaired.
+    - P and B export concurrently: one record.
+    - X2 enqueues exactly once across a crash at each step.
+12. **Coverage.** Each of these stops coverage, and R2 waits:
+    - KICK or PART;
+    - a disconnect;
+    - a stale catch-up reply;
+    - a failed V1;
+    - a checkpoint that disagrees with the stored mark;
+    - a bridge restart.
+13. **Independent flow.** Another account, and the same account with another
+    text, are delivered in the same flush while an entry is undecided,
+    refused or failing.
+14. **Unchanged paths.** All of these keep #19's acceptance:
+    - legacy and ack entries;
+    - a failure before any write queues the whole post;
+    - a slow but confirmed post;
+    - silent-run suppression;
+    - `pchat` exit codes and messages;
+    - ack retry.
 
 ## 10. Feasibility and risks
 
-**Feasibility.** Python's standard `sqlite3` module covers everything here,
-with no new dependency. The change keeps PR #20's:
+**Feasibility.** Everything uses the standard library's `sqlite3`, plus
+process and socket probes. The change keeps PR #20's:
 
 - per-part posting;
 - fixed parts;
 - the refusal and legacy paths;
-- the coverage model;
-- the membership-loss handling.
+- the coverage model.
 
-It replaces about 300 lines of file-state code in the bridge and `chatlib`
-(reservations, attribution files, `_Claimed`, and matching that relies on
-snapshots).
+It replaces the bridge's and `chatlib`'s file state, about 300 lines, with
+the database layer, and adds the drain and the probes.
 
 **Risks.**
 
-- **Storage locking.** SQLite locking on a local disk is reliable. The
-  bounded busy timeout turns contention into a failure before anything is
-  sent, never after.
-- **Liveness probes.** Reading the boot id and process start time differs
-  between macOS and Linux, and both need fakes in tests. An unreadable value
-  always means "not gone".
-- **Assumptions C-2 and C-4** are not proved. C-4 is defended by the prefix
-  rule; C-2 depends on `SETTLE` being long enough.
-- **Narrowings N1–N3** may produce more 24-hour dead letters in rare
-  same-text cases. Each one carries an alert, and none is a duplicate.
-- **Scope.** Every transport caller changes (`pchat`, `agentcli`,
-  `announce`, the bridge). The tests in section 9 are the guard.
-- **Activation.** Nothing here touches live state. Quiescing the old writers,
-  and the first live import, belong to the separately authorized activation.
+- **More dead letters.** D2 without designation, and N5–N7, will dead-letter
+  more uncertain parts after 24 hours. Each one has an alert, and none is a
+  duplicate.
+- **Probe portability.** Process start time, boot id and open sockets are
+  read differently on macOS and Linux. An unreadable probe proves nothing,
+  so the cost is delay, never a resend.
+- **Scope.** Every transport caller changes. The tests in section 9 guard it.
+- **Activation.** Live import, quiescing the old writers and designation are
+  outside this work, and separately authorized.
+
+## 11. Revisions
+
+**Revision 1** (`46c470c`) was reviewed in design review round 1:
+CHANGES_REQUESTED. Revision 2 makes these changes, numbered by that review's
+findings.
+
+1. **Untracked substitution in R1.** R1 now requires an owner-designated
+   account (C-7), monitored by suspension. Without designation it never
+   fires. This is identified as difference D2.
+2. **Unproved `SETTLE`.** `SETTLE` is removed. R2 requires finality, proved by
+   the in-order reply on the attempt's own connection (section 5.2). The
+   drain recovers late replies. Without finality, R2 never applies (N7).
+3. **Fragments beyond prefixes.** Atomicity is no longer assumed. The fragment
+   test covers every possible partial text. It blocks R2, and excludes R1.
+4. **Collection.** I-7 now keys on account and channel windows, covering
+   fragment dependencies. It keeps attributions with their messages, keeps
+   terminal rows until their exports are done, and never collects open-window
+   dead attempts.
+5. **Explicit-id duplicates.** Occurrence identity is always (file, ordinal),
+   and explicit ids never replace it.
+6. **PR #20-format state.** It is never imported; it is held or left
+   untouched and reported (section 6.2).
+7. **A handoff stranded by abandonment.** H1 is a B transition guarded by the
+   entry id and the writer identity, and may reopen an abandoned entry.
+8. **Acks.** E1 and A1 now precede the TAGMSG. Ack retry is today's behavior
+   (A11).
+9. **Refusal storage errors and closed flows.** Pending outcomes are retried.
+   An unrecorded refusal degrades to UNKNOWN (N6), never to a retry. A8c ends
+   a closed flow inside a live host.
+10. **Exports.** P and B are serialized; each write is made durable before
+    its mark; a torn line is repaired; the alert goes on the pending queue,
+    once.
+11. **The N3 exemption.** E7 now applies to `writing` attempts too, without
+    ending them. Acceptance 7's fixture change is named (AD-1), and so is
+    acceptance 3's (AD-2).
+12. **Crash matrix and tests.** Section 5.5 covers every boundary, and
+    section 9 adds the round-1 counterexamples and both transports.
