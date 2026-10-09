@@ -34,11 +34,11 @@ paths relative to their own location, so nothing needed rewiring.
 
 | Baseline path | Plateia path | Capture |
 | --- | --- | --- |
-| `chat/scripts/agentcli.py` | `packages/chat/scripts/agentcli.py` | changed: `who`'s hint names the config's assistant identity |
+| `chat/scripts/agentcli.py` | `packages/chat/scripts/agentcli.py` | changed: `who`'s hint names the config's assistant identity; a notice that failed partway queues only its unconfirmed remainder (#19, D-72) |
 | `chat/scripts/binding.py` | `packages/chat/scripts/binding.py` | changed: one docstring path example |
-| `chat/scripts/chatlib.py` | `packages/chat/scripts/chatlib.py` | changed: docstring config example uses placeholders |
+| `chat/scripts/chatlib.py` | `packages/chat/scripts/chatlib.py` | changed: docstring config example uses placeholders; posts go part by part, each confirmed, and a failure reports every part's state (#19, D-72) |
 | `chat/scripts/identities.py` | `packages/chat/scripts/identities.py` | byte-for-byte |
-| `chat/scripts/pchat` | `packages/chat/scripts/pchat` | byte-for-byte |
+| `chat/scripts/pchat` | `packages/chat/scripts/pchat` | changed: a post that failed partway queues only its unconfirmed remainder; `status` shows posts awaiting a delivery check and partly published dead letters (#19, D-72) |
 | `chat/scripts/receipt_experiment.py` | `packages/chat/scripts/receipt_experiment.py` | byte-for-byte (first review in PLT-9, D-69) |
 | `chat/scripts/role_colors.py` | `packages/chat/scripts/role_colors.py` | changed: owner, assistant and other identity names read from the chat config at runtime; stale forced colors dropped |
 | `chat/scripts/runstore.py` | `packages/chat/scripts/runstore.py` | byte-for-byte |
@@ -75,13 +75,13 @@ baseline.
 
 | Baseline path | Plateia path | Source | Capture |
 | --- | --- | --- | --- |
-| `chat/scripts/chat-bridge` | `packages/chat/scripts/chat-bridge` | `c572bad` | changed: message-ID deduplication covers the whole channel log (deliberate deviation, below) |
+| `chat/scripts/chat-bridge` | `packages/chat/scripts/chat-bridge` | `c572bad` | changed: message-ID deduplication covers the whole channel log, and the outbox resends only unconfirmed parts after checking the record (deliberate deviations, below) |
 | `chat/scripts/rotate-logs` | `packages/chat/scripts/rotate-logs` | `c572bad` | byte-for-byte |
 | `chat/scripts/tests/test_bridge.py` | `packages/chat/scripts/tests/test_bridge.py` | `c572bad` | changed: invented names |
 | `chat/scripts/tests/test_receipt_experiment.py` | `packages/chat/scripts/tests/test_receipt_experiment.py` | `c572bad` | changed: invented names (first review of the bridge's receipt routing, D-69) |
 | `chat/scripts/tests/test_rotate_logs.py` | `packages/chat/scripts/tests/test_rotate_logs.py` | `c572bad` | byte-for-byte |
 | `chat/scripts/tests/fixtures/codex-interrupted-background.txt` | `packages/chat/scripts/tests/fixtures/codex-interrupted-background.txt` | `c572bad` | byte-for-byte |
-| `chat/SKILL.md` | `packages/chat/SKILL.md` | `8ff325e` | changed: says where the owner's and assistants' accounts are configured; invented examples |
+| `chat/SKILL.md` | `packages/chat/SKILL.md` | `8ff325e` | changed: says where the owner's and assistants' accounts are configured; invented examples; describes partial-post queueing (#19) |
 
 The bridge tests use the owner `pat` and assistant `sam`, with projects
 `nova`, `alpha`, `gamma`, `delta`, `epsilon` and `zeta` (prefixes `nov`,
@@ -98,6 +98,21 @@ time, and a request already accepted was queued again. The captured bridge
 reads every line. `test_replay_dedup.py` reproduces the failure with six full
 1,000-message pages, a dropped connection and a restart. The running bridge
 keeps the baseline behavior until activation (D-23).
+
+A second deliberate deviation, by owner decision on 2026-10-09 (D-72), repairs
+partial-post delivery (#19). Before it, `chatlib.post` waited once, after the
+whole post, for the server's answer. A long post whose completion timed out
+after the server had committed it was then queued whole, and every outbox flush
+posted it again under new message IDs.
+
+Now each part is confirmed before the next is written. `pchat`, agent notices
+and the bridge's announcements queue only the unconfirmed remainder. The
+bridge checks a part that may already be in the channel against the channel
+record before any resend, and the guarantee stays at-least-once with that
+check. `test_outbox_resend.py` reproduces the reposting with a fake server and
+covers recovery. It changes `chatlib.py`, `pchat`, `agentcli.py`, `chat-bridge`
+and `SKILL.md`. The running tools keep the baseline behavior until activation
+(D-23).
 
 `SKILL.md` keeps three things that point outside the capture, recorded in its
 provenance entry's `external_references`:
@@ -117,6 +132,13 @@ Plateia-only files added with PLT-15:
 - `test_replay_dedup.py` shows message-ID deduplication after acceptance
   recovery, across a crash, a restart, and a restart after a cut-short
   catch-up of more than 5,000 messages.
+
+Plateia-only file added with #19:
+
+- `test_outbox_resend.py` covers partial-post delivery against a fake server
+  with an injected clock. It tests per-part confirmation, remainder-only
+  queueing, record reconciliation, crash and restart recovery, independent
+  delivery, refusals and the one-day dead letter.
 
 Not captured, by design: `install-identities` is excluded from every capture
 (D-20).

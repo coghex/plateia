@@ -1307,6 +1307,9 @@ selected because it would reopen D-15.
 recorded fix to the bridge's deduplication window; otherwise the captured code
 behaves as today's live tools.
 
+**Amended by D-72 (2026-10-09):** the first activation also brings #19's
+recorded repair of partial-post delivery through the outbox.
+
 ### D-24. PLT-15 also captures the chat skill's operating guidance
 
 Owner decision in this conversation, 2026-10-08: amend the approved PLT-15
@@ -2057,6 +2060,49 @@ Two alternatives were not selected:
   into place.** It doesn't close the race, because the temporary directory's
   own parents can be swapped instead. A built environment also can't be
   moved: its console scripts name their build path.
+
+### D-72. #19 repairs partial-post delivery through the outbox as a recorded deviation
+
+Owner decision, 2026-10-09: the owner authorized the repair, and the plateia
+manager confirmed at the issue's signoff that it is recorded here. It amends
+D-23's "behaves as today's live tools" for this one transport repair only, as
+D-70 did for the deduplication window.
+
+**The defect.** A long post goes to the chat server in parts. The captured
+`chatlib.post` wrote every part, then waited once for the server's answer, so
+a timeout after the server had committed the parts looked like nothing was
+sent:
+
+- `pchat post` queued the whole text;
+- every outbox flush posted it all again, each copy under new message IDs that
+  msgid deduplication cannot catch;
+- each copy woke the recipient again.
+
+**The repair.**
+
+- Each part is confirmed before the next is written, and a failure says which
+  parts are confirmed, uncertain or unsent.
+- Every caller that feeds the outbox queues only the unconfirmed remainder.
+- The bridge records each part's state durably around every write.
+- It checks an uncertain part against the channel record, and resends it only
+  once the record is known complete well past the attempt and holds no such
+  message.
+- A part still undecided after a day is dead-lettered, with a content-free
+  owner alert.
+
+Delivery stays at-least-once with that check; nothing claims exactly-once.
+`packages/chat/provenance.json` records the change for each file. The drift
+check still compares the live tree with the baseline, and the live tools are
+unchanged, so it reports no new drift for these files.
+
+The running tools keep the defect until the release and activation slices
+(PLT-11, PLT-12, PLT-14) replace them with the captured code. #19 changes
+neither the running bridge nor the live skills tree.
+
+Fixing only the live tools was not selected: it would split the shared code
+D-23 makes plateia the single source of. Capturing the defect verbatim and
+fixing it in a later slice was not selected either: the reposting wakes
+managers on every flush.
 
 ## Open questions
 
