@@ -41,9 +41,11 @@ only; no network access.
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime
 import fcntl
 import hashlib
+import io
 import json
 import os
 import plistlib
@@ -51,6 +53,7 @@ import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -71,21 +74,26 @@ STEPS = ("create-release-dir", "copy-artifacts", "create-environment", "install-
 IMPORTER_LIMIT = 2 << 20  # larger files aren't scripts; they are skipped, not read
 SCRIPT_SUFFIXES = (".py", ".sh", ".bash", ".zsh")  # with the executable bit: the files searched
 
-# A path-bound importer manipulates the import path (or PYTHONPATH) and names
+# A path-bound importer changes the import path (assigning, extending or
+# inserting into sys.path, site.addsitedir, or PYTHONPATH) and names
 # the chat/scripts location, as "chat" / "scripts", os.path.join(..., "chat",
 # "scripts") or a "chat/scripts" string.
-SYS_PATH = re.compile(r"sys\.path\s*(?:\.\s*(?:insert|append|extend)\b|\[|\+=)|\bPYTHONPATH\b")
+SYS_PATH = re.compile(r"sys\.path\s*(?:\.\s*(?:insert|append|extend|__setitem__|__iadd__)\b|\[|\+=|=(?!=))"
+                      r"|\bsite\.addsitedir\b|\bPYTHONPATH\b")
 CHAT_SCRIPTS = re.compile(r"""["']chat["']\s*[/,]\s*["']scripts["']|["'][^"'\n]*\bchat/scripts\b""")
 
 PROBE = ("import json, platform, sys; print(json.dumps({'implementation': platform.python_implementation(), "
          "'version': platform.python_version(), 'system': platform.system(), 'prefix': sys.prefix}))")
 ENV_PROBE = r"""
-import json, platform, sys
+import json, platform, sys, sysconfig
 from importlib import metadata
 import plateia_chat
+dist = metadata.distribution("plateia-chat")
 print(json.dumps({"implementation": platform.python_implementation(), "version": platform.python_version(),
                   "system": platform.system(), "prefix": sys.prefix, "module": plateia_chat.__file__,
-                  "dist_version": metadata.version("plateia-chat"), "path": sys.path}))
+                  "dist_version": dist.version, "path": sys.path, "purelib": sysconfig.get_paths()["purelib"],
+                  "record": [[str(f), f.hash.mode + "=" + f.hash.value if f.hash else None, str(f.locate())]
+                             for f in dist.files or []]}))
 """
 
 CALLS = []  # every external command this process ran: the process boundary tests inspect
@@ -196,13 +204,39 @@ def observe_launchagent(t, path, skills, provenance):
         return observed, f"unknown ownership: its Label is not {t['label']}"
     observed["label"] = t["label"]
     program = expand(t["program"], skills)
-    arguments = plist.get("ProgramArguments")
-    if not (isinstance(arguments, list) and any(isinstance(a, str) and Path(os.path.normpath(a)) == program
-                                                for a in arguments)):
-        return observed, f"retargeted program: its ProgramArguments don't name {shown(program)}"
+    invocation = launch_invocation(plist, program)
+    if invocation is None:
+        return observed, (f"retargeted program: it doesn't run {shown(program)} (Program and ProgramArguments "
+                          "must be the script itself, or a Python interpreter and the script, and nothing else)")
     observed["program"] = shown(program)
+    observed["invocation"] = invocation
     problem = content_problem(t["content"], skills, provenance)
     return observed, problem
+
+
+PYTHON = re.compile(r"python(?:3(?:\.\d+)?)?")
+
+
+def launch_invocation(plist, program):
+    """How a LaunchAgent runs `program`: "direct" when launchd executes the
+    script itself, "interpreter" when a Python interpreter runs it as its
+    only argument; None for anything else. launchd executes Program when it
+    is set, else ProgramArguments[0], and passes ProgramArguments as argv."""
+    arguments = plist.get("ProgramArguments")
+    executable = plist.get("Program")
+    if not (isinstance(arguments, list) and arguments and all(isinstance(a, str) for a in arguments)):
+        return None
+    if executable is None:
+        executable = arguments[0]
+    if not isinstance(executable, str):
+        return None
+    same = lambda a: Path(os.path.normpath(a)) == program  # noqa: E731
+    if same(executable) and len(arguments) == 1:
+        return "direct"
+    if PYTHON.fullmatch(os.path.basename(executable)) and len(arguments) == 2 and same(arguments[1]) \
+            and PYTHON.fullmatch(os.path.basename(arguments[0])):
+        return "interpreter"
+    return None
 
 
 def folder_inventory(skills, provenance, prefix=""):
@@ -476,16 +510,36 @@ def observed_versions():
     found["identity-registry"] = ([value] if value else [], f"{shown(state / 'identities.json')}: {problem}"
                                   if problem else None)
     runs, problems = set(), []
-    for path in sorted((Path.home() / ".local/state/project-manager").glob("*/runs/*/state.json")):
-        value, problem = read_field(path, "schema")
-        if problem:
-            problems.append(f"{shown(path)}: {problem}")
-        else:
-            runs.add(value)
+    for project in listing(Path.home() / ".local/state/project-manager", problems):
+        for run_dir in listing(project / "runs", problems) if project.is_dir() and not project.is_symlink() else ():
+            if not run_dir.is_dir() or run_dir.is_symlink():
+                continue
+            value, problem = read_field(run_dir / "state.json", "schema")
+            if problem == "missing":
+                continue  # a run still being created has no snapshot yet
+            if problem:
+                problems.append(f"{shown(run_dir / 'state.json')}: {problem}")
+            else:
+                runs.add(value)
     found["child-runs"] = (sorted(runs), "; ".join(problems[:3]) or None)
-    markers = sorted(p.name[:-len(".enabled")] for p in (state / "experiments").glob("review-start-receipts-v*.enabled"))
-    found["receipt-experiment-marker"] = (markers, None)
+    problems = []
+    markers = sorted(p.name[:-len(".enabled")] for p in listing(state / "experiments", problems)
+                     if re.fullmatch(r"review-start-receipts-v[^/]*\.enabled", p.name))
+    found["receipt-experiment-marker"] = (markers, "; ".join(problems) or None)
     return found
+
+
+def listing(folder, problems):
+    """A directory's entries, sorted. A missing directory has none; one that
+    can't be listed is a problem, never an empty inventory."""
+    try:
+        with os.scandir(folder) as entries:
+            return sorted(Path(e.path) for e in entries)
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        problems.append(f"{shown(folder)}: can't be listed ({e.strerror or e.__class__.__name__})")
+        return []
 
 
 def compatibility(manifest, spec):
@@ -538,6 +592,24 @@ def compatibility(manifest, spec):
     return results
 
 
+IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+
+
+def identity_problem(manifest):
+    """Why the manifest's release identity or artifact names can't name
+    files under the staging root, or None: each must be one plain path
+    component, and the identity must be the package's name and version."""
+    identity, pkg = manifest.get("release"), manifest.get("package") or {}
+    if not (isinstance(identity, str) and IDENTITY.fullmatch(identity)) \
+            or identity != f"{pkg.get('name')}-{pkg.get('version')}":
+        return "its release identity is not the package's name and version as one plain path component"
+    names = [a.get("name") for a in manifest["artifacts"]]
+    if not all(isinstance(n, str) and IDENTITY.fullmatch(n) and n != MANIFEST for n in names) \
+            or len(set(names)) != len(names):
+        return "an artifact name is not one plain, distinct path component"
+    return None
+
+
 def api_result(manifest):
     if "api_version" not in manifest and "api" not in manifest:
         return ("not applicable", "api", "the manifest declares no API version (D-23: it joins from PLT-10)")
@@ -552,6 +624,9 @@ def preflight(release, python=None, spec_path=None):
     results = []
     try:
         manifest = build_release.verify(release)
+        problem = identity_problem(manifest)
+        if problem:
+            raise Refused(f"the manifest can't be staged: {problem}")
         results.append(("pass", "manifest", f"{manifest['release']}: {len(manifest['artifacts'])} artifacts "
                                             "match, source commit and interpreter pinned"))
     except Refused as e:
@@ -583,13 +658,46 @@ class Journal:
 
     def __init__(self, root, crash=None):
         self.root, self.path, self.crash = root, root / JOURNAL, crash
-        self.lock = open(root / LOCK, "a")
+        no_links(root, root / LOCK, self.path)
+        self.lock = os.fdopen(open_nofollow(root / LOCK, os.O_WRONLY | os.O_CREAT | os.O_APPEND), "a")
         try:
             fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             self.lock.close()
             raise Refused("another staging run holds the journal lock; refusing to interleave") from None
+        self.repaired = self.repair_tail()
         self.records = read_journal(self.path)
+
+    def repair_tail(self):
+        """Under the lock: drop a torn final line (a crash mid-write), or end
+        a complete final record that only lacks its newline, durably, so
+        the next record starts on a line of its own. Returns the bytes
+        dropped."""
+        try:
+            data = self.path.read_bytes()
+        except FileNotFoundError:
+            return 0
+        lines = data.splitlines(keepends=True)
+        if not lines:
+            return 0
+        last = lines[-1]
+        try:
+            record = json.loads(last)
+            whole = isinstance(record, dict) and record.get("schema") == JOURNAL_SCHEMA
+        except ValueError:
+            whole = False
+        if whole and last.endswith(b"\n"):
+            return 0
+        fd = open_nofollow(self.path, os.O_WRONLY | os.O_APPEND)
+        try:
+            if whole:
+                os.write(fd, b"\n")
+            else:
+                os.ftruncate(fd, len(data) - len(last))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return 0 if whole else len(last)
 
     def close(self):
         self.lock.close()
@@ -598,16 +706,52 @@ class Journal:
         record = dict(record, schema=JOURNAL_SCHEMA, seq=len(self.records) + 1,
                       at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
         new = not self.path.exists()
-        with open(self.path, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, sort_keys=True) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        fd = open_nofollow(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        try:
+            write_all(fd, (json.dumps(record, sort_keys=True) + "\n").encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         if new:
             fsync_dir(self.root)
         self.records.append(record)
         if self.crash:
             self.crash(record)
         return record
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def open_nofollow(path, flags, mode=0o644):
+    """os.open that refuses a symlink at the path itself."""
+    try:
+        return os.open(path, flags | os.O_NOFOLLOW, mode)
+    except OSError as e:
+        if os.path.islink(path):
+            raise Refused(f"{shown(path)} is a symlink; staging never follows a link under its destination") \
+                from None
+        raise
+
+
+def no_links(root, *paths):
+    """Refuse when any existing component of a path below the staging root
+    is a symlink: every staging write then lands, resolved, under the root
+    that build_release's guard already checked."""
+    real_root = os.path.realpath(root)
+    for path in paths:
+        current = Path(root)
+        for part in Path(path).relative_to(root).parts:
+            current = current / part
+            if current.is_symlink():
+                raise Refused(f"{shown(current)} is a symlink; staging never follows a link under its "
+                              "destination")
+        resolved = os.path.realpath(path)
+        if resolved != real_root and not resolved.startswith(real_root + os.sep):
+            raise Refused(f"{shown(path)} resolves outside the staging destination")
 
 
 def read_journal(path):
@@ -660,11 +804,13 @@ def fsync_dir(path):
 
 def write_atomic(path, data):
     temp = path.with_name(f".{path.name}.tmp")
-    with open(temp, "wb") as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temp, path)
+    fd = open_nofollow(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    try:
+        write_all(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(temp, path)  # replaces the directory entry; never writes through a link
     fsync_dir(path.parent)
 
 
@@ -710,6 +856,62 @@ def interpreter_of(lines):
     return words[0] if words else None
 
 
+def wheel_contents(wheel):
+    """({member: RECORD hash} for the wheel's hashed files, {command: entry
+    point}) from a wheel that already verified against its manifest."""
+    with zipfile.ZipFile(wheel) as z:
+        names = z.namelist()
+        record = next(n for n in names if n.endswith(".dist-info/RECORD"))
+        files = {row[0]: row[1] for row in csv.reader(io.StringIO(z.read(record).decode())) if row and row[1]}
+        points = next((n for n in names if n.endswith(".dist-info/entry_points.txt")), None)
+        text = z.read(points).decode() if points else ""
+    entry_points, section = {}, None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            section = line
+        elif section == "[console_scripts]" and "=" in line:
+            name, _, target = line.partition("=")
+            entry_points[name.strip()] = target.strip()
+    return files, entry_points
+
+
+def verify_payload(found, wheel_files, inside):
+    """Every hashed file of the verified wheel is installed with the same
+    bytes; every file the installed RECORD hashes (the package and its
+    generated commands) still matches; and nothing unrecorded was added to
+    the package directory."""
+    purelib = Path(found["purelib"])
+    if not inside(str(purelib)):
+        raise Refused("the staged environment's site-packages is outside it")
+    for member, expected in sorted(wheel_files.items()):
+        path = purelib / member
+        try:
+            data = path.read_bytes() if not path.is_symlink() else None
+        except OSError:
+            data = None
+        if data is None or build_release.record_hash(data) != expected:
+            raise Refused(f"the installed {member} differs from the verified wheel")
+    for name, expected, located in found["record"]:
+        if not expected:
+            continue
+        try:
+            data = Path(located).read_bytes()
+        except OSError:
+            data = None
+        if data is None or build_release.record_hash(data) != expected:
+            raise Refused(f"the installed {name} no longer matches the package's RECORD")
+    listed = {os.path.realpath(located) for _, _, located in found["record"]}
+    package = purelib / "plateia_chat"
+    for folder, dirs, files in os.walk(package):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for name in files:
+            path = os.path.realpath(os.path.join(folder, name))
+            if path not in listed:
+                raise Refused(f"the installed package holds a file its RECORD doesn't list "
+                              f"({os.path.relpath(path, os.path.realpath(purelib))})")
+
+
 def verify_staged(release_dir, manifest_sha, manifest, interpreter):
     """Check a staged release directory's artifacts and environment; returns
     the environment probe or raises Refused naming the problem."""
@@ -726,7 +928,8 @@ def verify_staged(release_dir, manifest_sha, manifest, interpreter):
         found = json.loads(r.stdout.strip().splitlines()[-1])
         assert all(isinstance(found.get(k), str) for k in ("implementation", "version", "system", "prefix",
                                                             "module", "dist_version"))
-        assert isinstance(found.get("path"), list)
+        assert isinstance(found.get("path"), list) and isinstance(found.get("record"), list)
+        assert isinstance(found.get("purelib"), str)
     except (IndexError, ValueError, AssertionError, AttributeError):
         raise Refused("the staged environment can't import plateia_chat") from None
     def inside(path):
@@ -743,17 +946,28 @@ def verify_staged(release_dir, manifest_sha, manifest, interpreter):
     if any(isinstance(e, str) and e and os.path.realpath(e).startswith(str(CHECKOUT) + os.sep)
            for e in found["path"]):
         raise Refused("the staged environment has this checkout on its import path")
+    wheel_files, entry_points = wheel_contents(artifacts / staged["package"]["artifact"])
+    recorded = {os.path.realpath(located) for _, _, located in found["record"]}
     for command in staged["package"]["commands"]:
         script = env / "bin" / command
         try:
-            lines = script.read_text(encoding="utf-8").splitlines()
+            text = script.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
-            lines = []
-        if not lines:
+            text = ""
+        if not text or script.is_symlink():
             raise Refused(f"the staged environment has no {command} command")
-        runs = interpreter_of(lines)
+        runs = interpreter_of(text.splitlines())
         if not runs or not inside(runs):
             raise Refused(f"the staged {command} command doesn't run the staged interpreter")
+        if not os.access(script, os.X_OK):
+            raise Refused(f"the staged {command} command is not executable")
+        module, _, attr = entry_points.get(command, "").partition(":")
+        if not attr or f"from {module} import {attr}" not in text:
+            raise Refused(f"the staged {command} command doesn't call the wheel's entry point "
+                          f"({entry_points.get(command, 'none declared')})")
+        if os.path.realpath(script) not in recorded:
+            raise Refused(f"the staged {command} command isn't in the installed package's RECORD")
+    verify_payload(found, wheel_files, inside)
     result = interpreter_result(manifest, found, str(python))
     if result[0] != "pass":
         raise Refused(f"the staged environment's {result[2]}")
@@ -780,6 +994,8 @@ def stage(release, dest, python=None, plan_path=None, spec_path=None, crash=None
     if report["refused"]:
         raise Refused("preflight refused: " + "; ".join(report["refused"]) + "; nothing was staged")
     manifest = build_release.verify(release)
+    if identity_problem(manifest):
+        raise Refused(f"the manifest can't be staged: {identity_problem(manifest)}; nothing was staged")
     identity = manifest["release"]
     root = check_destination(dest, identity)
     root.mkdir(parents=True, exist_ok=True)
@@ -790,9 +1006,22 @@ def stage(release, dest, python=None, plan_path=None, spec_path=None, crash=None
         journal.close()
 
 
+def staging_paths(root, release_dir, manifest):
+    """Every path staging writes, reads back or removes under the root."""
+    artifacts = release_dir / "artifacts"
+    names = [MANIFEST] + [a["name"] for a in manifest["artifacts"]]
+    return ([root / RELEASES, release_dir, release_dir / MARKER, release_dir / f".{MARKER}.tmp", artifacts,
+             release_dir / "env", release_dir / STAGED, release_dir / f".{STAGED}.tmp"]
+            + [artifacts / n for n in names] + [artifacts / f".{n}.tmp" for n in names])
+
+
 def run_operation(journal, root, release, manifest, plan, report, python, spec_path):
     identity = manifest["release"]
     release_dir = root / RELEASES / identity
+    if release_dir.parent != root / RELEASES:
+        raise Refused("the release directory would not be directly under the staging root's releases")
+    paths = staging_paths(root, release_dir, manifest)
+    no_links(root, *paths)
     # The targets are checked again, under the lock, immediately before the
     # operation records them.
     spec, skills, provenance = load_spec(spec_path)
@@ -834,13 +1063,15 @@ def run_operation(journal, root, release, manifest, plan, report, python, spec_p
                         "compatibility": report["results"]})
     else:
         journal.append({"op": op_id, "kind": "resume",
-                        "found": {"last": ops[op_id]["last"], "release_dir_exists": release_dir.exists()}})
+                        "found": {"last": ops[op_id]["last"], "release_dir_exists": release_dir.exists(),
+                                  "torn_bytes_dropped": journal.repaired}})
     attempt = 1 + max([r.get("attempt", 0) for r in journal.records if r["op"] == op_id] or [0])
 
     def step(name, action):
         journal.append({"op": op_id, "kind": "intent", "step": name, "attempt": attempt})
         try:
             try:
+                no_links(root, *paths)  # again, right before this step writes
                 detail = action()
             except OSError as e:
                 raise Refused(f"{e.strerror or e.__class__.__name__}"

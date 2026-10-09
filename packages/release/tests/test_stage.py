@@ -105,6 +105,15 @@ class StageCase(unittest.TestCase):
         return _staging.write(self.where / f"fake-python-{implementation}-{version}-{system}",
                               f"#!/bin/sh\necho '{report}'\n", 0o755)
 
+    def crash_at(self, n):
+        seen = []
+
+        def hook(record):
+            seen.append(record)
+            if len(seen) == n:
+                raise stage_release.Crash(f"crash after record {n}")
+        return hook
+
     def journal(self):
         return [json.loads(line) for line in (self.dest / "journal.jsonl").read_text().splitlines()]
 
@@ -160,6 +169,36 @@ class HappyPathTests(StageCase):
         self.assertEqual((again["operation"], again["state"]), (first["operation"], "already staged, verified"))
         self.assertEqual(len(self.journal()), count)
         self.assertEqual(os.listdir(self.dest / "releases"), [self.manifest["release"]])
+
+    def test_a_corrupted_installed_payload_is_not_reported_staged(self):
+        self.stage()
+        env = self.dest / "releases" / self.manifest["release"] / "env"
+        site = next(env.glob("lib/python*/site-packages"))
+        pchat, chatlib = env / "bin/pchat", site / "plateia_chat/scripts/chatlib.py"
+        launcher_only = "\n".join(pchat.read_text().splitlines()[:1]) + "\nraise RuntimeError('replaced')\n"
+        cases = ((lambda: pchat.write_text(launcher_only), r"the staged pchat command doesn't call the wheel's "
+                                                           r"entry point"),
+                 (lambda: pchat.write_text(pchat.read_text() + "import os; os.environ.clear()\n"),
+                  r"the installed \.\./\.\./\.\./bin/pchat no longer matches the package's RECORD"),
+                 (lambda: chatlib.write_text(chatlib.read_text() + "# edited\n"),
+                  r"the installed plateia_chat/scripts/chatlib\.py differs from the verified wheel"),
+                 (lambda: pchat.chmod(0o644), r"the staged pchat command is not executable"),
+                 (lambda: (site / "plateia_chat/sitecustomize.py").write_text("x = 1\n"),
+                  r"holds a file its RECORD doesn't list \(plateia_chat/sitecustomize\.py\)"))
+        for damage, pattern in cases:
+            with self.subTest(case=pattern[:30]):
+                saved = {p: (p.read_bytes(), p.stat().st_mode) for p in (pchat, chatlib)}
+                damage()
+                try:
+                    with self.assertRaisesRegex(Refused, rf"recorded complete, but its staged release doesn't "
+                                                         rf"verify \(.*{pattern}"):
+                        self.stage()
+                finally:
+                    for p, (data, mode) in saved.items():
+                        p.write_bytes(data)
+                        p.chmod(mode)
+                    (site / "plateia_chat/sitecustomize.py").unlink(missing_ok=True)
+                self.assertEqual(self.stage()[0]["state"], "already staged, verified")
 
     def test_a_completed_stage_whose_environment_was_damaged_is_not_reported_staged(self):
         self.stage()
@@ -228,11 +267,29 @@ class BlockingTests(StageCase):
         self.assertNothingStaged(r"pchat: retargeted link: it points to .*/elsewhere/pchat, not "
                                  r"~/\.codex/skills/chat/scripts/pchat")
 
+    def test_a_launchagent_must_run_the_script_itself(self):
+        script = self.skills / "chat/scripts/chat-bridge"
+        path = self.home / "Library/LaunchAgents/com.coghex.chat-bridge.plist"
+        cases = (({"ProgramArguments": ["/bin/echo", str(script)]}, "echo before the script"),
+                 ({"Program": "/bin/echo"}, "a Program override"),
+                 ({"ProgramArguments": ["/usr/bin/python3", str(script), "--replay-all"]}, "an extra argument"),
+                 ({"ProgramArguments": ["/usr/bin/python3", "-c", str(script)]}, "the script as code"))
+        for extra, why in cases:
+            with self.subTest(why=why):
+                _staging.plist(path, "com.coghex.chat-bridge", script, extra)
+                self.before = _staging.snapshot_tree(self.home)
+                self.assertNothingStaged(r"chat-bridge LaunchAgent: retargeted program: it doesn't run "
+                                         r"~/\.codex/skills/chat/scripts/chat-bridge")
+        _staging.plist(path, "com.coghex.chat-bridge", script, {"ProgramArguments": [str(script)]})
+        by = {t["name"]: t for t in self.plan()["targets"]}
+        self.assertEqual((by["chat-bridge LaunchAgent"]["status"], by["chat-bridge LaunchAgent"]["observed"]
+                          ["invocation"]), ("ok", "direct"))
+
     def test_a_retargeted_launchagent_program_blocks(self):
         _staging.plist(self.home / "Library/LaunchAgents/com.coghex.log-rotate.plist", "com.coghex.log-rotate",
                        self.where / "elsewhere/rotate-logs")
         self.before = _staging.snapshot_tree(self.home)
-        self.assertNothingStaged(r"rotate-logs LaunchAgent: retargeted program: its ProgramArguments don't name "
+        self.assertNothingStaged(r"rotate-logs LaunchAgent: retargeted program: it doesn't run "
                                  r"~/\.codex/skills/chat/scripts/rotate-logs")
 
     def test_a_missing_target_blocks(self):
@@ -279,6 +336,22 @@ class BlockingTests(StageCase):
         for python, pattern in cases:
             with self.subTest(python=python.name):
                 self.assertNothingStaged(rf"preflight refused: interpreter: {pattern}", python=python)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads unreadable directories")
+    def test_an_inventory_that_cant_be_listed_blocks(self):
+        runs = next((self.home / ".local/state/project-manager").glob("*/runs"))
+        experiments = self.home / ".local/state/chat/experiments"
+        for folder, pattern in ((runs, r"child-runs: state version evidence unreadable: "
+                                       r"~/\.local/state/project-manager/alpha/runs: can't be listed"),
+                                (experiments, r"receipt-experiment-marker: state version evidence unreadable: "
+                                              r"~/\.local/state/chat/experiments: can't be listed")):
+            with self.subTest(folder=folder.name):
+                folder.chmod(0)
+                self.before = _staging.snapshot_tree(self.home)  # as it can be seen while locked
+                try:
+                    self.assertNothingStaged(rf"preflight refused: .*{pattern}")
+                finally:
+                    folder.chmod(0o755)
 
     def test_an_unsupported_or_unreadable_state_version_blocks(self):
         state = self.home / ".local/state/chat"
@@ -353,11 +426,15 @@ class ImporterTests(StageCase):
         _staging.write(self.skills / "notes-bot/scripts/digest", "#!/usr/bin/env python3\nimport os, sys\n"
                        "sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'chat', 'scripts'))\n",
                        0o755)
+        _staging.write(self.skills / "reports/scripts/weekly", "#!/usr/bin/env python3\nimport sys\n"
+                       "from pathlib import Path\nsys.path = [str(Path(__file__).resolve().parents[2] / 'chat' / "
+                       "'scripts')] + sys.path\n", 0o755)
         _staging.write(self.home / ".claude/skills/helper/run.sh",
                        'PYTHONPATH="$HOME/.codex/skills/chat/scripts" exec python3 "$@"\n', 0o755)
         plan = self.plan()
         self.assertEqual(plan["importers"]["unlisted"],
-                         ["~/.claude/skills/helper/run.sh", "~/.codex/skills/notes-bot/scripts/digest"])
+                         ["~/.claude/skills/helper/run.sh", "~/.codex/skills/notes-bot/scripts/digest",
+                          "~/.codex/skills/reports/scripts/weekly"])
         self.assertIn("unlisted importer: ~/.codex/skills/notes-bot/scripts/digest (outside the known list; it "
                       "would stay on the old code)", stage_release.render_plan(plan))
 
@@ -394,15 +471,6 @@ class ImporterTests(StageCase):
 
 
 class RecoveryTests(StageCase):
-    def crash_at(self, n):
-        seen = []
-
-        def hook(record):
-            seen.append(record)
-            if len(seen) == n:
-                raise stage_release.Crash(f"crash after record {n}")
-        return hook
-
     def assertOneOperationStaged(self):
         records = self.journal()
         self.assertEqual(len({r["op"] for r in records}), 1, "a second operation was started")
@@ -485,6 +553,13 @@ class RecoveryTests(StageCase):
             stream.write('{"op": "stage-torn", "kind": "inte')
         summary, _, _ = self.stage()
         self.assertEqual(summary["state"], "resumed and staged")
+        self.assertTrue((self.dest / "journal.jsonl").read_bytes().endswith(b"\n"))
+        self.assertNotIn(b"stage-torn", (self.dest / "journal.jsonl").read_bytes())
+        self.assertEqual([op["state"] for op in stage_release.status(self.dest)], ["complete"])
+        again, _, _ = self.stage()
+        self.assertEqual(again["state"], "already staged, verified")
+        resume = next(r for r in self.journal() if r["kind"] == "resume")
+        self.assertEqual(resume["found"]["torn_bytes_dropped"], len('{"op": "stage-torn", "kind": "inte'))
 
 
 class ConcurrencyTests(StageCase):
@@ -500,6 +575,41 @@ class ConcurrencyTests(StageCase):
 
 
 class DestinationTests(StageCase):
+    def test_links_under_the_destination_are_never_followed(self):
+        config, registry = self.home / ".config/chat", self.home / ".local/state/chat/identities.json"
+        release_dir = self.dest / "releases" / self.manifest["release"]
+        cases = (("artifacts", lambda: (release_dir / "artifacts").symlink_to(config), 3),
+                 ("env", lambda: (release_dir / "env").symlink_to(config), 5),
+                 ("the marker", lambda: ((release_dir / ".operation").unlink(),
+                                         (release_dir / ".operation").symlink_to(registry)), 3),
+                 ("the journal", lambda: ((self.dest / "journal.jsonl").unlink(),
+                                          (self.dest / "journal.jsonl").symlink_to(registry)), 1),
+                 ("the lock", lambda: ((self.dest / "journal.lock").unlink(),
+                                       (self.dest / "journal.lock").symlink_to(registry)), 1))
+        for what, alias, crash_after in cases:
+            with self.subTest(alias=what):
+                if self.dest.exists():
+                    shutil.rmtree(self.dest)
+                with self.assertRaises(stage_release.Crash):
+                    self.stage(crash=self.crash_at(crash_after))
+                alias()
+                with self.assertRaisesRegex(Refused, r"is a symlink; staging never follows a link under its "
+                                                     r"destination"):
+                    self.stage()
+                self.assertHomeUnchanged()
+
+    def test_a_release_identity_that_escapes_the_destination_is_refused(self):
+        escape = str(self.home / ".local/state/chat/staged-here")
+        for identity in (escape, "../escaped", "plateia-chat-0.1.0+g000000000000", "x/y"):
+            with self.subTest(identity=identity):
+                release = self.release_copy()
+                self.rewrite_manifest(release, lambda m: m.update(release=identity))
+                self.assertNothingStaged(r"manifest: the manifest can't be staged: its release identity is not "
+                                         r"the package's name and version as one plain path component",
+                                         release=release)
+                self.assertFalse(os.path.lexists(escape))
+                self.assertFalse(os.path.lexists(self.where / "escaped"))
+
     def test_a_destination_through_a_link_into_a_managed_target_is_refused(self):
         (self.where / "innocent").symlink_to(self.skills / "chat/scripts")
         for dest, pattern in ((self.where / "innocent" / "staging", r"under ~/\.codex"),
