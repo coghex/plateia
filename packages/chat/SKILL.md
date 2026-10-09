@@ -154,6 +154,16 @@ pchat status                                         # server, bridge, delivery 
   to `~/.local/state/chat/outbox.jsonl` and exits with code 3. The bridge posts
   it within a minute of chat coming back, marked "delayed". Don't write the
   outbox by hand.
+  - A long post goes out in parts, each confirmed by the server before the
+    next. If it fails partway, only the unposted remainder is queued: say parts
+    1 and 2 of a 3-part `[question alpha-20261009-1]` were confirmed, then only
+    part 3 waits in the outbox. A confirmed part is never posted again.
+  - A part that was sent but never confirmed may already be in the channel.
+    The bridge checks it against the channel record before any resend, and
+    sends it again only once the record shows it never arrived. One still
+    undecided after a day is dead-lettered, and the owner is told.
+  - This is not exactly-once delivery: it avoids repeats it can rule out.
+    `pchat status` shows how many outbox posts await such a check.
 - **No dropped wake-ups or pushes.** Each is queued on disk, and every
   attempt is recorded in `~/.local/state/chat/deliveries.jsonl`. A wake-up is
   followed until `delivered`.
@@ -246,7 +256,9 @@ The server authenticates every account, and each log entry records
 ## When chat is down
 
 `pchat post` queues the post in the outbox itself (exit code 3) and the bridge
-posts it once chat is back, so carry on with your work. If `pchat status`
+posts it once chat is back, so carry on with your work. If the post failed
+partway, pchat says how many parts were already posted; only the rest is
+queued, so don't post it again yourself. If `pchat status`
 still shows the server or bridge down after a few minutes, tell the owner
 some other way: through your manager, or in your session.
 

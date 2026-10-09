@@ -26,10 +26,16 @@ def notify(record, text, kind='status'):
         print(f'pchat agent: notice withheld: {refusal}', file=sys.stderr)
         return
     cfg = chatlib.load_config()
+    entry = dict(channel=channel, text=message, cont=tag, **{'as': record['name']}, at=ids.now())
     try:
         chatlib.post(channel, message, record['name'], cfg, cont=tag)
-    except (OSError, chatlib.ChatError):
-        chatlib.outbox_append([dict(channel=channel, text=message, cont=tag, **{'as': record['name']}, at=ids.now())])
+    except chatlib.Refused as err:
+        if chatlib.part_counts(err.parts or [])['confirmed']:  # partly published: never repost those parts
+            chatlib.dead_letter_post({**entry, 'parts': err.parts}, str(err))
+        else:
+            chatlib.outbox_append([entry])
+    except (OSError, chatlib.ChatError) as err:  # only what the server has not confirmed is queued
+        chatlib.outbox_append([chatlib.queued_entry(entry, err)])
 
 
 def run_agent(a):

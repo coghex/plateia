@@ -55,11 +55,15 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "262d42bf09af99eac65e19ef4e50ec6fea7d7072969c8308d3ff58848c94e272",
       "capture": "changed",
-      "sha256": "0c829109ced770f70049ad718a066cc18fba6d46ca29b688fc3ef06491dff0eb",
+      "sha256": "3eb8622bcbc331280b3806e78464d54d2cbb847f43c1ab4c731b327da30d8ec6",
       "changes": [
         {
           "change": "`pchat agent who`'s 'outside cmux use --as ... explicitly' hint names the chat config's assistant identity (the identity whose role is assistant), or ACCOUNT if none, instead of a fixed account name.",
           "reason": "Resolve the assistant's name at runtime (requirement 3); the message is unchanged for a config whose assistant identity is the account the baseline named."
+        },
+        {
+          "change": "notify() queues only the unconfirmed remainder of a notice that failed partway, and dead-letters, rather than requeues, one refused after some parts were published.",
+          "reason": "Every caller that feeds the outbox must keep partial progress (#19 review amendment). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
     },
@@ -95,11 +99,15 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "d5fd3bca06e139c3f61dfb6d34ef56947255c0b723fb9778c6da3afea874e8d0",
       "capture": "changed",
-      "sha256": "745369360dc58c67566c2d8a70e42c7673ad7a00ded36192268072c2f51793a5",
+      "sha256": "792de47fa5e5bd6e9c250eb89a53541aac07969fbff5fd3351cced712e2cb8b8",
       "changes": [
         {
           "change": "The config example in the module docstring shows placeholder owner and assistant names.",
           "reason": "Remove real account names (requirement 3); docstring only, no behaviour change."
+        },
+        {
+          "change": "post() writes a post one part at a time (a draft/multiline batch, or a line) and confirms each against an absolute per-part deadline before the next; a failure raises PostIncomplete (or Refused) carrying every part's state (confirmed, uncertain or unsent); parts are fixed on the first write and a retry resends exactly those that are not confirmed, never re-split; queued_entry() keeps only the unconfirmed remainder; outbox_summary(), outbox_flushing() and dead_letter_post() support the bridge and pchat status.",
+          "reason": "A long post whose completion timed out after the server had committed it was queued whole and reposted on every outbox flush, each copy with new msgids (#19). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
     },
@@ -129,9 +137,14 @@
       },
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "edf4615c95b572c9b677994bfb65da9d2158513dca4d2ec943ed11d86a558227",
-      "capture": "byte-for-byte",
-      "sha256": "edf4615c95b572c9b677994bfb65da9d2158513dca4d2ec943ed11d86a558227",
-      "changes": []
+      "capture": "changed",
+      "sha256": "00f8df70161714f7b9cf59499dcc6fa815412d3c2aa6b1bd2c695cabbf2bf25a",
+      "changes": [
+        {
+          "change": "pchat post queues only the unconfirmed remainder of a post that failed partway and says how many parts were posted; a refusal after some parts were published is recorded in dead letters with its parts; pchat status reports outbox posts awaiting a delivery check and each partly published dead-lettered post's progress.",
+          "reason": "pchat queued the whole text on any failure, including a completion timeout after the server had committed the post (#19). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
+        }
+      ]
     },
     {
       "baseline_path": "chat/scripts/receipt_experiment.py",
@@ -278,11 +291,15 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
       "capture": "changed",
-      "sha256": "bc0c1802af66beff9a77c1162f1f57edec17840a33d8b07f5946970fd9949d29",
+      "sha256": "c13df7fd5995164a89f02817d549e73343f498096a9c5e8c23105a5dd4c00cea",
       "changes": [
         {
           "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
           "reason": "Deliberate deviation from c572bad, by owner decision on PR #16's first review: a catch-up cut short leaves the checkpoint behind, so after a restart more than 5,000 replayed messages would be logged again and an accepted request queued again (PLT-15 requirement 8). The running bridge keeps the baseline behavior until activation."
+        },
+        {
+          "change": "flush_outbox rewrites each claimed file after every change and removes it only when empty, so a crash leaves exactly what is still owed; a part caught mid-write is uncertain and is reconciled against the channel record (delivered, absent only over a record known complete through a sync well after the write, else undecided, dead-lettered with a content-free owner alert after a day) instead of being resent; announce() queues only the unconfirmed remainder; run() tracks where each channel's record is complete (record-coverage.json) and syncs with a PING before each flush.",
+          "reason": "Stop the outbox reposting committed parts of a long post on every flush, and never resend a part that may already be in the channel without proof of absence (#19). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
     },
@@ -383,7 +400,7 @@
       "source_commit": "8ff325ee307b92e53157594e570235bc9f2f5229",
       "effective_sha256": "e5eda84d2d8b8773ef5b4660b40f1dee0e2545d2db764d5d0e1b20929d7fe438",
       "capture": "changed",
-      "sha256": "003953fccd1166c62a791bd57bc7754ff5de62d1d3247d7de4902cefaac1572b",
+      "sha256": "82866dd6ca185a07e8e39216db0754cc8d0a70fe64eea45da2852cf55b701327",
       "changes": [
         {
           "change": "Where the guidance named the owner's or the global assistant's account, it now says where that account is configured (`owner` and `assistants` in the chat config); examples that used the owner's or assistant's account use `<assistant>` / `@<owner>`.",
@@ -392,6 +409,10 @@
         {
           "change": "Examples use invented projects, prefixes, agents, channels and request IDs (beta/bet, alpha/alp); the example request and search text is invented (\"parser crash\").",
           "reason": "No real project names, channels or messages in the guidance (PLT-15 requirement 3)."
+        },
+        {
+          "change": "\"No lost posts\" and \"When chat is down\" describe partial posts: only the unposted remainder is queued, an uncertain part is checked against the record before any resend, and the guarantee is not exactly-once.",
+          "reason": "The guidance must match the behavior agents see from pchat post (#19). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
         }
       ],
       "external_references": [
@@ -453,6 +474,10 @@
     {
       "path": "packages/chat/scripts/tests/test_replay_dedup.py",
       "purpose": "Message-ID deduplication after acceptance recovery, across a crash, a restart and a restart after a cut-short catch-up of six full pages (PLT-15 requirement 8)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_outbox_resend.py",
+      "purpose": "Partial-post delivery (#19): per-part confirmation, remainder-only queueing, record reconciliation, crash and restart recovery, independent delivery, refusals and the one-day dead letter, against a fake server with an injected clock."
     }
   ]
 }

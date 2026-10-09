@@ -217,18 +217,33 @@ def main(argv=None):
                 return 4
             identities.remember(account, args.channel, args.re)
             cont = f"[{tag}]" if tag else ""
+            entry = {"channel": args.channel, "as": account, "text": text, "cont": cont,
+                     "reply_to": args.reply_to, "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())}
             try:
                 n = chatlib.post(args.channel, text, account, cfg, cont=cont, reply_to=args.reply_to)
                 print(f"posted {n} line(s) to {args.channel} as {account}")
             except chatlib.Refused as err:  # queuing it would only be refused again
+                counts = chatlib.part_counts(err.parts or [])
+                if counts["confirmed"]:  # partly published: keep the record of what went out and what didn't
+                    chatlib.dead_letter_post({**entry, "parts": err.parts}, str(err))
+                    print(f"pchat: {err}; not queued ({counts['confirmed']} of {len(err.parts)} parts were"
+                          " already posted; recorded in dead letters)", file=sys.stderr)
+                    return 2
                 print(f"pchat: {err}; not queued", file=sys.stderr)
                 return 2
             except (chatlib.ChatError, OSError) as err:
-                # Never lose a post: queue it; the bridge posts it once chat is back.
-                chatlib.outbox_append([{"channel": args.channel, "as": account, "text": text, "cont": cont,
-                                        "reply_to": args.reply_to,
-                                        "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())}])
-                print(f"pchat: post failed ({err}); queued in the outbox for the bridge to post", file=sys.stderr)
+                # Never lose a post: queue it; the bridge posts it once chat is back. Parts the
+                # server already confirmed are never queued again; only the rest is.
+                queued = chatlib.queued_entry(entry, err)
+                chatlib.outbox_append([queued])
+                if "parts" in queued:
+                    counts = chatlib.part_counts(queued["parts"])
+                    print(f"pchat: post partly sent ({err}); {counts['confirmed']} of {len(queued['parts'])} parts"
+                          " posted, the rest queued in the outbox for the bridge"
+                          + (" (one part's delivery is checked against the record before any resend)"
+                             if counts["uncertain"] else ""), file=sys.stderr)
+                else:
+                    print(f"pchat: post failed ({err}); queued in the outbox for the bridge to post", file=sys.stderr)
                 return 3
         elif args.cmd == "ack":
             account = who(args, cfg)
@@ -365,9 +380,21 @@ def main(argv=None):
                     else:
                         failed += 1
             dead = chatlib.STATE_DIR / "dead-letters.jsonl"
-            ndead = len(dead.read_text().splitlines()) if dead.exists() else 0
+            dead_rows = dead.read_text().splitlines() if dead.exists() else []
+            ndead = len(dead_rows)
             print(f"deliveries (24h): {done} done, {waiting} checks while queued at cmux, {failed} failed attempts")
-            print(f"dead letters: {ndead}   outbox (unposted): {chatlib.outbox_pending()}")
+            box = chatlib.outbox_summary()
+            print(f"dead letters: {ndead}   outbox (unposted): {chatlib.outbox_pending()}"
+                  f" ({box['unsent']} waiting to post, {box['checking']} awaiting a delivery check)")
+            for raw in dead_rows:  # a post dead-lettered partway: what went out, what didn't
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue
+                if d.get("kind") == "post" and d.get("parts"):
+                    c = chatlib.part_counts(d["parts"])
+                    print(f"   post to {d.get('channel')} as {d.get('as')}: {c['confirmed']} of {len(d['parts'])}"
+                          f" parts posted, {len(d['parts']) - c['confirmed']} not ({d.get('last_detail', '')[:60]})")
             rows = unaccepted(cfg)
             print(f"owner/assistant posts not yet accepted by their manager: {len(rows)}")
             for u in rows:

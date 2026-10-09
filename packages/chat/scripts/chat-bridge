@@ -48,7 +48,13 @@ Runs as a service (launchd). Logged in as the `chatbridge` account, it:
   authority (`owner`/`assistants` in the config), types the post into the
   manager's empty prompt, pressing Enter only when the whole draft matches,
   and counts it delivered only on evidence that it was submitted;
-- flushes the outbox (posts that failed earlier) every minute;
+- flushes the outbox (posts that failed earlier) about every minute. A post
+  that failed partway keeps the state of each of its parts: a part the server
+  confirmed is never sent again, and a part written but never confirmed is
+  checked against the channel record first. It is sent again only once the
+  record is known complete well past the attempt and holds no such message;
+  one still undecided after a day is dead-lettered, with the owner told. This
+  is at-least-once delivery with that check, not exactly-once;
 - pushes an ntfy notification to the owner when the owner is @-mentioned. The
   push says who needs the owner and where, never the message text;
 - routes by who speaks to whom. The manager hears its project's unaddressed
@@ -70,6 +76,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -91,6 +98,10 @@ EVIDENCE_LOG = chatlib.STATE_DIR / "evidence.jsonl"
 EVIDENCE_MAX = 20_000_000  # bytes; a larger cited file is recorded but not copied
 TMP_PATH = re.compile(r"(?<![\w/])((?:/private)?/tmp/[^\s`'\"()<>\[\]{}|]+)")
 ACKS = chatlib.STATE_DIR / "acks.jsonl"
+COVERAGE = chatlib.STATE_DIR / "record-coverage.json"
+CLOCK_ALLOWANCE = 5      # seconds of clock difference allowed when matching a written part in the record
+SETTLE = 600             # a part is ruled absent only once the record is complete this long after it was written
+UNDECIDED_MAX = 86400    # a part neither found nor ruled absent for this long is dead-lettered
 BRIDGE_LOG = chatlib.STATE_DIR / "bridge.log"
 LOG_LIMIT = 5_000_000
 BACKOFF = (5, 30, 120, 600, 1800)  # seconds before attempts 2..6; then dead-letter
@@ -651,11 +662,17 @@ def _interrupt(item, surface, brand, label):
 
 def announce(cfg, item, text):
     """Post the bridge's own progress line, as a reply to the post it is about."""
+    entry = {"channel": item["channel"], "as": "chatbridge", "reply_to": item["msgid"],
+             "text": f"[status] chatbridge: {text}", "cont": "[status]", "at": now_iso()[:19]}
     try:
         chatlib.post(item["channel"], f"[status] chatbridge: {text}", "chatbridge", cfg, reply_to=item["msgid"])
-    except (chatlib.ChatError, OSError):
-        chatlib.outbox_append([{"channel": item["channel"], "as": "chatbridge", "reply_to": item["msgid"],
-                                "text": f"[status] chatbridge: {text}", "cont": "[status]", "at": now_iso()[:19]}])
+    except chatlib.Refused as err:
+        if chatlib.part_counts(err.parts or [])["confirmed"]:  # partly published: never repost those parts
+            chatlib.dead_letter_post({**entry, "parts": err.parts}, str(err))
+        else:
+            chatlib.outbox_append([entry])
+    except (chatlib.ChatError, OSError) as err:  # only what the server has not confirmed is queued
+        chatlib.outbox_append([chatlib.queued_entry(entry, err)])
 
 
 def agent_surface(name):
@@ -752,38 +769,242 @@ def push_owner(cfg, item):
         return False, str(e)[:160]
 
 
-def flush_outbox(cfg, post=None, ack=None):
-    """Post anything that failed to post earlier. Claims the outbox first, so
-    posts queued while this runs go to a fresh outbox and are never lost;
-    entries that still fail are queued again."""
-    post = post or chatlib.post
-    for claimed in chatlib.outbox_claim():
-        retry = []
-        for raw in claimed.read_text().splitlines():
+def _now():
+    return time.time()
+
+
+class Coverage:
+    """Per channel, an interval over which the log is known to hold every
+    message the server published there: from `since` through `through`, as
+    seconds since the epoch. It begins when the channel's log becomes complete
+    on a connection (a finished catch-up, or a new channel joined), and is
+    carried over a reconnection only when that catch-up resumed from the very
+    checkpoint this record last saw, so nothing in between went unread. It
+    reaches a time only through a sync: a PING the server answered, after
+    which everything it published earlier has been read and logged. A seeded
+    checkpoint, a newest logged message, a dropped connection or a catch-up
+    cut short never extends it."""
+
+    def __init__(self):
+        try:
+            self.spans = json.loads(COVERAGE.read_text())
+        except (OSError, ValueError):
+            self.spans = {}
+
+    def _save(self):
+        tmp = COVERAGE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.spans))
+        os.replace(tmp, COVERAGE)
+
+    def begin(self, channel, start_mark, mark):
+        """The channel's log just became complete on this connection, after a
+        catch-up from `start_mark` (None for a new channel), through `mark`."""
+        ch = channel.lower()
+        span = self.spans.get(ch) or {}
+        if not (start_mark and span.get("mark") == start_mark and span.get("since") is not None):
+            span = {"since": _now(), "through": None}
+        span["mark"] = mark
+        self.spans[ch] = span
+        self._save()
+
+    def mark(self, channel, mark):
+        """A live message in a complete channel was fully handled: the log's checkpoint is now `mark`."""
+        span = self.spans.get(channel.lower())
+        if span is not None and mark and span.get("mark") != mark:
+            span["mark"] = mark
+            self._save()
+
+    def sync(self, channels, sent_at):
+        """The server answered a PING sent at `sent_at` while `channels` were complete on this connection."""
+        changed = False
+        for ch in channels:
+            span = self.spans.get(ch.lower())
+            if span is not None and (span.get("through") or 0) < sent_at:
+                span["through"] = sent_at
+                changed = True
+        if changed:
+            self._save()
+
+    def covers(self, channel, start, end):
+        span = self.spans.get(channel.lower()) or {}
+        return (span.get("since") is not None and span.get("through") is not None
+                and span["since"] <= start and span["through"] >= end)
+
+
+def _record_matches(channel, account, text, since):
+    """Logged messages in `channel` from the server-verified `account` with exactly
+    `text`, at or after `since` (seconds since the epoch), oldest first."""
+    path = chatlib.channel_log(channel)
+    found = []
+    if path.exists():
+        for line in path.read_text().splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if (e.get("verified") and e.get("from") == account and e.get("text") == text and e.get("msgid")
+                    and e.get("channel", "").lower() == channel.lower() and e.get("at")
+                    and parse_time(e["at"]).timestamp() >= since):
+                found.append((parse_time(e["at"]).timestamp(), e["msgid"]))
+    return [mid for _, mid in sorted(found)]
+
+
+def reconcile(entry, coverage, attributed):
+    """Decide the entry's uncertain parts from the record. A part is delivered
+    when distinct logged messages account for it and for every other part of
+    this post with the same text; it is absent when the record is complete over
+    the whole interval and holds no message left for it. Anything less leaves it
+    undecided. A message already attributed to another part is never reused.
+    Returns 'delivered', 'absent' or 'undecided' for the earliest uncertain part."""
+    parts = entry["parts"]
+    first = next(i for i, p in enumerate(parts) if p["state"] == "uncertain")
+    text = parts[first]["text"]
+    same = [p for p in parts if p["text"] == text and not p.get("msgid") and p["state"] in ("confirmed", "uncertain")]
+    start = min(p.get("written_at") or 0 for p in same) - CLOCK_ALLOWANCE
+    found = [m for m in _record_matches(entry["channel"], entry["as"], text, start) if m not in attributed]
+    if len(found) >= len(same):
+        for part, mid in zip(sorted(same, key=lambda p: p.get("written_at") or 0), found):
+            part["msgid"] = mid
+            attributed.add(mid)
+            if part["state"] == "uncertain":
+                part["state"] = "confirmed"
+        return "delivered"
+    confirmed = sum(1 for p in same if p["state"] == "confirmed")
+    latest = max(p.get("written_at") or 0 for p in same if p["state"] == "uncertain")
+    if len(found) <= confirmed and coverage.covers(entry["channel"], start, latest + SETTLE):
+        return "absent"
+    return "undecided"
+
+
+class _Claimed:
+    """One claimed outbox file, rewritten whole after every change, so what it
+    holds is always exactly what is still owed. An unreadable line is kept as it is."""
+
+    def __init__(self, path):
+        self.path, self.rows = path, []
+        for raw in path.read_text().splitlines():
             if not raw.strip():
                 continue
             try:
-                e = json.loads(raw)
+                self.rows.append(json.loads(raw))
             except ValueError:
-                log(f"outbox: unreadable entry kept in {claimed.name}")
-                retry.append({"unreadable": raw})
-                continue
-            try:
-                if e.get("ack"):
-                    (ack or chatlib.ack)(e["channel"], e["ack"], e["as"], cfg)
-                else:
-                    post(e["channel"], f"{e['text']} (delayed; written {e.get('at', '?')[:19]}Z)", e["as"], cfg,
-                         cont=e.get("cont", ""), reply_to=e.get("reply_to"))
-                log(f"outbox: sent to {e['channel']} as {e['as']}")
-            except chatlib.Refused as err:  # retrying can't help: keep it where pchat status shows it
-                _append_jsonl(DEAD_LETTERS, {**e, "kind": "post", "dead_at": now_iso(), "last_detail": str(err)})
-                log(f"outbox: refused by the server; dead-lettered ({err!r:.100})")
-            except Exception as err:  # still failing: queue it again
-                retry.append(e)
-                log(f"outbox: still failing ({err!r:.100})")
-        if retry:
-            chatlib.outbox_append(retry)
-        claimed.unlink()
+                self.rows.append(raw)
+        for row in self.rows:  # a part caught mid-write by a crash may have reached the server
+            for part in (row.get("parts") or []) if isinstance(row, dict) else []:
+                if part.get("state") == "writing":
+                    part["state"] = "uncertain"
+
+    def save(self):
+        if not self.rows:
+            self.path.unlink(missing_ok=True)
+            return
+        tmp = self.path.with_name("." + self.path.name + ".tmp")
+        tmp.write_text("".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in self.rows))
+        os.replace(tmp, self.path)
+
+    def done(self, row):
+        self.rows.remove(row)
+        self.save()
+
+
+def _dead_post(e, detail, deliveries, alert):
+    _append_jsonl(DEAD_LETTERS, {**e, "kind": "post", "dead_at": now_iso(), "last_detail": detail})
+    if alert and deliveries is not None:  # content-free: who and where, never the text
+        deliveries.add_all([{"kind": "push", "msgid": e.get("id"), "channel": e["channel"], "sender": "chatbridge",
+                             "project": None, "attempt": 0, "next_at": 0,
+                             "text": f"an outbox post from {e['as']} {alert}; dead-lettered"}])
+
+
+def flush_outbox(cfg, post=None, ack=None, coverage=None, deliveries=None):
+    """Post anything that failed to post earlier. Claims the outbox first, so
+    posts queued while this runs go to a fresh outbox and are never lost.
+    A claimed file is rewritten after every change and removed only when
+    empty, so a crash at any point leaves exactly what is still owed: a part
+    the server confirmed is never sent again, and a part caught mid-write is
+    treated as uncertain. Every entry gets its attempt each flush; one waiting
+    on a check or failing never holds up another."""
+    post = post or chatlib.post
+    coverage = coverage if coverage is not None else Coverage()
+    with chatlib.outbox_flushing() as mine:
+        if not mine:
+            log("outbox: another flush is running; skipped")
+            return
+        files = [_Claimed(path) for path in chatlib.outbox_claim()]
+        attributed = {p["msgid"] for f in files for r in f.rows if isinstance(r, dict)
+                      for p in r.get("parts") or [] if p.get("msgid")}
+        for claimed in files:
+            for e in list(claimed.rows):
+                if isinstance(e, str):
+                    log(f"outbox: unreadable entry kept in {claimed.path.name}")
+                    continue
+                try:
+                    if _flush_entry(e, claimed, cfg, post, ack, coverage, deliveries, attributed):
+                        claimed.done(e)
+                except Exception as err:  # still failing: it stays owed, as recorded
+                    claimed.save()
+                    log(f"outbox: still failing ({err!r:.100})")
+            claimed.save()
+
+
+def _flush_entry(e, claimed, cfg, post, ack, coverage, deliveries, attributed):
+    """One outbox entry's attempt. True when nothing more is owed for it."""
+    if e.get("ack"):
+        (ack or chatlib.ack)(e["channel"], e["ack"], e["as"], cfg)
+        log(f"outbox: acknowledged in {e['channel']} as {e['as']}")
+        return True
+    parts = e.get("parts")
+    while parts and any(p["state"] == "uncertain" for p in parts):
+        index = next(i for i, p in enumerate(parts) if p["state"] == "uncertain")
+        verdict = reconcile(e, coverage, attributed)
+        claimed.save()
+        if verdict == "delivered":
+            log(f"outbox: part {index + 1} of a post to {e['channel']} as {e['as']} is in the record"
+                f" as msgid={parts[index]['msgid']}; not sent again")
+        elif verdict == "absent":  # the record is complete and holds no such message: it never arrived
+            part = next(p for p in parts if p["state"] == "uncertain")
+            part.setdefault("attempts", []).append({"written_at": part.pop("written_at", None), "outcome": "absent"})
+            part["state"] = "unsent"
+            claimed.save()
+            log(f"outbox: a part of a post to {e['channel']} as {e['as']} never arrived; sending it again")
+        elif verdict == "undecided":
+            written = max(p.get("written_at") or 0 for p in parts if p["state"] == "uncertain")
+            if _now() - written > UNDECIDED_MAX:
+                _dead_post(e, f"a part's delivery could not be confirmed or ruled out for {UNDECIDED_MAX // 3600} h",
+                           deliveries, f"to {e['channel']} could not be confirmed for {UNDECIDED_MAX // 3600} h")
+                log(f"outbox: DEAD-LETTERED a post to {e['channel']} as {e['as']}: delivery undecided")
+                return True
+            log(f"outbox: a part of a post to {e['channel']} as {e['as']} awaits a delivery check")
+            return False
+    if parts and all(p["state"] == "confirmed" for p in parts):
+        return True
+
+    def record(new_parts):
+        e["parts"] = new_parts
+        e.setdefault("id", uuid.uuid4().hex)
+        claimed.save()  # durable before the next part is written
+
+    try:
+        with chatlib.reporting(record):
+            if parts:
+                post(e["channel"], e["text"], e["as"], cfg, cont=e.get("cont", ""), reply_to=e.get("reply_to"),
+                     parts=parts)
+            else:
+                post(e["channel"], f"{e['text']} (delayed; written {e.get('at', '?')[:19]}Z)", e["as"], cfg,
+                     cont=e.get("cont", ""), reply_to=e.get("reply_to"))
+    except chatlib.Refused as err:  # retrying can't help: keep it where pchat status shows it
+        if err.parts:
+            e["parts"] = err.parts
+        _dead_post(e, str(err), deliveries, None)
+        log(f"outbox: refused by the server; dead-lettered ({err!r:.100})")
+        return True
+    except chatlib.PostIncomplete as err:
+        e["parts"] = err.parts
+        e.setdefault("id", uuid.uuid4().hex)
+        claimed.save()
+        log(f"outbox: still failing ({err!r:.100})")
+        return False
+    log(f"outbox: sent to {e['channel']} as {e['as']}")
+    return True
 
 
 # --- handling ---------------------------------------------------------------
@@ -912,18 +1133,23 @@ def handle_tagmsg(msg, cfg, deliveries, acks):
                  how=f"ack:{tags['+draft/react']}")
 
 
-def run(cfg, record, deliveries, acks, checkpoints):
+def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
+    coverage = coverage if coverage is not None else Coverage()
     conn = chatlib.login("chatbridge", cfg, caps=CAPS)
     log("connected")
     joined, caught_up, pager = set(), set(), HistoryPager()
     complete = set()  # channels whose catch-up has finished on this connection
+    started = {}      # channel -> the checkpoint its catch-up on this connection started from
     multiline = {}    # open draft/multiline batches: ref -> (opening line, lines so far)
+    sync = None       # (token, sent at) of the PING that precedes the next outbox flush
+    flush_due = False
 
     def privmsg(m, history):
         handle(m, cfg, record, deliveries, acks, replayed=history)
         ch, mid = m["params"][0], m["tags"].get("msgid")
         if not history and mid and ch.lower() in complete:
             checkpoints.set(ch, f"msgid={mid}")
+            coverage.mark(ch, f"msgid={mid}")
 
     for p in cfg.get("projects", {}).values():
         conn.send(f"JOIN {p['channel']}")
@@ -955,9 +1181,11 @@ def run(cfg, record, deliveries, acks, checkpoints):
                         caught_up.add(ch.lower())
                         cur = checkpoints.get(ch)
                         if cur:
+                            started[ch.lower()] = cur
                             conn.send(f"CHATHISTORY AFTER {ch} {cur} {HISTORY_PAGE}")
                         else:
                             complete.add(ch.lower())  # a new channel: nothing to catch up
+                            coverage.begin(ch, None, None)
                         log(f"joined {ch}" + (f" (catching up after {cur[:30]})" if cur else ""))
                 elif cmd == "BATCH":
                     ref = msg["params"][0]
@@ -978,13 +1206,19 @@ def run(cfg, record, deliveries, acks, checkpoints):
                             log(f"catch-up page full; next: {nxt[:60]}")
                         elif target:  # the last page: the log is complete through its newest message
                             complete.add(target.lower())
-                            checkpoints.set(target, Record.cursor(target))
+                            mark = Record.cursor(target)
+                            checkpoints.set(target, mark)
+                            coverage.begin(target, started.get(target.lower()), mark)
                 elif cmd == "PRIVMSG" and batch in multiline:
                     multiline[batch][1].append(msg)
                 elif cmd == "PRIVMSG" and msg["params"][0].startswith("#"):
                     privmsg(msg, pager.is_history(batch))
                 elif cmd == "TAGMSG" and msg["params"][0].startswith("#"):
                     handle_tagmsg(msg, cfg, deliveries, acks)
+                elif cmd == "PONG" and sync and msg["params"][-1:] == [sync[0]]:
+                    coverage.sync(complete, sync[1])  # everything published before the PING is logged
+                    flush_due = True
+                    break
                 if time.time() > next_list:
                     break
         except TimeoutError:
@@ -993,9 +1227,12 @@ def run(cfg, record, deliveries, acks, checkpoints):
             if "timed out" not in str(e):
                 raise
         deliveries.process(cfg)
-        if time.time() > next_outbox:
-            flush_outbox(cfg)
-            next_outbox = time.time() + 60
+        if flush_due or (sync and _now() - sync[1] > 60):  # synced, or the answer never came: flush anyway
+            flush_outbox(cfg, coverage=coverage, deliveries=deliveries)
+            next_outbox, sync, flush_due = time.time() + 60, None, False
+        elif time.time() > next_outbox and sync is None:
+            sync = (f"outbox-sync-{time.time_ns()}", _now())
+            conn.send(f"PING :{sync[0]}")
         if time.time() > next_list:
             conn.send("LIST")
             next_list = time.time() + 10
@@ -1004,9 +1241,10 @@ def run(cfg, record, deliveries, acks, checkpoints):
 def main():
     chatlib.STATE_DIR.mkdir(parents=True, exist_ok=True)
     record, deliveries, acks, checkpoints = Record(), Deliveries(), Acks(), Checkpoints()
+    coverage = Coverage()
     while True:
         try:
-            run(chatlib.load_config(), record, deliveries, acks, checkpoints)
+            run(chatlib.load_config(), record, deliveries, acks, checkpoints, coverage)
         except Exception as e:  # reconnect on anything; the service must stay up
             log(f"disconnected: {e!r}; reconnecting in 5s")
             time.sleep(5)

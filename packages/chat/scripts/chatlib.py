@@ -23,12 +23,14 @@ import os
 import sys
 import socket
 import time
+import uuid
 from pathlib import Path
 
 CONFIG_PATH = Path(os.environ.get("CHAT_CONFIG", Path.home() / ".config" / "chat" / "config.json"))
 STATE_DIR = Path(os.environ.get("CHAT_STATE", Path.home() / ".local" / "state" / "chat"))
 LOG_DIR = STATE_DIR / "logs"
 MAX_TEXT = 400  # bytes per PRIVMSG body, well under IRC's 512-byte line limit
+PART_WAIT = 30.0  # seconds the server has, from writing one part of a post, to confirm it
 
 
 class ChatError(RuntimeError):
@@ -36,7 +38,25 @@ class ChatError(RuntimeError):
 
 
 class Refused(ChatError):
-    """The server rejected the post itself (FAIL); retrying it cannot help."""
+    """The server rejected the post itself (FAIL); retrying it cannot help.
+    Raised by post() mid-way, `parts` says which parts were already published."""
+    parts = None
+
+
+class PostIncomplete(ChatError):
+    """A post stopped after some of its parts were written. `parts` gives each
+    part's state: confirmed (the server accepted it and answered after it, in
+    order), uncertain (written, at least partly, but never confirmed) or unsent.
+    Queue only what is not confirmed; an uncertain part may already be in the
+    channel, so it is checked against the record before any resend."""
+
+    def __init__(self, message: str, parts: list):
+        super().__init__(message)
+        self.parts = parts
+
+
+def _wallclock() -> float:
+    return time.time()
 
 
 def load_config() -> dict:
@@ -131,6 +151,7 @@ class Connection:
         cfg = cfg or load_config()
         self.sock = socket.create_connection((cfg.get("server", "127.0.0.1"), cfg.get("port", 6667)), timeout)
         self.buf = b""
+        self.deadline = None  # while set (time.monotonic()), no read waits past it
         self.account = account
         self.caps, self.cap_values = set(), {}  # acknowledged caps; values the server offered
         want = set(caps) | ({"sasl"} if account else set())
@@ -156,6 +177,11 @@ class Connection:
                     self.send("PONG :" + (msg["params"][-1] if msg["params"] else ""))
                     continue
                 yield msg
+            if self.deadline is not None:
+                left = self.deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError("timed out")
+                self.sock.settimeout(left)
             data = self.sock.recv(65536)
             if not data:
                 raise ChatError("server closed the connection")
@@ -308,43 +334,209 @@ def silence_refusal(account: str) -> str | None:
     return runstore.silent_refusal(account, os.environ)
 
 
+def _joined(lines) -> str:
+    """The text the channel shows for one part: what the bridge records."""
+    text = ""
+    for i, (piece, concat) in enumerate(lines):
+        text += piece if i == 0 or concat else "\n" + piece
+    return text
+
+
+def fix_parts(text: str, cont: str, conn) -> list[dict]:
+    """Divide a post into the parts it is published as: one draft/multiline
+    batch each where the server offers it, otherwise one line each. Fixed the
+    first time any part is written; retries send these same parts unchanged."""
+    if "draft/multiline" in conn.caps:
+        batches = [[[p, bool(c)] for p, c in b] for b in multiline_batches(text, cont, *_multiline_limits(conn))]
+        kind = "multiline"
+    else:
+        batches = [[[line, False]] for line in split_text(text, cont)]
+        kind = "line"
+    return [{"kind": kind, "lines": b, "text": _joined(b), "state": "unsent"} for b in batches]
+
+
+def _part_lines(conn, channel: str, part: dict, n: int, pre: str) -> list[str]:
+    """The IRC lines that publish `part` unchanged on this connection, or a
+    ChatError when this server can no longer carry it as it was fixed."""
+    lines = part["lines"]
+    if part["kind"] == "multiline" and len(lines) > 1:
+        max_bytes, max_lines = _multiline_limits(conn)
+        if ("draft/multiline" not in conn.caps or len(lines) > max_lines
+                or sum(len(p.encode()) + 1 for p, _ in lines) > max_bytes):
+            raise ChatError(f"part {n + 1} needs draft/multiline within its original limits; kept unsent")
+        out = [f"{pre}BATCH +p{n} draft/multiline {channel}"]
+        out += [f"@batch=p{n}" + (";draft/multiline-concat" if concat else "") + f" PRIVMSG {channel} :{piece}"
+                for piece, concat in lines]
+        return out + [f"BATCH -p{n}"]
+    if part["kind"] == "multiline" and "draft/multiline" in conn.caps:
+        return [f"{pre}BATCH +p{n} draft/multiline {channel}",
+                f"@batch=p{n} PRIVMSG {channel} :{lines[0][0]}", f"BATCH -p{n}"]
+    return [f"{pre}PRIVMSG {channel} :{lines[0][0]}"]
+
+
+def _confirm(conn, deadline: float) -> set[str]:
+    """Wait for the server's answer to the PING sent after a part. Returns the
+    numerics and FAILs seen before it. Unrelated traffic does not extend the
+    wait: past `deadline` it is a TimeoutError, whatever is still arriving."""
+    seen = set()
+    conn.deadline = deadline
+    try:
+        for msg in conn.lines(max(0.001, deadline - time.monotonic())):
+            if msg["command"] == "PONG" and msg["params"][-1:] == ["round"]:
+                return seen
+            if msg["command"].isdigit():
+                seen.add(msg["command"])
+            elif msg["command"] == "FAIL":  # e.g. a multiline batch over the server's limits
+                seen.add("FAIL " + " ".join(msg["params"][:2]))
+            if time.monotonic() >= deadline:
+                break
+    except (OSError, ChatError):
+        if not any(s.startswith("FAIL") for s in seen):
+            raise
+    finally:
+        conn.deadline = None
+    if any(s.startswith("FAIL") for s in seen):
+        return seen  # a refusal already seen stands, whatever happens after it
+    raise TimeoutError("timed out waiting for the server to confirm a part")
+
+
+_progress_sink = None
+
+
+@contextlib.contextmanager
+def reporting(sink):
+    """While active, post() hands every change to a post's parts to `sink`
+    (the outbox flush records it durably before the next part is written)."""
+    global _progress_sink
+    previous, _progress_sink = _progress_sink, sink
+    try:
+        yield
+    finally:
+        _progress_sink = previous
+
+
 def post(channel: str, text: str, account: str, cfg: dict | None = None, cont: str = "",
-         reply_to: str | None = None) -> int:
+         reply_to: str | None = None, *, parts: list | None = None, on_event=None) -> int:
     """Post to a channel without joining it (channels are created without +n),
     creating the channel first if it does not exist. Returns lines sent.
-    Where the server offers draft/multiline, the post goes as one batch: one
-    message with one msgid however long it is. Otherwise it is split into lines.
+    Where the server offers draft/multiline, each part goes as one batch: one
+    message with one msgid. Otherwise it is split into lines.
     `reply_to` marks the post as a reply to that message id (+draft/reply).
-    A silent child run's post is Refused here, below every caller."""
+    A silent child run's post is Refused here, below every caller.
+
+    Parts go one at a time, each confirmed before the next is written, so a
+    failure says exactly what was published: PostIncomplete (or Refused) carries
+    every part's state. `parts` resumes a post already divided by an earlier
+    attempt; its confirmed parts are never written again. Every state change
+    goes to `on_event` (or the active reporting() sink) before the next write;
+    if recording it fails, nothing more is written."""
     why = silence_refusal(account)
     if why:
         raise Refused(why)
+    report = on_event or _progress_sink or (lambda _parts: None)
     conn = login(account, cfg, caps=("message-tags", "batch", "draft/multiline"))
+    sent, joined = 0, False
     try:
+        if parts is None:
+            parts = fix_parts(text, cont, conn)
         pre = _tag_prefix({"+draft/reply": reply_to} if reply_to else None)
-        if "draft/multiline" in conn.caps:
-            privmsgs = []
-            for n, batch in enumerate(multiline_batches(text, cont, *_multiline_limits(conn))):
-                privmsgs.append(f"{pre}BATCH +p{n} draft/multiline {channel}")
-                for piece, concat in batch:
-                    tags = f"batch=p{n}" + (";draft/multiline-concat" if concat else "")
-                    privmsgs.append(f"@{tags} PRIVMSG {channel} :{piece}")
-                privmsgs.append(f"BATCH -p{n}")
-            lines = [m for m in privmsgs if " PRIVMSG " in m]
-        else:
-            lines = split_text(text, cont)
-            privmsgs = [f"{pre}PRIVMSG {channel} :{line}" for line in lines]
-        replies = _round(conn, privmsgs)
-        if "403" in replies:  # no such channel: create it with the bridge inside
-            ensure_channel(conn, channel)
-            replies = _round(conn, [*privmsgs, f"PART {channel}"])
-        if any(r.startswith("FAIL") for r in replies):
-            raise Refused(f"server refused the post to {channel}: {sorted(replies)}")
-        if replies & {"403", "404", "482"}:
-            raise ChatError(f"cannot post to {channel} (server replied {sorted(replies)})")
-        return len(lines)
+
+        def progress():
+            return [dict(p) for p in parts]
+
+        def stop(err):
+            err.parts = progress()
+            return err
+
+        for n, part in enumerate(parts):
+            if part["state"] == "confirmed":
+                continue
+            if part["state"] != "unsent":  # uncertain: the caller reconciles it first
+                raise stop(PostIncomplete(f"part {n + 1} of {len(parts)} awaits a delivery check", None))
+            try:
+                lines = _part_lines(conn, channel, part, n, pre)
+            except ChatError as err:
+                raise stop(PostIncomplete(str(err), None)) from None
+            for attempt in range(2):
+                part.update(state="writing", written_at=_wallclock())
+                report(progress())  # durable before anything of this part is written
+                try:
+                    for line in lines + ["PING :round"]:
+                        conn.send(line)
+                except OSError as err:  # how much reached the server is unknown
+                    part["state"] = "uncertain"
+                    raise stop(PostIncomplete(f"part {n + 1} of {len(parts)}: write failed ({err!r:.80})", None)) from None
+                try:
+                    replies = _confirm(conn, time.monotonic() + PART_WAIT)
+                except (OSError, ChatError) as err:
+                    part["state"] = "uncertain"
+                    raise stop(PostIncomplete(f"part {n + 1} of {len(parts)} unconfirmed ({err!r:.80})", None)) from None
+                if "403" in replies and attempt == 0 and not joined:
+                    # no such channel: nothing was accepted; create it with the bridge inside, then resend
+                    part["state"] = "unsent"
+                    report(progress())
+                    try:
+                        ensure_channel(conn, channel)
+                    except (OSError, ChatError) as err:
+                        raise stop(PostIncomplete(f"cannot create {channel} ({err!r:.80})", None)) from None
+                    joined = True
+                    continue
+                break
+            if any(r.startswith("FAIL") for r in replies):
+                part["state"] = "refused"
+                report(progress())
+                raise stop(Refused(f"server refused the post to {channel}: {sorted(replies)}"))
+            if replies & {"403", "404", "482"}:
+                part["state"] = "unsent"  # the server answered with an error: nothing was accepted
+                report(progress())
+                raise stop(PostIncomplete(f"cannot post to {channel} (server replied {sorted(replies)})", None))
+            part.update(state="confirmed")
+            report(progress())
+            sent += sum(1 for line in lines if " PRIVMSG " in line or line.startswith("PRIVMSG "))
+        return sent
+    except PostIncomplete as err:
+        if not any(p["state"] != "unsent" for p in err.parts):
+            raise ChatError(str(err)) from None  # nothing was written: a plain failure, as before
+        raise
     finally:
-        conn.close("posted")
+        try:  # a failure to leave never undoes what was confirmed, or the error above
+            if joined:
+                conn.send(f"PART {channel}")
+            conn.close("posted")
+        except (OSError, ChatError):
+            pass
+
+
+def written(err) -> bool:
+    """Whether a failed post wrote anything: then only its remainder is queued."""
+    return any(p.get("state") != "unsent" for p in (getattr(err, "parts", None) or []))
+
+
+def queued_entry(base: dict, err) -> dict:
+    """The outbox entry to keep after a failed post: the whole post when nothing
+    of it was written, as always; otherwise its parts and their states, so a
+    confirmed part is never sent again."""
+    if not written(err):
+        return base
+    parts = [{**p, "state": "uncertain"} if p["state"] == "writing" else p for p in err.parts]
+    return {**base, "id": base.get("id") or uuid.uuid4().hex, "parts": parts}
+
+
+def dead_letter_post(entry: dict, detail: str) -> None:
+    """Record a post that won't be retried, keeping its parts and their states."""
+    path = STATE_DIR / "dead-letters.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps({**entry, "kind": "post", "dead_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "last_detail": detail}) + "\n")
+
+
+def part_counts(parts: list) -> dict:
+    counts = {"confirmed": 0, "uncertain": 0, "unsent": 0, "refused": 0}
+    for p in parts:
+        state = "uncertain" if p.get("state") == "writing" else p.get("state", "unsent")
+        counts[state] = counts.get(state, 0) + 1
+    return counts
 
 
 def ack(channel: str, msgid: str, account: str, cfg: dict | None = None) -> None:
@@ -405,6 +597,42 @@ def outbox_claim() -> list[Path]:
 def outbox_pending() -> int:
     files = ([OUTBOX] if OUTBOX.exists() else []) + list(STATE_DIR.glob("outbox.claimed-*.jsonl"))
     return sum(1 for f in files for line in f.read_text().splitlines() if line.strip())
+
+
+def outbox_summary() -> dict:
+    """Pending outbox entries by what they wait for: `checking` ones have a part
+    that may already be in the channel and is being checked against the record
+    before any resend; `unsent` ones simply have parts still to post."""
+    files = ([OUTBOX] if OUTBOX.exists() else []) + list(STATE_DIR.glob("outbox.claimed-*.jsonl"))
+    summary = {"pending": 0, "checking": 0, "unsent": 0}
+    for f in files:
+        for line in f.read_text().splitlines():
+            if not line.strip():
+                continue
+            summary["pending"] += 1
+            try:
+                parts = json.loads(line).get("parts") or []
+            except (ValueError, AttributeError):
+                parts = []
+            counts = part_counts(parts)
+            summary["checking" if counts["uncertain"] else "unsent"] += 1
+    return summary
+
+
+@contextlib.contextmanager
+def outbox_flushing():
+    """Yields True while this process alone may flush the outbox, else False."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_DIR / "outbox.flush.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def register(account: str, password: str, cfg: dict | None = None) -> str:
