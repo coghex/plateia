@@ -73,6 +73,10 @@ A release is `plateia-chat-<package version>`. The version is the
     tree is walked without following links, and each symlink's target
     counts: a directory's target, or a file's target directory, as with
     `~/.local/bin/pchat` or a project's `manager.json`.
+  - **A symlinked directory's target is walked too**, once, so links
+    inside it count as well (a project directory linked elsewhere whose
+    `manager.json` links into live state). A cycle of links ends the
+    walk rather than looping.
   - **The walk fails closed:** a tree it can't read completely, or more
     than a million entries, is a refusal rather than a guess. On the
     owner's machine the walk takes about a second.
@@ -203,9 +207,9 @@ arm64, CPython 3.14.8), using this PR's build step.
 
 - **Inputs:**
   - **Builder:** this PR's `packages/release/build_release.py`, at builder
-    revision `4b78ea95a2b4775c5828a46093e8cea6ac71acf7`, not dirty: the PR
-    head after its fourth review. Earlier runs with `2ab6c29`, `01d0d57`,
-    `706a986` and `f5b268b` gave the same outcomes and byte-identical artifacts. Only the manifest's
+    revision `dd026d22eaf91490399c677a6b1c13015562db9a`, not dirty: the PR
+    head after its fifth review. Earlier runs with `2ab6c29`, `01d0d57`,
+    `706a986`, `f5b268b` and `4b78ea9` gave the same outcomes and byte-identical artifacts. Only the manifest's
     builder identity and format inventory differed.
   - **Source:** a clean detached checkout of `origin/master` at
     `48b901ac3e81d1f0c2b249f9381cf1af4aa2524a`. That commit contains #11's
