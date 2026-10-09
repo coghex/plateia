@@ -726,6 +726,7 @@ class RecoveryTests(StageCase):
         n = 0
         while True:
             n += 1
+            self.assertLess(n, 200, "staging never completed; a refusal repeats every run")
             with self.subTest(crash_after=n):
                 if self.dest.exists():
                     shutil.rmtree(self.dest)
@@ -1089,26 +1090,28 @@ class EnvironmentIntegrityTests(StageCase):
                 self.assertFalse((self.env().parent / "env-inventory.json").exists())
                 self.assertHomeUnchanged()
 
-    def test_the_probe_runs_only_between_static_checks(self):
+    def is_import_check(self, argv):
+        return stage_release.IMPORT_PROBE in [str(a) for a in argv]
+
+    def test_the_import_check_runs_only_between_static_checks(self):
         """A change to the environment, or a swapped directory, around the
-        probe's run is refused and the operation never recorded complete."""
+        import check is refused and the operation never recorded complete."""
         real = stage_release.run
-        rel_dir = self.dest / "releases" / self.manifest["release"]
         for name, act, pattern in (
-                ("hook added during the probe", lambda: (self.site() / "zz-hook.pth").write_text("import os\n"),
-                 r"the staged environment changed while its probe ran \(lib/python.*zz-hook\.pth\)"),
-                ("environment swapped during the probe",
+                ("hook added during the import check",
+                 lambda: (self.site() / "zz-hook.pth").write_text("import os\n"),
+                 r"the staged environment changed while the import check ran \(lib/python.*zz-hook\.pth\)"),
+                ("environment swapped during the import check",
                  lambda: (os.rename(self.env(), f"{self.env()}-moved"),
                           os.symlink(self.home / ".local/state/chat", self.env())),
-                 r".*/env changed while the environment probe ran: .*so the environment probe may have run other "
-                 r"code; refused")):
+                 r".*/env changed while the import check ran: .*so what it checked may no longer be what is "
+                 r"there; refused")):
             with self.subTest(change=name):
                 if self.dest.exists():
                     shutil.rmtree(self.dest)
 
                 def boundary(argv, act=act, **kw):
-                    text = " ".join(str(a) for a in argv)
-                    if "-c" in [str(a) for a in argv] and str(rel_dir) in text:
+                    if self.is_import_check(argv):
                         act()
                     return real(argv, **kw)
                 with mock.patch.object(stage_release, "run", boundary):
@@ -1119,6 +1122,67 @@ class EnvironmentIntegrityTests(StageCase):
                 if os.path.islink(self.env()):
                     os.unlink(self.env())
                     os.rename(f"{self.env()}-moved", self.env())
+                self.assertHomeUnchanged()
+
+    def test_an_environment_swapped_at_the_import_check_never_runs(self):
+        """Round 7's swap: at the import check's process boundary the
+        environment is swapped for a copy carrying a .pth hook, a
+        sitecustomize, a changed package initializer and a bin/python that
+        is a script, each written to leave a marker and overwrite the
+        invented registry. Nothing in the environment runs: the marker is
+        never written, the protected files are byte-identical, and the
+        operation is refused and unfinished, with no staged.json."""
+        real = stage_release.run
+        marker = self.where / "hook-ran"
+        hook = f"open({str(marker)!r}, 'w').close(); " + self.payload()
+
+        def swap():
+            env, moved, hooked = self.env(), Path(f"{self.env()}-moved"), Path(f"{self.env()}-hooked")
+            shutil.copytree(env, hooked, symlinks=True)
+            site = next(hooked.glob("lib/python*/site-packages"))
+            (site / "zz-hook.pth").write_text("import os; " + hook)
+            (site / "sitecustomize.py").write_text(hook)
+            init = site / "plateia_chat/__init__.py"
+            init.write_text(hook + init.read_text())
+            (hooked / "bin/python").unlink()
+            _staging.write(hooked / "bin/python", f"#!/bin/sh\ntouch {marker}\necho overwritten > "
+                                                  f"{self.registry()}\n", 0o755)
+            os.rename(env, moved)
+            os.rename(hooked, env)
+
+        def boundary(argv, **kw):
+            if self.is_import_check(argv):
+                swap()
+            return real(argv, **kw)
+        with mock.patch.object(stage_release, "run", boundary):
+            with self.assertRaisesRegex(Refused, r"verify-environment failed: .*/env changed while the import check "
+                                                 r"ran: .*; refused, and the step isn't recorded complete"):
+                self.stage()
+        self.assertFalse(marker.exists(), "code from the swapped environment ran")
+        self.assertHomeUnchanged()
+        self.assertEqual(stage_release.status(self.dest)[0]["state"],
+                         "unfinished (last: outcome verify-environment: failed)")
+        self.assertFalse((self.env().parent / "staged.json").exists())
+        self.assertFalse([c for c in stage_release.CALLS if c[0].startswith(str(self.dest))
+                          and "pip" not in c], "the environment's interpreter ran outside pip")
+
+    def test_a_verified_package_that_fails_to_import_is_refused(self):
+        """Live-import coverage is kept: a genuine, verifying release whose
+        package initializer raises is refused by the import check, and the
+        operation is never recorded complete."""
+        broken = _staging.write(self.where / "plateia_chat_init.py",
+                                build_release.INIT_PATH.read_text() + "\nraise RuntimeError('invented import "
+                                                                      "failure')\n")
+        repo, _ = make_repo(self.where / "repo")
+        with mock.patch.object(build_release, "INIT_PATH", broken):
+            release, _ = build_release.build(repo, self.where / "releases")
+        build_release.verify(release)
+        with self.assertRaisesRegex(Refused, r"verify-environment failed: the staged environment can't import "
+                                             r"plateia_chat \(RuntimeError: invented import failure\)"):
+            self.stage(release=release)
+        self.assertEqual(stage_release.status(self.dest)[0]["state"],
+                         "unfinished (last: outcome verify-environment: failed)")
+        self.assertHomeUnchanged()
 
 
 class AliasMatrixTests(StageCase):

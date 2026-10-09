@@ -90,16 +90,80 @@ CHAT_SCRIPTS = re.compile(r"""["']chat["']\s*[/,]\s*["']scripts["']|["'][^"'\n]*
 
 PROBE = ("import json, platform, sys; print(json.dumps({'implementation': platform.python_implementation(), "
          "'version': platform.python_version(), 'system': platform.system(), 'prefix': sys.prefix}))")
-ENV_PROBE = r"""
-import json, platform, sys, sysconfig
+# The import check runs the operation's chosen interpreter (checked at
+# preflight, outside the environment), never the environment's own: with -I
+# -S, so no site, .pth or sitecustomize, and / as its working directory. The
+# package's sources and dist-info metadata arrive on stdin, already read
+# through pinned descriptors and checked against the verified wheel and the
+# journaled inventory, and a minimal in-memory finder imports plateia_chat
+# from those bytes. Only that interpreter and those bytes run, so a swap of
+# the environment can't put other code in the way, and an import-time error
+# under the chosen interpreter still surfaces. What it proves live is that
+# the verified package imports under the chosen interpreter; the
+# environment's own startup (bin/python, pyvenv.cfg, site processing) is
+# never run, only checked statically (environment_facts).
+IMPORT_PROBE = r"""
+import base64, importlib.abc, importlib.machinery, importlib.util, json, pathlib, platform, re, sys
 from importlib import metadata
-import plateia_chat
-dist = metadata.distribution("plateia-chat")
-print(json.dumps({"implementation": platform.python_implementation(), "version": platform.python_version(),
-                  "system": platform.system(), "prefix": sys.prefix, "module": plateia_chat.__file__,
-                  "dist_version": dist.version, "path": sys.path, "purelib": sysconfig.get_paths()["purelib"],
-                  "record": [[str(f), f.hash.mode + "=" + f.hash.value if f.hash else None, str(f.locate())]
-                             for f in dist.files or []]}))
+given = json.load(sys.stdin)
+site, sources = given["site"], {k: base64.b64decode(v) for k, v in given["sources"].items()}
+info = {k: base64.b64decode(v).decode("utf-8") for k, v in given["metadata"].items()}
+shadowed = importlib.machinery.PathFinder.find_spec("plateia_chat") is not None
+
+
+class Source(importlib.abc.Loader):
+    def __init__(self, rel):
+        self.rel = rel
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        exec(compile(sources[self.rel], module.__spec__.origin, "exec", dont_inherit=True), module.__dict__)
+
+
+class Located(pathlib.PurePosixPath):
+    def exists(self):  # files are listed from the verified RECORD; the disk is never consulted
+        return True
+
+
+class Dist(metadata.Distribution):
+    def read_text(self, filename):
+        return info.get(filename)
+
+    def locate_file(self, path):
+        return Located(site) / str(path)
+
+
+class Finder(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] != "plateia_chat":
+            return None
+        base = name.replace(".", "/")
+        for rel, package in ((base + "/__init__.py", True), (base + ".py", False)):
+            if rel in sources:
+                spec = importlib.util.spec_from_loader(name, Source(rel), origin=site + "/" + rel,
+                                                       is_package=package)
+                spec.has_location = True
+                return spec
+        return None
+
+    def find_distributions(self, context=metadata.DistributionFinder.Context()):
+        if context.name is None or re.sub(r"[-_.]+", "-", context.name).lower() == "plateia-chat":
+            yield Dist()
+
+
+sys.meta_path.insert(0, Finder())
+found = {"implementation": platform.python_implementation(), "version": platform.python_version(),
+         "system": platform.system(), "path": list(sys.path), "shadowed": shadowed}
+try:
+    import plateia_chat
+    dist = metadata.distribution("plateia-chat")
+    found.update(module=plateia_chat.__file__, dist_version=dist.version,
+                 record=[[str(f), f"{f.hash.mode}={f.hash.value}" if f.hash else None] for f in dist.files or []])
+except Exception as e:
+    found["error"] = f"{type(e).__name__}: {e}"[:300]
+print(json.dumps(found))
 """
 
 CALLS = []  # every external command this process ran: the process boundary tests inspect
@@ -1230,7 +1294,7 @@ class Writer:
             if st is None or not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != inode:
                 if after:
                     effect = (f"so {process}'s writes through it may have landed elsewhere (D-71)"
-                              if process in ("venv", "pip") else f"so {process} may have run other code")
+                              if process in ("venv", "pip") else "so what it checked may no longer be what is there")
                     raise Refused(f"{shown(path)} changed while {process} ran: it is no longer the directory "
                                   f"staging created and checked, {effect}; refused, and the step isn't recorded "
                                   "complete")
@@ -1514,6 +1578,8 @@ def pip_additions(site, wheel):
         located = os.path.normpath(os.path.join(site, member))
         if located.startswith("..") or os.path.isabs(located) or ".data/" in member:
             raise Refused(f"the verified wheel holds {member}, which pip would place outside site-packages")
+        if "/" not in member and (member.endswith(".pth") or member in STARTUP_HOOKS):
+            raise Refused(f"the verified wheel holds {member}, a startup hook")
         files.append(located)
     permitted = {}
     for rel in files:
@@ -1655,41 +1721,141 @@ def verify_static(writer, rel_dir, manifest_sha, manifest, inventory_sha):
             raise Refused(f"the staged environment differs from what this operation built ({changed})")
         check_installed(actual, fd, writer.root / rel_dir / "env", artifacts[manifest["package"]["artifact"]],
                         manifest["package"])
-    return expected
+    return expected, artifacts[manifest["package"]["artifact"]]
+
+
+STARTUP_HOOKS = ("sitecustomize.py", "usercustomize.py")
+
+
+def environment_facts(expected, env_fd, env, interpreter):
+    """What the environment's own startup would establish, derived without
+    running it from the trusted inventory and files read through the pinned
+    environment: bin/python leads, through links inside the environment, to
+    the operation's chosen interpreter; pyvenv.cfg names that interpreter's
+    directory and version and keeps the system site-packages out, so the
+    prefix is the environment and its one site-packages is purelib; no
+    sitecustomize or usercustomize is anywhere in it; and the import path's
+    additions are the site-packages folder plus the directory lines of its
+    .pth files (each venv built, pinned by the inventory, and read here).
+    These are static checks only: they don't show that bin/python starts,
+    or that its venv detection and site processing (the .pth files' import
+    lines included) run as expected. Returns (prefix, purelib relative to the environment, additions to the
+    import path, the .pth files)."""
+    rel, hops = "bin/python", 0
+    while expected.get(rel, [None])[0] == "link" and hops < 8:
+        target, hops = expected[rel][1], hops + 1
+        if os.path.isabs(target):
+            rel = target
+            break
+        rel = os.path.normpath(os.path.join(os.path.dirname(rel), target))
+    if not os.path.isabs(rel) or os.path.realpath(rel) != os.path.realpath(interpreter["path"]):
+        raise Refused(f"the staged environment's bin/python doesn't lead to the operation's interpreter "
+                      f"({shown(interpreter['path'])})")
+    entry = expected.get("pyvenv.cfg")
+    data = read_inside(env_fd, "pyvenv.cfg") if entry and entry[0] == "file" else None
+    if data is None or hashlib.sha256(data).hexdigest() != entry[1]:
+        raise Refused("the staged environment's pyvenv.cfg is missing or changed while it was read")
+    cfg = dict(line.split("=", 1) for line in data.decode("utf-8", errors="replace").splitlines() if "=" in line)
+    cfg = {k.strip(): v.strip() for k, v in cfg.items()}
+    if cfg.get("include-system-site-packages") != "false":
+        raise Refused("the staged environment's pyvenv.cfg doesn't keep the system site-packages out")
+    if cfg.get("version") != interpreter["version"] or \
+            os.path.realpath(cfg.get("home", "")) != os.path.realpath(os.path.dirname(rel)):
+        raise Refused("the staged environment's pyvenv.cfg doesn't name the operation's interpreter")
+    major_minor = ".".join(interpreter["version"].split(".")[:2])
+    site = site_packages(expected)
+    if site != f"lib/python{major_minor}/site-packages":
+        raise Refused(f"the staged environment's site-packages ({site}) isn't the chosen interpreter's")
+    hooks = sorted(k for k in expected if os.path.basename(k) in STARTUP_HOOKS)
+    if hooks:
+        raise Refused(f"the staged environment holds a startup hook ({hooks[0]})")
+    additions, pth = [os.path.join(env, site)], []
+    for rel_pth in sorted(k for k in expected if os.path.dirname(k) == site and k.endswith(".pth")):
+        if expected[rel_pth][0] != "file":
+            raise Refused(f"the staged environment's {rel_pth} is not a file")
+        text = read_inside(env_fd, rel_pth)
+        if hashlib.sha256(text).hexdigest() != expected[rel_pth][1]:
+            raise Refused(f"the staged environment's {rel_pth} changed while it was read")
+        pth.append(rel_pth)
+        for line in text.decode("utf-8", errors="replace").splitlines():
+            if line.strip() and not line.startswith(("#", "import ", "import\t")):
+                additions.append(os.path.normpath(os.path.join(env, site, line.rstrip())))
+    return str(env), os.path.join(env, site), additions, pth
+
+
+def import_payload(expected, env_fd, site, wheel):
+    """The package's sources and dist-info metadata for the import check,
+    read through the pinned environment: each source and the metadata file
+    must hash as the verified wheel says, and the installed RECORD as the
+    journaled inventory says."""
+    wheel_files, _, dist_info = wheel_contents(io.BytesIO(wheel))
+    sources, info = {}, {}
+    for member, want in sorted(wheel_files.items()):
+        is_source = member.startswith("plateia_chat/") and member.endswith(".py")
+        if not is_source and member not in (f"{dist_info}/METADATA", f"{dist_info}/entry_points.txt"):
+            continue
+        data = read_inside(env_fd, f"{site}/{member}")
+        if build_release.record_hash(data) != want:
+            raise Refused(f"the installed {member} differs from the verified wheel")
+        if is_source:
+            sources[member] = base64.b64encode(data).decode()
+        else:
+            info[os.path.basename(member)] = base64.b64encode(data).decode()
+    record = read_inside(env_fd, f"{site}/{dist_info}/RECORD")
+    entry = expected.get(f"{site}/{dist_info}/RECORD")
+    if not entry or hashlib.sha256(record).hexdigest() != entry[1]:
+        raise Refused("the installed RECORD differs from the journaled inventory")
+    info["RECORD"] = base64.b64encode(record).decode()
+    return {"sources": sources, "metadata": info}
 
 
 def verify_staged(writer, rel_dir, manifest_sha, manifest, interpreter, inventory_sha):
-    """Check a staged release: statically first (verify_static), then by
-    running the environment's interpreter once, then statically again. The
-    interpreter runs by path, so the path is checked against the pinned
-    directories just before and after it runs, and the environment's
-    contents are compared with the trusted inventory again afterwards: a
-    change around the run is refused and never reported verified. Returns
-    the probe, or raises Refused naming the problem."""
-    expected = verify_static(writer, rel_dir, manifest_sha, manifest, inventory_sha)
+    """Check a staged release without running anything from its
+    environment: statically (verify_static, environment_facts), then by
+    importing plateia_chat in the operation's chosen interpreter from the
+    environment's own files, read through pinned descriptors and
+    hash-checked (IMPORT_PROBE), then statically again. The environment's
+    path is checked against the pinned directories just before and after the
+    import check, and its contents compared with the trusted inventory
+    afterwards: a change around it is refused and never reported verified.
+    Returns what was found, or raises Refused naming the problem."""
+    expected, wheel = verify_static(writer, rel_dir, manifest_sha, manifest, inventory_sha)
     env_rel = f"{rel_dir}/env"
     env = writer.root / env_rel
-    python = env / "bin" / "python"
-    writer.path_intact(env_rel, "the environment probe")
+    with writer.pinned(env_rel) as fd:
+        prefix, purelib, additions, _ = environment_facts(expected, fd, env, interpreter)
+        site = site_packages(expected)
+        payload = import_payload(expected, fd, site, wheel)
+    payload["site"] = str(env / site)
+    python = interpreter["path"]
+    writer.path_intact(env_rel, "the import check")
     try:
-        r = run([python, "-I", "-B", "-c", ENV_PROBE], env=child_env(), cwd=os.sep)
+        r = run([python, "-I", "-S", "-B", "-c", IMPORT_PROBE], env=child_env(), cwd=os.sep,
+                input=json.dumps(payload))
     finally:
-        writer.path_intact(env_rel, "the environment probe", after=True)
+        writer.path_intact(env_rel, "the import check", after=True)
         with writer.pinned(env_rel) as fd:
             changed = first_difference(inventory_at(fd), expected)
         if changed:
-            raise Refused(f"the staged environment changed while its probe ran ({changed})")
+            raise Refused(f"the staged environment changed while the import check ran ({changed})")
     try:
         found = json.loads(r.stdout.strip().splitlines()[-1])
-        assert all(isinstance(found.get(k), str) for k in ("implementation", "version", "system", "prefix",
-                                                            "module", "dist_version"))
+        assert all(isinstance(found.get(k), str) for k in ("implementation", "version", "system"))
         assert isinstance(found.get("path"), list)
     except (IndexError, ValueError, AssertionError, AttributeError):
-        raise Refused("the staged environment can't import plateia_chat") from None
+        raise Refused("the chosen interpreter didn't report the import check") from None
+    if found.get("error") or not isinstance(found.get("module"), str) or \
+            not isinstance(found.get("dist_version"), str):
+        raise Refused(f"the staged environment can't import plateia_chat ({found.get('error', 'no module')})")
+    if found["shadowed"]:
+        raise Refused("the chosen interpreter's own library holds a plateia_chat, which would shadow the staged one")
+    recorded = dict(tuple(row) for row in found.get("record") or [])
+    for member, data in payload["sources"].items():
+        if recorded.get(member) != build_release.record_hash(base64.b64decode(data)):
+            raise Refused(f"the installed package's metadata doesn't match the imported {member}")
+    found.update(prefix=prefix, purelib=purelib, path=found["path"] + additions)
 
     def inside(path):
-        # A venv's bin/python is a link to the base interpreter, so the
-        # path as written counts as well as the resolved one.
         return any(p == base or p.startswith(base + os.sep)
                    for p, base in ((os.path.normpath(path), os.path.normpath(env)),
                                    (os.path.realpath(path), os.path.realpath(env))))
@@ -1908,8 +2074,8 @@ def run_operation(journal, writer, release, manifest, plan, report, python, spec
     def verify_environment():
         found = verify_staged(writer, rel_dir, binding["manifest_sha256"], manifest, binding["interpreter"],
                               inventory_sha())
-        return f"artifacts verify; plateia-chat {found['dist_version']} loads from the environment on " \
-               f"{found['implementation']} {found['version']}"
+        return f"artifacts verify; plateia-chat {found['dist_version']} imports from the environment's verified " \
+               f"files on {found['implementation']} {found['version']}"
 
     def complete():
         writer.write(f"{rel_dir}/{STAGED}", (json.dumps(
