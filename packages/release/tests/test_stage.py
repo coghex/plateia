@@ -504,6 +504,15 @@ class ImporterTests(StageCase):
         self.assertIn("unlisted importer: ~/.codex/skills/notes-bot/scripts/digest (outside the known list; it "
                       "would stay on the old code)", stage_release.render_plan(plan))
 
+    def test_an_importer_expression_over_several_lines_is_found(self):
+        _staging.write(self.skills / "tidy/scripts/tidy", "#!/usr/bin/env python3\nimport sys\n"
+                       "from pathlib import Path\n\nsys.path.insert(\n    0,\n"
+                       "    str(\n        Path(__file__).resolve().parents[2]\n        / \"chat\"\n"
+                       "        / \"scripts\"\n    ),\n)\n", 0o755)
+        importers = self.plan()["importers"]
+        self.assertEqual(importers["unlisted"], ["~/.codex/skills/tidy/scripts/tidy"])
+        self.assertTrue(importers["complete"])
+
     def test_importers_behind_symlinks_are_found_once_and_cycles_end(self):
         helper = self.where / "external-helper"
         _staging.write(helper / "scripts/tool", "#!/usr/bin/env python3\nimport sys\n"
@@ -863,6 +872,62 @@ class AliasMatrixTests(StageCase):
         self.assertEqual((self.where / "out-existing.json").read_text(), "an earlier plan\n")
         self.assertFalse(os.path.lexists(self.home / ".local/state/chat/plan.json"))
         self.assertHomeUnchanged()
+
+    def test_a_parent_swapped_for_a_link_mid_write_is_never_written_through(self):
+        """A directory swapped for a symlink into protected state right after
+        it was checked, at the journal boundary before the write: the write
+        stays in the pinned original directory, and the next one is refused."""
+        state = self.home / ".local/state/chat"
+        rel = f"releases/{self.manifest['release']}"
+        cases = (("artifacts", lambda r: r["kind"] == "creating" and "/artifacts/" in r["path"]),
+                 ("release directory", lambda r: r["kind"] == "creating" and "/artifacts/" in r["path"]),
+                 ("env", lambda r: r["kind"] == "created" and r["path"].endswith("/env")))
+        for what, when in cases:
+            with self.subTest(swapped=what):
+                if self.dest.exists():
+                    shutil.rmtree(self.dest)
+                target = self.dest / {"artifacts": f"{rel}/artifacts", "release directory": rel,
+                                      "env": f"{rel}/env"}[what]
+                swapped = []
+
+                def hook(record, when=when, target=target):
+                    if not swapped and when(record):
+                        target.rename(target.with_name(target.name + ".moved-away"))
+                        target.symlink_to(state)
+                        swapped.append(record)
+                with self.assertRaisesRegex(Refused, r"is not a directory staging created|is no longer the "
+                                                     r"directory this operation created|doesn't resolve under the "
+                                                     r"staging destination|is under ~/\.local/state"):
+                    self.stage(crash=hook)
+                self.assertFalse(any(state.glob("*.whl")) or any(state.glob("*.zip")) or
+                                 (state / "manifest.json").exists() or (state / "bin").exists())
+                self.assertTrue(swapped)
+                self.assertHomeUnchanged()
+
+    def test_the_writer_writes_through_its_pinned_directory_not_the_path(self):
+        """Below the path checks: a directory swapped for a link to protected
+        state after the writer pinned it still receives the write, and the
+        protected directory doesn't."""
+        root, protected = self.where / "pin-root", self.where / "pin-protected"
+        root.mkdir(mode=0o755)
+        protected.mkdir()
+        writer = stage_release.Writer(root, [])
+        self.addCleanup(writer.close)
+        swapped = []
+
+        def record(r):
+            if r["kind"] == "creating" and not swapped:  # after the parent is pinned, before the create
+                (root / "a").rename(root / "a-moved")
+                (root / "a").symlink_to(protected)
+                swapped.append(r)
+        writer.record = record
+        writer.mkdir("a")
+        writer.write("a/x.txt", b"pinned\n")
+        self.assertEqual(os.listdir(protected), [])
+        self.assertEqual((root / "a-moved/x.txt").read_bytes(), b"pinned\n")
+        with self.assertRaisesRegex(Refused, r"is not a directory staging created|doesn't resolve"):
+            writer.write("a/y.txt", b"refused\n")
+        self.assertEqual(os.listdir(protected), [])
 
     def test_a_replaced_directory_staging_created_is_refused(self):
         with self.assertRaises(stage_release.Crash):

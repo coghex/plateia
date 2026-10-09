@@ -41,6 +41,7 @@ only; no network access.
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import datetime
 import fcntl
@@ -341,20 +342,28 @@ def private_target(path, bases):
     return any(under(b) for b in broad)
 
 
+IMPORTER_WINDOW = 16  # physical lines searched together, so an expression split over lines is matched
+
+
 def imports_chat_scripts(path):
-    """Whether a script both changes the import path and names chat/scripts,
-    read line by line so a large script is searched whole; None for a
-    file that turns out to be binary."""
+    """Whether a script both changes the import path and names chat/scripts.
+    It is read line by line, so a large script is searched whole, and each
+    search covers the last IMPORTER_WINDOW lines joined, so an expression
+    spread over several lines (a parenthesized sys.path.insert(...) with
+    / "chat" and / "scripts" on lines of their own) still matches. None for
+    a file that turns out to be binary."""
     path_change = names_location = False
+    window = collections.deque(maxlen=IMPORTER_WINDOW)
     with open(path, "rb") as stream:
         head = stream.read(8192)
         if b"\0" in head:
             return None
         stream.seek(0)
         for raw in stream:
-            line = raw.decode("utf-8", errors="ignore")
-            path_change = path_change or bool(SYS_PATH.search(line))
-            names_location = names_location or bool(CHAT_SCRIPTS.search(line))
+            window.append(raw.decode("utf-8", errors="ignore"))
+            text = "".join(window)
+            path_change = path_change or bool(SYS_PATH.search(text))
+            names_location = names_location or bool(CHAT_SCRIPTS.search(text))
             if path_change and names_location:
                 return True
     return False
@@ -760,12 +769,7 @@ def write_all(fd, data):
         view = view[os.write(fd, view):]
 
 
-def fsync_dir(path):
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
 class Writer:
@@ -773,13 +777,17 @@ class Writer:
 
     - A path is plain components (letters, digits, `._+-`; never `.` or
       `..`) under a root build_release's guard accepted.
-    - Every directory below the root on the way is a real directory, owned
-      by this user on the root's device, that the journal records staging
-      created.
+    - The root is held open, and every directory on the way is opened
+      relative to the one above it with O_DIRECTORY|O_NOFOLLOW, then checked
+      by its inode against the journal's record that staging created it
+      (owned by this user, on the root's device). Every create, rename and
+      delete happens relative to those pinned descriptors, so swapping a
+      directory for a link after it was checked can't redirect a write.
     - The final path and its parent resolve under the root, and outside this
       checkout and every protected location.
     - Files are created with O_CREAT|O_EXCL|O_NOFOLLOW under a fresh
-      temporary name, journaled first, then renamed into place.
+      temporary name, journaled first, their inode journaled right after,
+      then renamed into place.
     - Nothing is replaced, truncated or deleted unless the journal records
       that this operation created it, and it is still that entry: same
       inode, singly linked, this owner. Anything else is refused."""
@@ -793,12 +801,22 @@ class Writer:
             raise Refused(f"{shown(self.root)} doesn't exist") from None
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != self.uid:
             raise Refused(f"{shown(self.root)} is not a directory this user owns; left unchanged")
+        if st.st_mode & 0o022:
+            raise Refused(f"{shown(self.root)} is writable by other users; left unchanged")
         reason = protected_reason(self.root, self.protected)
         if reason:
             raise Refused(f"{shown(self.root)} is {reason}; left unchanged")
+        self.root_fd = os.open(self.root, DIR_FLAGS)
+        held = os.fstat(self.root_fd)
+        if (held.st_dev, held.st_ino) != (st.st_dev, st.st_ino):
+            os.close(self.root_fd)
+            raise Refused(f"{shown(self.root)} changed while it was opened; left unchanged")
         self.dev = st.st_dev
         self.dirs, self.mine = {}, {}
         self.record = None
+
+    def close(self):
+        os.close(self.root_fd)
 
     def load(self, records, op_id):
         """What the journal says staging created, by inode: directories by
@@ -812,14 +830,15 @@ class Writer:
                     self.mine[r["path"]] = inode
 
     def resolve(self, rel):
+        """Check rel's names and that it resolves under the root and outside
+        every protected location; returns its path (for messages and the
+        processes that need one)."""
         parts = rel.split("/")
         if any(not SAFE_NAME.fullmatch(p) or p in (".", "..") for p in parts):
             raise Refused(f"{rel!r} is not a plain path under the staging destination")
-        for i in range(1, len(parts)):
-            self.expect_dir("/".join(parts[:i]))
         path = self.root.joinpath(*parts)
         parent = os.path.realpath(path.parent)
-        if parent != os.path.normpath(os.path.join(self.real, *parts[:-1])):
+        if os.path.lexists(path.parent) and parent != os.path.normpath(os.path.join(self.real, *parts[:-1])):
             raise Refused(f"{shown(path)} doesn't resolve under the staging destination")
         for candidate in (parent, os.path.join(parent, parts[-1])):
             reason = protected_reason(candidate, self.protected)
@@ -827,18 +846,46 @@ class Writer:
                 raise Refused(f"{shown(path)} is {reason}; left unchanged")
         return path
 
-    def foreign(self, path, st, why):
+    def foreign(self, path, why):
         raise Refused(f"{shown(path)} {why}; staging never writes through, replaces or deletes an entry it "
                       "didn't create, and left it unchanged")
 
-    def expect_dir(self, rel):
-        path = self.root / rel
-        st = os.lstat(path)
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-            self.foreign(path, st, "is not a directory staging created")
+    def open_dir(self, parent_fd, name, rel):
+        """A directory staging created, opened relative to its pinned parent
+        and checked by inode; the caller closes it."""
+        try:
+            fd = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+        except FileNotFoundError:
+            raise
+        except OSError:
+            self.foreign(self.root / rel, "is not a directory staging created")
+        st = os.fstat(fd)
         if st.st_uid != self.uid or st.st_dev != self.dev or self.dirs.get(rel) != (st.st_dev, st.st_ino):
-            self.foreign(path, st, "is a directory staging didn't create")
-        return st
+            os.close(fd)
+            self.foreign(self.root / rel, "is a directory staging didn't create")
+        return fd
+
+    def parent(self, rel):
+        """(pinned descriptor of rel's directory, rel's last name). Raises
+        FileNotFoundError when a directory on the way is missing."""
+        self.resolve(rel)
+        parts = rel.split("/")
+        fd = os.dup(self.root_fd)
+        try:
+            for i, name in enumerate(parts[:-1], 1):
+                child = self.open_dir(fd, name, "/".join(parts[:i]))
+                os.close(fd)
+                fd = child
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd, parts[-1]
+
+    def entry(self, fd, name):
+        try:
+            return os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
 
     def owned(self, rel, st):
         return (self.mine.get(rel) == (st.st_dev, st.st_ino) and st.st_uid == self.uid and st.st_dev == self.dev
@@ -848,23 +895,31 @@ class Writer:
         """The entry at rel, or None when it (or a directory on the way) is
         missing; refuses an alias on the way to it."""
         try:
-            return os.lstat(self.resolve(rel))
+            fd, name = self.parent(rel)
         except FileNotFoundError:
             return None
+        try:
+            return self.entry(fd, name)
+        finally:
+            os.close(fd)
 
     def inspect(self, rel):
         """Refuse an existing entry at rel that this operation (or, for a
         directory, staging) didn't create; walking stops at a missing one."""
-        parts = rel.split("/")
-        for i in range(1, len(parts) + 1):
-            sub = "/".join(parts[:i])
-            st = self.lstat(sub)
+        try:
+            fd, name = self.parent(rel)  # every directory on the way is checked
+        except FileNotFoundError:
+            return
+        try:
+            st = self.entry(fd, name)
             if st is None:
                 return
-            if i < len(parts) or stat.S_ISDIR(st.st_mode):
-                self.expect_dir(sub)
-            elif not self.owned(sub, st):
-                self.foreign(self.root / sub, st, "is not a file this operation created")
+            if stat.S_ISDIR(st.st_mode):
+                os.close(self.open_dir(fd, name, rel))
+            elif not self.owned(rel, st):
+                self.foreign(self.root / rel, "is not a file this operation created")
+        finally:
+            os.close(fd)
 
     def note(self, rel, st, kind):
         inode = (st.st_dev, st.st_ino)
@@ -874,79 +929,131 @@ class Writer:
             self.dirs[rel] = inode
 
     def mkdir(self, rel):
-        path = self.resolve(rel)
-        if os.path.lexists(path):
-            self.expect_dir(rel)
-            return path
-        os.mkdir(path, 0o755)
-        self.note(rel, os.lstat(path), "dir")
-        fsync_dir(path.parent)
-        return path
+        fd, name = self.parent(rel)
+        try:
+            if self.entry(fd, name) is not None:
+                os.close(self.open_dir(fd, name, rel))
+                return self.root / rel
+            os.mkdir(name, 0o755, dir_fd=fd)
+            made = os.open(name, DIR_FLAGS, dir_fd=fd)
+            try:
+                self.note(rel, os.fstat(made), "dir")
+            finally:
+                os.close(made)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return self.root / rel
 
     def write(self, rel, data):
         """Write a file this operation owns: a new one, or a replacement for
         one it created; never through or over anything else."""
-        path = self.resolve(rel)
-        st = self.lstat(rel)
-        if st is not None and not (stat.S_ISREG(st.st_mode) and self.owned(rel, st)):
-            self.foreign(path, st, "exists and is not a file this operation created")
-        head, _, name = rel.rpartition("/")
-        temp_rel = (head + "/" if head else "") + f".{name}.{secrets.token_hex(6)}.tmp"
-        temp = self.resolve(temp_rel)
-        self.record({"kind": "creating", "path": temp_rel})  # journaled before it exists
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        fd, name = self.parent(rel)
         try:
-            self.note(temp_rel, os.fstat(fd), "temp")  # its inode: the evidence that lets recovery remove it
-            write_all(fd, data)
+            st = self.entry(fd, name)
+            if st is not None and not (stat.S_ISREG(st.st_mode) and self.owned(rel, st)):
+                self.foreign(self.root / rel, "exists and is not a file this operation created")
+            head = rel.rpartition("/")[0]
+            temp = f".{name}.{secrets.token_hex(6)}.tmp"
+            temp_rel = (head + "/" if head else "") + temp
+            self.resolve(temp_rel)
+            self.record({"kind": "creating", "path": temp_rel})  # journaled before it exists
+            out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+            try:
+                self.note(temp_rel, os.fstat(out), "temp")  # its inode: the evidence that lets recovery remove it
+                write_all(out, data)
+                os.fsync(out)
+                made = os.fstat(out)
+            finally:
+                os.close(out)
+            os.replace(temp, name, src_dir_fd=fd, dst_dir_fd=fd)
+            self.note(rel, made, "file")
             os.fsync(fd)
-            made = os.fstat(fd)
         finally:
             os.close(fd)
-        os.replace(temp, path)
-        self.note(rel, made, "file")
-        fsync_dir(path.parent)
-        return path
+        return self.root / rel
 
     def create(self, rel, data):
         """Create a new file exclusively (plan --out): never an existing one."""
-        path = self.resolve(rel)
+        fd, name = self.parent(rel)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-        except FileExistsError:
-            raise Refused(f"{shown(path)} already exists; staging writes only new files, so choose a new path") \
-                from None
-        try:
-            write_all(fd, data)
+            try:
+                out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+            except FileExistsError:
+                raise Refused(f"{shown(self.root / rel)} already exists; staging writes only new files, so choose "
+                              "a new path") from None
+            try:
+                write_all(out, data)
+                os.fsync(out)
+            finally:
+                os.close(out)
             os.fsync(fd)
         finally:
             os.close(fd)
-        fsync_dir(path.parent)
-        return path
+        return self.root / rel
 
     def remove(self, rel):
         """Delete a file the journal records this operation created, by its
         inode, that is still that singly linked file. A journaled intent to
         create a name is not evidence: anything at such a name without a
         creation record is left untouched."""
-        path = self.resolve(rel)
-        st = os.lstat(path)
-        if not (stat.S_ISREG(st.st_mode) and self.owned(rel, st)):
-            self.foreign(path, st, "is not a file the journal records this operation created")
-        os.unlink(path)
-        fsync_dir(path.parent)
+        fd, name = self.parent(rel)
+        try:
+            st = self.entry(fd, name)
+            if st is None or not (stat.S_ISREG(st.st_mode) and self.owned(rel, st)):
+                self.foreign(self.root / rel, "is not a file the journal records this operation created")
+            os.unlink(name, dir_fd=fd)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def remove_tree(self, rel):
         """Delete a directory this operation created, with what it put
-        there (the environment its own venv run filled). Links inside are
-        removed, never followed."""
-        path = self.resolve(rel)
-        st = os.lstat(path)
-        if not (stat.S_ISDIR(st.st_mode) and self.owned(rel, st)):
-            self.foreign(path, st, "is not a directory this operation created")
-        shutil.rmtree(path)
+        there (the environment its own venv run filled), through pinned
+        descriptors. Links inside are removed, never followed."""
+        fd, name = self.parent(rel)
+        try:
+            st = self.entry(fd, name)
+            if st is None or not (stat.S_ISDIR(st.st_mode) and self.owned(rel, st)):
+                self.foreign(self.root / rel, "is not a directory this operation created")
+            remove_tree_at(fd, name, (st.st_dev, st.st_ino))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         self.mine.pop(rel, None)
         self.dirs.pop(rel, None)
-        fsync_dir(path.parent)
+
+    def same_dir(self, rel):
+        """Refuse unless rel is still the directory this operation created:
+        checked around each process that writes into it by path."""
+        fd, name = self.parent(rel)
+        try:
+            st = self.entry(fd, name)
+            if st is None or not (stat.S_ISDIR(st.st_mode) and self.owned(rel, st)):
+                self.foreign(self.root / rel, "is no longer the directory this operation created")
+        finally:
+            os.close(fd)
+
+
+def remove_tree_at(parent_fd, name, inode):
+    """Remove a directory and everything in it relative to its parent's
+    descriptor, never following a link; the directory must still be inode."""
+    fd = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != inode:
+            raise Refused("a directory changed while it was being removed; stopped")
+        with os.scandir(fd) as entries:
+            items = [(e.name, e.is_dir(follow_symlinks=False)) for e in entries]
+        for child, is_dir in items:
+            if is_dir:
+                remove_tree_at(fd, child, (lambda s: (s.st_dev, s.st_ino))(
+                    os.stat(child, dir_fd=fd, follow_symlinks=False)))
+            else:
+                os.unlink(child, dir_fd=fd)
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=parent_fd)
 
 
 # --- journal -----------------------------------------------------------------
@@ -960,7 +1067,8 @@ class Journal:
     def __init__(self, writer, crash=None):
         self.writer, self.crash = writer, crash
         self.path, lock_path = writer.resolve(JOURNAL), writer.resolve(LOCK)
-        if os.path.lexists(self.path) and not os.path.lexists(lock_path):
+        self.root_fd = writer.root_fd
+        if writer.entry(self.root_fd, JOURNAL) is not None and writer.entry(self.root_fd, LOCK) is None:
             raise Refused(f"{shown(self.path)} has no lock beside it, so staging didn't create it; left unchanged")
         self.lock = self.open_lock(lock_path)
         try:
@@ -979,34 +1087,37 @@ class Journal:
         w = self.writer
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != w.uid or st.st_dev != w.dev:
             os.close(fd)
-            w.foreign(path, st, "is not a singly linked file this user owns on the destination's device")
+            w.foreign(path, "is not a singly linked file this user owns on the destination's device")
         return st
 
     def open_lock(self, path):
         """The lock is only ever opened read-only once it exists: nothing is
         written to it."""
-        if os.path.islink(path):
+        st = self.writer.entry(self.root_fd, LOCK)
+        if st is not None and stat.S_ISLNK(st.st_mode):
             raise Refused(f"{shown(path)} is a symlink; staging never follows a link under its destination")
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(LOCK, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.root_fd)
         except FileNotFoundError:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            fsync_dir(path.parent)
+            fd = os.open(LOCK, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.root_fd)
+            os.fsync(self.root_fd)
         self.lock_inode = list((lambda st: (st.st_dev, st.st_ino))(self.check(fd, path)))
         return fd
 
     def open_journal(self):
-        if os.path.islink(self.path):
+        st = self.writer.entry(self.root_fd, JOURNAL)
+        if st is not None and stat.S_ISLNK(st.st_mode):
             raise Refused(f"{shown(self.path)} is a symlink; staging never follows a link under its destination")
         try:
-            fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW)
+            fd = os.open(JOURNAL, os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW, dir_fd=self.root_fd)
         except FileNotFoundError:
-            fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            fd = os.open(JOURNAL, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644,
+                         dir_fd=self.root_fd)
             st = os.fstat(fd)
             header = {"op": None, "kind": "journal", "inode": [st.st_dev, st.st_ino], "lock": self.lock_inode}
             self.fd, self.records = fd, []
             self.write_record(header)
-            fsync_dir(self.path.parent)
+            os.fsync(self.root_fd)
             return fd, self.records, 0
         st = self.check(fd, self.path)
         data = os.pread(fd, st.st_size, 0)
@@ -1313,11 +1424,14 @@ def stage(release, dest, python=None, plan_path=None, spec_path=None, crash=None
     root = check_destination(dest, manifest["release"])
     root.mkdir(parents=True, exist_ok=True)
     writer = Writer(root, build_release.live_roots())
-    journal = Journal(writer, crash)
     try:
-        return run_operation(journal, writer, release, manifest, plan, report, python, spec_path), plan, report
+        journal = Journal(writer, crash)
+        try:
+            return run_operation(journal, writer, release, manifest, plan, report, python, spec_path), plan, report
+        finally:
+            journal.close()
     finally:
-        journal.close()
+        writer.close()
 
 
 def run_operation(journal, writer, release, manifest, plan, report, python, spec_path):
@@ -1422,15 +1536,19 @@ def run_operation(journal, writer, release, manifest, plan, report, python, spec
         if writer.lstat(env_rel) is not None:
             writer.remove_tree(env_rel)  # a partial environment this operation's venv run left
         writer.mkdir(env_rel)
+        writer.same_dir(env_rel)
         r = run([python, "-m", "venv", env], env=child_env(), cwd=str(release_dir))
+        writer.same_dir(env_rel)
         if r.returncode:
             raise Refused(f"venv exited {r.returncode}")
         return "venv created with the chosen interpreter and its bundled pip"
 
     def install_package():
         wheel = release_dir / "artifacts" / manifest["package"]["artifact"]
+        writer.same_dir(env_rel)
         r = run([env / "bin" / "python", "-m", "pip", "install", "--no-index", "--no-deps", "--no-cache-dir",
                  "--disable-pip-version-check", wheel], env=child_env(), cwd=str(release_dir))
+        writer.same_dir(env_rel)
         if r.returncode:
             raise Refused(f"pip exited {r.returncode}")
         data = (json.dumps(env_inventory(env), indent=1, sort_keys=True) + "\n").encode()
@@ -1498,8 +1616,11 @@ def main(argv=None):
             plan = make_plan(a.release, a.dest)
             if a.out:
                 out = Path(os.path.abspath(a.out))
-                Writer(out.parent, build_release.live_roots()).create(
-                    out.name, (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode())
+                writer = Writer(out.parent, build_release.live_roots())
+                try:
+                    writer.create(out.name, (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode())
+                finally:
+                    writer.close()
             print(json.dumps(plan, indent=2, sort_keys=True) if a.json else render_plan(plan))
             return 1 if plan["blocked"] else 0
         if a.cmd == "preflight":
