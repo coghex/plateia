@@ -317,6 +317,24 @@ class HappyPathTests(StageCase):
             with self.subTest(lines=lines):
                 self.assertIsNone(stage_release.interpreter_of(lines))
 
+    def test_a_launcher_is_judged_as_python_and_the_kernel_read_it(self):
+        """Hardening beside round 10's launcher findings: a coding
+        declaration (utf-7) that turns a comment into an extra import, and a
+        carriage return after the interpreter on the shebang line. The
+        launcher is parsed from its bytes, as Python reads the file, and the
+        shebang line ends only at a newline, as the kernel reads it: both
+        are refused."""
+        env_python = "/invented/staging/releases/r/env/bin/python"
+        launcher = (f"#!{env_python}\n# -*- coding: utf-7 -*-\n# a comment +AAo-import os\nimport sys\n"
+                    "from plateia_chat import pchat\nif __name__ == '__main__':\n"
+                    "    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n    sys.exit(pchat())\n")
+        plain = launcher.replace("# -*- coding: utf-7 -*-\n", "").replace("# a comment +AAo-import os\n", "")
+        launcher_problem = stage_release.launcher_problem
+        self.assertIsNone(launcher_problem(plain.encode(), "plateia_chat", "pchat"))
+        self.assertEqual(launcher_problem(launcher.encode(), "plateia_chat", "pchat"),
+                         "it imports something other than re and sys before the entry point")
+        self.assertIsNone(stage_release.interpreter_of(f"#!{env_python}\r# x\nimport sys".split("\n")))
+
     def test_the_api_check_is_not_applicable_never_a_pass(self):
         report = self.preflight()
         self.assertIn(["not applicable", "api",
@@ -407,6 +425,29 @@ class BlockingTests(StageCase):
                                                     r"~/\.claude, which is or holds private data; nothing under it is "
                                                     r"read")
         self.assertFalse(plan["importers"]["complete"])
+        self.assertNotIn(_staging.SECRETS[0], json.dumps(plan))
+        self.assertNotIn(_staging.SECRETS[0], stage_release.render_plan(plan))
+
+    def test_an_aliased_launchagents_folder_into_private_data_is_never_opened(self):
+        """Round 10's fixture: ~/Library/LaunchAgents is a link to the
+        invented ~/.config/chat, which holds private content at both expected
+        plist names. A managed file is read only when it is reached from the
+        home folder with no alias on the way: with open and os.open set to
+        fail on those inodes, the full plan never opens them, both
+        LaunchAgent targets block naming why, and staging is refused."""
+        agents, private_dir = self.home / "Library/LaunchAgents", self.home / ".config/chat"
+        private = [_staging.write(private_dir / name, f'{{"token": "{_staging.SECRETS[0]}"}}\n')
+                   for name in ("com.coghex.chat-bridge.plist", "com.coghex.log-rotate.plist")]
+        shutil.rmtree(agents)
+        agents.symlink_to(private_dir)
+        self.before = _staging.snapshot_tree(self.home)
+        with self.never_opened(*private):
+            plan = self.plan()
+            self.assertNothingStaged(r"blocked")
+        blocked = {t["name"]: t["problems"] for t in plan["targets"] if t["kind"] == "launchagent"}
+        self.assertEqual(len(blocked), 2)
+        for problems in blocked.values():
+            self.assertRegex(problems[0], r"can't be read \(reached through an alias, which may lead to private data")
         self.assertNotIn(_staging.SECRETS[0], json.dumps(plan))
         self.assertNotIn(_staging.SECRETS[0], stage_release.render_plan(plan))
 
@@ -1325,6 +1366,60 @@ class EnvironmentIntegrityTests(StageCase):
                 ("sys.argv[0].endswith()", endswith_rewrite,
                  r"the staged pchat command isn't the launcher pip writes for the wheel's entry point "
                  r"\(plateia_chat:pchat\): its __main__ block doesn't normalise sys\.argv\[0\] as pip does")):
+            with self.subTest(launcher=name):
+                if self.dest.exists():
+                    shutil.rmtree(self.dest)
+
+                def boundary(argv, rewrite=rewrite, **kw):
+                    result = real(argv, **kw)
+                    if is_pip(argv):
+                        pchat = self.env() / "bin/pchat"
+                        data = rewrite(pchat.read_text()).encode()
+                        self.assertNotEqual(data, pchat.read_bytes())
+                        pchat.write_bytes(data)
+                        record = next(self.site().glob("plateia_chat-*.dist-info/RECORD"))
+                        rows = [line if not line.startswith("../../../bin/pchat,") else
+                                f"../../../bin/pchat,{build_release.record_hash(data)},{len(data)}"
+                                for line in record.read_text().splitlines()]
+                        record.write_text("\n".join(rows) + "\n")
+                    return result
+                with mock.patch.object(stage_release, "run", boundary):
+                    with self.assertRaisesRegex(Refused, r"install-package failed: " + pattern):
+                        self.stage()
+                self.assertEqual(stage_release.status(self.dest)[0]["state"],
+                                 "unfinished (last: outcome install-package: failed)")
+                self.assertFalse((self.env().parent / "env-inventory.json").exists())
+                self.assertHomeUnchanged()
+
+    def test_a_launcher_missing_its_template_import_or_with_shebang_arguments_is_refused(self):
+        """Round 10's fixtures: right after pip returns, pchat carries the
+        re.sub normalisation without `import re`, or its shebang passes the
+        interpreter an argument (-S), each with its RECORD row updated. A
+        launcher must be exactly one of pip's templates, imports included,
+        and run bin/python with no arguments: refused, naming the command,
+        and nothing recorded installed."""
+        real = stage_release.run
+
+        def without_import_re(text):
+            lines = [line for line in text.splitlines() if line != "import re"]
+            start = next(i for i, line in enumerate(lines) if line.startswith("if __name__"))
+            end = next(i for i, line in enumerate(lines) if line.strip().startswith("sys.exit("))
+            return "\n".join(lines[:start + 1] + ["    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', "
+                                                   "sys.argv[0])"] + lines[end:]) + "\n"
+
+        def shebang_argument(text):
+            lines = text.splitlines()
+            if lines[0] == "#!/bin/sh":
+                lines[1] = lines[1].replace('" "$0"', '" -S "$0"')
+            else:
+                lines[0] += " -S"
+            return "\n".join(lines) + "\n"
+        for name, rewrite, pattern in (
+                ("re.sub without import re", without_import_re,
+                 r"the staged pchat command isn't the launcher pip writes for the wheel's entry point "
+                 r"\(plateia_chat:pchat\): its imports aren't those of the pip template its __main__ block follows"),
+                ("shebang argument -S", shebang_argument,
+                 r"the staged pchat command doesn't run the environment's verified interpreter")):
             with self.subTest(launcher=name):
                 if self.dest.exists():
                     shutil.rmtree(self.dest)

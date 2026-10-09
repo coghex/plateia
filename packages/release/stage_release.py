@@ -312,7 +312,14 @@ def observe_launchagent(t, path, skills, provenance):
         return {"type": "symlink" if path.is_symlink() else "other"}, \
             "unknown ownership: not a regular property-list file"
     try:
-        data = guarded_bytes(path)
+        # Read only when reached from the home folder with no alias on the
+        # way: ~/Library/LaunchAgents linked into private data, say, makes
+        # the expected plist name private data, which is never opened.
+        home = os.path.normpath(os.path.abspath(Path.home()))
+        rel = os.path.relpath(os.path.normpath(os.path.abspath(path)), home)
+        if rel.startswith(".."):
+            raise OSError(errno.EINVAL, "outside the home folder; not read")
+        data = guarded_bytes(path, (home, rel))
     except OSError as e:
         return {"type": "file"}, f"unknown ownership: {shown(path)} can't be read ({e.strerror or e})"
     observed = {"type": "file", "sha256": hashlib.sha256(data).hexdigest()}
@@ -1631,33 +1638,38 @@ def check_root_contents(writer):
 LAUNCHER = re.compile(r"""^'''exec' (?:"([^"]+)"|(\S+)) "\$0" "\$@"$""")  # quoted only with spaces
 
 
-# The sys.argv[0] normalisations pip writes in a console-script launcher,
-# across the pip versions venv bundles (distlib's template, then pip's own,
-# before and after it adopted str.removesuffix). A launcher's __main__ block
-# carries exactly one of them, statement for statement.
-PIP_ARGV0 = tuple(ast.dump(ast.parse(form)) for form in (
-    r"sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])",
-    r"sys.argv[0] = re.sub(r'(-script\.pyw?|\.exe)?$', '', sys.argv[0])",
-    "if sys.argv[0].endswith('-script.pyw'):\n    sys.argv[0] = sys.argv[0][:-11]\n"
-    "elif sys.argv[0].endswith('.exe'):\n    sys.argv[0] = sys.argv[0][:-4]",
-    "if sys.argv[0].endswith('.exe'):\n    sys.argv[0] = sys.argv[0][:-4]",
-    "sys.argv[0] = sys.argv[0].removesuffix('.exe')"))
+# pip's console-script launcher templates, across the pip versions venv
+# bundles (distlib's, then pip's own, before and after it adopted
+# str.removesuffix): {the sys.argv[0] normalisation, as ast.dump: the imports
+# that template has before the entry point's, in order}. A launcher carries
+# exactly one normalisation, statement for statement, with exactly its
+# template's imports.
+PIP_ARGV0 = {ast.dump(ast.parse(form)): imports for form, imports in (
+    (r"sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])", ("re", "sys")),
+    (r"sys.argv[0] = re.sub(r'(-script\.pyw?|\.exe)?$', '', sys.argv[0])", ("re", "sys")),
+    ("if sys.argv[0].endswith('-script.pyw'):\n    sys.argv[0] = sys.argv[0][:-11]\n"
+     "elif sys.argv[0].endswith('.exe'):\n    sys.argv[0] = sys.argv[0][:-4]", ("sys",)),
+    ("if sys.argv[0].endswith('.exe'):\n    sys.argv[0] = sys.argv[0][:-4]", ("sys",)),
+    ("sys.argv[0] = sys.argv[0].removesuffix('.exe')", ("sys",)))}
 
 
-def launcher_problem(text, module, attr):
+def launcher_problem(data, module, attr):
     """None when a console script is the launcher pip writes for the entry
     point module:attr, judged by its structure (ast.parse runs nothing),
     never by its RECORD hash: after the shebang (and, for a long path, the
-    /bin/sh exec preamble, a bare string to Python), only `import re` and
-    `import sys`, the one import of the entry point, and an
-    `if __name__ == "__main__":` block that normalises sys.argv[0] exactly
-    as a pip launcher does (PIP_ARGV0) and then exits with the entry
-    point's result. Otherwise the reason."""
+    /bin/sh exec preamble, a bare string to Python), exactly one of pip's
+    templates (PIP_ARGV0): that template's imports (`import re` and
+    `import sys`, or `import sys` alone), the one import of the entry point,
+    and an `if __name__ == "__main__":` block that normalises sys.argv[0]
+    as that template does and then exits with the entry point's result.
+    The bytes are parsed as Python reads the file, its coding declaration
+    included, so nothing can hide from the check in a comment. Otherwise
+    the reason."""
     try:
-        body = ast.parse(text).body
+        body = ast.parse(data).body
     except (SyntaxError, ValueError):
         return "it isn't valid Python"
-    if text.startswith("#!/bin/sh\n"):
+    if data.startswith(b"#!/bin/sh\n"):
         if not (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
                 and isinstance(body[0].value.value, str)):
             return "its /bin/sh preamble isn't pip's"
@@ -1678,8 +1690,11 @@ def launcher_problem(text, module, attr):
     *rewrites, last = guard.body
     if ast.unparse(last) != f"sys.exit({attr}())":
         return f"its __main__ block doesn't end by exiting with {attr}()"
-    if ast.dump(ast.Module(body=rewrites, type_ignores=[])) not in PIP_ARGV0:
+    template = PIP_ARGV0.get(ast.dump(ast.Module(body=rewrites, type_ignores=[])))
+    if template is None:
         return "its __main__ block doesn't normalise sys.argv[0] as pip does"
+    if imports != [(name, None) for name in template]:
+        return "its imports aren't those of the pip template its __main__ block follows"
     return None
 
 
@@ -1687,13 +1702,13 @@ def interpreter_of(lines):
     """The interpreter a console script runs: its shebang's, or, when pip
     wrote the /bin/sh launcher it uses for a path too long for a shebang
     (Linux allows 127 bytes), the one that launcher execs."""
-    if not lines or not lines[0].startswith("#!"):
+    if not lines:
         return None
-    words = lines[0][2:].split()
-    if words == ["/bin/sh"]:
-        m = LAUNCHER.match(lines[1]) if len(lines) > 1 else None
+    if lines[0] == "#!/bin/sh":
+        m = LAUNCHER.match(lines[1]) if len(lines) > 2 and lines[2] == "' '''" else None
         return (m.group(1) or m.group(2)) if m else None
-    return words[0] if words else None
+    m = re.fullmatch(r"#!(\S+)", lines[0])  # pip passes the interpreter no argument
+    return m.group(1) if m else None
 
 
 def wheel_contents(wheel):
@@ -1804,7 +1819,7 @@ def check_installed(inventory, env_fd, env, wheel, package):
         if hashlib.sha256(data).hexdigest() != entry[1]:
             raise Refused(f"the staged {command} command changed while it was read")
         text = data.decode("utf-8", errors="replace")
-        runs = interpreter_of(text.splitlines())
+        runs = interpreter_of(text.split("\n"))  # lines as the kernel reads a shebang: \r is no line end
         if not runs or os.path.normpath(runs) != os.path.normpath(Path(env) / "bin" / "python"):
             raise Refused(f"the staged {command} command doesn't run the environment's verified interpreter "
                           "(its bin/python)")
@@ -1821,8 +1836,7 @@ def check_installed(inventory, env_fd, env, wheel, package):
             raise Refused(f"the installed {named} no longer matches the package's RECORD")
     for command in package["commands"]:
         module, _, attr = entry_points[command].partition(":")
-        problem = launcher_problem(read_inside(env_fd, f"bin/{command}").decode("utf-8", errors="replace"),
-                                   module, attr)
+        problem = launcher_problem(read_inside(env_fd, f"bin/{command}"), module, attr)
         if problem:
             raise Refused(f"the staged {command} command isn't the launcher pip writes for the wheel's entry point "
                           f"({entry_points[command]}): {problem}")
