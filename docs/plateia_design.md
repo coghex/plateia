@@ -2127,8 +2127,9 @@ decisions.
   - Absence is proved only by finality specific to the attempt: the server's
     in-order reply on the attempt's own connection.
   - A crash, a broken connection, or no response by the end of a bounded
-    drain leaves the part unknown. So does a refusal whose durable record
-    failed. A timeout never proves a message was not sent.
+    drain can never prove absence, and neither can a timeout. Such a part is
+    confirmed only by the designated-sender rule. Otherwise it stays unknown.
+  - A refusal whose durable record failed stays unknown.
   - An unknown part is kept, never resent, and after 24 hours it is
     dead-lettered, keeping its progress, with a content-free owner alert.
   - Confirmed parts are never resent, and independent posts keep flowing.
@@ -2138,9 +2139,28 @@ decisions.
   - Acceptance 7 recovers the SQLite crash state rather than a claimed file,
     with the same behavioral assertions (AD-1).
   - Acceptance 3's absence fixture needs finality specific to the attempt,
-    not a bare timeout (AD-2).
+    not a bare timeout (AD-2). The second amendment makes that a non-refusal
+    error reply with the attempt's matching completion PONG: a late PONG
+    without an error confirms the part, and a FAIL dead-letters it.
 
-  #19 carries the owner's amendment saying so.
+  #19 carries the owner's amendments saying so.
+- **Release packaging (second amendment, 2026-10-09).** #19's implementation
+  includes, in the same pull request, the minimal release metadata and
+  validation that package the SQLite authority correctly:
+  - the `outbox.db` state format, with its read and write versions;
+  - the new fallback-row and versioned dead-letter versions;
+  - every new runtime module in the payload;
+  - the new host interfaces;
+  - a test tying them to the shipped code.
+
+  That resolves #19's conflict between "`packages/chat` only" and its
+  release exclusion. Other release behavior, staging, live migration and
+  activation stay excluded. No rollback compatibility across `outbox-db/1`
+  is claimed: that is a breaking state migration, reserved for activation's
+  owner checkpoint and recovery plan. The details are in
+  [chat_outbox_state.md](chat_outbox_state.md) section 10.1.
+  - **Requirement 12.** It is satisfied by D-72 and this decision; no further
+    D-number is created for it.
 
 Delivery stays at-least-once with the record check, and nothing claims
 exactly-once. These decisions approve the design only: implementing it needs

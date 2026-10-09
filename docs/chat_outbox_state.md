@@ -4,10 +4,15 @@ This is the design note for #19 and pull request #20. It is design only:
 nothing here is implemented, and implementing it needs a separate owner
 decision.
 
-This is revision 3, the final design revision. It answers design review round
-2, and section 12 lists what changed and why. The owner's decisions of
-2026-10-09 are recorded in section 11 and in D-73 of
-[plateia_design.md](plateia_design.md).
+This is revision 4. Revision 3 answered design review round 2. Revision 4
+aligns the note with the owner's second amendment to #19:
+
+- the release-packaging scope;
+- the corrections and additions from the canonical issue review of the first
+  amendment.
+
+Section 12 lists what changed and why. The owner's decisions of 2026-10-09 are
+recorded in section 11, and in D-73 of [plateia_design.md](plateia_design.md).
 
 ## Background
 
@@ -64,6 +69,8 @@ Every example uses invented data: projects `alpha` and `beta`, the owner
 | `A` (`CLOCK_ALLOWANCE`) | 5 s | The allowed difference between the writer's wall clock and the server's message time. |
 | `PART_WAIT` | 30 s | The absolute deadline for the server to confirm one part (as in PR #20). |
 | `DRAIN_WAIT` | 30 s | After `PART_WAIT`, how much longer the writer keeps reading for the server's late in-order reply before closing (section 5.2). |
+| `LOGIN_WAIT` | 30 s | The absolute deadline for connecting, capability negotiation, SASL and the welcome, from opening the socket (section 5.1). |
+| `CHANNEL_WAIT` | 15 s | The absolute deadline for creating or joining a channel and seeing the bridge in it, after a 403 (section 5.1). |
 | `UNDECIDED_MAX` | 24 h | How long a part may stay undecided, counted from its attempt's write. Then it is dead-lettered. |
 | `GC_MARGIN` | 1 h | The extra age before evidence may be collected (I-7). |
 
@@ -209,8 +216,8 @@ entry.
 
 | # | From | To | Actor | Guard | Durable write (one `TX`) | After commit |
 |---|---|---|---|---|---|---|
-| Q0 | (none) | `open`, `outbox`, no parts | P | No E1 has committed for this call. The failure came before any byte was written: no connection, a failed login, or a failed E1. Silent-run refusal is checked first and commits nothing. | A new entry with a fresh random id, the post's or ack's legacy fields, and no parts. If this `TX` fails, P falls back to a durable legacy append (section 6.4). | exit 3, as today: the whole post is queued |
-| E1 | (none) | `open`, `direct` | P | after logging in | The entry, and its parts as `unsent`, fixed now from the connection's capabilities. An ack has one pseudo-part. | A1 for part 0 |
+| Q0 | (none) | `open`, `outbox`, no parts | P | Entry *X* does not exist. The failure came before any byte was written: no connection, a failed login or setup, or a failed E1. Silent-run refusal is checked first and commits nothing. | `INSERT` entry *X* with the post's or ack's legacy fields and no parts. If *X* already exists, because an E1 that reported failure had in fact landed, nothing is inserted, and P runs E3 on *X* instead. If this `TX` fails, P makes the durable fallback append (section 6.4). | exit 3, as today: the whole post is queued once |
+| E1 | (none) | `open`, `direct` | P | after logging in | `INSERT` entry *X*, and its parts as `unsent`, fixed now from the connection's capabilities. An ack has one pseudo-part. | A1 for part 0 |
 | E2 | (none) | `open`, `outbox` | B, by import | `L_flush` + `L_outbox` | The entry with its occurrence identity, committed with the `imports` row. | I3 |
 | E3 | `open`, `direct` | `open`, `outbox` | P, owner | — | `owner_kind = 'outbox'` (the handoff). | exit 3, as today |
 | H1 | `open`, `direct`; or `abandoned` with `abandon_epoch = import_epoch` | `open`, `outbox` | B, by importing a handoff row | `L_flush` + `L_outbox`. The row's entry id **and** writer identity equal the entry's. | `owner_kind = 'outbox'`, and `state = 'open'` again if it was `abandoned`. | none |
@@ -219,6 +226,14 @@ entry.
 | E6 | `open` | `terminal` (refused) | the writer recording A3 | — | The terminal reason, in A3's `TX`; `export_version = 1`. | X1 |
 | E7 | `open` or `abandoned` | `terminal` (undecided) | B | Some part's attempt, `writing` or `ended`, is undecided more than `UNDECIDED_MAX` after its `written_at`. | Terminal, with the alert flag; `export_version = 1`. An `ended` attempt becomes `dead` (A10). A `writing` attempt is **left** `writing`. | X1, X2 |
 | E8 | `open`, `direct` | `abandoned` | B | The owner is **gone**, and none of its attempts is `writing` (A8 first). | `abandoned`, `abandon_epoch = import_epoch`. Its unsent remainder is not adopted (D1). Its unknown parts still go to E7. | none |
+
+**One identity per call.** Each `pchat post`, `pchat ack`, `notify` or
+`announce` call generates one random entry id *X* before its first `TX`. E1,
+Q0, E3 and the fallback row all name *X*, and `entries.id` is the primary key.
+So whichever creation lands first wins, and every later attempt to create *X*
+is a no-op or a handoff, never a second obligation. Two separate calls, even
+with identical text, have distinct ids, so they stay distinct occurrences
+(F5 of the issue review).
 
 `done` and `terminal` are final. An `abandoned` entry leaves only by:
 
@@ -400,7 +415,9 @@ discards a committed obligation.
 
 **Why it holds.**
 
-- **A1 fails:** nothing is written, and the call queues itself by Q0.
+- **A1 fails:** nothing is written. If entry *X* exists, P hands it off
+  (E3), so the existing E1 entry is kept and no second obligation is created.
+  Otherwise P queues by Q0.
 - **A2–A5 fail:** the writer closes the connection if it is still open, keeps
   the observed outcome in memory, and retries the commit:
   - within the call, up to `PART_WAIT`;
@@ -435,9 +452,23 @@ That is round-5 finding 3.
 
 A row may be deleted only when every condition for its kind holds.
 
+**Dependency components.** For each unresolved attempt U (`writing`,
+`ended`, or `dead` with an open window), take its *dependency component*. That
+is every attempt of the same account and channel, of **any** text key and any
+state, connected to U through overlapping windows, transitively. The *hull* is
+the span from the earliest window start to the latest window end of that
+component; it is unbounded if any window is open.
+
+The component includes everything R1 and R2 may count for U:
+
+- the members of U's own reconciliation component, including confirmed
+  attempts without a msgid;
+- the confirmed attempts R2 condition 5 uses to account for other texts;
+- a confirmed member whose own message lies outside U's window but inside its
+  own (issue review addition).
+
 1. **Messages.**
-   - No attempt of the same account and channel whose window contains the
-     message's time is `writing`, `ended`, or `dead` with an open window.
+   - The message's time lies inside the hull of no dependency component.
      This covers every fragment and every cross-key dependency, because all
      of them share the account and channel.
    - The message's time is before `now − A − GC_MARGIN`.
@@ -454,9 +485,7 @@ A row may be deleted only when every condition for its kind holds.
      the entry, and its progress is no longer reopenable (F4);
    - none of its attempts is `writing`, `ended`, or `dead` with an open
      window;
-   - no attempt of another entry with the same account and channel that is
-     `writing`, `ended`, or `dead` with an open window has a window
-     overlapping theirs;
+   - none of its attempts belongs to any dependency component;
    - their windows ended before `now − A − GC_MARGIN`.
 4. **Never collected:**
    - entry rows, which are kept as tombstones;
@@ -486,8 +515,12 @@ An entry interacts with others only through same-account, same-channel
 evidence. An undecided, failing or refused entry never stops the flush from
 attempting every other open outbox entry.
 
-Each entry's work is isolated. Each attempt's wait is bounded by `PART_WAIT +
-DRAIN_WAIT`.
+Each entry's work is isolated, and each entry's turn in a flush is bounded by
+absolute deadlines that unrelated traffic cannot extend:
+
+- `LOGIN_WAIT` for setup;
+- `PART_WAIT + DRAIN_WAIT` per part;
+- `CHANNEL_WAIT` for one channel recreation.
 
 ### How each round-5 finding is closed
 
@@ -505,6 +538,19 @@ DRAIN_WAIT`.
 - **One flow per connection.** A connection belongs to the one flow that
   opened it, in one `post()` or ack call. It carries at most one unresolved
   attempt at a time.
+- **Bounded setup.** Every wait has an absolute monotonic deadline, checked
+  before every read, as PR #20 already does for `PART_WAIT`. Unrelated
+  traffic, such as server notices or other channels' messages, never extends
+  one:
+  - connecting, capability negotiation, SASL and the welcome share one
+    `LOGIN_WAIT` deadline;
+  - creating or joining a channel after a 403, and waiting to see the bridge
+    join it, share one `CHANNEL_WAIT` deadline.
+
+  Missing a setup deadline is a failure before any byte of the next part is
+  written:
+  - a direct call queues by Q0, or hands off its entry by E3;
+  - a flush records nothing new and moves on to the next entry.
 - **Close before `ended`.** The writer closes the socket (shutdown, then
   close), and only then commits A5.
 - **After closing.** The process cannot send on that socket again. Bytes
@@ -626,10 +672,12 @@ before it (or before its commit) and just after it. "→" names the recovery.
 
 | Boundary | Crash just before | Crash just after |
 |---|---|---|
-| login, or connection setup | nothing durable, nothing sent | → Q0 if P is still running |
-| Q0 `TX` | nothing durable, as today | `open`, `outbox` → flushed |
-| Q0 fallback append, then `fsync` | nothing durable, as today. A power loss before the `fsync` is the same. | durable → imported (E2) |
-| E1 | nothing durable, nothing sent → Q0 | `open`, `direct`, all `unsent` → if the writer is gone, E8, nothing unknown → retired as today |
+| login, or connection setup (bounded by `LOGIN_WAIT`) | nothing durable, nothing sent | → Q0 on *X* if P is still running |
+| Q0 `TX` | nothing durable, as today | `open`, `outbox` *X* → flushed |
+| Q0 `TX` reported failure but landed | — | *X* exists. P's fallback row names *X*, so its import is a no-op, never a second entry. |
+| Q0 fallback append, then `fsync` | nothing durable, as today. A power loss before the `fsync` is the same. | durable → imported as *X* (section 6.4) |
+| E1 | nothing durable, nothing sent → Q0 on *X* | `open`, `direct` *X*, all `unsent` → if P is still running, E3 hands *X* off. If the writer is gone, E8, nothing unknown → retired as today. |
+| E1 reported failure but landed | — | P finds *X* before Q0 → E3 on *X*: one obligation |
 | A1 | the previous state → Q0 if nothing was written, else E3 | `writing` → A8 → `uncertain`, no finality → R1 or E7 |
 | sending lines and PING | `writing` → A8 | same |
 | `PART_WAIT` and the drain | `writing` → A8 | same |
@@ -765,7 +813,7 @@ only local work.
      for example `sha256(name + ":" + i)`, and is UNIQUE. An explicit id
      never replaces it.
    - **A text or ack row** becomes an `open`, `outbox` entry (E2).
-   - **A fallback row** is handled by its kind (section 6.4).
+   - **A fallback row** is applied by its entry id *X* (section 6.4).
    - **Any other row** is held.
    - **Record the import:** insert the `imports` row (name, line count,
      sha256, epoch).
@@ -777,24 +825,26 @@ only local work.
 
 Every fallback append is a durable append under `L_outbox` (section 2.1).
 
-- **A queue row (Q0's fallback).** When Q0's `TX` fails, P appends the post's
-  or ack's legacy fields, exactly today's whole-post row. It imports as an
-  ordinary legacy occurrence.
+There is one fallback row shape, for both Q0 and E3. It holds the post's or
+ack's legacy fields, plus `fallback: true`, the call's entry id *X*, and P's
+writer identity when P had a connection. P appends it when Q0's or E3's `TX`
+cannot commit. Import applies it by *X*, never by occurrence:
 
-  P generates E1's entry id before E1's `TX`. Before Q0, P therefore checks
-  in a new `TX` whether that id exists, which happens when a commit reported
-  failure but had in fact landed. If it exists, P marks it `abandoned` itself
-  (it is the owner, and the entry has no attempts). If P cannot, the entry
-  has no attempts and is never sent, and once P is gone it is abandoned (E8).
-  Either way the post is delivered once, through Q0.
-- **A handoff row (E3's fallback).** P appends the legacy fields, plus
-  `handoff: true`, the entry id and P's writer identity. On import:
-  - **the entry exists:** apply H1 if its guard holds; otherwise hold the row.
-    Nothing is merged.
-  - **no such entry:** this is impossible, because E3 needs E1, and entry
-    rows are never deleted. The row is held, and never imported as a whole
-    post.
-  - **a second row for the same entry:** a no-op once H1 has applied.
+- **Entry *X* exists and is `open`, `direct`, or `abandoned` with H1's
+  guard:** apply H1. The existing E1 entry and its progress are kept.
+- **Entry *X* exists and is already `outbox`, `done` or `terminal`:** a no-op.
+  This includes a Q0 commit that reported failure but had landed. Nothing is
+  merged, and no second entry is created.
+- **Entry *X* exists, and H1's identity guard fails:** hold the row.
+- **Entry *X* does not exist:** E1 never committed, so by I-1 nothing of this
+  call was sent. Import inserts entry *X* (`open`, `outbox`, no parts),
+  delivering the whole post once, as today. The row's occurrence (file,
+  ordinal) is recorded with it.
+
+Every creation is an `INSERT` on the primary key *X*, so an ambiguous commit
+that becomes visible later, whether E1's or Q0's, collides with the import's
+insert instead of duplicating it. Legacy rows from the old tools carry no *X*,
+and keep their occurrence-derived ids (section 6.3).
 
 If a fallback append fails too, P fails as it does today when the outbox
 cannot be written. Whatever already committed still prevents a blind resend.
@@ -1012,15 +1062,18 @@ posted on the issue. The mapping is to the amended issue.
 | R1, per-part outcome | A2, A5 and A4, and the part states. `PART_WAIT` is absolute, and the drain is bounded. |
 | R2, no resend of a confirmed part | I-3; E3, H1 and Q0 queue only what has no committed attempt. |
 | R3, fixed parts; legacy rows as today | E1 and E4; section 6.2. |
-| R4, durable progress | A1 before bytes; A2 or A5 before the next part; A8 and A8c; I-5. A failure before any write queues the whole post (Q0, as today). |
+| R4, durable progress | A1 before bytes; A2 or A5 before the next part; A8 and A8c; I-5. A failure before any write queues the whole post once (Q0 on *X*, as today). An existing E1 entry is kept, and handed off by E3. |
 | R5, reconciliation, as amended (D2, N6, N7) | R1, R2, R3, E7, X1 and X2. |
-| R6, independent flow | I-10 |
+| R6, independent flow | I-10; bounded setup (section 5.1). |
 | R7, refusals | A3 and E6; N6 for a refusal that could not be recorded. |
 | R8, visibility | `pchat status` from the database: waiting to post, awaiting a check, held rows, suspended designations. |
 | R9, no exactly-once | Stated here. |
-| R10–R13 | Unchanged. |
+| R10–R11, R13 | Unchanged. |
+| R12, contract documentation | Satisfied by D-72 and D-73, which are updated as needed. No new D-number. |
+| R14, the SQLite authority | Sections 2–7. |
+| R15, release packaging (second amendment) | Section 10.1. |
 | Acceptance 1, 2, 4–6, 8–10 | Behavior unchanged. For acceptance 2, the test designates its fake account (D2). |
-| Acceptance 3 | As amended (AD-2): the fixture needs attempt-specific finality. |
+| Acceptance 3 | As amended (AD-2, corrected by the second amendment). The fixture gives part 3 a **non-refusal** error reply together with its matching completion PONG, complete coverage, and no unexplained message. Companion checks: a late PONG without an error is A2, confirmed and not resent; a FAIL is A3, dead-lettered and not retried; a bare timeout, crash or broken connection never proves absence. |
 | Acceptance 7 | As amended (AD-1): the test recovers the SQLite crash state, with the same assertions. |
 
 **Narrowings inside UNKNOWN.** Each of these ends as UNKNOWN, never as a
@@ -1105,14 +1158,42 @@ differ.
 10. **Late outcomes (F6).** A paused writer resumes after E7's export: version
     2 is exported, and supersedes version 1, before G1 may collect anything.
     The entry stays terminal.
-11. **Failure before E1 (F7).** For `pchat post`, `pchat ack`, `notify` and
-    `announce`:
+11. **Failure before E1 (F7), and ambiguous creation commits.** For `pchat
+    post`, `pchat ack`, `notify` and `announce`:
     - a failed login;
     - a failed E1;
     - a crash before and after Q0;
-    - Q0's fallback append, and power loss on either side of its `fsync`.
+    - Q0's fallback append, and power loss on either side of its `fsync`;
+    - **an E1 commit that reports failure but lands.** P finds *X* and hands
+      it off. Restart, then import.
+    - **a Q0 commit that reports failure but lands, then a fallback row.**
+      Import, restart, import again: one entry *X*.
 
-    Each queues the whole post once, as today.
+    Each queues the whole post once, as today. Two separate calls with
+    identical text are still two entries.
+19. **Collection, then delayed reconciliation.** A confirmed attempt K has no
+    msgid, and its message lies before the window of an unresolved attempt U,
+    but K's window overlaps U's. Run G1 when K's message is older than
+    `GC_MARGIN`, then reconcile U. K's message and attempt are kept, and U's
+    verdict is the same as without G1.
+20. **Bounded setup.** On an injected clock, the fake server trickles
+    unrelated lines during each of these phases:
+    - capability negotiation;
+    - SASL;
+    - the welcome;
+    - NAMES or INVITE in channel creation.
+
+    Each phase fails at its absolute deadline. Another entry in the same
+    flush still gets its attempt.
+21. **Release packaging (future, under R15).** The release inventory test ties
+    markers in the shipped code to the new format entries:
+    - `outbox.db` to the outbox store format, read and written;
+    - the fallback rows to the outbox format version, read and written;
+    - versioned post dead letters to the delivery records version;
+    - each new host probe to its read-only format.
+
+    The built payload contains every new runtime module. Every other format
+    entry, and the release behavior, are unchanged.
 12. **Crash at every boundary.** One case per row of section 5.5.
 13. **A paused writer, and the liveness probes.** Never ended or retried. E7
     at 24 hours. A missing pid, a changed start time and a changed boot id are
@@ -1147,9 +1228,57 @@ and process and socket probes. The change keeps PR #20's:
 - the refusal and legacy paths;
 - the coverage model.
 
-It replaces the file state with the database layer, and adds the drain, the
-probes, durable file writes and the import epoch. That is about 1,000 to 2,000
-changed lines, including tests.
+It replaces the file state with the database layer, and adds:
+
+- the drain;
+- the setup deadlines;
+- the probes;
+- durable file writes;
+- the import epoch;
+- the minimal release metadata (section 10.1).
+
+That is about 1,000 to 2,000 changed lines, including tests.
+
+### 10.1 Release packaging (second amendment, R15)
+
+The release contract
+([release_contract.md](release_contract.md#the-manifest)) requires
+every persistent format, with the versions read and written, to be declared,
+and every runtime module to be in the payload. So the future implementation,
+in the same PR #20, makes these minimal declarations in
+`packages/release/release.json`:
+
+- **A new `state` format for the SQLite authority.**
+  - Path: `$CHAT_STATE/outbox.db`, with its `-wal` and `-shm` files.
+  - Read and write versions: `outbox-db/1`.
+  - Its version is embedded in the `meta` table's schema-version row.
+- **The `outbox` format** (`outbox.jsonl`, `outbox.lock`, claim files). Its
+  write version moves to `outbox/2`, which adds the fallback row; it reads
+  `outbox/1` and `outbox/2`.
+- **The `delivery-records` format.** Versioned post dead letters (`version`,
+  `supersedes`) write `delivery-records/2`, and it reads `/1` and `/2`.
+- **Every new runtime module** the implementation adds under
+  `packages/chat/scripts` is listed in `package.files`. It is also recorded in
+  `provenance.json` as a plateia-only file.
+- **The interpreter note** says that the standard library's `sqlite3` module
+  is required.
+- **New host interfaces the probes read:**
+  - a TCP socket listing, if it is not the existing `open-files` record;
+  - the boot id.
+
+  Each is a read-only `wire` format. Process start time is already declared as
+  `process-table`.
+
+Nothing else in the release changes: the builder, verification, staging, other
+format entries, the skill, and the package version policy. If declaring these
+needs any builder change, the implementer stops and asks.
+
+**Rollback is not claimed.** Releases before this one do not read
+`outbox-db/1`. Rolling back across it is a breaking state migration, which
+plateia_design.md's rollback principle reserves for an explicit owner
+checkpoint and a reviewed recovery plan. That belongs to activation, which
+stays excluded. The release declares the formats honestly, and claims no
+rollback compatibility.
 
 **Risks.**
 
@@ -1182,9 +1311,12 @@ The owner approved these on 2026-10-09. They are recorded as D-73 in
 3. **Conservative finality (N6, N7).**
    - Absence is proved only with attempt-specific server finality: the
      in-order reply on the attempt's own connection.
-   - A crash, a broken connection, or no response through the drain stays
-     UNKNOWN: preserved, and dead-lettered after 24 hours with its progress
-     kept. A timeout never proves a message was not sent.
+   - A crash, a broken connection, or no response through the drain can
+     never be proved absent. A timeout never proves a message was not sent.
+   - Missing finality does not prevent Delivered. When every designated-sender
+     condition of R1 holds, the part is delivered (second amendment).
+     Otherwise it stays UNKNOWN: preserved, and dead-lettered after 24 hours
+     with its progress kept.
    - A refusal whose durable commit fails is UNKNOWN.
    - Confirmed parts are never resent, and independent obligations keep
      flowing.
@@ -1195,6 +1327,13 @@ The owner approved these on 2026-10-09. They are recorded as D-73 in
      file, with the same behavioral assertions.
    - **AD-2:** acceptance 3's absence fixture needs attempt-specific server
      finality (a reply, an error, or a late PONG), not a bare timeout.
+
+6. **Release packaging (second amendment).** #19's implementation includes
+   the minimal release metadata and validation of section 10.1, in the same
+   PR #20. That resolves the conflict between #19's "packages/chat only" scope
+   and its release exclusion. Releases, staging, live migration and activation
+   otherwise stay excluded, and no rollback compatibility is claimed. Requirement
+   12 is satisfied by D-72 and D-73, with no new D-number.
 
 Implementation is **not** approved by these decisions. It needs a separate
 owner decision.
@@ -1229,3 +1368,16 @@ owner decision.
     every caller.
 - **Section 11** records the owner's decisions. D2, N6 and N7, AD-1 and AD-2
   are no longer open proposals.
+- **Revision 4** aligns the note with the owner's second #19 amendment:
+  - **Release packaging:** new section 10.1 and decision 6.
+  - **Acceptance 3:** the fixture uses a non-refusal error with the matching
+    PONG.
+  - **Finality vs Delivered:** missing finality blocks Absent, not
+    designated-sender Delivered.
+  - **One identity per call:** the call's entry id *X* makes every ambiguous
+    creation commit (E1 or Q0) and its fallback row a single obligation, and
+    an existing E1 entry is handed off, not replaced.
+  - **Collection:** by dependency component, including confirmed members whose
+    message lies outside the unresolved window.
+  - **Bounded setup:** absolute `LOGIN_WAIT` and `CHANNEL_WAIT` deadlines.
+  - **Tests:** 19–21 added.
