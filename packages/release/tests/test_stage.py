@@ -801,7 +801,7 @@ class AliasMatrixTests(StageCase):
     def test_a_replaced_directory_staging_created_is_refused(self):
         with self.assertRaises(stage_release.Crash):
             self.stage(crash=self.crash_when(lambda r: r["kind"] == "created" and r["path"] == "releases"))
-        (self.dest / "releases").rmdir()
+        (self.dest / "releases").rename(self.where / "old-releases")  # kept, so its inode can't be reused
         (self.dest / "releases").mkdir()  # same name, another inode
         with self.assertRaisesRegex(Refused, r"releases is a directory staging didn't create"):
             self.stage()
