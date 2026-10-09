@@ -25,8 +25,10 @@ only to see that it parses; values are never printed or recorded. Until a
 manifest declares an API version, the API check is "not applicable".
 
 `stage` runs both, then puts the release's artifacts and a private Python
-environment (the chosen interpreter's venv and its bundled pip, offline) in
-ROOT/releases/<release>/, under a locked, durable journal at ROOT/journal.jsonl.
+environment in ROOT/releases/<release>/ (the chosen interpreter's venv, with
+no pip or activation scripts, the package installed offline by that
+interpreter's bundled pip), under a locked, durable journal at
+ROOT/journal.jsonl.
 Every step's intent is journaled before it runs and its outcome after. A
 repeated or interrupted run reconciles the same operation from the journal and
 the disk, and verifies the artifacts and environment before reporting it
@@ -167,6 +169,22 @@ except Exception as e:
     found["error"] = f"{type(e).__name__}: {e}"[:300]
 print(json.dumps(found))
 """
+# venv runs in the operation's chosen interpreter with -I -S (no site, nothing
+# from the environment variables) and builds the environment with no pip and
+# no activation scripts, so what it leaves holds no code at all: the fixed
+# layout venv_problem checks it against before anything in it runs.
+VENV_BUILD = """import sys, venv
+class Builder(venv.EnvBuilder):
+    def setup_scripts(self, context):
+        pass  # no activation scripts
+Builder(symlinks=True).create(sys.argv[1])
+"""
+# pip runs from the chosen interpreter's bundled wheel (ensurepip's, the one
+# venv would install), never from the environment, with -I and with -B so it
+# writes no bytecode there.
+PIP_BOOT = ("import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); "
+            "runpy.run_module('pip', run_name='__main__', alter_sys=True)")
+ENSUREPIP_PROBE = "import ensurepip, os; print(os.path.dirname(ensurepip.__file__))"
 
 CALLS = []  # every external command this process ran: the process boundary tests inspect
 
@@ -387,7 +405,15 @@ def observe(t, skills, provenance):
         expected["content"] = f"{t['content']} as the provenance records it"
     record["expected"] = expected
     problems = []
-    if not os.path.lexists(path):
+    # The skills root's private-data boundary comes before any observation:
+    # a root that resolves into private data (~/.codex/skills linked to
+    # ~/.claude, say) exempts no managed file, so nothing under it, or
+    # reached through it, is read, and every target blocks.
+    excluded = private_bases(skills)[3].get(str(skills))
+    if excluded:
+        observed, problems = {"type": "not observed"}, [
+            f"unknown ownership: the skills root {shown(skills)} {excluded}; nothing under it is read"]
+    elif not os.path.lexists(path):
         observed, problems = {"type": "missing"}, [f"missing: {shown(path)}"]
     elif t["kind"] == "symlink":
         observed, problem = observe_symlink(t, path, skills, provenance)
@@ -1058,7 +1084,8 @@ class Writer:
       checkout and every protected location.
     - Files are created with O_CREAT|O_EXCL|O_NOFOLLOW under a fresh
       temporary name, journaled first, their inode journaled right after,
-      then renamed into place.
+      then linked into place, which never replaces an entry, and the
+      temporary name removed.
     - Nothing is replaced, truncated or deleted unless the journal records
       that this operation created it, and it is still that entry: same
       inode, singly linked, this owner. Anything else is refused."""
@@ -1209,14 +1236,25 @@ class Writer:
             os.close(fd)
         return self.root / rel
 
+    def replaceable(self, fd, name, rel):
+        """True when rel holds a regular file this operation created, False
+        when nothing is there; anything else is refused."""
+        st = self.entry(fd, name)
+        if st is not None and not (stat.S_ISREG(st.st_mode) and self.owned(rel, st)):
+            self.foreign(self.root / rel, "exists and is not a file this operation created")
+        return st is not None
+
     def write(self, rel, data):
         """Write a file this operation owns: a new one, or a replacement for
-        one it created; never through or over anything else."""
+        one it created; never through or over anything else. The bytes go
+        to a fresh temporary name and are published with link(), which never
+        replaces an entry: the name is checked again just before, and a
+        replacement first removes the file this operation created there, so
+        an entry that appears at the name meanwhile, whatever it is, is left
+        as it is and the write refused."""
         fd, name = self.parent(rel)
         try:
-            st = self.entry(fd, name)
-            if st is not None and not (stat.S_ISREG(st.st_mode) and self.owned(rel, st)):
-                self.foreign(self.root / rel, "exists and is not a file this operation created")
+            self.replaceable(fd, name, rel)
             head = rel.rpartition("/")[0]
             temp = f".{name}.{secrets.token_hex(6)}.tmp"
             temp_rel = (head + "/" if head else "") + temp
@@ -1230,7 +1268,13 @@ class Writer:
                 made = os.fstat(out)
             finally:
                 os.close(out)
-            os.replace(temp, name, src_dir_fd=fd, dst_dir_fd=fd)
+            if self.replaceable(fd, name, rel):
+                os.unlink(name, dir_fd=fd)
+            try:
+                os.link(temp, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+            except FileExistsError:
+                self.foreign(self.root / rel, "exists and is not a file this operation created")
+            os.unlink(temp, dir_fd=fd)
             self.note(rel, made, "file")
             os.fsync(fd)
         finally:
@@ -1587,7 +1631,17 @@ def check_root_contents(writer):
 LAUNCHER = re.compile(r"""^'''exec' (?:"([^"]+)"|(\S+)) "\$0" "\$@"$""")  # quoted only with spaces
 
 
-ARGV0 = "sys.argv[0]"
+# The sys.argv[0] normalisations pip writes in a console-script launcher,
+# across the pip versions venv bundles (distlib's template, then pip's own,
+# before and after it adopted str.removesuffix). A launcher's __main__ block
+# carries exactly one of them, statement for statement.
+PIP_ARGV0 = tuple(ast.dump(ast.parse(form)) for form in (
+    r"sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])",
+    r"sys.argv[0] = re.sub(r'(-script\.pyw?|\.exe)?$', '', sys.argv[0])",
+    "if sys.argv[0].endswith('-script.pyw'):\n    sys.argv[0] = sys.argv[0][:-11]\n"
+    "elif sys.argv[0].endswith('.exe'):\n    sys.argv[0] = sys.argv[0][:-4]",
+    "if sys.argv[0].endswith('.exe'):\n    sys.argv[0] = sys.argv[0][:-4]",
+    "sys.argv[0] = sys.argv[0].removesuffix('.exe')"))
 
 
 def launcher_problem(text, module, attr):
@@ -1596,9 +1650,9 @@ def launcher_problem(text, module, attr):
     never by its RECORD hash: after the shebang (and, for a long path, the
     /bin/sh exec preamble, a bare string to Python), only `import re` and
     `import sys`, the one import of the entry point, and an
-    `if __name__ == "__main__":` block that at most rewrites sys.argv[0]
-    from itself and then exits with the entry point's result. Otherwise
-    the reason."""
+    `if __name__ == "__main__":` block that normalises sys.argv[0] exactly
+    as a pip launcher does (PIP_ARGV0) and then exits with the entry
+    point's result. Otherwise the reason."""
     try:
         body = ast.parse(text).body
     except (SyntaxError, ValueError):
@@ -1624,36 +1678,9 @@ def launcher_problem(text, module, attr):
     *rewrites, last = guard.body
     if ast.unparse(last) != f"sys.exit({attr}())":
         return f"its __main__ block doesn't end by exiting with {attr}()"
-    if not all(argv0_rewrite(r) for r in rewrites):
-        return "its __main__ block does more than rewrite sys.argv[0]"
+    if ast.dump(ast.Module(body=rewrites, type_ignores=[])) not in PIP_ARGV0:
+        return "its __main__ block doesn't normalise sys.argv[0] as pip does"
     return None
-
-
-def argv0_rewrite(node):
-    """An assignment to sys.argv[0], or an if/elif over such assignments,
-    computed only from sys.argv[0], constants, slices, its endswith and
-    removesuffix, and re.sub: what pip's launchers (across its versions) do
-    to drop a -script.pyw or .exe suffix."""
-    if isinstance(node, ast.If):
-        return safe_expression(node.test) and all(argv0_rewrite(n) for n in node.body + node.orelse)
-    return (isinstance(node, ast.Assign) and len(node.targets) == 1 and ast.unparse(node.targets[0]) == ARGV0
-            and safe_expression(node.value))
-
-
-def safe_expression(node):
-    for n in ast.walk(node):
-        if isinstance(n, ast.Call):
-            name = ast.unparse(n.func)
-            if not (name == "re.sub" or (name in (f"{ARGV0}.endswith", f"{ARGV0}.removesuffix"))):
-                return False
-        elif isinstance(n, ast.Name) and n.id not in ("sys", "re"):
-            return False
-        elif isinstance(n, ast.Attribute) and n.attr not in ("argv", "sub", "endswith", "removesuffix"):
-            return False
-        elif not isinstance(n, (ast.Call, ast.Name, ast.Attribute, ast.Subscript, ast.Slice, ast.Constant,
-                                ast.UnaryOp, ast.USub, ast.Load, ast.Compare, ast.Eq)):
-            return False
-    return True
 
 
 def interpreter_of(lines):
@@ -1778,8 +1805,9 @@ def check_installed(inventory, env_fd, env, wheel, package):
             raise Refused(f"the staged {command} command changed while it was read")
         text = data.decode("utf-8", errors="replace")
         runs = interpreter_of(text.splitlines())
-        if not runs or os.path.normpath(runs) != os.path.normpath(Path(env) / "bin" / os.path.basename(runs)):
-            raise Refused(f"the staged {command} command doesn't run the staged interpreter")
+        if not runs or os.path.normpath(runs) != os.path.normpath(Path(env) / "bin" / "python"):
+            raise Refused(f"the staged {command} command doesn't run the environment's verified interpreter "
+                          "(its bin/python)")
         if not entry[2] & 0o100:
             raise Refused(f"the staged {command} command is not executable")
         module, _, attr = entry_points.get(command, "").partition(":")
@@ -1862,6 +1890,85 @@ def verify_static(writer, rel_dir, manifest_sha, manifest, inventory_sha):
 STARTUP_HOOKS = ("sitecustomize.py", "usercustomize.py")
 
 
+def link_chain(inventory, rel):
+    """Where the environment's link at rel leads, following links inside the
+    environment by its inventory: an absolute path, or None."""
+    for _ in range(8):
+        entry = inventory.get(rel)
+        if not entry or entry[0] != "link":
+            return None
+        if os.path.isabs(entry[1]):
+            return entry[1]
+        rel = os.path.normpath(os.path.join(os.path.dirname(rel), entry[1]))
+    return None
+
+
+def interpreter_problem(inventory, rel, interpreter):
+    """None when the environment's link at rel leads to the operation's chosen interpreter."""
+    end = link_chain(inventory, rel)
+    if end is None or os.path.realpath(end) != os.path.realpath(interpreter["path"]):
+        return (f"the staged environment's {rel} doesn't lead to the operation's interpreter "
+                f"({shown(interpreter['path'])})")
+    return None
+
+
+def pyvenv_problem(inventory, env_fd, interpreter):
+    """None when pyvenv.cfg, read through the pinned environment, names the
+    chosen interpreter's directory and version and keeps the system
+    site-packages out."""
+    entry = inventory.get("pyvenv.cfg")
+    data = read_inside(env_fd, "pyvenv.cfg") if entry and entry[0] == "file" else None
+    if data is None or hashlib.sha256(data).hexdigest() != entry[1]:
+        return "the staged environment's pyvenv.cfg is missing or changed while it was read"
+    cfg = dict(line.split("=", 1) for line in data.decode("utf-8", errors="replace").splitlines() if "=" in line)
+    cfg = {k.strip(): v.strip() for k, v in cfg.items()}
+    if cfg.get("include-system-site-packages") != "false":
+        return "the staged environment's pyvenv.cfg doesn't keep the system site-packages out"
+    home = os.path.dirname(link_chain(inventory, "bin/python") or "")
+    if cfg.get("version") != interpreter["version"] or os.path.realpath(cfg.get("home", "")) != os.path.realpath(home):
+        return "the staged environment's pyvenv.cfg doesn't name the operation's interpreter"
+    return None
+
+
+def venv_problem(inventory, env_fd, interpreter):
+    """None when what venv left is exactly what the standard library's venv
+    builds with no pip and no activation scripts (VENV_BUILD), judged
+    against that layout and the operation's chosen interpreter, never
+    against what was observed: the bin, include, lib and
+    lib/pythonX.Y/site-packages directories, all empty but bin; in bin,
+    only links that lead, inside the environment, to the chosen
+    interpreter; lib64 as a link to lib, where the platform makes one; and
+    a pyvenv.cfg naming the chosen interpreter that keeps the system
+    site-packages out. So nothing venv left can hold code: no .pth file,
+    sitecustomize or usercustomize, and no module. Otherwise the first
+    entry that differs, or the reason."""
+    major_minor = ".".join(interpreter["version"].split(".")[:2])
+    dirs = {"bin", "include", "lib", f"lib/python{major_minor}", f"lib/python{major_minor}/site-packages"}
+    for rel, entry in sorted(inventory.items()):
+        if (rel in dirs and entry == ["dir"]) or (rel == "lib64" and entry == ["link", "lib"]) \
+                or (rel == "pyvenv.cfg" and entry[0] == "file") \
+                or (os.path.dirname(rel) == "bin" and entry[0] == "link"
+                    and interpreter_problem(inventory, rel, interpreter) is None):
+            continue
+        return f"venv left {rel}, which the standard library's venv layout doesn't account for"
+    missing = sorted((dirs | {"bin/python", "pyvenv.cfg"}) - set(inventory))
+    if missing:
+        return f"venv left no {missing[0]}"
+    return interpreter_problem(inventory, "bin/python", interpreter) or pyvenv_problem(inventory, env_fd, interpreter)
+
+
+def bundled_pip(python):
+    """The chosen interpreter's bundled pip wheel, the one its venv would
+    install (ensurepip/_bundled): a file of the interpreter's own standard
+    library, outside the environment."""
+    r = run([python, "-I", "-S", "-c", ENSUREPIP_PROBE], env=child_env(), cwd=os.sep)
+    lines = r.stdout.strip().splitlines() if r.returncode == 0 else []
+    wheels = sorted(Path(lines[-1], "_bundled").glob("pip-*.whl")) if lines else []
+    if len(wheels) != 1 or not wheels[0].is_file():
+        raise Refused("the chosen interpreter has no single bundled pip wheel (ensurepip/_bundled); pip was not run")
+    return wheels[0]
+
+
 def environment_facts(expected, env_fd, env, interpreter):
     """What the environment's own startup would establish, derived without
     running it from the trusted inventory and files read through the pinned
@@ -1876,27 +1983,9 @@ def environment_facts(expected, env_fd, env, interpreter):
     or that its venv detection and site processing (the .pth files' import
     lines included) run as expected. Returns (prefix, purelib relative to the environment, additions to the
     import path, the .pth files)."""
-    rel, hops = "bin/python", 0
-    while expected.get(rel, [None])[0] == "link" and hops < 8:
-        target, hops = expected[rel][1], hops + 1
-        if os.path.isabs(target):
-            rel = target
-            break
-        rel = os.path.normpath(os.path.join(os.path.dirname(rel), target))
-    if not os.path.isabs(rel) or os.path.realpath(rel) != os.path.realpath(interpreter["path"]):
-        raise Refused(f"the staged environment's bin/python doesn't lead to the operation's interpreter "
-                      f"({shown(interpreter['path'])})")
-    entry = expected.get("pyvenv.cfg")
-    data = read_inside(env_fd, "pyvenv.cfg") if entry and entry[0] == "file" else None
-    if data is None or hashlib.sha256(data).hexdigest() != entry[1]:
-        raise Refused("the staged environment's pyvenv.cfg is missing or changed while it was read")
-    cfg = dict(line.split("=", 1) for line in data.decode("utf-8", errors="replace").splitlines() if "=" in line)
-    cfg = {k.strip(): v.strip() for k, v in cfg.items()}
-    if cfg.get("include-system-site-packages") != "false":
-        raise Refused("the staged environment's pyvenv.cfg doesn't keep the system site-packages out")
-    if cfg.get("version") != interpreter["version"] or \
-            os.path.realpath(cfg.get("home", "")) != os.path.realpath(os.path.dirname(rel)):
-        raise Refused("the staged environment's pyvenv.cfg doesn't name the operation's interpreter")
+    problem = interpreter_problem(expected, "bin/python", interpreter) or pyvenv_problem(expected, env_fd, interpreter)
+    if problem:
+        raise Refused(problem)
     major_minor = ".".join(interpreter["version"].split(".")[:2])
     site = site_packages(expected)
     if site != f"lib/python{major_minor}/site-packages":
@@ -2142,7 +2231,7 @@ def run_operation(journal, writer, release, manifest, plan, report, python, spec
         return f"{len(names)} files copied and verified"
 
     env = release_dir / "env"
-    evidence = {}  # the environment venv built, inventoried through pinned descriptors right after it ran
+    evidence = {}  # the environment venv built, inventoried and checked against venv's layout right after it ran
 
     def create_environment():
         if writer.lstat(env_rel) is not None:
@@ -2150,15 +2239,25 @@ def run_operation(journal, writer, release, manifest, plan, report, python, spec
         writer.mkdir(env_rel)
         writer.path_intact(env_rel, "venv")
         try:
-            r = run([python, "-m", "venv", env], env=child_env(), cwd=os.sep)
+            r = run([python, "-I", "-S", "-c", VENV_BUILD, env], env=child_env(), cwd=os.sep)
         finally:
             writer.path_intact(env_rel, "venv", after=True)  # a swap during it is named, whatever venv did
         if r.returncode:
             raise Refused(f"venv exited {r.returncode}")
+        # What venv left becomes the trusted evidence only if it is exactly
+        # the layout the standard library's venv builds, checked against
+        # that layout and the chosen interpreter, never adopted as observed:
+        # a .pth hook or sitecustomize added as venv returned is refused here,
+        # before pip or anything else in the environment runs.
         with writer.pinned(env_rel) as fd:
-            evidence["venv"] = inventory_at(fd)
-        data = json.dumps(evidence["venv"], sort_keys=True).encode()
-        return ("venv created with the chosen interpreter and its bundled pip; inventoried",
+            built = inventory_at(fd)
+            problem = venv_problem(built, fd, binding["interpreter"])
+        if problem:
+            raise Refused(f"{problem}; pip was not run")
+        evidence["venv"] = built
+        data = json.dumps(built, sort_keys=True).encode()
+        return ("venv created with the chosen interpreter (no pip, no activation scripts) and checked against the "
+                "standard library's venv layout; inventoried",
                 {"venv_inventory_sha256": hashlib.sha256(data).hexdigest()})
 
     def install_package():
@@ -2166,18 +2265,20 @@ def run_operation(journal, writer, release, manifest, plan, report, python, spec
         wheel_bytes = verified_artifacts(writer, artifacts_rel, binding["manifest_sha256"], manifest)[wheel_name]
         if "venv" not in evidence:
             raise Refused("no environment was built in this run; pip was not run")
-        # The environment's own interpreter and pip are about to run: it must
-        # still be exactly what venv built (a .pth hook or link added since,
-        # say, would run inside pip).
+        pip_wheel = bundled_pip(python)
+        pip_wheel_sha = hashlib.sha256(pip_wheel.read_bytes()).hexdigest()
+        # The environment's interpreter is about to run pip: the environment
+        # must still be exactly what venv built and was checked (a .pth hook
+        # or link added since, say, would run inside pip).
         writer.path_intact(env_rel, "pip")
         with writer.pinned(env_rel) as fd:
             changed = first_difference(inventory_at(fd), evidence["venv"])
         if changed:
             raise Refused(f"the environment changed after venv built it ({changed}); pip was not run")
         try:
-            r = run([env / "bin" / "python", "-m", "pip", "install", "--no-index", "--no-deps", "--no-cache-dir",
-                     "--no-compile", "--disable-pip-version-check", release_dir / "artifacts" / wheel_name],
-                    env=child_env(), cwd=os.sep)
+            r = run([env / "bin" / "python", "-I", "-B", "-c", PIP_BOOT, pip_wheel, "install", "--no-index",
+                     "--no-deps", "--no-cache-dir", "--no-compile", "--disable-pip-version-check",
+                     release_dir / "artifacts" / wheel_name], env=child_env(), cwd=os.sep)
         finally:
             writer.path_intact(env_rel, "pip", after=True)
         if r.returncode:
@@ -2203,8 +2304,10 @@ def run_operation(journal, writer, release, manifest, plan, report, python, spec
                           "not recorded as installed")
         data = (json.dumps(after, indent=1, sort_keys=True) + "\n").encode()
         writer.write(f"{rel_dir}/{INVENTORY}", data)
-        return (f"{manifest['package']['name']} {manifest['package']['version']} installed offline; "
-                "environment inventoried", {"inventory_sha256": hashlib.sha256(data).hexdigest()})
+        return (f"{manifest['package']['name']} {manifest['package']['version']} installed offline by the chosen "
+                "interpreter's bundled pip; environment inventoried",
+                {"inventory_sha256": hashlib.sha256(data).hexdigest(),
+                 "pip_wheel": pip_wheel.name, "pip_wheel_sha256": pip_wheel_sha})
 
     def verify_environment():
         found = verify_staged(writer, rel_dir, binding["manifest_sha256"], manifest, binding["interpreter"],

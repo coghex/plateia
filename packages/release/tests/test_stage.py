@@ -23,6 +23,16 @@ import stage_release  # noqa: E402  (on the path through _support)
 from stage_release import Refused
 
 
+def is_venv(argv):
+    """Whether a recorded command is staging's venv run."""
+    return stage_release.VENV_BUILD in [str(a) for a in argv]
+
+
+def is_pip(argv):
+    """Whether a recorded command is staging's pip run."""
+    return stage_release.PIP_BOOT in [str(a) for a in argv]
+
+
 class StageCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -372,6 +382,32 @@ class BlockingTests(StageCase):
                     chatlib.unlink()
                     chatlib.write_bytes(original[0])
                     chatlib.chmod(original[1])
+
+    def test_a_skills_root_aliased_into_private_data_exempts_no_managed_file(self):
+        """Round 9's fixture: ~/.codex/skills is a link to ~/.claude, which
+        holds a chat folder with private content at chat/scripts/chatlib.py.
+        The root's private-data boundary is checked before any target is
+        observed, so no managed file under it is exempt: with open and
+        os.open set to fail on the private inode, the full plan never opens
+        it, every target blocks naming the root, and staging is refused."""
+        claude = self.home / ".claude"
+        shutil.copytree(self.skills / "chat", claude / "chat", symlinks=True)
+        private = claude / "chat/scripts/chatlib.py"
+        private.write_text(f"TOKEN = {_staging.SECRETS[0]!r}\n")
+        shutil.rmtree(self.skills)
+        self.skills.symlink_to(claude)
+        self.before = _staging.snapshot_tree(self.home)
+        with self.never_opened(private):
+            plan = self.plan()
+            self.assertNothingStaged(r"blocked")
+        self.assertEqual([t["name"] for t in plan["targets"] if not t["problems"]], [])
+        for target in plan["targets"]:
+            self.assertRegex(target["problems"][0], r"^unknown ownership: the skills root ~/\.codex/skills resolves to "
+                                                    r"~/\.claude, which is or holds private data; nothing under it is "
+                                                    r"read")
+        self.assertFalse(plan["importers"]["complete"])
+        self.assertNotIn(_staging.SECRETS[0], json.dumps(plan))
+        self.assertNotIn(_staging.SECRETS[0], stage_release.render_plan(plan))
 
     def test_a_changed_target_blocks(self):
         with open(self.skills / "chat/scripts/chatlib.py", "a") as stream:
@@ -851,7 +887,7 @@ class RecoveryTests(StageCase):
                     stage_release.CALLS.clear()
                     summary, _, _ = self.stage()
                     self.assertEqual(summary["state"], "resumed and staged")
-                    venv_at = next(i for i, c in enumerate(stage_release.CALLS) if "venv" in c)
+                    venv_at = next(i for i, c in enumerate(stage_release.CALLS) if is_venv(c))
                     self.assertFalse(any(Path(c[0]).parent.parent == env for c in stage_release.CALLS[:venv_at]),
                                      "the environment found on disk ran before it was rebuilt")
                     self.assertFalse((site() / "zz-hook.pth").exists() or (site() / "sitecustomize.py").exists())
@@ -1090,9 +1126,46 @@ class EnvironmentIntegrityTests(StageCase):
                 with self.assertRaisesRegex(Refused, r"install-package failed: the environment changed after venv "
                                                      r"built it \((lib/python|pyvenv|bin/python).*\); pip was not run"):
                     self.stage(crash=between)
-                self.assertFalse(any("pip" in c for c in stage_release.CALLS), "pip ran")
+                self.assertFalse(any(is_pip(c) for c in stage_release.CALLS), "pip ran")
                 self.assertEqual(stage_release.status(self.dest)[0]["state"],
                                  "unfinished (last: outcome install-package: failed)")
+                self.assertHomeUnchanged()
+
+    def test_a_startup_hook_added_right_after_venv_never_runs(self):
+        """Round 9's fixture: right after the venv process returns, before
+        anything is inventoried, a .pth hook (or a sitecustomize) is added
+        to the new environment, written to leave a marker and overwrite the
+        invented registry. What venv left is judged against the standard
+        library's venv layout and the chosen interpreter, never adopted as
+        observed: refused before pip or anything else in the environment
+        runs, the marker never written, the operation unfinished and the
+        protected files byte-identical."""
+        real = stage_release.run
+        marker = self.where / "hook-ran"
+        hook = f"open({str(marker)!r}, 'w').close(); " + self.payload()
+        for name, rel, text in (("a .pth hook", "zz-hook.pth", "import os; " + hook),
+                                ("sitecustomize", "sitecustomize.py", hook)):
+            with self.subTest(added=name):
+                if self.dest.exists():
+                    shutil.rmtree(self.dest)
+                stage_release.CALLS.clear()
+
+                def boundary(argv, rel=rel, text=text, **kw):
+                    result = real(argv, **kw)
+                    if is_venv(argv):
+                        (self.site() / rel).write_text(text)
+                    return result
+                with mock.patch.object(stage_release, "run", boundary):
+                    with self.assertRaisesRegex(Refused, rf"create-environment failed: venv left lib/python[^/]+/"
+                                                         rf"site-packages/{re.escape(rel)}, which the standard "
+                                                         r"library's venv layout doesn't account for; pip was not "
+                                                         r"run"):
+                        self.stage()
+                self.assertFalse(marker.exists(), "the planted hook ran")
+                self.assertFalse([c for c in stage_release.CALLS if c[0].startswith(str(self.dest))],
+                                 "the environment's interpreter ran")
+                self.assertEqual(stage_release.status(self.dest)[0]["state"],
+                                 "unfinished (last: outcome create-environment: failed)")
                 self.assertHomeUnchanged()
 
     def test_what_pip_leaves_beyond_its_record_is_never_trusted(self):
@@ -1105,7 +1178,7 @@ class EnvironmentIntegrityTests(StageCase):
 
                 def boundary(argv, plant=plant, **kw):
                     result = real(argv, **kw)
-                    if "pip" in [str(a) for a in argv]:
+                    if is_pip(argv):
                         plant()
                     return result
                 with mock.patch.object(stage_release, "run", boundary):
@@ -1138,7 +1211,7 @@ class EnvironmentIntegrityTests(StageCase):
 
                 def boundary(argv, rel=rel, text=text, **kw):
                     result = real(argv, **kw)
-                    if "pip" in [str(a) for a in argv]:
+                    if is_pip(argv):
                         data = text.encode()
                         (self.site() / rel).write_bytes(data)
                         record = next(self.site().glob("plateia_chat-*.dist-info/RECORD"))
@@ -1150,7 +1223,8 @@ class EnvironmentIntegrityTests(StageCase):
                                                          rf"lib/python[^/]+/site-packages/{re.escape(rel)}, which "
                                                          r"the verified wheel doesn't account for"):
                         self.stage()
-                self.assertEqual([c for c in stage_release.CALLS if c[0].endswith("/env/bin/python") and "-c" in c], [],
+                self.assertEqual([c for c in stage_release.CALLS
+                                  if c[0].endswith("/env/bin/python") and not is_pip(c)], [],
                                  "the environment probe ran")
                 self.assertFalse(marker.exists(), "the planted hook ran")
                 self.assertEqual(stage_release.status(self.dest)[0]["state"],
@@ -1207,7 +1281,7 @@ class EnvironmentIntegrityTests(StageCase):
 
                 def boundary(argv, rewrite=rewrite, **kw):
                     result = real(argv, **kw)
-                    if "pip" in [str(a) for a in argv]:
+                    if is_pip(argv):
                         pchat = self.env() / "bin/pchat"
                         data = rewrite(pchat.read_text()).encode()
                         pchat.write_bytes(data)
@@ -1221,6 +1295,54 @@ class EnvironmentIntegrityTests(StageCase):
                     with self.assertRaisesRegex(Refused, r"install-package failed: the staged pchat command isn't the "
                                                          r"launcher pip writes for the wheel's entry point "
                                                          r"\(plateia_chat:pchat\): "):
+                        self.stage()
+                self.assertEqual(stage_release.status(self.dest)[0]["state"],
+                                 "unfinished (last: outcome install-package: failed)")
+                self.assertFalse((self.env().parent / "env-inventory.json").exists())
+                self.assertHomeUnchanged()
+
+    def test_a_launcher_with_another_interpreter_or_argv_rewrite_is_refused(self):
+        """Round 9's fixtures: right after pip returns, pchat's interpreter
+        becomes env/bin/missing-python, or its sys.argv[0] normalisation
+        becomes sys.argv[0] = sys.argv[0].endswith(), each with its RECORD
+        row updated. A launcher must run the environment's verified
+        interpreter and normalise sys.argv[0] exactly as pip writes it:
+        refused, naming the command, and nothing recorded installed."""
+        real = stage_release.run
+
+        def other_interpreter(text):
+            return text.replace("/env/bin/python", "/env/bin/missing-python")
+
+        def endswith_rewrite(text):
+            lines = text.splitlines()
+            start = next(i for i, line in enumerate(lines) if line.startswith("if __name__"))
+            end = next(i for i, line in enumerate(lines) if line.strip().startswith("sys.exit("))
+            return "\n".join(lines[:start + 1] + ["    sys.argv[0] = sys.argv[0].endswith()"] + lines[end:]) + "\n"
+        for name, rewrite, pattern in (
+                ("env/bin/missing-python", other_interpreter,
+                 r"the staged pchat command doesn't run the environment's verified interpreter"),
+                ("sys.argv[0].endswith()", endswith_rewrite,
+                 r"the staged pchat command isn't the launcher pip writes for the wheel's entry point "
+                 r"\(plateia_chat:pchat\): its __main__ block doesn't normalise sys\.argv\[0\] as pip does")):
+            with self.subTest(launcher=name):
+                if self.dest.exists():
+                    shutil.rmtree(self.dest)
+
+                def boundary(argv, rewrite=rewrite, **kw):
+                    result = real(argv, **kw)
+                    if is_pip(argv):
+                        pchat = self.env() / "bin/pchat"
+                        data = rewrite(pchat.read_text()).encode()
+                        self.assertNotEqual(data, pchat.read_bytes())
+                        pchat.write_bytes(data)
+                        record = next(self.site().glob("plateia_chat-*.dist-info/RECORD"))
+                        rows = [line if not line.startswith("../../../bin/pchat,") else
+                                f"../../../bin/pchat,{build_release.record_hash(data)},{len(data)}"
+                                for line in record.read_text().splitlines()]
+                        record.write_text("\n".join(rows) + "\n")
+                    return result
+                with mock.patch.object(stage_release, "run", boundary):
+                    with self.assertRaisesRegex(Refused, r"install-package failed: " + pattern):
                         self.stage()
                 self.assertEqual(stage_release.status(self.dest)[0]["state"],
                                  "unfinished (last: outcome install-package: failed)")
@@ -1301,7 +1423,7 @@ class EnvironmentIntegrityTests(StageCase):
                          "unfinished (last: outcome verify-environment: failed)")
         self.assertFalse((self.env().parent / "staged.json").exists())
         self.assertFalse([c for c in stage_release.CALLS if c[0].startswith(str(self.dest))
-                          and "pip" not in c], "the environment's interpreter ran outside pip")
+                          and not is_pip(c)], "the environment's interpreter ran outside pip")
 
     def test_a_verified_package_that_fails_to_import_is_refused(self):
         """Live-import coverage is kept: a genuine, verifying release whose
@@ -1485,6 +1607,43 @@ class AliasMatrixTests(StageCase):
         with self.assertRaisesRegex(Refused, r"releases is a directory staging didn't create"):
             self.stage()
 
+    def test_a_foreign_entry_appearing_at_a_final_name_is_never_replaced(self):
+        """Round 9's fixture: at the journal boundary after a temporary file
+        is announced, or after its creation is recorded, a foreign regular
+        file appears at artifacts/manifest.json; and, on a resumed run that
+        would replace the manifest this operation copied, a foreign file
+        takes its place at that boundary. Publication never replaces it:
+        the foreign file is left byte-identical, and the operation stays
+        unfinished."""
+        foreign = b'{"invented": "a foreign manifest"}\n'
+        artifacts = self.dest / "releases" / self.manifest["release"] / "artifacts"
+        temp = re.compile(r"/artifacts/\.manifest\.json\.[0-9a-f]+\.tmp$")
+
+        def plant(record):
+            (artifacts / "manifest.json").unlink(missing_ok=True)
+            (artifacts / "manifest.json").write_bytes(foreign)
+        for name, when, resumed in (("announced", "creating", False), ("created", "created", False),
+                                    ("replacing its own copy", "creating", True)):
+            with self.subTest(boundary=name):
+                if self.dest.exists():
+                    shutil.rmtree(self.dest)
+                if resumed:
+                    with self.assertRaises(stage_release.Crash):
+                        self.stage(crash=self.crash_when(lambda r: r["kind"] == "outcome"
+                                                         and r.get("step") == "copy-artifacts"))
+
+                def hook(record, when=when):
+                    if record["kind"] == when and temp.search("/" + record["path"]):
+                        plant(record)
+                with self.assertRaisesRegex(Refused, r"copy-artifacts failed: .*/artifacts/manifest\.json exists and "
+                                                     r"is not a file this operation created; staging never writes "
+                                                     r"through, replaces or deletes an entry it didn't create"):
+                    self.stage(crash=hook)
+                self.assertEqual((artifacts / "manifest.json").read_bytes(), foreign)
+                self.assertEqual(stage_release.status(self.dest)[0]["state"],
+                                 "unfinished (last: outcome copy-artifacts: failed)")
+                self.assertHomeUnchanged()
+
     def test_a_journal_staging_didnt_create_is_left_byte_identical(self):
         for text in (b"my own notes\n", b"my own notes", b'{"schema": "something-else/1"}\n'):
             with self.subTest(text=text):
@@ -1512,8 +1671,7 @@ class ProcessSwapTests(StageCase):
         real = stage_release.run
 
         def boundary(argv, **kw):
-            text = " ".join(str(a) for a in argv)
-            if (" -m venv " in text) if process == "venv" else (" -m pip " in text):
+            if is_venv(argv) if process == "venv" else is_pip(argv):
                 os.rename(swapped, f"{swapped}-moved")
                 os.symlink(self.home / ".local/state/chat", swapped)
             return real(argv, **kw)
@@ -1550,7 +1708,7 @@ class ProcessSwapTests(StageCase):
                 started = [r["step"] for r in records if r["kind"] == "intent"]
                 self.assertEqual(started[-1], step, "a later step started")
                 if process == "venv":
-                    self.assertFalse(any("pip" in call for call in stage_release.CALLS), "pip ran after the swap")
+                    self.assertFalse(any(is_pip(call) for call in stage_release.CALLS), "pip ran after the swap")
                 ops = stage_release.status(journal.parent)
                 self.assertEqual([o["state"] for o in ops], [f"unfinished (last: outcome {step}: failed)"])
                 self.assertFalse(os.path.lexists(rel_dir / "staged.json"))
@@ -1624,10 +1782,11 @@ class PrivacyAndIsolationTests(StageCase):
         self.assertEqual(source.count("subprocess.run("), 1)
         self.assertNotRegex(source, r"os\.system|os\.exec|os\.spawn|Popen|os\.kill|launchctl\b(?! print)")
         self.stage()
-        kinds = sorted({("probe" if "-I" in c and "plateia_chat" not in c[-1] else "env-probe" if "-I" in c
-                         else "venv" if "venv" in c else "pip" if "pip" in c else "other") for c in
-                        stage_release.CALLS})
-        self.assertEqual(kinds, ["env-probe", "pip", "probe", "venv"])
+        marks = (("venv", stage_release.VENV_BUILD), ("pip", stage_release.PIP_BOOT),
+                 ("import check", stage_release.IMPORT_PROBE), ("pip lookup", stage_release.ENSUREPIP_PROBE),
+                 ("probe", stage_release.PROBE))
+        kinds = sorted({next((kind for kind, mark in marks if mark in c), "other") for c in stage_release.CALLS})
+        self.assertEqual(kinds, ["import check", "pip", "pip lookup", "probe", "venv"])
         self.assertNoServiceOrIdentityCall()
         self.assertHomeUnchanged()
 
