@@ -1,0 +1,56 @@
+{
+  "schema": "plateia-staging-spec/1",
+  "note": "What stage_release.py checks before staging a release (PLT-12, D-26). Each managed target's expected type, link destination, label and program are declared here, and expected file contents come from the capture provenance, so nothing observed on disk becomes its own baseline. Paths start at the home directory (~) or the skills tree ({skills}).",
+  "skills_root": "~/.codex/skills",
+  "provenance": "packages/chat/provenance.json",
+  "targets": [
+    {"name": "pchat", "kind": "symlink", "path": "~/.local/bin/pchat",
+     "target": "{skills}/chat/scripts/pchat", "content": "chat/scripts/pchat",
+     "proposed": "a symlink to the staged environment's bin/pchat"},
+    {"name": "chat-bridge LaunchAgent", "kind": "launchagent",
+     "path": "~/Library/LaunchAgents/com.coghex.chat-bridge.plist",
+     "label": "com.coghex.chat-bridge", "program": "{skills}/chat/scripts/chat-bridge",
+     "content": "chat/scripts/chat-bridge",
+     "proposed": "ProgramArguments naming the staged environment's bin/chat-bridge"},
+    {"name": "rotate-logs LaunchAgent", "kind": "launchagent",
+     "path": "~/Library/LaunchAgents/com.coghex.log-rotate.plist",
+     "label": "com.coghex.log-rotate", "program": "{skills}/chat/scripts/rotate-logs",
+     "content": "chat/scripts/rotate-logs",
+     "proposed": "ProgramArguments naming the staged environment's bin/rotate-logs"},
+    {"name": "WeeChat role_colors autoload link", "kind": "symlink",
+     "path": "~/.local/share/weechat/python/autoload/role_colors.py",
+     "target": "{skills}/chat/scripts/role_colors.py", "content": "chat/scripts/role_colors.py",
+     "proposed": "a symlink to role_colors.py in the staged environment's plateia_chat/scripts"},
+    {"name": "chat skill folder", "kind": "skill-folder", "path": "{skills}/chat",
+     "proposed": "the release's chat skill: SKILL.md and skill.json from its skill archive"},
+    {"name": "Claude chat skill link", "kind": "symlink", "path": "~/.claude/skills/chat",
+     "target": "{skills}/chat",
+     "proposed": "unchanged: still a symlink to the chat skill folder"},
+    {"name": "chat/scripts import location", "kind": "import-location", "path": "{skills}/chat/scripts",
+     "proposed": "a thin layer handing off to the selected release's plateia_chat modules (D-26)"}
+  ],
+  "importers": {
+    "roots": ["{skills}", "~/.claude/skills"],
+    "skip_dirs": [".git", "__pycache__", "node_modules"],
+    "known": [
+      {"name": "launch-worker", "path": "{skills}/project-manager/scripts/launch-worker"},
+      {"name": "childrun", "path": "{skills}/project-manager/scripts/childrun"},
+      {"name": "report", "path": "{skills}/project-manager/scripts/report"},
+      {"name": "reconcile", "path": "{skills}/project-manager/scripts/reconcile"},
+      {"name": "modelclass", "path": "{skills}/model-classes/scripts/modelclass"}
+    ]
+  },
+  "live_versions": {
+    "note": "The wire and state versions the live tools (the D-19 baseline in the skills tree) read and write; the formats with an embedded version are also read from the existing state.",
+    "irc-client": "chat-irc/1", "irc-bridge": "chat-irc/1", "post-text": "chat-post/1",
+    "cmux-cli": "cmux-cli/1", "launchd-query": "launchctl-print/1", "process-table": "ps-fields/1",
+    "open-files": "lsof-fields/1", "service-signal": "sighup-reopen/1",
+    "agent-run-environment": "chat-agent-env/1", "ntfy-push": "ntfy-push/1",
+    "chat-config": "chat-config/1", "identity-registry": "1", "channel-log": "channel-log/1",
+    "outbox": "outbox/1", "delivery-queue": "pending/1", "delivery-records": "delivery-records/1",
+    "checkpoints": "checkpoints/1", "evidence": "evidence/1", "agent-runs": "agent-runs/1",
+    "receipt-experiment-marker": "review-start-receipts-v1", "bridge-log": "bridge-log/1",
+    "manager-record": "manager-record/1", "child-runs": "childrun/2",
+    "weechat-role-colors": "weechat-nick-colors/1", "ergo-log-rotation": "rotated-log/1"
+  }
+}
