@@ -292,7 +292,7 @@ The tests cover:
   record no call. Every recorded command is the chosen interpreter or the
   staged environment's.
 
-### Crash recovery (invented fixtures, stager at `e323c57`)
+### Crash recovery (invented fixtures, stager at `bc015cc`)
 
 Each row is a fresh invented home. The run was stopped right after the
 journal record named in the first column, then run again with the same
