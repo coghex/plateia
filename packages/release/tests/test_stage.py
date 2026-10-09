@@ -9,6 +9,7 @@ import json
 import os
 import plistlib
 import re
+import secrets
 import shutil
 import sys
 import unittest
@@ -1620,7 +1621,8 @@ class AliasMatrixTests(StageCase):
         temp = re.compile(r"/artifacts/\.manifest\.json\.[0-9a-f]+\.tmp$")
 
         def plant(record):
-            (artifacts / "manifest.json").unlink(missing_ok=True)
+            if (artifacts / "manifest.json").exists():  # kept, so its inode can't be reused for the foreign file
+                (artifacts / "manifest.json").rename(self.where / f"kept-{secrets.token_hex(4)}")
             (artifacts / "manifest.json").write_bytes(foreign)
         for name, when, resumed in (("announced", "creating", False), ("created", "created", False),
                                     ("replacing its own copy", "creating", True)):
