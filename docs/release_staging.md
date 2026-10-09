@@ -26,8 +26,10 @@ python3 packages/release/stage_release.py status --dest <root>
 - `stage` runs the plan and the preflight first, and writes nothing if either
   blocks.
 - **Exit status:** 0 success, 1 refused or blocked, 2 bad usage.
-- Standard library only. The environment is the interpreter's own `venv`
-  with its bundled pip, installing offline (`--no-index`).
+- Standard library only. The environment is built by the chosen
+  interpreter's own `venv`, with no pip and no activation scripts. The
+  package is installed offline (`--no-index`) by that interpreter's bundled
+  pip, run from its wheel.
 
 ## Plan
 
@@ -156,6 +158,12 @@ read. The file opened must still be the one checked, with one link, before
 anything is read. That covers the drift check's hashing, the content checks
 behind each link and LaunchAgent, and the folder inventory.
 
+The skills root's private-data boundary is checked first, before any target
+is observed. A skills root that resolves into private data
+(`~/.codex/skills` linked to `~/.claude`, say) exempts no managed file.
+Nothing under it, or reached through it, is read: every target blocks,
+naming the root, and the root is excluded from importer discovery too.
+
 ## Preflight
 
 Preflight refuses a release, naming the check, in these cases:
@@ -255,9 +263,13 @@ Every write staging makes goes through one layer (`Writer`), including
   location.
 - **New files only.** A file is created with `O_CREAT|O_EXCL|O_NOFOLLOW`
   under a fresh temporary name, which is journaled before it exists. Its
-  inode is journaled right after the create, and it is then renamed into
-  place. Nothing is ever opened through a link or written into an existing
-  file.
+  inode is journaled right after the create. It is then linked into place
+  with `link()`, which never replaces an entry, and the temporary name is
+  removed. The final name is checked again just before. A replacement first
+  removes the file this operation created there, checked by its inode. So an
+  entry that appears at the name in the meantime, whatever it is, is left as
+  it is, and the write is refused. Nothing is ever opened through a link or
+  written into an existing file.
 - **Nothing it didn't create.** An entry is replaced, truncated or deleted
   only if the journal records that this operation created it and it is still
   that entry: the same inode, singly linked, this owner. Anything else is
@@ -276,7 +288,7 @@ Every write staging makes goes through one layer (`Writer`), including
 
 ### `venv` and pip (D-71)
 
-`venv` and the environment's pip are separate processes. They're given the
+`venv` and pip are separate processes. They're given the
 environment's absolute path and write by that path while they run, so the
 pinned descriptors above don't cover their writes. The owner's decision
 [D-71](plateia_design.md#d-71-plt-12-stagings-threat-boundary-for-concurrent-directory-swaps) (2026-10-09, [#14's amendment](https://github.com/coghex/plateia/issues/14#issuecomment-6077164625)) narrows requirement 8 for this one case. If
@@ -302,9 +314,33 @@ What staging does instead:
 The environment's contents are checked too, because pip runs the
 environment's own interpreter, startup hooks included:
 
+- **What `venv` builds.** `venv` runs in the chosen interpreter with
+  `-I -S` and builds the environment with no pip and no activation scripts.
+  What it leaves therefore holds no code:
+  - `bin/`, holding links to the interpreter;
+  - empty `include/`, `lib/` and `lib/pythonX.Y/site-packages/`;
+  - `lib64` as a link to `lib`, where the platform makes one;
+  - `pyvenv.cfg`.
 - **Right after `venv`**, the environment is inventoried through
-  descriptors: every entry, link target, file hash and permission bit. Its
-  sha256 goes in the `create-environment` outcome.
+  descriptors: every entry, link target, file hash and permission bit. That
+  inventory is checked against the layout above and the chosen interpreter,
+  never adopted as it was observed:
+  - every link in `bin/` must lead, inside the environment, to the chosen
+    interpreter;
+  - `pyvenv.cfg` must name that interpreter and keep the system
+    `site-packages` out;
+  - nothing else may be there.
+
+  A `.pth` hook, a `sitecustomize` or any other entry added as `venv`
+  returns is refused, naming it, before pip or anything else in the
+  environment runs. Only then does the inventory become the evidence, and
+  its sha256 goes in the `create-environment` outcome.
+- **Pip comes from the interpreter, not the environment.** Pip runs from the
+  chosen interpreter's bundled wheel (`ensurepip/_bundled`, the pip `venv`
+  would install), as `bin/python -I -B -c <bootstrap> <wheel> install …`.
+  Nothing of pip is installed into the environment. The wheel's name and
+  sha256 go in the `install-package` outcome. The environment's interpreter
+  starts with its site processing over a `site-packages` checked empty.
 - **Immediately before pip**, the environment must still match that
   inventory exactly. A `.pth` hook or link, a `sitecustomize`, a changed
   `pyvenv.cfg` or a replaced interpreter link added between the steps is
@@ -359,7 +395,7 @@ Each step then journals an `intent` before it runs and an `outcome` after:
 - `copy-artifacts`
 - `create-environment`
 - `install-package`, whose outcome also records the environment inventory's
-  sha256
+  sha256 and the bundled pip wheel's name and sha256
 - `verify-environment`
 - `complete`
 
@@ -406,16 +442,21 @@ its inode. Every temporary file gets a `creating` record before it exists.
   - every file the verified wheel hashes is installed with the same bytes;
   - every file the installed `RECORD` hashes still matches, and the package
     directory holds nothing `RECORD` doesn't list;
-  - each command is executable, calls the wheel's entry point, and runs the
-    staged interpreter, read from its shebang or from the `/bin/sh` launcher
-    pip writes for long paths;
+  - each command is executable and calls the wheel's entry point. It runs
+    the environment's `bin/python`, whose links lead to the chosen
+    interpreter, read from its shebang or from the `/bin/sh` launcher pip
+    writes for long paths. Any other interpreter is refused, even another
+    name in `bin/`;
   - each command is the launcher pip writes, judged by its structure, never
     by its `RECORD` hash. It's parsed (nothing runs): after the shebang, or
     the `/bin/sh` preamble, only `import re` and `import sys`, the one
     import of the wheel's entry point, and an `if __name__ == "__main__":`
-    block that at most rewrites `sys.argv[0]` from itself and then exits
-    with the entry point's result. This is checked at install, and again
-    whenever the environment is verified;
+    block. That block normalises `sys.argv[0]` with exactly one of the forms
+    pip's versions write, statement for statement, and then exits with the
+    entry point's result. The forms are distlib's `re.sub`, the `.exe`
+    slice (with or without the `-script.pyw` branch), and
+    `removesuffix('.exe')`. This is checked at install, and again whenever
+    the environment is verified;
   - what the environment's own startup would establish, from the same
     snapshot: `bin/python` leads, through links inside the environment, to
     the operation's chosen interpreter; `pyvenv.cfg` names that
@@ -423,9 +464,9 @@ its inode. Every temporary file gets a `creating` record before it exists.
     `site-packages` out, so the prefix is the environment and its one
     `lib/pythonX.Y/site-packages` is `purelib`; there's no `sitecustomize`
     or `usercustomize` anywhere in it; and the import path's additions are
-    that `site-packages` plus the directory lines of its `.pth` files (each
-    one `venv` built, pinned by the inventory). The wheel may not carry a
-    startup hook.
+    that `site-packages` plus the directory lines of its `.pth` files, each
+    pinned by the inventory. An environment staging built has none: `venv`
+    builds none, and the wheel may not carry a startup hook.
 - **Then the import check.** Nothing from the environment ever runs after
   pip. The operation's chosen interpreter, which preflight checked and which
   lives outside the environment, runs once with `-I -S -B` (no site, `.pth`
@@ -453,10 +494,8 @@ its inode. Every temporary file gets a `creating` record before it exists.
   starts anything by a path inside the environment.
 
   What this doesn't observe is the environment's own interpreter starting
-  up: its `venv` detection and its site processing, including running the
-  `import` lines of the `.pth` files `venv` built (on 3.10, the bundled
-  setuptools' `distutils-precedence.pth`). Those facts are derived from
-  the pinned files above, not watched.
+  up: its `venv` detection and its site processing. Those facts are derived
+  from the pinned files above, not watched.
 - **Different inputs are a conflict.** While an operation is unfinished, a run
   with different inputs (another interpreter, a changed target, another
   release) is refused, naming the inputs that differ. Repeating the run with
@@ -473,9 +512,9 @@ its inode. Every temporary file gets a `creating` record before it exists.
 
 All external commands go through one recorded boundary. Staging runs only:
 
-- the chosen interpreter, for its preflight probe, `venv` and the import
-  check;
-- the environment's own interpreter, only to run pip.
+- the chosen interpreter, for its preflight probe, finding its bundled pip
+  wheel, `venv` and the import check;
+- the environment's own interpreter, only to run pip from that wheel.
 
 Staging never calls `install-identities` or any identity rollout, creates
 accounts, starts, restarts or loads a service, or starts the merge worker or
@@ -510,6 +549,11 @@ The tests cover:
     left in its place. With `open` and `os.open` set to fail on the private
     inodes, the full plan never opens them, blocks with the reason named,
     and prints no private value;
+  - round 9's fixture: `~/.codex/skills` is a link to `~/.claude`, which
+    holds a chat folder with private content at `chat/scripts/chatlib.py`.
+    With `open` and `os.open` set to fail on that inode, the full plan never
+    opens it. Every target blocks, naming the skills root, and staging is
+    refused;
   - a changed file;
   - a retargeted link or program;
   - a missing target;
@@ -561,6 +605,11 @@ The tests cover:
     `plan --out`;
   - `plan --out` through a symlink, a hardlink or an existing file;
   - a journal staging didn't create, which is left byte-identical;
+  - round 9's fixture: a foreign `artifacts/manifest.json` appears at the
+    journal boundary after its temporary file is announced, or after its
+    creation is recorded. Separately, on a resumed run, a foreign file takes
+    the place of the manifest this operation copied. It's never replaced: it
+    stays byte-identical and the operation unfinished;
   - the artifacts directory, the release directory or the environment
     swapped for a link into protected state at the exact journal boundary
     after its check. Nothing reaches protected state, and a writer-level
@@ -601,6 +650,12 @@ The tests cover:
     present or missing: refused, nothing created inside protected state;
   - `status` never follows a link at the journal.
 - **Environment integrity:**
+  - **Right after `venv` (round 9):** before anything is inventoried, a
+    `.pth` hook or a `sitecustomize` is added, each written to leave a
+    marker and overwrite the invented registry. Each is refused at
+    `create-environment` as outside `venv`'s layout, before pip or anything
+    else in the environment runs. The marker never appears, the operation is
+    unfinished and the home is unchanged.
   - **Between `venv` and pip:** a `.pth` link to an external hook, a `.pth`
     file, a `sitecustomize`, a changed `pyvenv.cfg` or a replaced interpreter
     link. Each is refused before pip runs. Pip never appears in the recorded
@@ -612,6 +667,11 @@ The tests cover:
     point's import and a `raise`, or by the original with a statement
     appended, and its `RECORD` row updated to match. The install is refused,
     naming the command, and nothing is recorded installed.
+  - **A launcher's interpreter or normalisation (round 9):** right after pip
+    returns, `pchat`'s interpreter becomes `env/bin/missing-python`, or its
+    normalisation becomes `sys.argv[0] = sys.argv[0].endswith()`. Each has
+    its `RECORD` row updated. Each is refused at install, naming the
+    command, and nothing is recorded installed.
   - **A change after verification (round 8):** right after
     `verify-environment` records `ok`, the environment is swapped for a
     link into the invented private state, or a `.pth` hook is added. The
@@ -645,7 +705,7 @@ The tests cover:
   record no call. Every recorded command is the chosen interpreter or the
   staged environment's.
 
-### Crash recovery (invented fixtures, stager at `411401e`)
+### Crash recovery (invented fixtures, stager at `787f780`)
 
 Each row is a fresh invented home. The run was stopped right after the
 journal record in the first column, then run again with the same inputs.
@@ -667,13 +727,13 @@ macOS arm64, CPython 3.14.8:
 | intent copy-artifacts | unfinished | (empty) | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.manifest.json.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
-| created <release>/artifacts/.manifest.json.d822c26716ec.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.manifest.json.b8bb49ac54e4.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/manifest.json | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
-| created <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.2efd6510ecde.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.a5e44bdfa3bc.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/plateia-skill-chat-0.1.0+g04cab9561a11.zip | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
-| created <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.34a31c54a814.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.b07cdb58dab4.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | outcome copy-artifacts | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | intent create-environment | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
@@ -681,14 +741,14 @@ macOS arm64, CPython 3.14.8:
 | outcome create-environment | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
 | intent install-package | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
 | creating <release>/.env-inventory.json.<random>.tmp | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
-| created <release>/.env-inventory.json.39ae1211ffe5.tmp | unfinished | .env-inventory.json.39ae1211ffe5.tmp, artifacts, env | resumed and staged | 1 | 1 | yes |
+| created <release>/.env-inventory.json.995cc3885f9a.tmp | unfinished | .env-inventory.json.995cc3885f9a.tmp, artifacts, env | resumed and staged | 1 | 1 | yes |
 | created <release>/env-inventory.json | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | outcome install-package | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | intent verify-environment | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | outcome verify-environment | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | intent complete | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | creating <release>/.staged.json.<random>.tmp | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
-| created <release>/.staged.json.a8b7cb239566.tmp | unfinished | .staged.json.a8b7cb239566.tmp, artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
+| created <release>/.staged.json.71f49c730064.tmp | unfinished | .staged.json.71f49c730064.tmp, artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | created <release>/staged.json | unfinished | artifacts, env, env-inventory.json, staged.json | resumed and staged | 1 | 1 | yes |
 | outcome complete | complete | artifacts, env, env-inventory.json, staged.json | already staged, verified | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.<random>.tmp (and the manifest copy cut short) | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
