@@ -21,7 +21,8 @@ python3 packages/release/stage_release.py status --dest <root>
 ```
 
 - `plan`, `preflight` and `status` never write anything. (`plan --out` writes
-  only the plan file.)
+  only the plan file: a new file, through the same safe-write layer as
+  `stage`.)
 - `stage` runs the plan and the preflight first, and writes nothing if either
   blocks.
 - **Exit status:** 0 success, 1 refused or blocked, 2 bad usage.
@@ -103,10 +104,16 @@ The plan searches two declared roots: the skills tree (`~/.codex/skills`) and
 - **Which files are searched.** Only scripts are opened: a `.py`, `.sh`,
   `.bash` or `.zsh` suffix, or the executable bit. Data files are never
   opened.
-- **What is skipped.** Links aren't followed. `.git`, `__pycache__`,
-  `node_modules` and the chat folder itself are skipped.
-- **Incomplete inventory.** A root or script that can't be read marks the
-  inventory incomplete instead of clean.
+- **Links are followed, once.** Symlinked folders and scripts inside a root
+  are searched. Each resolved folder is walked once, so a cycle ends, and
+  each resolved script is counted once, under the first path that reaches
+  it, so an alias such as `~/.claude/skills/project-manager` doesn't
+  duplicate a known importer.
+- **What is skipped.** `.git`, `__pycache__`, `node_modules` and the chat
+  folder itself, however it is reached.
+- **Incomplete inventory.** A root, folder or script that can't be read, or
+  more than 200,000 entries, marks the inventory incomplete instead of
+  clean.
 - **Not a block.** Unlisted importers and an incomplete inventory don't block
   staging, since staging replaces nothing. They are recorded in the plan and
   the journal for PLT-14.
@@ -164,12 +171,12 @@ now, because no consumer compatibility matrix exists to check it against.
 `stage` writes only under `--dest <root>`:
 
 ```
-<root>/journal.jsonl      the journal
-<root>/journal.lock       its lock
-<root>/releases/<release>/.operation    the owning operation's id
-<root>/releases/<release>/artifacts/    the release's manifest and artifacts, verified
-<root>/releases/<release>/env/          the private venv with the package installed
-<root>/releases/<release>/staged.json   written last: complete, "selected": false
+<root>/journal.jsonl                          the journal
+<root>/journal.lock                           its lock
+<root>/releases/<release>/artifacts/          the release's manifest and artifacts, verified
+<root>/releases/<release>/env/                the private venv with the package installed
+<root>/releases/<release>/env-inventory.json  every entry of env/, recorded right after install
+<root>/releases/<release>/staged.json         written by the complete step: "selected": false
 ```
 
 - **The guard.** The root, the journal, the lock and the release, environment
@@ -179,15 +186,43 @@ now, because no consumer compatibility matrix exists to check it against.
 - **What the guard covers.** The live locations are the skills tree and all of
   `~/.codex` and `~/.claude`, the chat config and state, `~/.local/bin`,
   LaunchAgents, WeeChat's directories, and every symlink target inside them.
-- **Links under the destination are never followed.** Every path staging
-  writes, reads back or removes under the root is checked component by
-  component right before each step: the journal, lock, marker, artifacts,
-  environment, `staged.json` and their temporary files. A symlink anywhere
-  among them is refused. Files are opened with `O_NOFOLLOW`, and replaced
-  by renaming, so nothing is ever written through a link.
 - **Unrelated content is refused, not adopted.** A destination holding
   anything staging didn't create is refused, as is a release directory no
   journaled operation created.
+
+### One safe-write layer
+
+Every write staging makes goes through one layer (`Writer`), including
+`plan --out` and every removal during recovery:
+
+- **Plain names.** A path is plain components: letters, digits and `._+-`,
+  never `.` or `..`. The release identity must be the package's name and
+  version as one such component, and artifact names must be plain and
+  distinct.
+- **Only staging's own directories.** Every directory on the way below the
+  root must be a real directory, owned by this user on the root's device,
+  that the journal records staging created, by its inode.
+- **Resolved and guarded.** The final path and its parent must resolve under
+  the root, and both must sit outside this checkout and every protected
+  location.
+- **New files only.** A file is created with `O_CREAT|O_EXCL|O_NOFOLLOW`
+  under a fresh temporary name, which is journaled before it exists, then
+  renamed into place. Nothing is ever opened through a link or written into
+  an existing file.
+- **Nothing it didn't create.** An entry is replaced, truncated or deleted
+  only if the journal records that this operation created it and it is still
+  that entry: the same inode, singly linked, this owner. Anything else is
+  refused and left unchanged: a symlink, a hardlink, a directory or file
+  someone else put there, or a directory replaced by another of the same
+  name.
+- **The environment** is a directory this operation creates and records; its
+  own `venv` run fills it. Recovery may remove that directory, with what the
+  run put there. Links inside are removed, never followed.
+- **The journal** names its own inode and the lock's in its first record. A
+  file at the journal's name that isn't singly linked, isn't this user's, or
+  isn't the journal its first record names is refused and left
+  byte-identical, as is a journal with no lock beside it. The lock is only
+  ever opened read-only once it exists.
 
 ### Order
 
@@ -199,10 +234,13 @@ Nothing is written until all of these pass, in order:
 4. The journal lock is taken. A second run is refused.
 5. Every target is checked again, under the lock, immediately before the
    operation records it. A change since the plan blocks.
+6. Every path the operation will touch is inspected. An alias anywhere among
+   them is refused before anything changes.
 
 ### The journal
 
-The journal is one JSON record per line, flushed and fsynced. The `begin`
+The journal is one JSON record per line, each fsynced. It starts with a
+header naming the journal's and the lock's inodes. An operation's `begin`
 record holds:
 
 - **the operation id**, derived from its binding;
@@ -220,45 +258,58 @@ Each step then journals an `intent` before it runs and an `outcome` after:
 - `create-release-dir`
 - `copy-artifacts`
 - `create-environment`
-- `install-package`
+- `install-package`, whose outcome also records the environment inventory's
+  sha256
 - `verify-environment`
 - `complete`
+
+Within a step, every directory and file created gets a `created` record with
+its inode. Every temporary file gets a `creating` record before it exists.
 
 ### Repeats and recovery
 
 - **The same inputs give the same operation id.**
-  - **A completed operation** is verified again (artifacts, environment and
-    interpreter) and reported `already staged, verified`. Nothing is written.
-    If it no longer verifies, it is not reported staged.
+  - **A completed operation** is verified again and reported `already staged,
+    verified`. Nothing is written. If it no longer verifies, it is not
+    reported staged.
   - **An unfinished one** is resumed: a `resume` record, then every step
     again.
 - **The steps are safe to repeat.**
-  - Stray partial copies are removed and the artifacts recopied and verified.
-  - A partial environment, inside the operation's own marked directory, is
-    removed and created again.
+  - Artifacts this operation copied are replaced. Its journaled temporary
+    files are removed. Anything else in the directory is refused, never
+    deleted.
+  - A partial environment, a directory this operation created, is removed and
+    created again.
 - **Completion means verified.** `complete` is recorded only after
-  `verify-environment` succeeds.
-- **The verification checks** that the artifacts match the manifest. The
-  environment must load `plateia_chat` from itself at the manifest's version,
-  with this checkout off its import path, and its interpreter must be the
-  operation's and meet the manifest.
-- **The installed payload must match too:**
+  `verify-environment` succeeds. `staged.json` is written by the `complete`
+  step just before its outcome. The journal's `complete` outcome, not that
+  file, is what makes an operation complete, and `status` reports it so.
+- **Verification is static first.** Nothing in the environment runs until
+  these hold:
+  - the artifacts match the manifest;
+  - the environment matches, entry by entry, the inventory this operation
+    recorded right after install, whose sha256 is in the journal. That covers
+    startup hooks (`.pth` files), bytecode, the interpreter link, `pyvenv.cfg`,
+    the commands and their permission bits;
   - every file the verified wheel hashes is installed with the same bytes;
-  - every file the installed `RECORD` hashes, including the generated
-    commands, still matches;
-  - the package directory holds nothing `RECORD` doesn't list;
+  - every file the installed `RECORD` hashes still matches, and the package
+    directory holds nothing `RECORD` doesn't list;
   - each command is executable, calls the wheel's entry point, and runs the
     staged interpreter, read from its shebang or from the `/bin/sh` launcher
     pip writes for long paths.
+- **Then the probe.** Only then does the environment's interpreter run once,
+  to confirm that it loads `plateia_chat` from itself at the manifest's
+  version, with this checkout off its import path, and that the interpreter
+  is the operation's and meets the manifest.
 - **Different inputs are a conflict.** While an operation is unfinished, a run
   with different inputs (another interpreter, a changed target, another
   release) is refused, naming the inputs that differ. Repeating the run with
   the operation's own inputs finishes it.
-- **A torn last journal line** from a crash mid-write is truncated under the
-  lock, durably, before the next record. A complete last record that only
-  lacks its newline gets one. The `resume` record notes the bytes dropped.
-  `status`, which never writes, ignores a torn last line. Any other
-  unreadable line is a refusal.
+- **A torn last journal line** is truncated under the lock, durably, before
+  the next record, and the `resume` record notes the bytes dropped. Only a
+  final fragment that has no newline and starts like one of staging's
+  records counts as torn. `status`, which never writes, ignores it. Any
+  other unreadable content is a refusal, and the journal is left unchanged.
 - **Nothing is ever selected.** `status` reports each operation `complete` or
   `unfinished (last: …)`, always with `selected: no`.
 
@@ -308,11 +359,31 @@ The tests cover:
   - an undeclared, malformed or extra format, and no platform systems;
   - a tampered or missing artifact, or an unpinned manifest.
 - **API:** "not applicable", never "pass". A declared API version is refused.
-- **Importers:** a sixth importer in each root is named, a missing known
-  importer is reported, an unreadable root makes the inventory incomplete,
-  and data files are never opened.
+- **Importers:** a sixth importer in each root is named, including one using
+  `sys.path` assignment and ones reached through a symlinked folder or
+  script. A cycle ends. An alias of a known importer isn't duplicated. A
+  missing known importer is reported, an unreadable root makes the inventory
+  incomplete, and data files are never opened.
 - **Recovery:** the table below, plus a conflicting retry, a torn journal line
-  and a damaged completed release.
+  and a damaged completed release. Also: a stray file in the artifacts
+  directory is refused, never deleted.
+- **Alias matrix:** at every write site (journal, lock, `releases`, the
+  release directory, `artifacts`, an artifact, a temporary file, `env`,
+  `env-inventory.json`, `staged.json`), a symlink to protected state, a
+  hardlink to the invented identity registry for a file site, and a
+  directory staging didn't create for a directory site. Each is refused with
+  the registry and the whole home byte-identical. Also covered:
+  - a directory staging created, replaced by another of the same name;
+  - traversal through the release identity, an artifact name and
+    `plan --out`;
+  - `plan --out` through a symlink, a hardlink or an existing file;
+  - a journal staging didn't create, which is left byte-identical.
+- **Changed environment:** on a completed retry, a modified `__init__.py`, an
+  added `.pth` startup hook, a changed command, a cleared executable bit or
+  an edited `pyvenv.cfg` is refused before the environment's interpreter
+  runs, and the registry the planted code would write is unchanged. The
+  deeper wheel, `RECORD` and entry-point checks are tested with the inventory
+  re-recorded to match a change.
 - **Concurrency:** a run while the journal lock is held is refused.
 - **Destinations:**
   - through a link into a managed target, under `~/.local/bin`, or inside
@@ -325,38 +396,54 @@ The tests cover:
   record no call. Every recorded command is the chosen interpreter or the
   staged environment's.
 
-### Crash recovery (invented fixtures, stager at `5de31b0`)
+### Crash recovery (invented fixtures, stager at `eda4336`)
 
 Each row is a fresh invented home. The run was stopped right after the
-journal record named in the first column, then run again with the same
-inputs. "Home unchanged" means every file, link and directory in the home
-compares byte-identical to before the first run.
+journal record in the first column, then run again with the same inputs.
+That covers every record the journal holds after its header: the operation,
+every intent and outcome, and every directory and file created. The last two
+rows also left damage before stopping: a manifest copy cut short, and a venv
+half written. "Home unchanged" means every file, link and directory in the
+home compares byte-identical to before the first run.
 
 macOS arm64, CPython 3.14.8:
 
-| Interrupted after | Status after the interruption | On disk | Rerun | Operations | Release dirs | Home unchanged |
+| Interrupted after | Status after the interruption | Release dir holds | Rerun | Operations | Release dirs | Home unchanged |
 | --- | --- | --- | --- | --- | --- | --- |
 | begin | unfinished | no release dir | resumed and staged | 1 | 1 | yes |
 | intent create-release-dir | unfinished | no release dir | resumed and staged | 1 | 1 | yes |
-| outcome create-release-dir | unfinished | .operation | resumed and staged | 1 | 1 | yes |
-| intent copy-artifacts | unfinished | .operation | resumed and staged | 1 | 1 | yes |
-| outcome copy-artifacts | unfinished | .operation, artifacts | resumed and staged | 1 | 1 | yes |
-| intent create-environment | unfinished | .operation, artifacts | resumed and staged | 1 | 1 | yes |
-| outcome create-environment | unfinished | .operation, artifacts, env | resumed and staged | 1 | 1 | yes |
-| intent install-package | unfinished | .operation, artifacts, env | resumed and staged | 1 | 1 | yes |
-| outcome install-package | unfinished | .operation, artifacts, env | resumed and staged | 1 | 1 | yes |
-| intent verify-environment | unfinished | .operation, artifacts, env | resumed and staged | 1 | 1 | yes |
-| outcome verify-environment | unfinished | .operation, artifacts, env | resumed and staged | 1 | 1 | yes |
-| intent complete | unfinished | .operation, artifacts, env | resumed and staged | 1 | 1 | yes |
-| outcome complete | complete | .operation, artifacts, env, staged.json | already staged, verified | 1 | 1 | yes |
-| intent copy-artifacts (partial copy) | unfinished | .operation, artifacts | resumed and staged | 1 | 1 | yes |
-| intent create-environment (partial env) | unfinished | .operation, artifacts, env | resumed and staged | 1 | 1 | yes |
+| created releases | unfinished | no release dir | resumed and staged | 1 | 1 | yes |
+| created <release> | unfinished | (empty) | resumed and staged | 1 | 1 | yes |
+| outcome create-release-dir | unfinished | (empty) | resumed and staged | 1 | 1 | yes |
+| intent copy-artifacts | unfinished | (empty) | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| creating <release>/artifacts/.manifest.json.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/manifest.json | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| creating <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/plateia-skill-chat-0.1.0+g04cab9561a11.zip | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| creating <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| outcome copy-artifacts | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| intent create-environment | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/env | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
+| outcome create-environment | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
+| intent install-package | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
+| creating <release>/.env-inventory.json.<random>.tmp | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
+| created <release>/env-inventory.json | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
+| outcome install-package | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
+| intent verify-environment | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
+| outcome verify-environment | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
+| intent complete | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
+| creating <release>/.staged.json.<random>.tmp | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
+| created <release>/staged.json | unfinished | artifacts, env, env-inventory.json, staged.json | resumed and staged | 1 | 1 | yes |
+| outcome complete | complete | artifacts, env, env-inventory.json, staged.json | already staged, verified | 1 | 1 | yes |
+| creating <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.<random>.tmp (and the manifest copy cut short) | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/env (and the venv half written) | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
 
-The last two rows left damage before stopping: a truncated wheel copy, and an
-environment with only `pyvenv.cfg`. Both were redone in place. No
-interruption was ever reported complete, and `staged.json` appeared only once
-the operation was complete. On Linux, the same scenarios run in CI on both
-Python versions (`test_a_crash_after_any_journaled_intent_or_outcome_reconciles_to_one_operation`,
+No interruption was ever reported complete. `staged.json` exists only once
+the `complete` step has written it, and the operation is complete only at
+that step's outcome. On Linux, the same scenarios run in CI on both Python
+versions (`test_a_crash_after_any_journaled_intent_or_outcome_reconciles_to_one_operation`,
 `test_a_partial_copy_and_a_partial_environment_are_redone_in_place`).
 
 ## Before the change
