@@ -123,6 +123,13 @@ class StageCase(unittest.TestCase):
     def journal(self):
         return [json.loads(line) for line in (self.dest / "journal.jsonl").read_text().splitlines()]
 
+    def writer(self):
+        """A writer on the destination that knows what the journal's operation created."""
+        writer = stage_release.Writer(self.dest, build_release.live_roots())
+        self.addCleanup(writer.close)
+        writer.load(self.journal(), self.journal()[1]["op"])
+        return writer
+
 
 class HappyPathTests(StageCase):
     def test_a_full_stage_plans_stages_verifies_and_changes_nothing_live(self):
@@ -240,11 +247,14 @@ class HappyPathTests(StageCase):
             with self.subTest(case=pattern[:30]):
                 saved = {p: (p.read_bytes(), p.stat().st_mode) for p in (pchat, chatlib)}
                 damage()
-                data = (json.dumps(stage_release.env_inventory(env), indent=1, sort_keys=True) + "\n").encode()
+                with self.writer().pinned(f"releases/{self.manifest['release']}/env") as fd:
+                    found = stage_release.inventory_at(fd)
+                data = (json.dumps(found, indent=1, sort_keys=True) + "\n").encode()
                 (release_dir / "env-inventory.json").write_bytes(data)
                 try:
                     with self.assertRaisesRegex(Refused, pattern):
-                        stage_release.verify_static(release_dir, self.journal()[1]["binding"]["manifest_sha256"],
+                        stage_release.verify_static(self.writer(), f"releases/{self.manifest['release']}",
+                                                    self.journal()[1]["binding"]["manifest_sha256"], self.manifest,
                                                     __import__("hashlib").sha256(data).hexdigest())
                 finally:
                     for p, (content, mode) in saved.items():
@@ -876,6 +886,162 @@ class DestinationTests(StageCase):
         with self.assertRaisesRegex(Refused, r"releases without a journal"):
             self.stage()
         self.assertEqual(os.listdir(self.dest / "releases" / self.manifest["release"]), [])
+
+
+    def test_an_ancestor_swapped_after_the_guard_cant_place_the_root_in_protected_state(self):
+        """Round 6: the guard passes, then an ancestor of the destination is
+        swapped for a link into the invented chat state before the root is
+        created: after check_destination returns (the pin's own recheck
+        refuses it), or after the pin's recheck (its walk, one name at a time
+        without following links, refuses it). The root, and a missing
+        parent, are created only through pinned descriptors, so nothing is
+        created inside protected state."""
+        state = self.home / ".local/state/chat"
+        real_check, real_reason = stage_release.check_destination, stage_release.protected_reason
+        for when, pattern in (("after the guard", r"is under ~/\.local/state, where the live chat tools live"),
+                              ("after the pin's recheck", r"changed after it was checked: a directory on the way to "
+                                                          r"it is now a link or not a directory; nothing was created")):
+            for dest in (self.where / "outer" / "new-staging", self.where / "outer" / "missing" / "new-staging"):
+                with self.subTest(when=when, dest=str(dest.relative_to(self.where))):
+                    swapped = self.where / "outer"
+                    for leftover in (swapped, Path(f"{swapped}-moved")):
+                        if os.path.lexists(leftover):
+                            leftover.unlink() if leftover.is_symlink() else shutil.rmtree(leftover)
+                    swapped.mkdir()
+                    done = []
+
+                    def swap():
+                        if not done:
+                            os.rename(swapped, f"{swapped}-moved")
+                            os.symlink(state, swapped)
+                            done.append(True)
+
+                    def check_then_swap(path, identity):
+                        root = real_check(path, identity)
+                        swap()
+                        return root
+
+                    def reason_then_swap(path, bases):
+                        result = real_reason(path, bases)
+                        if str(path).endswith("new-staging"):
+                            swap()
+                        return result
+                    patch = (mock.patch.object(stage_release, "check_destination", check_then_swap)
+                             if when == "after the guard" else
+                             mock.patch.object(stage_release, "protected_reason", reason_then_swap))
+                    with patch:
+                        with self.assertRaisesRegex(Refused, pattern):
+                            self.stage(dest=dest)
+                    self.assertTrue(done, "the swap never happened")
+                    self.assertFalse(os.path.lexists(state / "new-staging"))
+                    self.assertFalse(os.path.lexists(state / "missing"))
+                    self.assertHomeUnchanged()
+
+    def test_status_never_follows_a_link_at_the_journal(self):
+        self.dest.mkdir()
+        (self.dest / "journal.jsonl").symlink_to(self.home / ".local/state/chat/identities.json")
+        with self.assertRaisesRegex(Refused, r"not a journal staging can read without following a link"):
+            stage_release.status(self.dest)
+
+
+class EnvironmentIntegrityTests(StageCase):
+    """Round 6 and the audit: nothing from the staged environment runs
+    unless it was statically checked, through pinned descriptors, against
+    trusted evidence just before (the inventory taken right after venv, for
+    pip; the inventory journaled at install, for the probe), and what a
+    process leaves behind is checked again before it is trusted."""
+
+    def registry(self):
+        return self.home / ".local/state/chat/identities.json"
+
+    def payload(self):
+        return f"open({str(self.registry())!r}, 'w').write('overwritten')\n"
+
+    def env(self):
+        return self.dest / "releases" / self.manifest["release"] / "env"
+
+    def site(self):
+        return next(self.env().glob("lib/python*/site-packages"))
+
+    def test_a_change_after_venv_is_refused_before_pip_runs(self):
+        hook = _staging.write(self.where / "external/hook.pth", "import os; " + self.payload())
+        plants = {
+            ".pth link": lambda: (self.site() / "zz-hook.pth").symlink_to(hook),
+            ".pth file": lambda: (self.site() / "zz-hook.pth").write_text("import os; " + self.payload()),
+            "sitecustomize": lambda: (self.site() / "sitecustomize.py").write_text(self.payload()),
+            "pyvenv.cfg": lambda: (self.env() / "pyvenv.cfg").write_text("home = /invented\n"),
+            "interpreter link": lambda: ((self.env() / "bin/python").unlink(),
+                                         (self.env() / "bin/python").symlink_to(self.where / "elsewhere-python")),
+        }
+        for name, plant in plants.items():
+            with self.subTest(change=name):
+                if self.dest.exists():
+                    shutil.rmtree(self.dest)
+                stage_release.CALLS.clear()
+
+                def between(record, plant=plant):
+                    if record["kind"] == "outcome" and record.get("step") == "create-environment":
+                        plant()
+                with self.assertRaisesRegex(Refused, r"install-package failed: the environment changed after venv "
+                                                     r"built it \((lib/python|pyvenv|bin/python).*\); pip was not run"):
+                    self.stage(crash=between)
+                self.assertFalse(any("pip" in c for c in stage_release.CALLS), "pip ran")
+                self.assertEqual(stage_release.status(self.dest)[0]["state"],
+                                 "unfinished (last: outcome install-package: failed)")
+                self.assertHomeUnchanged()
+
+    def test_what_pip_leaves_beyond_its_record_is_never_trusted(self):
+        real = stage_release.run
+        for name, plant in (("unlisted hook", lambda: (self.site() / "zz-hook.pth").write_text("import os\n")),
+                            ("venv file changed", lambda: (self.env() / "pyvenv.cfg").write_text("home = /x\n"))):
+            with self.subTest(change=name):
+                if self.dest.exists():
+                    shutil.rmtree(self.dest)
+
+                def boundary(argv, plant=plant, **kw):
+                    result = real(argv, **kw)
+                    if "pip" in [str(a) for a in argv]:
+                        plant()
+                    return result
+                with mock.patch.object(stage_release, "run", boundary):
+                    with self.assertRaisesRegex(Refused, r"install-package failed: (the environment holds .*RECORD "
+                                                         r"doesn't list|pip changed or removed pyvenv\.cfg)"):
+                        self.stage()
+                records = self.journal()
+                self.assertFalse(any(r["kind"] == "outcome" and r.get("step") == "install-package"
+                                     and r["result"] == "ok" for r in records))
+                self.assertFalse((self.env().parent / "env-inventory.json").exists())
+
+    def test_the_probe_runs_only_between_static_checks(self):
+        """A change to the environment, or a swapped directory, around the
+        probe's run is refused and the operation never recorded complete."""
+        real = stage_release.run
+        rel_dir = self.dest / "releases" / self.manifest["release"]
+        for name, act, pattern in (
+                ("hook added during the probe", lambda: (self.site() / "zz-hook.pth").write_text("import os\n"),
+                 r"the staged environment changed while its probe ran \(lib/python.*zz-hook\.pth\)"),
+                ("environment swapped during the probe",
+                 lambda: (os.rename(self.env(), f"{self.env()}-moved"),
+                          os.symlink(self.home / ".local/state/chat", self.env())),
+                 r".*/env changed while the environment probe ran: .*so the environment probe may have run other "
+                 r"code; refused")):
+            with self.subTest(change=name):
+                if self.dest.exists():
+                    shutil.rmtree(self.dest)
+
+                def boundary(argv, act=act, **kw):
+                    text = " ".join(str(a) for a in argv)
+                    if "-c" in [str(a) for a in argv] and str(rel_dir) in text:
+                        act()
+                    return real(argv, **kw)
+                with mock.patch.object(stage_release, "run", boundary):
+                    with self.assertRaisesRegex(Refused, r"verify-environment failed: " + pattern):
+                        self.stage()
+                self.assertEqual(stage_release.status(self.dest)[0]["state"],
+                                 "unfinished (last: outcome verify-environment: failed)")
+                if os.path.islink(self.env()):
+                    os.unlink(self.env())
+                    os.rename(f"{self.env()}-moved", self.env())
 
 
 class AliasMatrixTests(StageCase):

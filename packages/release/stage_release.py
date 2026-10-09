@@ -41,7 +41,9 @@ only; no network access.
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
+import contextlib
 import csv
 import datetime
 import fcntl
@@ -52,7 +54,6 @@ import os
 import plistlib
 import re
 import secrets
-import shutil
 import stat
 import subprocess
 import sys
@@ -807,6 +808,104 @@ def write_all(fd, data):
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
+def pin_directory(path, protected, create=False):
+    """(descriptor, resolved path) for the directory at `path`.
+
+    The path is resolved once and checked against the protected locations.
+    Then that resolved path is opened from / one name at a time with
+    O_DIRECTORY|O_NOFOLLOW, each relative to the one before. A directory
+    swapped for a link after the check makes the open fail instead of
+    following it. With `create`, a missing name is created relative to its
+    pinned parent, so neither the root nor a missing parent can be created
+    anywhere but where the guard looked."""
+    real = os.path.realpath(path)
+    reason = protected_reason(real, protected)
+    if reason:
+        raise Refused(f"{shown(path)} is {reason}; left unchanged")
+    fd = os.open("/", DIR_FLAGS)
+    try:
+        for name in Path(real).parts[1:]:
+            try:
+                child = os.open(name, DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise Refused(f"{shown(path)} doesn't exist") from None
+                os.mkdir(name, 0o755, dir_fd=fd)
+                try:
+                    child = os.open(name, DIR_FLAGS, dir_fd=fd)
+                except OSError:
+                    raise Refused(f"{shown(path)} changed while it was being created; stopped") from None
+            except OSError:
+                raise Refused(f"{shown(path)} changed after it was checked: a directory on the way to it is now a "
+                              "link or not a directory; nothing was created through it") from None
+            os.close(fd)
+            fd = child
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, real
+
+
+def open_inside(fd, inner, flags=os.O_RDONLY):
+    """Open `inner` (a relative path) below the directory `fd`, one name at
+    a time, never following a link."""
+    parts = inner.split("/")
+    current = os.dup(fd)
+    try:
+        for name in parts[:-1]:
+            child = os.open(name, DIR_FLAGS, dir_fd=current)
+            os.close(current)
+            current = child
+        return os.open(parts[-1], flags | os.O_NOFOLLOW, dir_fd=current)
+    finally:
+        os.close(current)
+
+
+def read_inside(fd, inner):
+    """The bytes of the regular file `inner` below the directory `fd`, read
+    through descriptors only."""
+    try:
+        out = open_inside(fd, inner)
+    except OSError:
+        raise Refused(f"{inner} can't be read without following a link") from None
+    try:
+        if not stat.S_ISREG(os.fstat(out).st_mode):
+            raise Refused(f"{inner} is not a regular file")
+        chunks = []
+        while chunk := os.read(out, 1 << 20):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(out)
+
+
+def inventory_at(fd, prefix=""):
+    """Every entry below the directory `fd`, read through descriptors and
+    never following a link: a directory, a link's target, or a file's sha256
+    and permission bits."""
+    out = {}
+    with os.scandir(fd) as listing_:
+        names = sorted(e.name for e in listing_)
+    for name in names:
+        rel = prefix + name
+        st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if stat.S_ISLNK(st.st_mode):
+            out[rel] = ["link", os.readlink(name, dir_fd=fd)]
+        elif stat.S_ISDIR(st.st_mode):
+            out[rel] = ["dir"]
+            child = os.open(name, DIR_FLAGS, dir_fd=fd)
+            try:
+                out.update(inventory_at(child, rel + "/"))
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(st.st_mode):
+            data = read_inside(fd, name)
+            out[rel] = ["file", hashlib.sha256(data).hexdigest(), stat.S_IMODE(st.st_mode)]
+        else:
+            out[rel] = ["other"]
+    return out
+
+
 class Writer:
     """The one way staging changes the filesystem, `plan --out` included.
 
@@ -829,25 +928,18 @@ class Writer:
       that this operation created it, and it is still that entry: same
       inode, singly linked, this owner. Anything else is refused."""
 
-    def __init__(self, root, live):
-        self.root, self.real, self.protected = Path(root), os.path.realpath(root), protected_bases(live)
+    def __init__(self, root, live, create=False):
+        """Pin the root (pin_directory), creating it and any missing parent
+        only through pinned descriptors when `create`."""
+        self.root, self.protected = Path(root), protected_bases(live)
         self.uid = os.getuid()
-        try:
-            st = os.lstat(self.root)
-        except FileNotFoundError:
-            raise Refused(f"{shown(self.root)} doesn't exist") from None
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != self.uid:
-            raise Refused(f"{shown(self.root)} is not a directory this user owns; left unchanged")
-        if st.st_mode & 0o022:
-            raise Refused(f"{shown(self.root)} is writable by other users; left unchanged")
-        reason = protected_reason(self.root, self.protected)
-        if reason:
-            raise Refused(f"{shown(self.root)} is {reason}; left unchanged")
-        self.root_fd = os.open(self.root, DIR_FLAGS)
-        held = os.fstat(self.root_fd)
-        if (held.st_dev, held.st_ino) != (st.st_dev, st.st_ino):
+        self.root_fd, self.real = pin_directory(self.root, self.protected, create)
+        st = os.fstat(self.root_fd)
+        problem = ("is not a directory this user owns" if st.st_uid != self.uid
+                   else "is writable by other users" if st.st_mode & 0o022 else None)
+        if problem:
             os.close(self.root_fd)
-            raise Refused(f"{shown(self.root)} changed while it was opened; left unchanged")
+            raise Refused(f"{shown(self.root)} {problem}; left unchanged")
         self.dev, self.root_inode = st.st_dev, (st.st_dev, st.st_ino)
         self.dirs, self.mine = {}, {}
         self.record = None
@@ -1060,6 +1152,42 @@ class Writer:
         self.mine.pop(rel, None)
         self.dirs.pop(rel, None)
 
+    @contextlib.contextmanager
+    def pinned(self, rel):
+        """A descriptor for rel, a directory staging created, reached through
+        pinned descriptors and checked by inode; closed afterwards."""
+        fd, name = self.parent(rel)
+        try:
+            child = self.open_dir(fd, name, rel)
+        finally:
+            os.close(fd)
+        try:
+            yield child
+        finally:
+            os.close(child)
+
+    def read(self, rel):
+        """The bytes of a file this operation wrote, read through pinned
+        descriptors: still the same singly linked inode the journal records."""
+        fd, name = self.parent(rel)
+        try:
+            try:
+                out = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                self.foreign(self.root / rel, "can't be read as a file this operation created")
+            try:
+                st = os.fstat(out)
+                if not (stat.S_ISREG(st.st_mode) and self.owned(rel, st)):
+                    self.foreign(self.root / rel, "is not a file this operation created")
+                chunks = []
+                while chunk := os.read(out, 1 << 20):
+                    chunks.append(chunk)
+                return b"".join(chunks)
+            finally:
+                os.close(out)
+        finally:
+            os.close(fd)
+
     def same_dir(self, rel):
         """Refuse unless rel is still the directory this operation created."""
         fd, name = self.parent(rel)
@@ -1089,9 +1217,11 @@ class Writer:
                 st = None
             if st is None or not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != inode:
                 if after:
+                    effect = (f"so {process}'s writes through it may have landed elsewhere (D-71)"
+                              if process in ("venv", "pip") else f"so {process} may have run other code")
                     raise Refused(f"{shown(path)} changed while {process} ran: it is no longer the directory "
-                                  f"staging created and checked, so {process}'s writes through it may have landed "
-                                  "elsewhere (D-71); refused, and the step isn't recorded complete")
+                                  f"staging created and checked, {effect}; refused, and the step isn't recorded "
+                                  "complete")
                 raise Refused(f"{shown(path)} is no longer the directory staging created and checked; {process} "
                               "was not run")
         self.same_dir(rel)
@@ -1243,10 +1373,19 @@ def parse_journal(data, path):
 def read_journal(path):
     """The journal's records, read-only (status): a torn final fragment is
     ignored, not repaired."""
-    try:
-        data = Path(path).read_bytes()
-    except FileNotFoundError:
+    path = Path(path)
+    if not os.path.lexists(path.parent):
         return []
+    fd, _ = pin_directory(path.parent, [])  # read-only: through descriptors, never a link
+    try:
+        try:
+            data = read_inside(fd, path.name)
+        except Refused:
+            if not os.path.lexists(path):
+                return []
+            raise Refused(f"{shown(path)} is not a journal staging can read without following a link") from None
+    finally:
+        os.close(fd)
     return parse_journal(data, path)[0]
 
 
@@ -1299,6 +1438,17 @@ def check_destination(dest, identity):
     return root
 
 
+def check_root_contents(writer):
+    """check_destination's content check again, on the pinned root."""
+    present = set(os.listdir(writer.root_fd))
+    unknown = sorted(present - {JOURNAL, LOCK, RELEASES})
+    if RELEASES in present and JOURNAL not in present:
+        unknown.append(f"{RELEASES} without a journal")
+    if unknown:
+        raise Refused(f"the staging destination {shown(writer.root)} holds entries staging didn't create "
+                      f"({', '.join(unknown[:3])}); left unchanged")
+
+
 LAUNCHER = re.compile(r"""^'''exec' (?:"([^"]+)"|(\S+)) "\$0" "\$@"$""")  # quoted only with spaces
 
 
@@ -1336,104 +1486,160 @@ def wheel_contents(wheel):
     return files, entry_points, record.rsplit("/", 1)[0]
 
 
-def env_inventory(env):
-    """Every entry under the environment, without following links: a
-    directory, a link's target, or a file's sha256 and permission bits."""
-    out = {}
-    for folder, dirs, files in os.walk(env):
-        for name in sorted(dirs + files):
-            path = os.path.join(folder, name)
-            rel = os.path.relpath(path, env)
-            st = os.lstat(path)
-            if stat.S_ISLNK(st.st_mode):
-                out[rel] = ["link", os.readlink(path)]
-            elif stat.S_ISDIR(st.st_mode):
-                out[rel] = ["dir"]
-            elif stat.S_ISREG(st.st_mode):
-                out[rel] = ["file", sha256_file(path), stat.S_IMODE(st.st_mode)]
-            else:
-                out[rel] = ["other"]
-    return out
+def hex_to_record(hexdigest):
+    """A file's sha256 hex digest as a RECORD hash."""
+    return "sha256=" + base64.urlsafe_b64encode(bytes.fromhex(hexdigest)).rstrip(b"=").decode()
 
 
-def verify_static(release_dir, manifest_sha, inventory_sha):
-    """Everything that can be checked without running the environment's
-    code, checked before it runs: the artifacts against the manifest, the
-    environment entry by entry against the inventory recorded when this
-    operation built it (startup hooks, bytecode, the interpreter link and
-    pyvenv.cfg included), the installed package against the verified wheel
-    and its own RECORD, and each command. Returns the verified manifest."""
-    artifacts, env = release_dir / "artifacts", release_dir / "env"
-    staged = build_release.verify(artifacts)
-    if sha256_file(artifacts / MANIFEST) != manifest_sha:
-        raise Refused("the staged manifest differs from the release's")
-    try:
-        recorded = (release_dir / INVENTORY).read_bytes()
-    except OSError:
-        raise Refused("the staged environment has no recorded inventory") from None
-    if hashlib.sha256(recorded).hexdigest() != inventory_sha:
-        raise Refused("the staged environment's inventory differs from the one the journal recorded")
-    expected, actual = json.loads(recorded), env_inventory(env)
-    if actual != expected:
-        changed = sorted(set(actual) ^ set(expected) | {k for k in actual if actual[k] != expected.get(k)})
-        raise Refused(f"the staged environment differs from what this operation built ({changed[0]}"
-                      f"{f' and {len(changed) - 1} more' if len(changed) > 1 else ''})")
-    sites = sorted(env.glob("lib/python*/site-packages"))
+def first_difference(actual, expected):
+    changed = sorted(set(actual) ^ set(expected) | {k for k in actual if actual[k] != expected.get(k)})
+    return changed[0] + (f" and {len(changed) - 1} more" if len(changed) > 1 else "") if changed else None
+
+
+def site_packages(inventory):
+    sites = [k for k, v in inventory.items() if v == ["dir"] and re.fullmatch(r"lib/python[^/]+/site-packages", k)]
     if len(sites) != 1:
         raise Refused("the staged environment has no single site-packages")
-    purelib = sites[0]
-    wheel_files, entry_points, dist_info = wheel_contents(artifacts / staged["package"]["artifact"])
+    return sites[0]
+
+
+def check_installed(inventory, env_fd, env, wheel, package):
+    """What can be checked from one pinned snapshot of the environment,
+    without running anything: every file the verified wheel hashes is
+    installed with its bytes; every file the installed RECORD hashes
+    matches, and RECORD names nothing outside the environment; the package
+    directory holds nothing RECORD doesn't list; and each command is a
+    regular executable file, listed in RECORD, that runs the staged
+    interpreter and calls the wheel's entry point. Returns the paths RECORD
+    lists, relative to the environment."""
+    site = site_packages(inventory)
+    wheel_files, entry_points, dist_info = wheel_contents(io.BytesIO(wheel))
+
+    def file_hash(rel):
+        entry = inventory.get(rel)
+        return hex_to_record(entry[1]) if entry and entry[0] == "file" else None
     for member, digest_ in sorted(wheel_files.items()):
-        path = purelib / member
-        if path.is_symlink() or not path.is_file() or build_release.record_hash(path.read_bytes()) != digest_:
+        if file_hash(f"{site}/{member}") != digest_:
             raise Refused(f"the installed {member} differs from the verified wheel")
     try:
-        rows = list(csv.reader(io.StringIO((purelib / dist_info / "RECORD").read_text(encoding="utf-8"))))
-    except OSError:
+        record = read_inside(env_fd, f"{site}/{dist_info}/RECORD")
+    except Refused:
         raise Refused("the installed package has no RECORD") from None
-    listed, named = {}, {}
-    for row in rows:
+    if file_hash(f"{site}/{dist_info}/RECORD") != build_release.record_hash(record):
+        raise Refused("the installed RECORD changed while it was read")
+    listed = {}
+    for row in csv.reader(io.StringIO(record.decode("utf-8"))):
         if not row:
             continue
-        located = os.path.normpath(purelib / row[0])
-        if not located.startswith(os.path.normpath(env) + os.sep):
+        located = os.path.normpath(os.path.join(site, row[0]))
+        if located.startswith("..") or os.path.isabs(located):
             raise Refused(f"the installed RECORD names {row[0]}, outside the environment")
-        listed[located], named[located] = (row[1] if len(row) > 1 else ""), row[0]
-    for command in staged["package"]["commands"]:
-        script = env / "bin" / command
-        text = script.read_text(encoding="utf-8") if script.is_file() and not script.is_symlink() else ""
-        if not text:
+        listed[located] = (row[1] if len(row) > 1 else "", row[0])
+    for command in package["commands"]:
+        rel = f"bin/{command}"
+        entry = inventory.get(rel)
+        if not entry or entry[0] != "file":
             raise Refused(f"the staged environment has no {command} command")
+        data = read_inside(env_fd, rel)
+        if hashlib.sha256(data).hexdigest() != entry[1]:
+            raise Refused(f"the staged {command} command changed while it was read")
+        text = data.decode("utf-8", errors="replace")
         runs = interpreter_of(text.splitlines())
-        if not runs or os.path.normpath(runs) != os.path.normpath(env / "bin" / os.path.basename(runs)):
+        if not runs or os.path.normpath(runs) != os.path.normpath(Path(env) / "bin" / os.path.basename(runs)):
             raise Refused(f"the staged {command} command doesn't run the staged interpreter")
-        if not os.access(script, os.X_OK):
+        if not entry[2] & 0o100:
             raise Refused(f"the staged {command} command is not executable")
         module, _, attr = entry_points.get(command, "").partition(":")
         if not attr or f"from {module} import {attr}" not in text:
             raise Refused(f"the staged {command} command doesn't call the wheel's entry point "
                           f"({entry_points.get(command, 'none declared')})")
-        if os.path.normpath(script) not in listed:
+        if rel not in listed:
             raise Refused(f"the staged {command} command isn't in the installed package's RECORD")
-    for located, expected in sorted(listed.items()):
-        if expected and build_release.record_hash(Path(located).read_bytes()) != expected:
-            raise Refused(f"the installed {named[located]} no longer matches the package's RECORD")
-    for folder, dirs, files in os.walk(purelib / "plateia_chat"):
-        for name in files:
-            if os.path.normpath(os.path.join(folder, name)) not in listed:
-                raise Refused(f"the installed package holds a file its RECORD doesn't list "
-                              f"({os.path.relpath(os.path.join(folder, name), purelib)})")
-    return staged
+    for located, (expected, named) in sorted(listed.items()):
+        if expected and file_hash(located) != expected:
+            raise Refused(f"the installed {named} no longer matches the package's RECORD")
+    for rel, entry in sorted(inventory.items()):
+        if rel.startswith(f"{site}/plateia_chat/") and entry[0] != "dir" and rel not in listed:
+            raise Refused(f"the installed package holds a file its RECORD doesn't list "
+                          f"({os.path.relpath(rel, site)})")
+    return set(listed)
 
 
-def verify_staged(release_dir, manifest_sha, manifest, interpreter, inventory_sha):
-    """Check a staged release: statically first, then by running the
-    environment's interpreter once that is known to be what this operation
-    built. Returns the probe, or raises Refused naming the problem."""
-    staged = verify_static(release_dir, manifest_sha, inventory_sha)
-    env = release_dir / "env"
+def verified_artifacts(writer, artifacts_rel, manifest_sha, manifest):
+    """The staged manifest and artifacts, read through pinned descriptors:
+    the manifest's bytes are the release's (by sha256) and say what the
+    verified manifest says, the directory holds exactly its artifacts, and
+    each matches its recorded sha256 and size. Returns {name: bytes}."""
+    data = {MANIFEST: writer.read(f"{artifacts_rel}/{MANIFEST}")}
+    if hashlib.sha256(data[MANIFEST]).hexdigest() != manifest_sha:
+        raise Refused("the staged manifest differs from the release's")
+    try:
+        staged = json.loads(data[MANIFEST])
+    except ValueError:
+        raise Refused("the staged manifest is unreadable") from None
+    if staged != manifest:
+        raise Refused("the staged manifest differs from the verified one")
+    with writer.pinned(artifacts_rel) as fd:
+        present = set(os.listdir(fd))
+    expected = {MANIFEST} | {a["name"] for a in manifest["artifacts"]}
+    if present != expected:
+        raise Refused(f"the staged artifacts directory holds {sorted(present ^ expected)[0]}, which the manifest "
+                      "doesn't list or is missing")
+    for entry in manifest["artifacts"]:
+        data[entry["name"]] = writer.read(f"{artifacts_rel}/{entry['name']}")
+        found = data[entry["name"]]
+        if hashlib.sha256(found).hexdigest() != entry["sha256"] or len(found) != entry.get("size"):
+            raise Refused(f"the staged artifact {entry['name']} does not match the manifest")
+    return data
+
+
+def verify_static(writer, rel_dir, manifest_sha, manifest, inventory_sha):
+    """Everything that can be checked without running the environment's
+    code, checked before it runs, through pinned descriptors only: the
+    artifacts against the manifest, the environment entry by entry against
+    the inventory recorded when this operation built it (startup hooks such
+    as .pth files and sitecustomize, bytecode, the interpreter link and
+    pyvenv.cfg included), the installed package against the verified wheel
+    and its own RECORD, and each command (check_installed)."""
+    artifacts = verified_artifacts(writer, f"{rel_dir}/artifacts", manifest_sha, manifest)
+    try:
+        recorded = writer.read(f"{rel_dir}/{INVENTORY}")
+    except (Refused, FileNotFoundError):
+        raise Refused("the staged environment has no recorded inventory") from None
+    if hashlib.sha256(recorded).hexdigest() != inventory_sha:
+        raise Refused("the staged environment's inventory differs from the one the journal recorded")
+    expected = json.loads(recorded)
+    with writer.pinned(f"{rel_dir}/env") as fd:
+        actual = inventory_at(fd)
+        changed = first_difference(actual, expected)
+        if changed:
+            raise Refused(f"the staged environment differs from what this operation built ({changed})")
+        check_installed(actual, fd, writer.root / rel_dir / "env", artifacts[manifest["package"]["artifact"]],
+                        manifest["package"])
+    return expected
+
+
+def verify_staged(writer, rel_dir, manifest_sha, manifest, interpreter, inventory_sha):
+    """Check a staged release: statically first (verify_static), then by
+    running the environment's interpreter once, then statically again. The
+    interpreter runs by path, so the path is checked against the pinned
+    directories just before and after it runs, and the environment's
+    contents are compared with the trusted inventory again afterwards: a
+    change around the run is refused and never reported verified. Returns
+    the probe, or raises Refused naming the problem."""
+    expected = verify_static(writer, rel_dir, manifest_sha, manifest, inventory_sha)
+    env_rel = f"{rel_dir}/env"
+    env = writer.root / env_rel
     python = env / "bin" / "python"
-    r = run([python, "-I", "-c", ENV_PROBE], env=child_env(), cwd=str(release_dir))
+    writer.path_intact(env_rel, "the environment probe")
+    try:
+        r = run([python, "-I", "-B", "-c", ENV_PROBE], env=child_env(), cwd=os.sep)
+    finally:
+        writer.path_intact(env_rel, "the environment probe", after=True)
+        with writer.pinned(env_rel) as fd:
+            changed = first_difference(inventory_at(fd), expected)
+        if changed:
+            raise Refused(f"the staged environment changed while its probe ran ({changed})")
     try:
         found = json.loads(r.stdout.strip().splitlines()[-1])
         assert all(isinstance(found.get(k), str) for k in ("implementation", "version", "system", "prefix",
@@ -1450,9 +1656,9 @@ def verify_staged(release_dir, manifest_sha, manifest, interpreter, inventory_sh
                                    (os.path.realpath(path), os.path.realpath(env))))
     if not inside(found["prefix"]) or not inside(found["module"]):
         raise Refused("the staged environment loads plateia_chat from outside itself")
-    if found["dist_version"] != staged["package"]["version"]:
+    if found["dist_version"] != manifest["package"]["version"]:
         raise Refused(f"the staged environment holds plateia-chat {found['dist_version']}, "
-                      f"not {staged['package']['version']}")
+                      f"not {manifest['package']['version']}")
     if any(isinstance(e, str) and e and os.path.realpath(e).startswith(str(CHECKOUT) + os.sep)
            for e in found["path"]):
         raise Refused("the staged environment has this checkout on its import path")
@@ -1485,9 +1691,10 @@ def stage(release, dest, python=None, plan_path=None, spec_path=None, crash=None
     if identity_problem(manifest):
         raise Refused(f"the manifest can't be staged: {identity_problem(manifest)}; nothing was staged")
     root = check_destination(dest, manifest["release"])
-    root.mkdir(parents=True, exist_ok=True)
-    writer = Writer(root, build_release.live_roots())
+    # The root and any missing parent are created through pinned descriptors.
+    writer = Writer(root, build_release.live_roots(), create=True)
     try:
+        check_root_contents(writer)
         journal = Journal(writer, crash)
         try:
             return run_operation(journal, writer, release, manifest, plan, report, python, spec_path), plan, report
@@ -1530,7 +1737,8 @@ def run_operation(journal, writer, release, manifest, plan, report, python, spec
 
     if op_id in ops and ops[op_id]["complete"]:
         try:
-            verify_staged(release_dir, binding["manifest_sha256"], manifest, binding["interpreter"], inventory_sha())
+            verify_staged(writer, rel_dir, binding["manifest_sha256"], manifest, binding["interpreter"],
+                          inventory_sha())
         except Refused as e:
             raise Refused(f"operation {op_id} is recorded complete, but its staged release doesn't verify "
                           f"({e}); it is not reported staged, and nothing was changed") from None
@@ -1555,7 +1763,7 @@ def run_operation(journal, writer, release, manifest, plan, report, python, spec
                         "compatibility": report["results"]})
     else:
         journal.append({"op": op_id, "kind": "resume",
-                        "found": {"last": ops[op_id]["last"], "release_dir_exists": release_dir.exists(),
+                        "found": {"last": ops[op_id]["last"], "release_dir_exists": writer.lstat(rel_dir) is not None,
                                   "torn_bytes_dropped": journal.repaired}})
     attempt = 1 + max([r.get("attempt", 0) for r in journal.records if r.get("op") == op_id] or [0])
 
@@ -1584,47 +1792,76 @@ def run_operation(journal, writer, release, manifest, plan, report, python, spec
 
     def copy_artifacts():
         writer.mkdir(artifacts_rel)
-        for stray in sorted(set(os.listdir(release_dir / "artifacts")) - set(names)):
+        with writer.pinned(artifacts_rel) as fd:
+            strays = sorted(set(os.listdir(fd)) - set(names))
+        for stray in strays:
             writer.remove(f"{artifacts_rel}/{stray}")  # only what this operation created
         for name in names:
             writer.write(f"{artifacts_rel}/{name}", (release / name).read_bytes())
-        build_release.verify(release_dir / "artifacts")
-        if sha256_file(release_dir / "artifacts" / MANIFEST) != binding["manifest_sha256"]:
-            raise Refused("the release's manifest changed while it was copied")
+        verified_artifacts(writer, artifacts_rel, binding["manifest_sha256"], manifest)  # the copies, read back pinned
         return f"{len(names)} files copied and verified"
 
     env = release_dir / "env"
+    evidence = {}  # the environment venv built, inventoried through pinned descriptors right after it ran
 
     def create_environment():
         if writer.lstat(env_rel) is not None:
-            writer.remove_tree(env_rel)  # a partial environment this operation's venv run left
+            writer.remove_tree(env_rel)  # an environment found on disk is never run: removed and built again
         writer.mkdir(env_rel)
         writer.path_intact(env_rel, "venv")
         try:
-            r = run([python, "-m", "venv", env], env=child_env(), cwd=str(release_dir))
+            r = run([python, "-m", "venv", env], env=child_env(), cwd=os.sep)
         finally:
             writer.path_intact(env_rel, "venv", after=True)  # a swap during it is named, whatever venv did
         if r.returncode:
             raise Refused(f"venv exited {r.returncode}")
-        return "venv created with the chosen interpreter and its bundled pip"
+        with writer.pinned(env_rel) as fd:
+            evidence["venv"] = inventory_at(fd)
+        data = json.dumps(evidence["venv"], sort_keys=True).encode()
+        return ("venv created with the chosen interpreter and its bundled pip; inventoried",
+                {"venv_inventory_sha256": hashlib.sha256(data).hexdigest()})
 
     def install_package():
-        wheel = release_dir / "artifacts" / manifest["package"]["artifact"]
+        wheel_name = manifest["package"]["artifact"]
+        wheel_bytes = verified_artifacts(writer, artifacts_rel, binding["manifest_sha256"], manifest)[wheel_name]
+        if "venv" not in evidence:
+            raise Refused("no environment was built in this run; pip was not run")
+        # The environment's own interpreter and pip are about to run: it must
+        # still be exactly what venv built (a .pth hook or link added since,
+        # say, would run inside pip).
         writer.path_intact(env_rel, "pip")
+        with writer.pinned(env_rel) as fd:
+            changed = first_difference(inventory_at(fd), evidence["venv"])
+        if changed:
+            raise Refused(f"the environment changed after venv built it ({changed}); pip was not run")
         try:
             r = run([env / "bin" / "python", "-m", "pip", "install", "--no-index", "--no-deps", "--no-cache-dir",
-                     "--disable-pip-version-check", wheel], env=child_env(), cwd=str(release_dir))
+                     "--disable-pip-version-check", release_dir / "artifacts" / wheel_name],
+                    env=child_env(), cwd=os.sep)
         finally:
             writer.path_intact(env_rel, "pip", after=True)
         if r.returncode:
             raise Refused(f"pip exited {r.returncode}")
-        data = (json.dumps(env_inventory(env), indent=1, sort_keys=True) + "\n").encode()
+        # What pip left becomes the trusted inventory only if it is what venv
+        # built plus exactly the files the installed package's RECORD lists,
+        # each matching it and the verified wheel.
+        with writer.pinned(env_rel) as fd:
+            after = inventory_at(fd)
+            listed = check_installed(after, fd, env, wheel_bytes, manifest["package"])
+        before = evidence["venv"]
+        for rel in sorted(set(before) | set(after)):
+            if rel in before and after.get(rel) != before[rel]:
+                raise Refused(f"pip changed or removed {rel}, which venv built; not recorded as installed")
+            if rel not in before and rel not in listed and not any(x.startswith(rel + "/") for x in listed):
+                raise Refused(f"the environment holds {rel}, which the installed package's RECORD doesn't list; "
+                              "not recorded as installed")
+        data = (json.dumps(after, indent=1, sort_keys=True) + "\n").encode()
         writer.write(f"{rel_dir}/{INVENTORY}", data)
         return (f"{manifest['package']['name']} {manifest['package']['version']} installed offline; "
                 "environment inventoried", {"inventory_sha256": hashlib.sha256(data).hexdigest()})
 
     def verify_environment():
-        found = verify_staged(release_dir, binding["manifest_sha256"], manifest, binding["interpreter"],
+        found = verify_staged(writer, rel_dir, binding["manifest_sha256"], manifest, binding["interpreter"],
                               inventory_sha())
         return f"artifacts verify; plateia-chat {found['dist_version']} loads from the environment on " \
                f"{found['implementation']} {found['version']}"
