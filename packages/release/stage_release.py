@@ -50,7 +50,9 @@ import json
 import os
 import plistlib
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import zipfile
@@ -68,10 +70,12 @@ SPEC_PATH = HERE / "staging.json"
 PLAN_SCHEMA = "plateia-stage-plan/1"
 JOURNAL_SCHEMA = "plateia-stage-journal/1"
 STAGED_SCHEMA = "plateia-staged-release/1"
-JOURNAL, LOCK, RELEASES, MARKER, STAGED = "journal.jsonl", "journal.lock", "releases", ".operation", "staged.json"
+JOURNAL, LOCK, RELEASES, STAGED, INVENTORY = ("journal.jsonl", "journal.lock", "releases", "staged.json",
+                                              "env-inventory.json")
 STEPS = ("create-release-dir", "copy-artifacts", "create-environment", "install-package",
          "verify-environment", "complete")
 IMPORTER_LIMIT = 2 << 20  # larger files aren't scripts; they are skipped, not read
+IMPORTER_WALK_LIMIT = 200_000  # entries searched for importers before the inventory is called incomplete
 SCRIPT_SUFFIXES = (".py", ".sh", ".bash", ".zsh")  # with the executable bit: the files searched
 
 # A path-bound importer changes the import path (assigning, extending or
@@ -314,14 +318,19 @@ def ownership(t, skills):
 
 def find_importers(spec, skills):
     """Path-bound importers of chat/scripts under the declared source roots.
-    Only scripts are opened (a Python or shell suffix, or the executable
-    bit), never data files, and links aren't followed; the chat folder
-    itself is skipped. A root or script that can't be read makes the
-    inventory incomplete rather than clean."""
+
+    Symlinked folders and scripts inside a root are followed, each resolved
+    folder walked once (so a cycle ends) and each resolved file counted
+    once, under the first path that reaches it. Only scripts are opened (a
+    Python or shell suffix, or the executable bit), never data files. The
+    managed chat folder is skipped, however it is reached. A root, folder or
+    script that can't be read, or more entries than the walk allows, makes
+    the inventory incomplete rather than clean."""
     cfg = spec["importers"]
-    managed = skills / "chat"
-    known = {expand(k["path"], skills): k["name"] for k in cfg["known"]}
-    found, roots = {}, []
+    managed = os.path.realpath(skills / "chat")
+    known = {os.path.realpath(expand(k["path"], skills)): (k["name"], expand(k["path"], skills))
+             for k in cfg["known"]}
+    found, roots, walked, seen = {}, [], set(), 0
     for text in cfg["roots"]:
         root = expand(text, skills)
         entry = {"path": shown(root), "status": "complete", "unreadable": []}
@@ -329,22 +338,38 @@ def find_importers(spec, skills):
         if not os.path.lexists(root):
             entry["status"] = "absent"
             continue
-        if root.is_symlink() or not root.is_dir():
-            entry["status"] = "incomplete"
-            entry["unreadable"].append(f"{shown(root)} is not a directory")
-            continue
-
-        def failed(error, entry=entry):
-            entry["unreadable"].append(shown(error.filename or root))
-        for folder, dirs, files in os.walk(root, onerror=failed):
-            dirs[:] = sorted(d for d in dirs if d not in cfg["skip_dirs"] and Path(folder, d) != managed
-                             and not Path(folder, d).is_symlink())
-            for name in sorted(files):
-                path = Path(folder, name)
+        pending = [root]
+        while pending:
+            folder = pending.pop()
+            real = os.path.realpath(folder)
+            if real == managed or real in walked:
+                continue
+            walked.add(real)
+            try:
+                with os.scandir(folder) as listing:
+                    items = sorted(listing, key=lambda e: e.name)
+            except OSError:
+                entry["unreadable"].append(shown(folder))
+                continue
+            for item in items:
+                seen += 1
+                if seen > IMPORTER_WALK_LIMIT:
+                    entry["unreadable"].append(f"more than {IMPORTER_WALK_LIMIT} entries")
+                    pending = []
+                    break
+                path = Path(item.path)
                 try:
-                    if path.is_symlink() or not path.is_file() or path.stat().st_size > IMPORTER_LIMIT:
+                    if item.is_dir():  # follows a link, deliberately
+                        if item.name not in cfg["skip_dirs"]:
+                            pending.append(path)
                         continue
-                    if not (path.suffix in SCRIPT_SUFFIXES or path.stat().st_mode & 0o111):
+                    if not item.is_file():
+                        continue
+                    st = path.stat()
+                    if st.st_size > IMPORTER_LIMIT or not (path.suffix in SCRIPT_SUFFIXES or st.st_mode & 0o111):
+                        continue
+                    target = os.path.realpath(path)
+                    if target in found or target.startswith(managed + os.sep):
                         continue
                     data = path.read_bytes()
                 except OSError:
@@ -354,13 +379,13 @@ def find_importers(spec, skills):
                     continue
                 text_ = data.decode("utf-8", errors="ignore")
                 if SYS_PATH.search(text_) and CHAT_SCRIPTS.search(text_):
-                    found[path] = known.get(path)
+                    found[target] = path
         if entry["unreadable"]:
             entry["status"] = "incomplete"
     return {"roots": roots,
-            "known": [{"name": name, "path": shown(path), "found": path in found}
-                      for path, name in known.items()],
-            "unlisted": sorted(shown(p) for p, name in found.items() if name is None),
+            "known": [{"name": name, "path": shown(path), "found": real in found}
+                      for real, (name, path) in known.items()],
+            "unlisted": sorted(shown(p) for real, p in found.items() if real not in known),
             "complete": all(r["status"] != "incomplete" for r in roots)}
 
 
@@ -650,148 +675,34 @@ def render_preflight(report):
     return "\n".join(["preflight"] + lines)
 
 
-# --- journal -----------------------------------------------------------------
+# --- the safe-write layer ----------------------------------------------------
 
-class Journal:
-    """The locked, durable stage journal: one JSON record per line, each
-    flushed and fsynced before the step it announces runs."""
+SAFE_NAME = re.compile(r"[A-Za-z0-9._+-]+")
 
-    def __init__(self, root, crash=None):
-        self.root, self.path, self.crash = root, root / JOURNAL, crash
-        no_links(root, root / LOCK, self.path)
-        self.lock = os.fdopen(open_nofollow(root / LOCK, os.O_WRONLY | os.O_CREAT | os.O_APPEND), "a")
-        try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            self.lock.close()
-            raise Refused("another staging run holds the journal lock; refusing to interleave") from None
-        self.repaired = self.repair_tail()
-        self.records = read_journal(self.path)
 
-    def repair_tail(self):
-        """Under the lock: drop a torn final line (a crash mid-write), or end
-        a complete final record that only lacks its newline, durably, so
-        the next record starts on a line of its own. Returns the bytes
-        dropped."""
-        try:
-            data = self.path.read_bytes()
-        except FileNotFoundError:
-            return 0
-        lines = data.splitlines(keepends=True)
-        if not lines:
-            return 0
-        last = lines[-1]
-        try:
-            record = json.loads(last)
-            whole = isinstance(record, dict) and record.get("schema") == JOURNAL_SCHEMA
-        except ValueError:
-            whole = False
-        if whole and last.endswith(b"\n"):
-            return 0
-        fd = open_nofollow(self.path, os.O_WRONLY | os.O_APPEND)
-        try:
-            if whole:
-                os.write(fd, b"\n")
-            else:
-                os.ftruncate(fd, len(data) - len(last))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        return 0 if whole else len(last)
+def protected_bases(live):
+    """build_release's protected locations, each as (name, resolved, given),
+    with this checkout first."""
+    return [("this checkout", Path(os.path.realpath(CHECKOUT)), Path(os.path.abspath(CHECKOUT)))] + \
+        [(name, Path(os.path.realpath(root)), Path(os.path.abspath(root))) for name, root in live]
 
-    def close(self):
-        self.lock.close()
 
-    def append(self, record):
-        record = dict(record, schema=JOURNAL_SCHEMA, seq=len(self.records) + 1,
-                      at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-        new = not self.path.exists()
-        fd = open_nofollow(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-        try:
-            write_all(fd, (json.dumps(record, sort_keys=True) + "\n").encode())
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        if new:
-            fsync_dir(self.root)
-        self.records.append(record)
-        if self.crash:
-            self.crash(record)
-        return record
+def protected_reason(path, bases):
+    """Why `path` may not be written, or None: inside this checkout or under a
+    protected location, comparing both the resolved and the given spelling."""
+    given, real = Path(os.path.abspath(path)), Path(os.path.realpath(path))
+    inside = lambda p, base: p == base or base in p.parents  # noqa: E731
+    for name, resolved, spelled in bases:
+        if inside(real, resolved) or inside(given, spelled):
+            return "inside this checkout" if name == "this checkout" else \
+                f"under {name}, where the live chat tools live"
+    return None
 
 
 def write_all(fd, data):
     view = memoryview(data)
     while view:
         view = view[os.write(fd, view):]
-
-
-def open_nofollow(path, flags, mode=0o644):
-    """os.open that refuses a symlink at the path itself."""
-    try:
-        return os.open(path, flags | os.O_NOFOLLOW, mode)
-    except OSError as e:
-        if os.path.islink(path):
-            raise Refused(f"{shown(path)} is a symlink; staging never follows a link under its destination") \
-                from None
-        raise
-
-
-def no_links(root, *paths):
-    """Refuse when any existing component of a path below the staging root
-    is a symlink: every staging write then lands, resolved, under the root
-    that build_release's guard already checked."""
-    real_root = os.path.realpath(root)
-    for path in paths:
-        current = Path(root)
-        for part in Path(path).relative_to(root).parts:
-            current = current / part
-            if current.is_symlink():
-                raise Refused(f"{shown(current)} is a symlink; staging never follows a link under its "
-                              "destination")
-        resolved = os.path.realpath(path)
-        if resolved != real_root and not resolved.startswith(real_root + os.sep):
-            raise Refused(f"{shown(path)} resolves outside the staging destination")
-
-
-def read_journal(path):
-    """The journal's records. A torn final line (a crash mid-write) is
-    ignored; any other unreadable line is a refusal."""
-    try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-    records = []
-    for n, line in enumerate(lines, 1):
-        try:
-            record = json.loads(line)
-            assert isinstance(record, dict) and record.get("schema") == JOURNAL_SCHEMA
-        except (ValueError, AssertionError):
-            if n == len(lines):
-                break
-            raise Refused(f"the journal {shown(path)} is unreadable at line {n}; nothing was changed") from None
-        records.append(record)
-    return records
-
-
-def operations(records):
-    """{operation id: summary} in journal order."""
-    ops = {}
-    for r in records:
-        op = ops.setdefault(r["op"], {"id": r["op"], "binding": None, "outcomes": {}, "intents": {},
-                                      "complete": False, "last": None})
-        if r["kind"] in ("begin", "resume"):
-            op["binding"] = r.get("binding", op["binding"])
-            op["last"] = r["kind"]
-        elif r["kind"] == "intent":
-            op["intents"][r["step"]] = r["attempt"]
-            op["last"] = f"intent {r['step']}"
-        elif r["kind"] == "outcome":
-            op["outcomes"][r["step"]] = r["result"]
-            op["last"] = f"outcome {r['step']}: {r['result']}"
-            if r["step"] == "complete" and r["result"] == "ok":
-                op["complete"] = True
-    return ops
 
 
 def fsync_dir(path):
@@ -802,16 +713,337 @@ def fsync_dir(path):
         os.close(fd)
 
 
-def write_atomic(path, data):
-    temp = path.with_name(f".{path.name}.tmp")
-    fd = open_nofollow(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+class Writer:
+    """The one way staging changes the filesystem, `plan --out` included.
+
+    - A path is plain components (letters, digits, `._+-`; never `.` or
+      `..`) under a root build_release's guard accepted.
+    - Every directory below the root on the way is a real directory, owned
+      by this user on the root's device, that the journal records staging
+      created.
+    - The final path and its parent resolve under the root, and outside this
+      checkout and every protected location.
+    - Files are created with O_CREAT|O_EXCL|O_NOFOLLOW under a fresh
+      temporary name, journaled first, then renamed into place.
+    - Nothing is replaced, truncated or deleted unless the journal records
+      that this operation created it, and it is still that entry: same
+      inode, singly linked, this owner. Anything else is refused."""
+
+    def __init__(self, root, live):
+        self.root, self.real, self.protected = Path(root), os.path.realpath(root), protected_bases(live)
+        self.uid = os.getuid()
+        try:
+            st = os.lstat(self.root)
+        except FileNotFoundError:
+            raise Refused(f"{shown(self.root)} doesn't exist") from None
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != self.uid:
+            raise Refused(f"{shown(self.root)} is not a directory this user owns; left unchanged")
+        reason = protected_reason(self.root, self.protected)
+        if reason:
+            raise Refused(f"{shown(self.root)} is {reason}; left unchanged")
+        self.dev = st.st_dev
+        self.dirs, self.mine, self.temps = {}, {}, set()
+        self.record = None
+
+    def load(self, records, op_id):
+        """What the journal says staging created: directories by any
+        operation here, files and temporary names by this one."""
+        for r in records:
+            if r.get("kind") == "created":
+                inode = tuple(r["inode"])
+                if r["type"] == "dir":
+                    self.dirs[r["path"]] = inode
+                if r.get("op") == op_id:
+                    self.mine[r["path"]] = inode
+            elif r.get("kind") == "creating" and r.get("op") == op_id:
+                self.temps.add(r["path"])
+
+    def resolve(self, rel):
+        parts = rel.split("/")
+        if any(not SAFE_NAME.fullmatch(p) or p in (".", "..") for p in parts):
+            raise Refused(f"{rel!r} is not a plain path under the staging destination")
+        for i in range(1, len(parts)):
+            self.expect_dir("/".join(parts[:i]))
+        path = self.root.joinpath(*parts)
+        parent = os.path.realpath(path.parent)
+        if parent != os.path.normpath(os.path.join(self.real, *parts[:-1])):
+            raise Refused(f"{shown(path)} doesn't resolve under the staging destination")
+        for candidate in (parent, os.path.join(parent, parts[-1])):
+            reason = protected_reason(candidate, self.protected)
+            if reason:
+                raise Refused(f"{shown(path)} is {reason}; left unchanged")
+        return path
+
+    def foreign(self, path, st, why):
+        raise Refused(f"{shown(path)} {why}; staging never writes through, replaces or deletes an entry it "
+                      "didn't create, and left it unchanged")
+
+    def expect_dir(self, rel):
+        path = self.root / rel
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            self.foreign(path, st, "is not a directory staging created")
+        if st.st_uid != self.uid or st.st_dev != self.dev or self.dirs.get(rel) != (st.st_dev, st.st_ino):
+            self.foreign(path, st, "is a directory staging didn't create")
+        return st
+
+    def owned(self, rel, st):
+        return (self.mine.get(rel) == (st.st_dev, st.st_ino) and st.st_uid == self.uid and st.st_dev == self.dev
+                and not stat.S_ISLNK(st.st_mode) and (stat.S_ISDIR(st.st_mode) or st.st_nlink == 1))
+
+    def lstat(self, rel):
+        """The entry at rel, or None when it (or a directory on the way) is
+        missing; refuses an alias on the way to it."""
+        try:
+            return os.lstat(self.resolve(rel))
+        except FileNotFoundError:
+            return None
+
+    def inspect(self, rel):
+        """Refuse an existing entry at rel that this operation (or, for a
+        directory, staging) didn't create; walking stops at a missing one."""
+        parts = rel.split("/")
+        for i in range(1, len(parts) + 1):
+            sub = "/".join(parts[:i])
+            st = self.lstat(sub)
+            if st is None:
+                return
+            if i < len(parts) or stat.S_ISDIR(st.st_mode):
+                self.expect_dir(sub)
+            elif not self.owned(sub, st):
+                self.foreign(self.root / sub, st, "is not a file this operation created")
+
+    def note(self, rel, st, kind):
+        inode = (st.st_dev, st.st_ino)
+        self.record({"kind": "created", "path": rel, "type": kind, "inode": list(inode)})
+        self.mine[rel] = inode
+        if kind == "dir":
+            self.dirs[rel] = inode
+
+    def mkdir(self, rel):
+        path = self.resolve(rel)
+        if os.path.lexists(path):
+            self.expect_dir(rel)
+            return path
+        os.mkdir(path, 0o755)
+        self.note(rel, os.lstat(path), "dir")
+        fsync_dir(path.parent)
+        return path
+
+    def write(self, rel, data):
+        """Write a file this operation owns: a new one, or a replacement for
+        one it created; never through or over anything else."""
+        path = self.resolve(rel)
+        st = self.lstat(rel)
+        if st is not None and not (stat.S_ISREG(st.st_mode) and self.owned(rel, st)):
+            self.foreign(path, st, "exists and is not a file this operation created")
+        head, _, name = rel.rpartition("/")
+        temp_rel = (head + "/" if head else "") + f".{name}.{secrets.token_hex(6)}.tmp"
+        temp = self.resolve(temp_rel)
+        self.record({"kind": "creating", "path": temp_rel})  # journaled before it exists
+        self.temps.add(temp_rel)
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        try:
+            write_all(fd, data)
+            os.fsync(fd)
+            made = os.fstat(fd)
+        finally:
+            os.close(fd)
+        os.replace(temp, path)
+        self.note(rel, made, "file")
+        fsync_dir(path.parent)
+        return path
+
+    def create(self, rel, data):
+        """Create a new file exclusively (plan --out): never an existing one."""
+        path = self.resolve(rel)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        except FileExistsError:
+            raise Refused(f"{shown(path)} already exists; staging writes only new files, so choose a new path") \
+                from None
+        try:
+            write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        fsync_dir(path.parent)
+        return path
+
+    def remove(self, rel):
+        """Delete a file this operation created, or a temporary file it
+        journaled before creating (singly linked, this owner)."""
+        path = self.resolve(rel)
+        st = os.lstat(path)
+        temp = (rel in self.temps and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == self.uid
+                and st.st_dev == self.dev)
+        if not (temp or (stat.S_ISREG(st.st_mode) and self.owned(rel, st))):
+            self.foreign(path, st, "is not a file this operation created")
+        os.unlink(path)
+        fsync_dir(path.parent)
+
+    def remove_tree(self, rel):
+        """Delete a directory this operation created, with what it put
+        there (the environment its own venv run filled). Links inside are
+        removed, never followed."""
+        path = self.resolve(rel)
+        st = os.lstat(path)
+        if not (stat.S_ISDIR(st.st_mode) and self.owned(rel, st)):
+            self.foreign(path, st, "is not a directory this operation created")
+        shutil.rmtree(path)
+        self.mine.pop(rel, None)
+        self.dirs.pop(rel, None)
+        fsync_dir(path.parent)
+
+
+# --- journal -----------------------------------------------------------------
+
+class Journal:
+    """The locked, durable stage journal: one JSON record per line, each
+    fsynced before the step it announces runs. Its first record names the
+    journal's and the lock's own inodes, so a later run can tell the journal
+    staging created from anything else at that name."""
+
+    def __init__(self, writer, crash=None):
+        self.writer, self.crash = writer, crash
+        self.path, lock_path = writer.resolve(JOURNAL), writer.resolve(LOCK)
+        if os.path.lexists(self.path) and not os.path.lexists(lock_path):
+            raise Refused(f"{shown(self.path)} has no lock beside it, so staging didn't create it; left unchanged")
+        self.lock = self.open_lock(lock_path)
+        try:
+            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self.lock)
+            raise Refused("another staging run holds the journal lock; refusing to interleave") from None
+        try:
+            self.fd, self.records, self.repaired = self.open_journal()
+        except BaseException:
+            os.close(self.lock)
+            raise
+
+    def check(self, fd, path):
+        st = os.fstat(fd)
+        w = self.writer
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != w.uid or st.st_dev != w.dev:
+            os.close(fd)
+            w.foreign(path, st, "is not a singly linked file this user owns on the destination's device")
+        return st
+
+    def open_lock(self, path):
+        """The lock is only ever opened read-only once it exists: nothing is
+        written to it."""
+        if os.path.islink(path):
+            raise Refused(f"{shown(path)} is a symlink; staging never follows a link under its destination")
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            fsync_dir(path.parent)
+        self.lock_inode = list((lambda st: (st.st_dev, st.st_ino))(self.check(fd, path)))
+        return fd
+
+    def open_journal(self):
+        if os.path.islink(self.path):
+            raise Refused(f"{shown(self.path)} is a symlink; staging never follows a link under its destination")
+        try:
+            fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            st = os.fstat(fd)
+            header = {"op": None, "kind": "journal", "inode": [st.st_dev, st.st_ino], "lock": self.lock_inode}
+            self.fd, self.records = fd, []
+            self.write_record(header)
+            fsync_dir(self.path.parent)
+            return fd, self.records, 0
+        st = self.check(fd, self.path)
+        data = os.pread(fd, st.st_size, 0)
+        try:
+            records, torn = parse_journal(data, self.path)
+            header = records[0] if records else {}
+            if header.get("kind") != "journal" or header.get("inode") != [st.st_dev, st.st_ino] \
+                    or header.get("lock") != self.lock_inode:
+                raise Refused(f"{shown(self.path)} is not the journal staging created here (its first record "
+                              "doesn't name this journal and lock); left unchanged")
+        except Refused:
+            os.close(fd)
+            raise
+        if torn:
+            os.ftruncate(fd, len(data) - torn)  # only a recognizable torn suffix, in staging's own journal
+            os.fsync(fd)
+        return fd, records, torn
+
+    def close(self):
+        os.close(self.fd)
+        os.close(self.lock)
+
+    def write_record(self, record):
+        record = dict(record, schema=JOURNAL_SCHEMA, seq=len(self.records) + 1,
+                      at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        write_all(self.fd, (json.dumps(record, sort_keys=True) + "\n").encode())
+        os.fsync(self.fd)
+        self.records.append(record)
+        return record
+
+    def append(self, record):
+        record = self.write_record(record)
+        if self.crash:
+            self.crash(record)
+        return record
+
+
+def parse_journal(data, path):
+    """(records, bytes of a torn suffix). Only a final fragment with no
+    newline that starts like one of staging's records counts as torn (a
+    crash mid-write); any other unreadable line, or a journal whose first
+    record isn't staging's header, is a refusal."""
+    lines = data.split(b"\n")
+    tail = lines.pop()  # after the last newline: empty unless the final write was cut short
+    records = []
+    for n, line in enumerate(lines, 1):
+        try:
+            record = json.loads(line)
+            assert isinstance(record, dict) and record.get("schema") == JOURNAL_SCHEMA
+        except (ValueError, AssertionError):
+            raise Refused(f"{shown(path)} is not a staging journal, or is damaged at line {n}; "
+                          "left unchanged") from None
+        records.append(record)
+    if tail and not (tail.startswith(b'{"') and records):
+        raise Refused(f"{shown(path)} ends with text that is not a cut-short staging record; left unchanged")
+    if records and records[0].get("kind") != "journal":
+        raise Refused(f"{shown(path)} is not a staging journal; left unchanged")
+    return records, len(tail)
+
+
+def read_journal(path):
+    """The journal's records, read-only (status): a torn final fragment is
+    ignored, not repaired."""
     try:
-        write_all(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(temp, path)  # replaces the directory entry; never writes through a link
-    fsync_dir(path.parent)
+        data = Path(path).read_bytes()
+    except FileNotFoundError:
+        return []
+    return parse_journal(data, path)[0]
+
+
+def operations(records):
+    """{operation id: summary} in journal order."""
+    ops = {}
+    for r in records:
+        if r.get("op") is None or r["kind"] not in ("begin", "resume", "intent", "outcome"):
+            continue
+        op = ops.setdefault(r["op"], {"id": r["op"], "binding": None, "outcomes": {}, "intents": {},
+                                      "complete": False, "last": None})
+        if r["kind"] in ("begin", "resume"):
+            op["binding"] = r.get("binding", op["binding"])
+            op["last"] = r["kind"]
+        elif r["kind"] == "intent":
+            op["intents"][r["step"]] = r["attempt"]
+            op["last"] = f"intent {r['step']}"
+        else:
+            op["outcomes"][r["step"]] = r["result"]
+            op["last"] = f"outcome {r['step']}: {r['result']}"
+            if r["step"] == "complete" and r["result"] == "ok":
+                op["complete"] = True
+    return ops
 
 
 # --- stage -------------------------------------------------------------------
@@ -858,7 +1090,8 @@ def interpreter_of(lines):
 
 def wheel_contents(wheel):
     """({member: RECORD hash} for the wheel's hashed files, {command: entry
-    point}) from a wheel that already verified against its manifest."""
+    point}, its dist-info directory) from a wheel that already verified
+    against its manifest."""
     with zipfile.ZipFile(wheel) as z:
         names = z.namelist()
         record = next(n for n in names if n.endswith(".dist-info/RECORD"))
@@ -873,65 +1106,115 @@ def wheel_contents(wheel):
         elif section == "[console_scripts]" and "=" in line:
             name, _, target = line.partition("=")
             entry_points[name.strip()] = target.strip()
-    return files, entry_points
+    return files, entry_points, record.rsplit("/", 1)[0]
 
 
-def verify_payload(found, wheel_files, inside):
-    """Every hashed file of the verified wheel is installed with the same
-    bytes; every file the installed RECORD hashes (the package and its
-    generated commands) still matches; and nothing unrecorded was added to
-    the package directory."""
-    purelib = Path(found["purelib"])
-    if not inside(str(purelib)):
-        raise Refused("the staged environment's site-packages is outside it")
-    for member, expected in sorted(wheel_files.items()):
-        path = purelib / member
-        try:
-            data = path.read_bytes() if not path.is_symlink() else None
-        except OSError:
-            data = None
-        if data is None or build_release.record_hash(data) != expected:
-            raise Refused(f"the installed {member} differs from the verified wheel")
-    for name, expected, located in found["record"]:
-        if not expected:
-            continue
-        try:
-            data = Path(located).read_bytes()
-        except OSError:
-            data = None
-        if data is None or build_release.record_hash(data) != expected:
-            raise Refused(f"the installed {name} no longer matches the package's RECORD")
-    listed = {os.path.realpath(located) for _, _, located in found["record"]}
-    package = purelib / "plateia_chat"
-    for folder, dirs, files in os.walk(package):
-        dirs[:] = [d for d in dirs if d != "__pycache__"]
-        for name in files:
-            path = os.path.realpath(os.path.join(folder, name))
-            if path not in listed:
-                raise Refused(f"the installed package holds a file its RECORD doesn't list "
-                              f"({os.path.relpath(path, os.path.realpath(purelib))})")
+def env_inventory(env):
+    """Every entry under the environment, without following links: a
+    directory, a link's target, or a file's sha256 and permission bits."""
+    out = {}
+    for folder, dirs, files in os.walk(env):
+        for name in sorted(dirs + files):
+            path = os.path.join(folder, name)
+            rel = os.path.relpath(path, env)
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                out[rel] = ["link", os.readlink(path)]
+            elif stat.S_ISDIR(st.st_mode):
+                out[rel] = ["dir"]
+            elif stat.S_ISREG(st.st_mode):
+                out[rel] = ["file", sha256_file(path), stat.S_IMODE(st.st_mode)]
+            else:
+                out[rel] = ["other"]
+    return out
 
 
-def verify_staged(release_dir, manifest_sha, manifest, interpreter):
-    """Check a staged release directory's artifacts and environment; returns
-    the environment probe or raises Refused naming the problem."""
-    artifacts = release_dir / "artifacts"
+def verify_static(release_dir, manifest_sha, inventory_sha):
+    """Everything that can be checked without running the environment's
+    code, checked before it runs: the artifacts against the manifest, the
+    environment entry by entry against the inventory recorded when this
+    operation built it (startup hooks, bytecode, the interpreter link and
+    pyvenv.cfg included), the installed package against the verified wheel
+    and its own RECORD, and each command. Returns the verified manifest."""
+    artifacts, env = release_dir / "artifacts", release_dir / "env"
     staged = build_release.verify(artifacts)
     if sha256_file(artifacts / MANIFEST) != manifest_sha:
         raise Refused("the staged manifest differs from the release's")
+    try:
+        recorded = (release_dir / INVENTORY).read_bytes()
+    except OSError:
+        raise Refused("the staged environment has no recorded inventory") from None
+    if hashlib.sha256(recorded).hexdigest() != inventory_sha:
+        raise Refused("the staged environment's inventory differs from the one the journal recorded")
+    expected, actual = json.loads(recorded), env_inventory(env)
+    if actual != expected:
+        changed = sorted(set(actual) ^ set(expected) | {k for k in actual if actual[k] != expected.get(k)})
+        raise Refused(f"the staged environment differs from what this operation built ({changed[0]}"
+                      f"{f' and {len(changed) - 1} more' if len(changed) > 1 else ''})")
+    sites = sorted(env.glob("lib/python*/site-packages"))
+    if len(sites) != 1:
+        raise Refused("the staged environment has no single site-packages")
+    purelib = sites[0]
+    wheel_files, entry_points, dist_info = wheel_contents(artifacts / staged["package"]["artifact"])
+    for member, digest_ in sorted(wheel_files.items()):
+        path = purelib / member
+        if path.is_symlink() or not path.is_file() or build_release.record_hash(path.read_bytes()) != digest_:
+            raise Refused(f"the installed {member} differs from the verified wheel")
+    try:
+        rows = list(csv.reader(io.StringIO((purelib / dist_info / "RECORD").read_text(encoding="utf-8"))))
+    except OSError:
+        raise Refused("the installed package has no RECORD") from None
+    listed, named = {}, {}
+    for row in rows:
+        if not row:
+            continue
+        located = os.path.normpath(purelib / row[0])
+        if not located.startswith(os.path.normpath(env) + os.sep):
+            raise Refused(f"the installed RECORD names {row[0]}, outside the environment")
+        listed[located], named[located] = (row[1] if len(row) > 1 else ""), row[0]
+    for command in staged["package"]["commands"]:
+        script = env / "bin" / command
+        text = script.read_text(encoding="utf-8") if script.is_file() and not script.is_symlink() else ""
+        if not text:
+            raise Refused(f"the staged environment has no {command} command")
+        runs = interpreter_of(text.splitlines())
+        if not runs or os.path.normpath(runs) != os.path.normpath(env / "bin" / os.path.basename(runs)):
+            raise Refused(f"the staged {command} command doesn't run the staged interpreter")
+        if not os.access(script, os.X_OK):
+            raise Refused(f"the staged {command} command is not executable")
+        module, _, attr = entry_points.get(command, "").partition(":")
+        if not attr or f"from {module} import {attr}" not in text:
+            raise Refused(f"the staged {command} command doesn't call the wheel's entry point "
+                          f"({entry_points.get(command, 'none declared')})")
+        if os.path.normpath(script) not in listed:
+            raise Refused(f"the staged {command} command isn't in the installed package's RECORD")
+    for located, expected in sorted(listed.items()):
+        if expected and build_release.record_hash(Path(located).read_bytes()) != expected:
+            raise Refused(f"the installed {named[located]} no longer matches the package's RECORD")
+    for folder, dirs, files in os.walk(purelib / "plateia_chat"):
+        for name in files:
+            if os.path.normpath(os.path.join(folder, name)) not in listed:
+                raise Refused(f"the installed package holds a file its RECORD doesn't list "
+                              f"({os.path.relpath(os.path.join(folder, name), purelib)})")
+    return staged
+
+
+def verify_staged(release_dir, manifest_sha, manifest, interpreter, inventory_sha):
+    """Check a staged release: statically first, then by running the
+    environment's interpreter once that is known to be what this operation
+    built. Returns the probe, or raises Refused naming the problem."""
+    staged = verify_static(release_dir, manifest_sha, inventory_sha)
     env = release_dir / "env"
     python = env / "bin" / "python"
-    if not python.exists():
-        raise Refused("the staged environment has no interpreter")
     r = run([python, "-I", "-c", ENV_PROBE], env=child_env(), cwd=str(release_dir))
     try:
         found = json.loads(r.stdout.strip().splitlines()[-1])
         assert all(isinstance(found.get(k), str) for k in ("implementation", "version", "system", "prefix",
                                                             "module", "dist_version"))
-        assert isinstance(found.get("path"), list) and isinstance(found.get("record"), list)
-        assert isinstance(found.get("purelib"), str)
+        assert isinstance(found.get("path"), list)
     except (IndexError, ValueError, AssertionError, AttributeError):
         raise Refused("the staged environment can't import plateia_chat") from None
+
     def inside(path):
         # A venv's bin/python is a link to the base interpreter, so the
         # path as written counts as well as the resolved one.
@@ -946,28 +1229,6 @@ def verify_staged(release_dir, manifest_sha, manifest, interpreter):
     if any(isinstance(e, str) and e and os.path.realpath(e).startswith(str(CHECKOUT) + os.sep)
            for e in found["path"]):
         raise Refused("the staged environment has this checkout on its import path")
-    wheel_files, entry_points = wheel_contents(artifacts / staged["package"]["artifact"])
-    recorded = {os.path.realpath(located) for _, _, located in found["record"]}
-    for command in staged["package"]["commands"]:
-        script = env / "bin" / command
-        try:
-            text = script.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            text = ""
-        if not text or script.is_symlink():
-            raise Refused(f"the staged environment has no {command} command")
-        runs = interpreter_of(text.splitlines())
-        if not runs or not inside(runs):
-            raise Refused(f"the staged {command} command doesn't run the staged interpreter")
-        if not os.access(script, os.X_OK):
-            raise Refused(f"the staged {command} command is not executable")
-        module, _, attr = entry_points.get(command, "").partition(":")
-        if not attr or f"from {module} import {attr}" not in text:
-            raise Refused(f"the staged {command} command doesn't call the wheel's entry point "
-                          f"({entry_points.get(command, 'none declared')})")
-        if os.path.realpath(script) not in recorded:
-            raise Refused(f"the staged {command} command isn't in the installed package's RECORD")
-    verify_payload(found, wheel_files, inside)
     result = interpreter_result(manifest, found, str(python))
     if result[0] != "pass":
         raise Refused(f"the staged environment's {result[2]}")
@@ -996,32 +1257,22 @@ def stage(release, dest, python=None, plan_path=None, spec_path=None, crash=None
     manifest = build_release.verify(release)
     if identity_problem(manifest):
         raise Refused(f"the manifest can't be staged: {identity_problem(manifest)}; nothing was staged")
-    identity = manifest["release"]
-    root = check_destination(dest, identity)
+    root = check_destination(dest, manifest["release"])
     root.mkdir(parents=True, exist_ok=True)
-    journal = Journal(root, crash)
+    writer = Writer(root, build_release.live_roots())
+    journal = Journal(writer, crash)
     try:
-        return run_operation(journal, root, release, manifest, plan, report, python, spec_path), plan, report
+        return run_operation(journal, writer, release, manifest, plan, report, python, spec_path), plan, report
     finally:
         journal.close()
 
 
-def staging_paths(root, release_dir, manifest):
-    """Every path staging writes, reads back or removes under the root."""
-    artifacts = release_dir / "artifacts"
-    names = [MANIFEST] + [a["name"] for a in manifest["artifacts"]]
-    return ([root / RELEASES, release_dir, release_dir / MARKER, release_dir / f".{MARKER}.tmp", artifacts,
-             release_dir / "env", release_dir / STAGED, release_dir / f".{STAGED}.tmp"]
-            + [artifacts / n for n in names] + [artifacts / f".{n}.tmp" for n in names])
-
-
-def run_operation(journal, root, release, manifest, plan, report, python, spec_path):
+def run_operation(journal, writer, release, manifest, plan, report, python, spec_path):
     identity = manifest["release"]
-    release_dir = root / RELEASES / identity
-    if release_dir.parent != root / RELEASES:
-        raise Refused("the release directory would not be directly under the staging root's releases")
-    paths = staging_paths(root, release_dir, manifest)
-    no_links(root, *paths)
+    rel_dir = f"{RELEASES}/{identity}"
+    release_dir = writer.root / RELEASES / identity
+    artifacts_rel, env_rel = f"{rel_dir}/artifacts", f"{rel_dir}/env"
+    names = [MANIFEST] + [a["name"] for a in manifest["artifacts"]]
     # The targets are checked again, under the lock, immediately before the
     # operation records them.
     spec, skills, provenance = load_spec(spec_path)
@@ -1031,14 +1282,25 @@ def run_operation(journal, root, release, manifest, plan, report, python, spec_p
         raise Refused(f"blocked: {', '.join(changed) or 'a target'} changed before staging could record it; "
                       "nothing was staged")
     binding = {"release": identity, "manifest_sha256": plan["manifest_sha256"],
-               "destination": str(root), "release_dir": str(release_dir),
+               "destination": str(writer.root), "release_dir": str(release_dir),
                "interpreter": {k: report["interpreter"][k] for k in ("path", "implementation", "version", "system")},
                "targets": {t["name"]: t["digest"] for t in recheck}}
     op_id = "stage-" + digest(binding)[:16]
     ops = operations(journal.records)
+    writer.load(journal.records, op_id)
+    writer.record = lambda r: journal.append(dict(r, op=op_id))
+    for rel in [RELEASES, rel_dir, artifacts_rel, env_rel, f"{rel_dir}/{INVENTORY}", f"{rel_dir}/{STAGED}"] \
+            + [f"{artifacts_rel}/{n}" for n in names]:
+        writer.inspect(rel)  # an alias anywhere staging will touch is refused before anything changes
+
+    def inventory_sha():
+        found = [r for r in journal.records if r.get("op") == op_id and r["kind"] == "outcome"
+                 and r["step"] == "install-package" and r["result"] == "ok"]
+        return found[-1].get("inventory_sha256") if found else None
+
     if op_id in ops and ops[op_id]["complete"]:
         try:
-            verify_staged(release_dir, binding["manifest_sha256"], manifest, binding["interpreter"])
+            verify_staged(release_dir, binding["manifest_sha256"], manifest, binding["interpreter"], inventory_sha())
         except Refused as e:
             raise Refused(f"operation {op_id} is recorded complete, but its staged release doesn't verify "
                           f"({e}); it is not reported staged, and nothing was changed") from None
@@ -1055,7 +1317,7 @@ def run_operation(journal, root, release, manifest, plan, report, python, spec_p
                           f"inputs ({', '.join(differs)}); repeat it with its own inputs, nothing was changed")
     resumed = op_id in ops
     if not resumed:
-        if os.path.lexists(release_dir):
+        if writer.lstat(rel_dir) is not None:
             raise Refused(f"{shown(release_dir)} already exists and no operation in the journal created it; "
                           "left unchanged")
         journal.append({"op": op_id, "kind": "begin", "binding": binding, "manifest": manifest,
@@ -1065,14 +1327,16 @@ def run_operation(journal, root, release, manifest, plan, report, python, spec_p
         journal.append({"op": op_id, "kind": "resume",
                         "found": {"last": ops[op_id]["last"], "release_dir_exists": release_dir.exists(),
                                   "torn_bytes_dropped": journal.repaired}})
-    attempt = 1 + max([r.get("attempt", 0) for r in journal.records if r["op"] == op_id] or [0])
+    attempt = 1 + max([r.get("attempt", 0) for r in journal.records if r.get("op") == op_id] or [0])
 
     def step(name, action):
         journal.append({"op": op_id, "kind": "intent", "step": name, "attempt": attempt})
+        extra = {}
         try:
             try:
-                no_links(root, *paths)  # again, right before this step writes
                 detail = action()
+                if isinstance(detail, tuple):
+                    detail, extra = detail
             except OSError as e:
                 raise Refused(f"{e.strerror or e.__class__.__name__}"
                               + (f" ({shown(e.filename)})" if e.filename else "")) from None
@@ -1080,41 +1344,31 @@ def run_operation(journal, root, release, manifest, plan, report, python, spec_p
             journal.append({"op": op_id, "kind": "outcome", "step": name, "attempt": attempt,
                             "result": "failed", "detail": str(e)})
             raise Refused(f"operation {op_id} is unfinished: {name} failed: {e}") from None
-        journal.append({"op": op_id, "kind": "outcome", "step": name, "attempt": attempt, "result": "ok",
-                        "detail": detail})
+        journal.append(dict({"op": op_id, "kind": "outcome", "step": name, "attempt": attempt, "result": "ok",
+                             "detail": detail}, **extra))
 
     def create_release_dir():
-        (root / RELEASES).mkdir(exist_ok=True)
-        if release_dir.exists():
-            mark = release_dir / MARKER
-            owner = mark.read_text().strip() if mark.is_file() else None
-            if owner != op_id and (owner is not None or any(release_dir.iterdir())):
-                raise Refused(f"{shown(release_dir)} exists and this operation didn't create it")
-        else:
-            release_dir.mkdir()
-            fsync_dir(root / RELEASES)
-        write_atomic(release_dir / MARKER, (op_id + "\n").encode())
-        return "created" if not resumed else "present and owned by this operation"
+        writer.mkdir(RELEASES)
+        writer.mkdir(rel_dir)
+        return "created" if not resumed else "present and created by this operation"
 
     def copy_artifacts():
-        artifacts = release_dir / "artifacts"
-        artifacts.mkdir(exist_ok=True)
-        wanted = [MANIFEST] + [a["name"] for a in manifest["artifacts"]]
-        for stray in sorted(set(os.listdir(artifacts)) - set(wanted)):
-            (artifacts / stray).unlink()  # a partial copy this operation left
-        for name in wanted:
-            data = (release / name).read_bytes()
-            write_atomic(artifacts / name, data)
-        build_release.verify(artifacts)
-        if sha256_file(artifacts / MANIFEST) != binding["manifest_sha256"]:
+        writer.mkdir(artifacts_rel)
+        for stray in sorted(set(os.listdir(release_dir / "artifacts")) - set(names)):
+            writer.remove(f"{artifacts_rel}/{stray}")  # only what this operation created
+        for name in names:
+            writer.write(f"{artifacts_rel}/{name}", (release / name).read_bytes())
+        build_release.verify(release_dir / "artifacts")
+        if sha256_file(release_dir / "artifacts" / MANIFEST) != binding["manifest_sha256"]:
             raise Refused("the release's manifest changed while it was copied")
-        return f"{len(wanted)} files copied and verified"
+        return f"{len(names)} files copied and verified"
 
     env = release_dir / "env"
 
     def create_environment():
-        if os.path.lexists(env):
-            shutil.rmtree(env)  # a partial environment this operation left
+        if writer.lstat(env_rel) is not None:
+            writer.remove_tree(env_rel)  # a partial environment this operation's venv run left
+        writer.mkdir(env_rel)
         r = run([python, "-m", "venv", env], env=child_env(), cwd=str(release_dir))
         if r.returncode:
             raise Refused(f"venv exited {r.returncode}")
@@ -1126,15 +1380,19 @@ def run_operation(journal, root, release, manifest, plan, report, python, spec_p
                  "--disable-pip-version-check", wheel], env=child_env(), cwd=str(release_dir))
         if r.returncode:
             raise Refused(f"pip exited {r.returncode}")
-        return f"{manifest['package']['name']} {manifest['package']['version']} installed offline"
+        data = (json.dumps(env_inventory(env), indent=1, sort_keys=True) + "\n").encode()
+        writer.write(f"{rel_dir}/{INVENTORY}", data)
+        return (f"{manifest['package']['name']} {manifest['package']['version']} installed offline; "
+                "environment inventoried", {"inventory_sha256": hashlib.sha256(data).hexdigest()})
 
     def verify_environment():
-        found = verify_staged(release_dir, binding["manifest_sha256"], manifest, binding["interpreter"])
+        found = verify_staged(release_dir, binding["manifest_sha256"], manifest, binding["interpreter"],
+                              inventory_sha())
         return f"artifacts verify; plateia-chat {found['dist_version']} loads from the environment on " \
                f"{found['implementation']} {found['version']}"
 
     def complete():
-        write_atomic(release_dir / STAGED, (json.dumps(
+        writer.write(f"{rel_dir}/{STAGED}", (json.dumps(
             {"schema": STAGED_SCHEMA, "operation": op_id, "release": identity,
              "manifest_sha256": binding["manifest_sha256"], "interpreter": binding["interpreter"],
              "selected": False}, indent=2, sort_keys=True) + "\n").encode())
@@ -1186,8 +1444,9 @@ def main(argv=None):
         if a.cmd == "plan":
             plan = make_plan(a.release, a.dest)
             if a.out:
-                build_release.check_output_dir(a.out.parent, CHECKOUT)
-                a.out.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                out = Path(os.path.abspath(a.out))
+                Writer(out.parent, build_release.live_roots()).create(
+                    out.name, (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode())
             print(json.dumps(plan, indent=2, sort_keys=True) if a.json else render_plan(plan))
             return 1 if plan["blocked"] else 0
         if a.cmd == "preflight":

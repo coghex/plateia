@@ -114,6 +114,12 @@ class StageCase(unittest.TestCase):
                 raise stage_release.Crash(f"crash after record {n}")
         return hook
 
+    def crash_when(self, predicate):
+        def hook(record):
+            if predicate(record):
+                raise stage_release.Crash("stopped")
+        return hook
+
     def journal(self):
         return [json.loads(line) for line in (self.dest / "journal.jsonl").read_text().splitlines()]
 
@@ -137,9 +143,11 @@ class HappyPathTests(StageCase):
         staged = json.loads((release_dir / "staged.json").read_text())
         self.assertEqual((staged["release"], staged["selected"]), (self.manifest["release"], False))
         records = self.journal()
-        self.assertEqual({r["op"] for r in records}, {summary["operation"]})
+        self.assertEqual(records[0]["kind"], "journal")
+        self.assertEqual({r["op"] for r in records[1:]}, {summary["operation"]})
+        records = records[1:]
         self.assertEqual(records[0]["kind"], "begin")
-        steps = [(r["kind"], r["step"]) for r in records[1:]]
+        steps = [(r["kind"], r["step"]) for r in records[1:] if r["kind"] in ("intent", "outcome")]
         self.assertEqual(steps, [(k, s) for s in stage_release.STEPS for k in ("intent", "outcome")])
         self.assertTrue(all(r["result"] == "ok" for r in records if r["kind"] == "outcome"))
         self.assertEqual(records[0]["manifest"]["release"], self.manifest["release"])
@@ -170,17 +178,55 @@ class HappyPathTests(StageCase):
         self.assertEqual(len(self.journal()), count)
         self.assertEqual(os.listdir(self.dest / "releases"), [self.manifest["release"]])
 
-    def test_a_corrupted_installed_payload_is_not_reported_staged(self):
+    def test_a_changed_environment_is_refused_before_any_of_its_code_runs(self):
+        """On a completed retry, a modified initializer, an added startup
+        hook, a replaced command, a cleared executable bit or an edited
+        pyvenv.cfg is refused by the static check, before the environment's
+        interpreter runs: the registry the planted code would write stays
+        byte-identical."""
         self.stage()
         env = self.dest / "releases" / self.manifest["release"] / "env"
+        site = next(env.glob("lib/python*/site-packages"))
+        registry = self.home / ".local/state/chat/identities.json"
+        payload = f"open({str(registry)!r}, 'w').write('overwritten')\n"
+        init, pth, pchat = site / "plateia_chat/__init__.py", site / "zz-hook.pth", env / "bin/pchat"
+        cases = ((lambda: init.write_text(init.read_text() + payload), "lib/python"),
+                 (lambda: pth.write_text("import os; " + payload), "lib/python"),
+                 (lambda: pchat.write_text(pchat.read_text() + payload), "bin/pchat"),
+                 (lambda: pchat.chmod(0o644), "bin/pchat"),
+                 (lambda: (env / "pyvenv.cfg").write_text("home = /invented\n"), "pyvenv.cfg"))
+        for damage, where in cases:
+            with self.subTest(changed=where):
+                saved = {p: (p.read_bytes(), p.stat().st_mode) for p in (init, pchat, env / "pyvenv.cfg")}
+                stage_release.CALLS.clear()
+                damage()
+                try:
+                    with self.assertRaisesRegex(Refused, rf"doesn't verify \(the staged environment differs from "
+                                                         rf"what this operation built \({re.escape(where)}"):
+                        self.stage()
+                    self.assertEqual(stage_release.CALLS[1:], [], "the environment's code ran")  # only the probe
+                finally:
+                    for p, (data, mode) in saved.items():
+                        p.write_bytes(data)
+                        p.chmod(mode)
+                    pth.unlink(missing_ok=True)
+                self.assertHomeUnchanged()
+        self.assertEqual(self.stage()[0]["state"], "already staged, verified")
+
+    def test_the_installed_payload_and_commands_must_match_the_wheel(self):
+        """The checks behind the inventory: with the inventory re-recorded to
+        match a change, the installed files are still compared with the
+        verified wheel and RECORD, and each command with its entry point."""
+        self.stage()
+        release_dir = self.dest / "releases" / self.manifest["release"]
+        env = release_dir / "env"
         site = next(env.glob("lib/python*/site-packages"))
         pchat, chatlib = env / "bin/pchat", site / "plateia_chat/scripts/chatlib.py"
         lines = pchat.read_text().splitlines()
         launcher = lines[:3] if lines[0] == "#!/bin/sh" else lines[:1]  # pip's long-path launcher is 3 lines
-        launcher_only = "\n".join(launcher) + "\nraise RuntimeError('replaced')\n"
-        cases = ((lambda: pchat.write_text(launcher_only), r"the staged pchat command doesn't call the wheel's "
-                                                           r"entry point"),
-                 (lambda: pchat.write_text(pchat.read_text() + "import os; os.environ.clear()\n"),
+        cases = ((lambda: pchat.write_text("\n".join(launcher) + "\nraise RuntimeError('replaced')\n"),
+                  r"the staged pchat command doesn't call the wheel's entry point"),
+                 (lambda: pchat.write_text(pchat.read_text() + "import os\n"),
                   r"the installed \.\./\.\./\.\./bin/pchat no longer matches the package's RECORD"),
                  (lambda: chatlib.write_text(chatlib.read_text() + "# edited\n"),
                   r"the installed plateia_chat/scripts/chatlib\.py differs from the verified wheel"),
@@ -191,22 +237,24 @@ class HappyPathTests(StageCase):
             with self.subTest(case=pattern[:30]):
                 saved = {p: (p.read_bytes(), p.stat().st_mode) for p in (pchat, chatlib)}
                 damage()
+                data = (json.dumps(stage_release.env_inventory(env), indent=1, sort_keys=True) + "\n").encode()
+                (release_dir / "env-inventory.json").write_bytes(data)
                 try:
-                    with self.assertRaisesRegex(Refused, rf"recorded complete, but its staged release doesn't "
-                                                         rf"verify \(.*{pattern}"):
-                        self.stage()
+                    with self.assertRaisesRegex(Refused, pattern):
+                        stage_release.verify_static(release_dir, self.journal()[1]["binding"]["manifest_sha256"],
+                                                    __import__("hashlib").sha256(data).hexdigest())
                 finally:
-                    for p, (data, mode) in saved.items():
-                        p.write_bytes(data)
+                    for p, (content, mode) in saved.items():
+                        p.write_bytes(content)
                         p.chmod(mode)
                     (site / "plateia_chat/sitecustomize.py").unlink(missing_ok=True)
-                self.assertEqual(self.stage()[0]["state"], "already staged, verified")
 
     def test_a_completed_stage_whose_environment_was_damaged_is_not_reported_staged(self):
         self.stage()
         (self.dest / "releases" / self.manifest["release"] / "env/bin/pchat").unlink()
         with self.assertRaisesRegex(Refused, r"recorded complete, but its staged release doesn't verify "
-                                             r"\(the staged environment has no pchat command\)"):
+                                             r"\(the staged environment differs from what this operation built "
+                                             r"\(bin/pchat\)\)"):
             self.stage()
 
     def test_both_console_script_forms_name_their_interpreter(self):
@@ -325,7 +373,7 @@ class BlockingTests(StageCase):
             with self.assertRaisesRegex(Refused, r"blocked: chat skill folder, chat/scripts import location changed "
                                                  r"before staging could record it; nothing was staged"):
                 self.stage()
-        self.assertFalse(os.path.exists(self.dest / "journal.jsonl"))
+        self.assertEqual(stage_release.status(self.dest), [])  # no operation was begun
         self.assertFalse(os.path.exists(self.dest / "releases"))
         self.assertHomeUnchanged()
 
@@ -440,6 +488,21 @@ class ImporterTests(StageCase):
         self.assertIn("unlisted importer: ~/.codex/skills/notes-bot/scripts/digest (outside the known list; it "
                       "would stay on the old code)", stage_release.render_plan(plan))
 
+    def test_importers_behind_symlinks_are_found_once_and_cycles_end(self):
+        helper = self.where / "external-helper"
+        _staging.write(helper / "scripts/tool", "#!/usr/bin/env python3\nimport sys\n"
+                       "sys.path.insert(0, '/x/.codex/skills/chat/scripts')\n", 0o755)
+        _staging.write(self.where / "loose/sync.py", "import sys\nsys.path.append('../chat/scripts')\n")
+        (self.skills / "helper").symlink_to(helper)                      # a symlinked skill folder
+        (self.skills / "unrelated/scripts/sync.py").symlink_to(self.where / "loose/sync.py")  # a symlinked script
+        (self.skills / "unrelated/loop").symlink_to(self.skills)        # a cycle
+        (self.home / ".claude/skills/project-manager").symlink_to(self.skills / "project-manager")  # an alias
+        importers = self.plan()["importers"]
+        self.assertTrue(importers["complete"])
+        self.assertEqual(importers["unlisted"], ["~/.codex/skills/helper/scripts/tool",
+                                                 "~/.codex/skills/unrelated/scripts/sync.py"])
+        self.assertTrue(all(k["found"] for k in importers["known"]))
+
     def test_data_files_are_not_opened(self):
         _staging.write(self.skills / "notes-bot/state.json", '{"sys.path.insert": "chat/scripts"}\n')
         opened = []
@@ -475,7 +538,7 @@ class ImporterTests(StageCase):
 class RecoveryTests(StageCase):
     def assertOneOperationStaged(self):
         records = self.journal()
-        self.assertEqual(len({r["op"] for r in records}), 1, "a second operation was started")
+        self.assertEqual(len({r["op"] for r in records} - {None}), 1, "a second operation was started")
         self.assertEqual(os.listdir(self.dest / "releases"), [self.manifest["release"]],
                          "a second release directory was created")
         release_dir = self.dest / "releases" / self.manifest["release"]
@@ -485,36 +548,62 @@ class RecoveryTests(StageCase):
         self.assertNoServiceOrIdentityCall()
 
     def test_a_crash_after_any_journaled_intent_or_outcome_reconciles_to_one_operation(self):
-        total = 1 + 2 * len(stage_release.STEPS)
-        for n in range(1, total + 1):
+        """Stopped right after each journal record in turn (the header, the
+        operation, every intent and outcome, and every record of a file or
+        directory created), then run again with the same inputs."""
+        n = 0
+        while True:
+            n += 1
             with self.subTest(crash_after=n):
                 if self.dest.exists():
                     shutil.rmtree(self.dest)
-                with self.assertRaises(stage_release.Crash):
+                try:
                     self.stage(crash=self.crash_at(n))
-                state = stage_release.status(self.dest)[0]["state"]
-                staged = self.dest / "releases" / self.manifest["release"] / "staged.json"
-                if n < total:
-                    # Interrupted: never reported done, and nothing marked staged.
-                    self.assertTrue(state.startswith("unfinished"), state)
-                    self.assertFalse(staged.exists())
+                except stage_release.Crash:
+                    pass
                 else:
-                    self.assertEqual(state, "complete")
+                    break  # n is past the last record: the run completed
+                records = self.journal()
+                ops = stage_release.status(self.dest)
+                staged = self.dest / "releases" / self.manifest["release"] / "staged.json"
+                complete = bool(ops) and ops[0]["state"] == "complete"
+                if not complete:
+                    # Interrupted: never reported done. staged.json can exist only once the
+                    # complete step wrote it; the journal's outcome is what completes it.
+                    self.assertTrue(not ops or ops[0]["state"].startswith("unfinished"), ops)
+                    wrote_staged = any(r["kind"] == "created" and r["path"].endswith("/staged.json")
+                                       for r in records)
+                    self.assertEqual(staged.exists(), wrote_staged)
                 summary, _, _ = self.stage()
-                self.assertIn(summary["state"], ("resumed and staged",) if n < total
-                              else ("already staged, verified",))
+                begun = any(r["kind"] == "begin" for r in records)
+                self.assertEqual(summary["state"], "already staged, verified" if complete
+                                 else "resumed and staged" if begun else "staged")
                 self.assertOneOperationStaged()
+        self.assertGreater(n, 25, "fewer journal records than expected")
 
     def test_a_partial_copy_and_a_partial_environment_are_redone_in_place(self):
-        for step, damage in (("copy-artifacts", self.partial_copy), ("create-environment", self.partial_env)):
-            with self.subTest(step=step):
+        """Interrupted mid-copy (one artifact written and recorded, the next
+        temporary file journaled) and mid-venv (the environment directory
+        made and half filled), a rerun redoes both in place."""
+        release_dir = self.dest / "releases" / self.manifest["release"]
+        wheel = self.manifest["package"]["artifact"]
+
+        def mid_copy(record):
+            if record["kind"] == "creating" and wheel in record["path"]:
+                (release_dir / "artifacts/manifest.json").write_bytes(b"{")  # cut short, in its own file
+                raise stage_release.Crash("mid-copy")
+
+        def mid_venv(record):
+            if record["kind"] == "created" and record["path"].endswith("/env"):
+                env = release_dir / "env"
+                (env / "bin").mkdir()
+                (env / "pyvenv.cfg").write_text("home = /invented\n")
+                (env / "bin/python").write_text("not an interpreter\n")
+                raise stage_release.Crash("mid-venv")
+        for why, hook in (("copy", mid_copy), ("venv", mid_venv)):
+            with self.subTest(interrupted=why):
                 if self.dest.exists():
                     shutil.rmtree(self.dest)
-
-                def hook(record, step=step):
-                    if record["kind"] == "intent" and record["step"] == step:
-                        damage()
-                        raise stage_release.Crash(step)
                 with self.assertRaises(stage_release.Crash):
                     self.stage(crash=hook)
                 self.assertTrue(stage_release.status(self.dest)[0]["state"].startswith("unfinished"))
@@ -522,18 +611,17 @@ class RecoveryTests(StageCase):
                 self.assertEqual(summary["state"], "resumed and staged")
                 self.assertOneOperationStaged()
 
-    def partial_copy(self):
-        artifacts = self.dest / "releases" / self.manifest["release"] / "artifacts"
-        artifacts.mkdir()
-        wheel = self.manifest["package"]["artifact"]
-        (artifacts / wheel).write_bytes((self.release / wheel).read_bytes()[:100])
-        (artifacts / f".{wheel}.tmp").write_bytes(b"half")
-
-    def partial_env(self):
-        env = self.dest / "releases" / self.manifest["release"] / "env"
-        (env / "bin").mkdir(parents=True)
-        (env / "pyvenv.cfg").write_text("home = /invented\n")
-        (env / "bin/python").write_text("not an interpreter\n")
+    def test_an_entry_staging_didnt_create_is_never_deleted(self):
+        """A stray file in the artifacts directory that this operation didn't
+        create is refused, not removed."""
+        with self.assertRaises(stage_release.Crash):
+            self.stage(crash=self.crash_when(lambda r: r["kind"] == "created" and r["path"].endswith("/artifacts")))
+        stray = self.dest / "releases" / self.manifest["release"] / "artifacts/notes.txt"
+        stray.write_text("someone else's\n")
+        with self.assertRaisesRegex(Refused, r"notes\.txt is not a file this operation created; staging never "
+                                             r"writes through, replaces or deletes an entry it didn't create"):
+            self.stage()
+        self.assertEqual(stray.read_text(), "someone else's\n")
 
     def test_a_retry_with_different_inputs_reports_the_conflict(self):
         with self.assertRaises(stage_release.Crash):
@@ -577,29 +665,6 @@ class ConcurrencyTests(StageCase):
 
 
 class DestinationTests(StageCase):
-    def test_links_under_the_destination_are_never_followed(self):
-        config, registry = self.home / ".config/chat", self.home / ".local/state/chat/identities.json"
-        release_dir = self.dest / "releases" / self.manifest["release"]
-        cases = (("artifacts", lambda: (release_dir / "artifacts").symlink_to(config), 3),
-                 ("env", lambda: (release_dir / "env").symlink_to(config), 5),
-                 ("the marker", lambda: ((release_dir / ".operation").unlink(),
-                                         (release_dir / ".operation").symlink_to(registry)), 3),
-                 ("the journal", lambda: ((self.dest / "journal.jsonl").unlink(),
-                                          (self.dest / "journal.jsonl").symlink_to(registry)), 1),
-                 ("the lock", lambda: ((self.dest / "journal.lock").unlink(),
-                                       (self.dest / "journal.lock").symlink_to(registry)), 1))
-        for what, alias, crash_after in cases:
-            with self.subTest(alias=what):
-                if self.dest.exists():
-                    shutil.rmtree(self.dest)
-                with self.assertRaises(stage_release.Crash):
-                    self.stage(crash=self.crash_at(crash_after))
-                alias()
-                with self.assertRaisesRegex(Refused, r"is a symlink; staging never follows a link under its "
-                                                     r"destination"):
-                    self.stage()
-                self.assertHomeUnchanged()
-
     def test_a_release_identity_that_escapes_the_destination_is_refused(self):
         escape = str(self.home / ".local/state/chat/staged-here")
         for identity in (escape, "../escaped", "plateia-chat-0.1.0+g000000000000", "x/y"):
@@ -633,6 +698,126 @@ class DestinationTests(StageCase):
         with self.assertRaisesRegex(Refused, r"releases without a journal"):
             self.stage()
         self.assertEqual(os.listdir(self.dest / "releases" / self.manifest["release"]), [])
+
+
+class AliasMatrixTests(StageCase):
+    """Every write site staging has, each aliased in turn: a symlink and a
+    hardlink to protected state (the invented identity registry, or the
+    invented chat-config directory for a directory site), a directory staging
+    didn't create, and traversal through the release identity, an artifact
+    name and the plan's output path. Each is refused, and every file in the
+    invented home stays byte-identical."""
+
+    def registry(self):
+        return self.home / ".local/state/chat/identities.json"
+
+    def plant(self, path, kind, directory):
+        if os.path.lexists(path):
+            shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+        if kind == "symlink":
+            path.symlink_to(self.home / ".config/chat" if directory else self.registry())
+        elif kind == "hardlink":
+            os.link(self.registry(), path)
+        else:  # a directory staging didn't create
+            path.mkdir()
+
+    def sites(self):
+        """(write site, a predicate on the record after which to stop, whether
+        the site is a directory). None means a fresh destination."""
+        rel = f"releases/{self.manifest['release']}"
+        created = lambda suffix: lambda r: r["kind"] == "created" and r["path"].endswith(suffix)  # noqa: E731
+        return [("journal.jsonl", None, False),
+                ("journal.lock", None, False),
+                ("releases", lambda r: r["kind"] == "begin", True),
+                (rel, created("releases"), True),
+                (f"{rel}/artifacts", created(self.manifest["release"]), True),
+                (f"{rel}/artifacts/manifest.json", created("/artifacts"), False),
+                ("temporary file", lambda r: r["kind"] == "creating", False),
+                (f"{rel}/env", lambda r: r["kind"] == "outcome" and r["step"] == "copy-artifacts", True),
+                (f"{rel}/env-inventory.json", lambda r: r["kind"] == "intent" and r["step"] == "install-package",
+                 False),
+                (f"{rel}/staged.json", lambda r: r["kind"] == "intent" and r["step"] == "complete", False)]
+
+    def test_symlink_hardlink_and_foreign_aliases_at_every_write_site(self):
+        for site, stop, directory in self.sites():
+            for kind in ("symlink", "dir") if directory else ("symlink", "hardlink"):
+                with self.subTest(site=site, alias=kind):
+                    if self.dest.exists():
+                        shutil.rmtree(self.dest)
+                    temp = []
+                    if stop is None:
+                        self.dest.mkdir()
+                    else:
+                        def hook(record, stop=stop):
+                            if record["kind"] == "creating":
+                                temp.append(record["path"])
+                            if stop(record):
+                                raise stage_release.Crash(site)
+                        with self.assertRaises(stage_release.Crash):
+                            self.stage(crash=hook)
+                    path = self.dest / (temp[-1] if site == "temporary file" else site)
+                    self.plant(path, kind, directory)
+                    registry_before = self.registry().read_bytes()
+                    with self.assertRaises(Refused) as caught:
+                        self.stage()
+                    self.assertNotIn("Traceback", str(caught.exception))
+                    self.assertEqual(self.registry().read_bytes(), registry_before)
+                    self.assertHomeUnchanged()
+
+    def test_traversal_through_the_identity_artifact_names_and_plan_output(self):
+        for change in (lambda m: m.update(release="../escaped"),
+                       lambda m: m.update(release=str(self.home / ".local/state/chat/staged-here")),
+                       lambda m: m["artifacts"][0].update(name="../../escaped.whl")):
+            with self.subTest(change=change):
+                release = self.release_copy()
+                self.rewrite_manifest(release, change)
+                with self.assertRaisesRegex(Refused, r"can't be staged|malformed artifact entry"):
+                    self.stage(release=release)
+                self.assertFalse(os.path.lexists(self.dest))
+                self.assertFalse(os.path.lexists(self.where / "escaped"))
+                self.assertFalse(os.path.lexists(self.home / ".local/state/chat/staged-here"))
+                self.assertHomeUnchanged()
+        registry = self.registry()
+        (self.where / "out-link.json").symlink_to(registry)
+        os.link(registry, self.where / "out-hard.json")
+        _staging.write(self.where / "out-existing.json", "an earlier plan\n")
+        traversal = self.where / "staging" / ".." / "home" / ".local/state/chat" / "plan.json"
+        for out, pattern in ((self.where / "out-link.json", r"already exists|under ~/\.local/state"),
+                             (self.where / "out-hard.json", r"already exists"),
+                             (self.where / "out-existing.json", r"already exists"),
+                             (traversal, r"under ~/\.local/state"),
+                             (self.home / ".local/bin/plan.json", r"under ~/\.local/bin")):
+            with self.subTest(out=out.name):
+                before = registry.read_bytes()
+                code, text = PrivacyAndIsolationTests.outputs(self, "plan", "--release", str(self.release),
+                                                              "--out", str(out))
+                self.assertEqual(code, 1, text)
+                self.assertRegex(text, pattern)
+                self.assertEqual(registry.read_bytes(), before)
+        self.assertEqual((self.where / "out-existing.json").read_text(), "an earlier plan\n")
+        self.assertFalse(os.path.lexists(self.home / ".local/state/chat/plan.json"))
+        self.assertHomeUnchanged()
+
+    def test_a_replaced_directory_staging_created_is_refused(self):
+        with self.assertRaises(stage_release.Crash):
+            self.stage(crash=self.crash_when(lambda r: r["kind"] == "created" and r["path"] == "releases"))
+        (self.dest / "releases").rmdir()
+        (self.dest / "releases").mkdir()  # same name, another inode
+        with self.assertRaisesRegex(Refused, r"releases is a directory staging didn't create"):
+            self.stage()
+
+    def test_a_journal_staging_didnt_create_is_left_byte_identical(self):
+        for text in (b"my own notes\n", b"my own notes", b'{"schema": "something-else/1"}\n'):
+            with self.subTest(text=text):
+                if self.dest.exists():
+                    shutil.rmtree(self.dest)
+                self.dest.mkdir()
+                (self.dest / "journal.jsonl").write_bytes(text)
+                with self.assertRaisesRegex(Refused, r"has no lock beside it, so staging didn't create it"):
+                    self.stage()
+                self.assertEqual((self.dest / "journal.jsonl").read_bytes(), text)
+                self.assertEqual(os.listdir(self.dest), ["journal.jsonl"])
+                self.assertFalse((self.dest / "releases").exists())
 
 
 class PrivacyAndIsolationTests(StageCase):
