@@ -257,6 +257,26 @@ class RefusalTests(BuildCase):
                 self.refused(rf"under {name}", out=out)
         self.assertEqual({d: snapshot(d) for d in before}, before)
 
+    def test_links_inside_a_linked_directory_and_link_cycles_are_handled(self):
+        """A symlinked project directory's own links count, and a cycle of
+        directory links ends the walk instead of looping."""
+        home = Path.home()
+        project, live = self.where / "project-state", self.where / "live-state"
+        project.mkdir()
+        live.mkdir()
+        (live / "manager.json").write_text("{}\n")
+        (project / "manager.json").symlink_to(live / "manager.json")
+        (project / "loop").symlink_to(project)  # a cycle back to itself
+        pm = home / ".local/state/project-manager"
+        pm.mkdir(parents=True)
+        self.addCleanup(lambda: [p.rmdir() for p in (pm, pm.parent, pm.parent.parent)])
+        (pm / "alpha").symlink_to(project)
+        self.addCleanup((pm / "alpha").unlink)
+        before = snapshot(live)
+        self.refused(r"under ~/.local/state/project-manager/alpha's target/manager.json's target",
+                     out=live / "releases")
+        self.assertEqual(snapshot(live), before)
+
     def test_adversarial_symlink_variants_are_refused(self):
         """A chain of links, a relative link, a hook under ~/.claude, and an
         output path that is itself a link to a protected target."""

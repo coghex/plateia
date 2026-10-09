@@ -247,8 +247,12 @@ def live_roots():
     if os.environ.get("CHAT_CONFIG"):
         roots.append(("CHAT_CONFIG's directory", Path(os.environ["CHAT_CONFIG"]).parent))
     linked, walked, seen = [], set(), 0
-    for name, root in roots:
-        real = os.path.realpath(root)
+    # Every root, then every symlinked directory's target, is walked once:
+    # links inside a linked directory count too. `walked` holds resolved
+    # paths, so a cycle of links ends.
+    pending = [(name, os.path.realpath(root)) for name, root in roots]
+    while pending:
+        name, real = pending.pop(0)
         if not os.path.isdir(real) or any(real == w or real.startswith(w + os.sep) for w in walked):
             continue
         walked.add(real)
@@ -265,8 +269,10 @@ def live_roots():
                 path = os.path.join(folder, entry)
                 if os.path.islink(path):
                     target = Path(os.path.realpath(path))
-                    rel = os.path.relpath(path, real)
-                    linked.append((f"{name}/{rel}'s target", target if target.is_dir() else target.parent))
+                    label = f"{name}/{os.path.relpath(path, real)}'s target"
+                    linked.append((label, target if target.is_dir() else target.parent))
+                    if target.is_dir():
+                        pending.append((label, str(target)))
     return roots + linked
 
 
