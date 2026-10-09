@@ -321,18 +321,47 @@ def private_bases(skills):
     """Where private data lives, which importer discovery never opens or
     walks into, even through an alias: chat state and config, other
     settings and state, and everything under ~/.codex and ~/.claude except
-    their skills folders (sessions, history, settings)."""
+    their skills folders (sessions, history, settings).
+
+    A skills folder is exempt only where it really is: a declared root
+    that reaches its own location with no alias, or one aliased to such a
+    root. A root that resolves to, contains or lands elsewhere inside
+    private data (~/.claude/skills linked to ~/.claude, say) exempts
+    nothing; it is returned among the dropped roots, with the reason, and
+    never searched."""
     home = Path.home()
     always = [chat_state(), chat_config().parent]
     broad = [home / ".config", home / ".local/state", home / ".local/share", home / "Library", home / ".ssh",
              home / ".gnupg", home / ".aws", home / ".netrc", home / ".codex", home / ".claude"]
-    allowed = [skills, home / ".claude/skills"]
     real = lambda paths: [os.path.realpath(p) for p in paths]  # noqa: E731
-    return real(always), real(allowed), real(broad)
+    always, broad = real(always), real(broad)
+    lexical_home, real_home = os.path.normpath(os.path.abspath(home)), os.path.realpath(home)
+
+    def own_place(root):
+        """Its location, when the root reaches it with no alias on the way from the home folder."""
+        lexical = os.path.normpath(os.path.abspath(root))
+        if not lexical.startswith(lexical_home + os.sep):
+            return None
+        place = os.path.join(real_home, os.path.relpath(lexical, lexical_home))
+        return place if os.path.realpath(root) == place else None
+
+    roots = [skills, home / ".claude/skills"]
+    canonical = {own_place(r) for r in roots} - {None}
+    allowed, dropped = [], {}
+    for root in roots:
+        target = os.path.realpath(root)
+        inside = [b for b in always + broad if target.startswith(b + os.sep)]
+        if any(target == b or b.startswith(target + os.sep) for b in always + broad):
+            dropped[str(root)] = f"resolves to {shown(target)}, which is or holds private data"
+        elif inside and (target not in canonical or any(target.startswith(b + os.sep) for b in always)):
+            dropped[str(root)] = f"is an alias resolving to {shown(target)}, inside private data"
+        else:
+            allowed.append(target)
+    return always, allowed, broad, dropped
 
 
 def private_target(path, bases):
-    always, allowed, broad = bases
+    always, allowed, broad, _ = bases
     real = os.path.realpath(path)
     under = lambda base: real == base or real.startswith(base + os.sep)  # noqa: E731
     if any(under(b) for b in always):
@@ -377,7 +406,8 @@ def find_importers(spec, skills):
     once, under the first path that reaches it. Only scripts are opened (a
     Python or shell suffix, or the executable bit), never data files, and
     nothing that resolves into private data (private_bases): such an alias
-    is named as excluded. The managed chat folder is skipped, however it is
+    is named as excluded, as is a declared root aliased into private data,
+    which is not searched at all. The managed chat folder is skipped, however it is
     reached. A root, folder or script that can't be read, a script over the
     size cap, an excluded alias, or more entries than the walk allows makes
     the inventory incomplete rather than clean."""
@@ -393,6 +423,11 @@ def find_importers(spec, skills):
         roots.append(entry)
         if not os.path.lexists(root):
             entry["status"] = "absent"
+            continue
+        if str(root) in private[3]:  # a declared root aliased into private data: nothing exempt, nothing searched
+            entry["excluded"].append(f"{shown(root)} (a declared root that {private[3][str(root)]}; not "
+                                     "searched, and nothing under it exempt)")
+            entry["status"] = "incomplete"
             continue
         pending = [root]
         while pending:
@@ -782,7 +817,9 @@ class Writer:
       by its inode against the journal's record that staging created it
       (owned by this user, on the root's device). Every create, rename and
       delete happens relative to those pinned descriptors, so swapping a
-      directory for a link after it was checked can't redirect a write.
+      directory for a link after it was checked can't redirect a write
+      staging makes itself. venv and pip write by path while they run:
+      path_intact checks around them, and D-71 bounds what that covers.
     - The final path and its parent resolve under the root, and outside this
       checkout and every protected location.
     - Files are created with O_CREAT|O_EXCL|O_NOFOLLOW under a fresh
@@ -811,7 +848,7 @@ class Writer:
         if (held.st_dev, held.st_ino) != (st.st_dev, st.st_ino):
             os.close(self.root_fd)
             raise Refused(f"{shown(self.root)} changed while it was opened; left unchanged")
-        self.dev = st.st_dev
+        self.dev, self.root_inode = st.st_dev, (st.st_dev, st.st_ino)
         self.dirs, self.mine = {}, {}
         self.record = None
 
@@ -1024,8 +1061,7 @@ class Writer:
         self.dirs.pop(rel, None)
 
     def same_dir(self, rel):
-        """Refuse unless rel is still the directory this operation created:
-        checked around each process that writes into it by path."""
+        """Refuse unless rel is still the directory this operation created."""
         fd, name = self.parent(rel)
         try:
             st = self.entry(fd, name)
@@ -1033,6 +1069,32 @@ class Writer:
                 self.foreign(self.root / rel, "is no longer the directory this operation created")
         finally:
             os.close(fd)
+
+    def path_intact(self, rel, process, after=False):
+        """Checked immediately before and after a process that writes into
+        rel by its path (venv, pip): that path must still lead, name by name,
+        to the directories staging created and pinned, the root and each one
+        below it by its inode, none of them a link. The first that differs
+        is named. A process writes by path while it runs, so a same-user
+        process that swaps one of these directories during it can redirect
+        its writes before this check sees the swap (D-71): staging then
+        refuses, and the step's outcome is recorded failed, never ok."""
+        parts = rel.split("/")
+        chain = [(self.root, self.root_inode)] + [(self.root.joinpath(*parts[:i]), self.dirs.get("/".join(parts[:i])))
+                                                 for i in range(1, len(parts) + 1)]
+        for path, inode in chain:
+            try:
+                st = os.lstat(path)
+            except OSError:
+                st = None
+            if st is None or not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != inode:
+                if after:
+                    raise Refused(f"{shown(path)} changed while {process} ran: it is no longer the directory "
+                                  f"staging created and checked, so {process}'s writes through it may have landed "
+                                  "elsewhere (D-71); refused, and the step isn't recorded complete")
+                raise Refused(f"{shown(path)} is no longer the directory staging created and checked; {process} "
+                              "was not run")
+        self.same_dir(rel)
 
 
 def remove_tree_at(parent_fd, name, inode):
@@ -1536,19 +1598,23 @@ def run_operation(journal, writer, release, manifest, plan, report, python, spec
         if writer.lstat(env_rel) is not None:
             writer.remove_tree(env_rel)  # a partial environment this operation's venv run left
         writer.mkdir(env_rel)
-        writer.same_dir(env_rel)
-        r = run([python, "-m", "venv", env], env=child_env(), cwd=str(release_dir))
-        writer.same_dir(env_rel)
+        writer.path_intact(env_rel, "venv")
+        try:
+            r = run([python, "-m", "venv", env], env=child_env(), cwd=str(release_dir))
+        finally:
+            writer.path_intact(env_rel, "venv", after=True)  # a swap during it is named, whatever venv did
         if r.returncode:
             raise Refused(f"venv exited {r.returncode}")
         return "venv created with the chosen interpreter and its bundled pip"
 
     def install_package():
         wheel = release_dir / "artifacts" / manifest["package"]["artifact"]
-        writer.same_dir(env_rel)
-        r = run([env / "bin" / "python", "-m", "pip", "install", "--no-index", "--no-deps", "--no-cache-dir",
-                 "--disable-pip-version-check", wheel], env=child_env(), cwd=str(release_dir))
-        writer.same_dir(env_rel)
+        writer.path_intact(env_rel, "pip")
+        try:
+            r = run([env / "bin" / "python", "-m", "pip", "install", "--no-index", "--no-deps", "--no-cache-dir",
+                     "--disable-pip-version-check", wheel], env=child_env(), cwd=str(release_dir))
+        finally:
+            writer.path_intact(env_rel, "pip", after=True)
         if r.returncode:
             raise Refused(f"pip exited {r.returncode}")
         data = (json.dumps(env_inventory(env), indent=1, sort_keys=True) + "\n").encode()

@@ -561,6 +561,45 @@ class ImporterTests(StageCase):
                           "~/.codex/skills/unrelated/scripts/settings.py"])
         self.assertNotIn(_staging.SECRETS[0], json.dumps(importers))
 
+    def test_a_declared_root_aliased_into_private_data_exempts_nothing(self):
+        """Round 5's fixture: ~/.claude/skills is a link to ~/.claude, the
+        managed chat link preserved through it, and a script name there
+        links to the private settings file. The settings file is never
+        opened, the alias is named as excluded and the inventory is
+        incomplete; the same holds for a root linked to the whole home
+        folder (one that contains private data) and one linked inside
+        ~/.claude elsewhere than its skills folder."""
+        claude = self.home / ".claude"
+        settings = _staging.write(claude / "settings.json",
+                                  f'{{"token": "{_staging.SECRETS[0]}", "sys.path.insert": "chat/scripts"}}\n')
+        settings.chmod(0o755)  # looks like a script, so only the exclusion keeps it closed
+        (claude / "skills/chat").rename(claude / "chat")  # still a link to the skills tree's chat folder
+        shutil.rmtree(claude / "skills")
+        for target in (claude, self.home, claude / "projects"):
+            with self.subTest(alias=target.name):
+                target.mkdir(exist_ok=True)
+                if os.path.lexists(claude / "skills"):
+                    (claude / "skills").unlink()
+                (claude / "skills").symlink_to(target)
+                if not os.path.lexists(target / "chat"):
+                    (target / "chat").symlink_to(self.skills / "chat")  # the managed link, kept through the alias
+                for script in (target / "settings.py", self.skills / "unrelated/scripts/settings.py"):
+                    if not os.path.lexists(script):
+                        script.symlink_to(settings)
+                importers, opened = self.opened_by_discovery()
+                self.assertNotIn(os.path.realpath(settings), {os.path.realpath(p) for p in opened})
+                self.assertFalse(importers["complete"])
+                root = next(r for r in importers["roots"] if r["path"] == "~/.claude/skills")
+                self.assertEqual(root["status"], "incomplete")
+                self.assertRegex(root["excluded"][0], r"^~/\.claude/skills \(a declared root that (resolves to|is "
+                                                      r"an alias resolving to) .*private data; not searched")
+                self.assertEqual(importers["unlisted"], [])
+                self.assertNotIn(_staging.SECRETS[0], json.dumps(importers))
+                plan = self.plan()
+                self.assertFalse(plan["importers"]["complete"])
+                self.assertEqual([t["name"] for t in plan["targets"] if t["problems"]], [])
+                self.assertNotIn(_staging.SECRETS[0], stage_release.render_plan(plan))
+
     def test_a_large_script_is_searched_and_one_over_the_cap_is_named(self):
         big = self.skills / "bulk/scripts/generated.py"
         _staging.write(big, "# generated\n" + ("x = 1\n" * 400_000) +
@@ -897,7 +936,8 @@ class AliasMatrixTests(StageCase):
                         swapped.append(record)
                 with self.assertRaisesRegex(Refused, r"is not a directory staging created|is no longer the "
                                                      r"directory this operation created|doesn't resolve under the "
-                                                     r"staging destination|is under ~/\.local/state"):
+                                                     r"staging destination|is under ~/\.local/state|is no longer the "
+                                                     r"directory staging created and checked"):
                     self.stage(crash=hook)
                 self.assertFalse(any(state.glob("*.whl")) or any(state.glob("*.zip")) or
                                  (state / "manifest.json").exists() or (state / "bin").exists())
@@ -949,6 +989,60 @@ class AliasMatrixTests(StageCase):
                 self.assertEqual((self.dest / "journal.jsonl").read_bytes(), text)
                 self.assertEqual(os.listdir(self.dest), ["journal.jsonl"])
                 self.assertFalse((self.dest / "releases").exists())
+
+
+class ProcessSwapTests(StageCase):
+    """D-71: venv and pip write by path while they run, so a same-user
+    process that swaps a directory during one of them can redirect its
+    writes, and these tests don't claim it can't. At the process boundary,
+    each directory on the environment's path is swapped for a link to
+    protected state (the invented chat state) just as the real venv or pip
+    starts. Staging must refuse, name the changed directory, and record no
+    completion for that step or any later one."""
+
+    def swap_during(self, process, swapped):
+        real = stage_release.run
+
+        def boundary(argv, **kw):
+            text = " ".join(str(a) for a in argv)
+            if (" -m venv " in text) if process == "venv" else (" -m pip " in text):
+                os.rename(swapped, f"{swapped}-moved")
+                os.symlink(self.home / ".local/state/chat", swapped)
+            return real(argv, **kw)
+        return mock.patch.object(stage_release, "run", boundary)
+
+    def test_a_directory_swapped_while_venv_or_pip_runs_is_named_and_the_step_never_completes(self):
+        rel_dir = self.dest / "releases" / self.manifest["release"]
+        for process, step in (("venv", "create-environment"), ("pip", "install-package")):
+            for swapped in (self.dest, rel_dir, rel_dir / "env"):
+                with self.subTest(process=process, swapped=swapped.name):
+                    for leftover in (self.dest, Path(f"{self.dest}-moved")):
+                        if os.path.lexists(leftover):
+                            leftover.unlink() if leftover.is_symlink() else shutil.rmtree(leftover)
+                    with self.swap_during(process, swapped):
+                        with self.assertRaises(Refused) as caught:
+                            self.stage()
+                    message = str(caught.exception)
+                    self.assertIn(f"{step} failed: {stage_release.shown(swapped)} changed while {process} ran",
+                                  message)
+                    self.assertIn("may have landed elsewhere (D-71)", message)
+                    journal_dir = Path(f"{self.dest}-moved") if swapped == self.dest else self.dest
+                    records = stage_release.read_journal(journal_dir / "journal.jsonl")
+                    outcomes = [r for r in records if r["kind"] == "outcome"]
+                    self.assertEqual([r["result"] for r in outcomes if r["step"] == step], ["failed"])
+                    late = [r for r in outcomes
+                            if r["result"] == "ok" and STEP_ORDER[r["step"]] >= STEP_ORDER[step]]
+                    self.assertEqual(late, [], "a step at or after the swap was recorded complete")
+                    self.assertEqual(stage_release.status(journal_dir)[0]["state"],
+                                     f"unfinished (last: outcome {step}: failed)")
+                    self.assertFalse(os.path.lexists(rel_dir / "staged.json"))
+                    # Nothing here asserts that no write landed: during the swap D-71 doesn't require that.
+                    os.unlink(swapped)
+                    if swapped != self.dest:
+                        shutil.rmtree(self.dest)
+
+
+STEP_ORDER = {name: i for i, name in enumerate(stage_release.STEPS)}
 
 
 class PrivacyAndIsolationTests(StageCase):
