@@ -1410,7 +1410,7 @@ class EnvironmentIntegrityTests(StageCase):
         def shebang_argument(text):
             lines = text.splitlines()
             if lines[0] == "#!/bin/sh":
-                lines[1] = lines[1].replace('" "$0"', '" -S "$0"')
+                lines[1] = lines[1].replace(' "$0"', ' -S "$0"')  # the path is quoted only when it holds a space
             else:
                 lines[0] += " -S"
             return "\n".join(lines) + "\n"
