@@ -2014,6 +2014,50 @@ The live bridge keeps the defect until the release and activation slices
 change the running bridge. Capturing the defect verbatim and fixing it in a
 later slice was not selected.
 
+### D-71. PLT-12 staging's threat boundary for concurrent directory swaps
+
+Owner decision, 2026-10-09 08:10 UTC, relayed through the plateia manager
+from the owner's verified assistant (option B). It explicitly narrows #14's
+requirement 8 ("Staging leaves byte-for-byte unchanged ...") for one case.
+It isn't full prevention.
+
+PLT-12's review found that staging builds its environment by running `venv`
+and the environment's `pip` as subprocesses with absolute paths. Staging's
+own writes are pinned to directories it created and checked. A subprocess,
+though, writes by path while it runs. So another process running as the
+same user that swaps a directory on that path for a link, during a single
+`venv` or `pip` step, can redirect that step's writes. They can land in
+protected state before staging's check after the step detects the swap.
+Such a process already has the owner's write access to every protected
+location.
+
+Staging keeps these guarantees:
+
+- It refuses, with a named reason and without writing, any alias, link,
+  hardlink or changed entry that exists before a run or appears between its
+  journaled steps. That includes a change found by the checks immediately
+  before and after a step that runs `venv` or `pip`.
+- Every write staging makes itself stays pinned to directories it created
+  and verified.
+- After a `venv` or `pip` step, staging detects a swapped directory. It then
+  refuses, records no completion for that step and names the directory that
+  changed.
+
+Staging doesn't promise that no write happens during such a swap. It isn't
+required to prevent writes redirected by a same-user process that
+deliberately swaps a directory while a `venv` or `pip` step runs.
+
+Two alternatives were not selected:
+
+- **Full prevention by building the environment in-process.** That means
+  writing `pyvenv.cfg`, the interpreter link and the wheel's files member by
+  member through the pinned directories. It is new installer code and is
+  unproven.
+- **Building the environment in a private temporary directory and moving it
+  into place.** It doesn't close the race, because the temporary directory's
+  own parents can be swapped instead. A built environment also can't be
+  moved: its console scripts name their build path.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
