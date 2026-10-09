@@ -107,6 +107,9 @@ The plan searches two declared roots: the skills tree (`~/.codex/skills`) and
   `~/.gnupg`, `~/.aws`, and `~/.codex` and `~/.claude` outside their skills
   folders (sessions, history, settings). Such an alias is named as excluded,
   and the inventory is marked incomplete.
+- **Expressions over several lines are matched.** Each search covers the
+  last 16 lines together, so a `sys.path.insert(...)` with `/ "chat"` and
+  `/ "scripts"` on lines of their own is found.
 - **Scripts are read whole, line by line.** Only a script over 64 MiB is
   named as unsearched, which marks the inventory incomplete.
 - **Which files are searched.** Only scripts are opened: a `.py`, `.sh`,
@@ -208,9 +211,15 @@ Every write staging makes goes through one layer (`Writer`), including
   never `.` or `..`. The release identity must be the package's name and
   version as one such component, and artifact names must be plain and
   distinct.
-- **Only staging's own directories.** Every directory on the way below the
-  root must be a real directory, owned by this user on the root's device,
-  that the journal records staging created, by its inode.
+- **Only staging's own directories, pinned.** The root is held open, and
+  every directory on the way is opened relative to the one above it with
+  `O_DIRECTORY|O_NOFOLLOW`. Each must be a real directory, owned by this user
+  on the root's device, that the journal records staging created, by its
+  inode. Every create, rename, delete and tree removal then happens relative
+  to those open descriptors. A directory swapped for a link after its check
+  therefore can't redirect a write: the write lands in the directory that
+  was checked, and the next walk refuses the link.
+- **A private root.** A destination writable by other users is refused.
 - **Resolved and guarded.** The final path and its parent must resolve under
   the root, and both must sit outside this checkout and every protected
   location.
@@ -226,8 +235,11 @@ Every write staging makes goes through one layer (`Writer`), including
   someone else put there, or a directory replaced by another of the same
   name.
 - **The environment** is a directory this operation creates and records; its
-  own `venv` run fills it. Recovery may remove that directory, with what the
-  run put there. Links inside are removed, never followed.
+  own `venv` run fills it. `venv` and pip address it by path, so the
+  directory is checked to still be the one this operation created right
+  before and right after each of them, and its contents are inventoried.
+  Recovery may remove that directory, with what the run put there, through
+  pinned descriptors. Links inside are removed, never followed.
 - **The journal** names its own inode and the lock's in its first record. A
   file at the journal's name that isn't singly linked, isn't this user's, or
   isn't the journal its first record names is refused and left
@@ -371,7 +383,8 @@ The tests cover:
   - an undeclared, malformed or extra format, and no platform systems;
   - a tampered or missing artifact, or an unpinned manifest.
 - **API:** "not applicable", never "pass". A declared API version is refused.
-- **Importers:** an alias into the invented chat config, state or `~/.claude`
+- **Importers:** an importer expression spread over several lines is named. An
+  alias into the invented chat config, state or `~/.claude`
   is never opened and is named as excluded. A 2.4 MB importer is found, and
   one over the cap is named as unsearched. A sixth importer in each root is
   named, including one using
@@ -395,7 +408,11 @@ The tests cover:
   - traversal through the release identity, an artifact name and
     `plan --out`;
   - `plan --out` through a symlink, a hardlink or an existing file;
-  - a journal staging didn't create, which is left byte-identical.
+  - a journal staging didn't create, which is left byte-identical;
+  - the artifacts directory, the release directory or the environment
+    swapped for a link into protected state at the exact journal boundary
+    after its check. Nothing reaches protected state, and a writer-level
+    test shows the write landing in the pinned original directory.
 - **Changed environment:** on a completed retry, a modified `__init__.py`, an
   added `.pth` startup hook, a changed command, a cleared executable bit or
   an edited `pyvenv.cfg` is refused before the environment's interpreter
@@ -414,7 +431,7 @@ The tests cover:
   record no call. Every recorded command is the chosen interpreter or the
   staged environment's.
 
-### Crash recovery (invented fixtures, stager at `eee4625`)
+### Crash recovery (invented fixtures, stager at `95b390d`)
 
 Each row is a fresh invented home. The run was stopped right after the
 journal record in the first column, then run again with the same inputs.
@@ -436,13 +453,13 @@ macOS arm64, CPython 3.14.8:
 | intent copy-artifacts | unfinished | (empty) | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.manifest.json.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
-| created <release>/artifacts/.manifest.json.3e6dabefb84e.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.manifest.json.d270391e2c44.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/manifest.json | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
-| created <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.27c8320e58ea.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.615b216f7836.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/plateia-skill-chat-0.1.0+g04cab9561a11.zip | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
-| created <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.d26c9a99f625.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.cc9760477c81.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | outcome copy-artifacts | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | intent create-environment | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
@@ -450,14 +467,14 @@ macOS arm64, CPython 3.14.8:
 | outcome create-environment | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
 | intent install-package | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
 | creating <release>/.env-inventory.json.<random>.tmp | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
-| created <release>/.env-inventory.json.61fa95255a2e.tmp | unfinished | .env-inventory.json.61fa95255a2e.tmp, artifacts, env | resumed and staged | 1 | 1 | yes |
+| created <release>/.env-inventory.json.48b42da26c2f.tmp | unfinished | .env-inventory.json.48b42da26c2f.tmp, artifacts, env | resumed and staged | 1 | 1 | yes |
 | created <release>/env-inventory.json | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | outcome install-package | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | intent verify-environment | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | outcome verify-environment | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | intent complete | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | creating <release>/.staged.json.<random>.tmp | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
-| created <release>/.staged.json.35acf7bc66ca.tmp | unfinished | .staged.json.35acf7bc66ca.tmp, artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
+| created <release>/.staged.json.90916afab3ad.tmp | unfinished | .staged.json.90916afab3ad.tmp, artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | created <release>/staged.json | unfinished | artifacts, env, env-inventory.json, staged.json | resumed and staged | 1 | 1 | yes |
 | outcome complete | complete | artifacts, env, env-inventory.json, staged.json | already staged, verified | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.<random>.tmp (and the manifest copy cut short) | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
