@@ -206,7 +206,7 @@ class RefusalTests(BuildCase):
         self.addCleanup(link.unlink)
         for out in (link / "releases", real / "releases"):
             with self.subTest(out=out):
-                self.refused(r"under ~/.codex/skills, where the live chat tools live", out=out)
+                self.refused(r"under ~/\.codex(/skills)?, where the live chat tools live", out=out)
         self.assertEqual(list(real.iterdir()), [])
 
     def test_resolved_default_runtime_locations_are_refused(self):
@@ -232,6 +232,80 @@ class RefusalTests(BuildCase):
             with self.subTest(out=out.name, under=name):
                 self.refused(rf"under {name}", out=out)
         self.assertEqual({d: snapshot(d) for d in before}, before)
+
+    def test_nested_runtime_symlink_targets_are_refused(self):
+        """A symlink deep inside a runtime tree protects its target too."""
+        home = Path.home()
+        external = self.where / "external-state"
+        external.mkdir()
+        (external / "manager.json").write_text("{}\n")
+        deep = self.where / "external-logs"
+        deep.mkdir()
+        self.addCleanup(lambda: [p.rmdir() for p in (
+            home / ".local/state/project-manager/alpha", home / ".local/state/project-manager",
+            home / ".local/state/chat/logs", home / ".local/state/chat", home / ".local/state", home / ".local")])
+        links = [(home / ".local/state/project-manager/alpha/manager.json", external / "manager.json"),
+                 (home / ".local/state/chat/logs/archive", deep)]
+        for link, target in links:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(target)
+            self.addCleanup(link.unlink)
+        before = {d: snapshot(d) for d in (external, deep)}
+        for out, name in ((external / "releases", r"~/.local/state/project-manager/alpha/manager.json's target"),
+                          (deep / "releases", r"~/.local/state/chat/logs/archive's target")):
+            with self.subTest(out=out):
+                self.refused(rf"under {name}", out=out)
+        self.assertEqual({d: snapshot(d) for d in before}, before)
+
+    def test_adversarial_symlink_variants_are_refused(self):
+        """A chain of links, a relative link, a hook under ~/.claude, and an
+        output path that is itself a link to a protected target."""
+        home = Path.home()
+        chained, relative, hooks = (self.where / n for n in ("chained-live", "relative-live", "hook-live"))
+        for d in (chained, relative, hooks):
+            d.mkdir()
+        (hooks / "on-start.sh").write_text("#!/bin/sh\n")
+        hop = self.where / "hop"
+        hop.symlink_to(chained)
+        state = home / ".local/state/chat"
+        state.mkdir(parents=True)
+        (home / ".claude/hooks").mkdir(parents=True)
+        self.addCleanup(lambda: [p.rmdir() for p in (home / ".claude/hooks", home / ".claude", state,
+                                                       state.parent, state.parent.parent)])
+        links = [(state / "chain", hop), (state / "relative", Path(os.path.relpath(relative, state))),
+                 (home / ".claude/hooks/on-start.sh", hooks / "on-start.sh")]
+        for link, target in links:
+            link.symlink_to(target)
+            self.addCleanup(link.unlink)
+        (self.where / "innocent-looking").symlink_to(relative)
+        before = {d: snapshot(d) for d in (chained, relative, hooks)}
+        for out, name in ((chained / "releases", r"~/.local/state/chat/chain's target"),
+                          (relative / "releases", r"~/.local/state/chat/relative's target"),
+                          (self.where / "innocent-looking" / "releases", r"~/.local/state/chat/relative's target"),
+                          (hooks / "releases", r"~/.claude/hooks/on-start.sh's target")):
+            with self.subTest(out=out):
+                self.refused(rf"under {name}", out=out)
+        self.assertEqual({d: snapshot(d) for d in before}, before)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads unreadable directories")
+    def test_an_unreadable_runtime_tree_is_refused(self):
+        locked = Path.home() / ".local/state/chat/locked"
+        locked.mkdir(parents=True)
+        locked.chmod(0)
+        self.addCleanup(lambda: [p.rmdir() for p in (locked, locked.parent, locked.parent.parent,
+                                                       locked.parent.parent.parent)])
+        self.addCleanup(locked.chmod, 0o755)
+        self.refused(r"cannot check ~/.local/state for symlinks .*refusing rather than risk")
+
+    def test_too_many_entries_to_check_is_refused(self):
+        tree = Path.home() / ".config/chat"
+        tree.mkdir(parents=True)
+        for n in range(5):
+            (tree / f"f{n}").write_text("x\n")
+        self.addCleanup(lambda: [p.unlink() for p in tree.iterdir()] and None or
+                        [tree.rmdir(), tree.parent.rmdir()])
+        with mock.patch.object(build_release, "WALK_LIMIT", 3):
+            self.refused(r"more than 3 entries to check for symlinks")
 
     def test_configured_chat_state_and_config_locations_are_refused(self):
         state, config = self.where / "chat-state", self.where / "chat-config"

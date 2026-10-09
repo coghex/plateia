@@ -54,16 +54,18 @@ SCHEMA = "plateia-release-manifest/1"
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)  # fixed, so the same commit always builds the same bytes
 SHA = re.compile(r"^[0-9a-f]{40}$")
 
-# Where the live chat tools keep code, settings and state: no release is
-# ever written there (requirement 8). Relative to the home directory: the
-# broad roots, then each concrete runtime location inside or beside them,
+# Where the live chat tools keep code, settings, state, hooks and services:
+# no release is ever written there (requirement 8). Relative to the home
+# directory: the broad roots (including the agents' own settings, hooks and
+# plugin caches under ~/.codex and ~/.claude), then each concrete runtime location inside or beside them,
 # because each may be a symlink to somewhere else and is resolved on its
 # own. The chat code's CHAT_STATE and CHAT_CONFIG are added at run time.
-LIVE_ROOTS = (".codex/skills", ".config/chat", ".config/cmux", ".local/state", ".local/bin",
+LIVE_ROOTS = (".codex", ".claude", ".codex/skills", ".config/chat", ".config/cmux", ".local/state", ".local/bin",
               "Library/LaunchAgents",
               ".codex/skills/chat", ".codex/skills/chat/scripts", ".local/state/chat",
               ".local/state/project-manager", ".local/state/ergo", ".local/share/weechat", ".config/weechat",
               ".weechat")
+WALK_LIMIT = 1_000_000  # entries checked for symlinks before the guard gives up (and refuses)
 
 # Patterns no artifact may carry (requirement 5). Invented placeholders that
 # the captured code uses in docstrings and examples are allowed.
@@ -233,25 +235,38 @@ def public_version(version):
 
 def live_roots():
     """(name, path) for every live location. Each named location counts, and
-    so does every symlink directly inside one: a symlinked directory's target,
-    or a symlinked file's target directory (an installed command such as
-    ~/.local/bin/pchat points into the tree it runs from)."""
+    so does the target of every symlink anywhere inside one (a directory's
+    target, or a file's target directory, as for ~/.local/bin/pchat or a
+    project's manager.json): the trees are walked without following links.
+    A tree that can't be read completely, or is too large to walk, is a
+    refusal rather than a guess."""
     home = Path.home()
     roots = [(f"~/{rel}", home / rel) for rel in LIVE_ROOTS]
     if os.environ.get("CHAT_STATE"):
         roots.append(("CHAT_STATE", Path(os.environ["CHAT_STATE"])))
     if os.environ.get("CHAT_CONFIG"):
         roots.append(("CHAT_CONFIG's directory", Path(os.environ["CHAT_CONFIG"]).parent))
-    linked = []
+    linked, walked, seen = [], set(), 0
     for name, root in roots:
-        try:
-            entries = list(os.scandir(root))
-        except OSError:
+        real = os.path.realpath(root)
+        if not os.path.isdir(real) or any(real == w or real.startswith(w + os.sep) for w in walked):
             continue
-        for entry in entries:
-            if entry.is_symlink():
-                target = Path(os.path.realpath(entry.path))
-                linked.append((f"{name}/{entry.name}'s target", target if target.is_dir() else target.parent))
+        walked.add(real)
+
+        def unreadable(error, name=name):
+            raise Refused(f"cannot check {name} for symlinks ({error.strerror}); "
+                          "refusing rather than risk writing into a live location")
+        for folder, dirs, files in os.walk(real, onerror=unreadable):
+            for entry in dirs + files:
+                seen += 1
+                if seen > WALK_LIMIT:
+                    raise Refused(f"the live locations hold more than {WALK_LIMIT} entries to check for "
+                                  "symlinks; refusing rather than risk writing into a live location")
+                path = os.path.join(folder, entry)
+                if os.path.islink(path):
+                    target = Path(os.path.realpath(path))
+                    rel = os.path.relpath(path, real)
+                    linked.append((f"{name}/{rel}'s target", target if target.is_dir() else target.parent))
     return roots + linked
 
 
