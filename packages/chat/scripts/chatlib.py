@@ -496,7 +496,7 @@ def post(channel: str, text: str, account: str, cfg: dict | None = None, cont: s
                 part["state"] = "uncertain"
                 report(progress())
                 raise stop(PostIncomplete(f"part {n + 1} of {len(parts)}: server replied {errors}", None))
-            part.update(state="confirmed")
+            part.update(state="confirmed", confirmed_at=_wallclock())
             report(progress())
             sent += sum(1 for line in lines if " PRIVMSG " in line or line.startswith("PRIVMSG "))
         return sent

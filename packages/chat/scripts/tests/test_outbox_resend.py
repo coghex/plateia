@@ -716,6 +716,55 @@ class RoundTwoTests(OutboxCase):
         self.assertEqual(sum(1 for w in self.server.writes if " PRIVMSG " in w), 1, "written once, not again")
 
 
+class RoundThreeTests(OutboxCase):
+    """Review round 3 of #20: a part the server confirmed keeps its message
+    reserved, pending or retired, so it never confirms another entry's part."""
+
+    def two_identical(self):
+        chatlib.outbox_append([{"channel": "#alpha", "as": "alp-solver-2", "text": "[status alpha-1] same", "at": "t"},
+                               {"channel": "#alpha", "as": "alp-solver-2", "text": "[status alpha-1] same", "at": "t"}])
+        self.serve("ok", "write-error")  # the first is confirmed; the second is written but never committed
+        self.flush()
+        self.assertEqual(len(self.server.published), 1)
+        self.assertEqual(self.states(), ["uncertain"])
+        self.log_record(self.server.published[0])  # only the first entry's message is in the record
+        self.clock.t += 30
+
+    def test_one_message_never_satisfies_two_entries_across_flushes_and_a_restart(self):
+        self.two_identical()
+        for _ in range(2):
+            self.flush()
+        self.assertEqual(self.states(), ["uncertain"], "the first entry's message is not the second's")
+        loader = importlib.machinery.SourceFileLoader("chat_bridge_restarted_r3", str(SCRIPTS / "chat-bridge"))
+        fresh = importlib.util.module_from_spec(importlib.util.spec_from_loader("chat_bridge_restarted_r3", loader))
+        loader.exec_module(fresh)
+        with mock.patch.object(fresh, "_now", self.clock):
+            self.flush(module=fresh)
+        self.assertEqual(self.states(), ["uncertain"], "nor after a restart")
+        self.assertEqual(len(self.server.published), 1)
+
+    def test_the_second_is_sent_once_when_the_complete_record_shows_it_never_arrived(self):
+        self.two_identical()
+        self.clock.t += bridge.SETTLE + 60
+        self.covered(T0 - 3600, self.clock.t)
+        self.flush()
+        self.flush()
+        self.assertEqual(self.entries(), [])
+        self.assertEqual(len(self.server.published), 2, "one message per entry, no more")
+
+    def test_a_pending_confirmed_part_also_keeps_its_message(self):
+        """The first entry is still owed (a later part failed), its confirmed part has no msgid."""
+        same = "… [status alpha-1] same"
+        first = uncertain_entry("e1", "tail", T0 + 1, before=[(same, T0)])
+        first["parts"][0]["confirmed_at"] = T0 + 0.5
+        second = uncertain_entry("e2", same, T0 + 2)
+        (chatlib.STATE_DIR / "outbox.claimed-1.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+        self.log_record({"account": "alp-solver-2", "channel": "#alpha", "text": same, "at": T0 + 0.2, "msgid": "srv1"})
+        self.clock.t += 30
+        self.flush()
+        self.assertEqual(self.states(self.entries()[1]), ["uncertain"])
+
+
 class CoverageTests(unittest.TestCase):
     """The record is complete over an interval only through a finished catch-up and a sync."""
 
@@ -778,6 +827,26 @@ class CoverageTests(unittest.TestCase):
         self.coverage.sync(since + 700)  # a sync while out of the channel, or before the catch-up ends
         self.assertIsNone(self.coverage.spans["#alpha"]["through"])
         self.assertFalse(self.coverage.covers("#alpha", since, since + 700))
+
+    def test_a_catch_up_open_when_the_channel_is_lost_completes_nothing(self):
+        from test_bridge import batch, join
+        kick = {"tags": {}, "prefix": "op!u@h", "command": "KICK", "params": ["#alpha", "chatbridge", "out"]}
+        self.connect([join("#alpha"), batch("b1", "#alpha"), batch("b1", None)])  # complete, from a real checkpoint
+        since = self.coverage.spans["#alpha"]["since"]
+        self.coverage.sync(since + 10)
+        self.connect([join("#alpha"), batch("b2", "#alpha"), kick, batch("b2", None)])  # lost mid catch-up
+        self.assertNotIn("#alpha", self.coverage.live)
+        self.coverage.sync(since + 2000)
+        self.assertFalse(self.coverage.covers("#alpha", since, since + 2000))
+        # A part committed after the kick, so missing from the record, is not judged absent and resent.
+        entry = uncertain_entry("e1", "committed while out", since + 100)
+        (chatlib.STATE_DIR / "outbox.claimed-1.jsonl").write_text(json.dumps(entry) + "\n")
+        writes = []
+        with mock.patch.object(chatlib, "login", lambda *a, **k: writes.append(a) or None):
+            bridge.flush_outbox(CFG, coverage=self.coverage)
+        self.assertEqual(writes, [])
+        [left] = [json.loads(line) for line in (chatlib.STATE_DIR / "outbox.claimed-1.jsonl").read_text().splitlines()]
+        self.assertEqual([p["state"] for p in left["parts"]], ["uncertain"])
 
     def test_a_resumed_catch_up_keeps_the_interval_and_a_seeded_one_does_not(self):
         from test_bridge import batch, join
