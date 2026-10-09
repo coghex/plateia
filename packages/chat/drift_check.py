@@ -95,7 +95,10 @@ def describe(path: Path, st: os.stat_result) -> str:
     return "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "special file"
 
 
-def check(tree: Path, provenance: dict) -> dict:
+def check(tree: Path, provenance: dict, hasher=None) -> dict:
+    """The drift report for `tree`. `hasher(path, rel)`, when given, hashes
+    each captured file in place of sha256(path), so a caller can refuse to
+    read a file (raising OSError) that this check would otherwise open."""
     tree = Path(tree)
     root_rel = provenance["monitored"]["root"].strip("/")
     patterns = [e["pattern"] for e in provenance["monitored"].get("exclude", [])]
@@ -135,7 +138,7 @@ def check(tree: Path, provenance: dict) -> dict:
             if not stat.S_ISREG(st.st_mode):
                 drift.append({"path": rel, "kind": "type changed", "detail": f"file -> {describe(path, st)}"})
                 continue
-            digest = sha256(path)
+            digest = sha256(path) if hasher is None else hasher(path, rel)
         except OSError as e:
             errors.append({"path": rel, "error": e.strerror or str(e)})
             continue

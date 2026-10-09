@@ -41,11 +41,13 @@ only; no network access.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import collections
 import contextlib
 import csv
 import datetime
+import errno
 import fcntl
 import hashlib
 import io
@@ -197,8 +199,31 @@ def shown(path):
     return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
 
 
-def sha256_file(path):
-    return drift_check.sha256(Path(path))
+def guarded_bytes(path, inside=None):
+    """The bytes of a managed or captured file, read only when it is a
+    regular file with a single link and, with `inside` as (root, rel), when
+    it is reached from root with no alias on the way. A hard link or an
+    alias may be private data under another name, and a path can't show
+    which, so such a file is never opened: OSError says why. The file opened
+    must still be the one checked, with one link, before anything is read."""
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(errno.EINVAL, "not a regular file; not read")
+    if st.st_nlink > 1:
+        raise OSError(errno.EMLINK, f"a file with {st.st_nlink} hard links, which may be private data under another "
+                                    "name; not read")
+    if inside is not None and os.path.realpath(path) != os.path.join(os.path.realpath(inside[0]), inside[1]):
+        raise OSError(errno.ELOOP, "reached through an alias, which may lead to private data; not read")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        now = os.fstat(stream.fileno())
+        if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino) or now.st_nlink > 1:
+            raise OSError(errno.EAGAIN, "changed or gained a hard link while it was checked; not read")
+        return stream.read()
+
+
+def sha256_file(path, inside=None):
+    return hashlib.sha256(guarded_bytes(path, inside)).hexdigest()
 
 
 def digest(value):
@@ -233,7 +258,10 @@ def content_problem(rel, skills, provenance):
     path = skills / rel
     if not path.is_file() or path.is_symlink():
         return f"missing: {shown(path)} is not a file"
-    found = sha256_file(path)
+    try:
+        found = sha256_file(path, (skills, rel))
+    except OSError as e:
+        return f"unknown ownership: {shown(path)} can't be read ({e.strerror or e})"
     if found not in (entry["baseline"]["sha256"], entry.get("effective_sha256")):
         return f"changed content: {shown(path)} matches neither the baseline nor a carried commit"
     return None
@@ -252,7 +280,10 @@ def observe_symlink(t, path, skills, provenance):
         problem = content_problem(t["content"], skills, provenance)
         if problem:
             return observed, problem
-        observed["sha256"] = sha256_file(expected)
+        try:
+            observed["sha256"] = sha256_file(expected, (skills, t["content"]))
+        except OSError as e:
+            return observed, f"unknown ownership: {shown(expected)} can't be read ({e.strerror or e})"
     elif not expected.is_dir() or expected.is_symlink():
         return observed, f"missing: the link destination {shown(expected)} is not a directory"
     return observed, None
@@ -262,11 +293,14 @@ def observe_launchagent(t, path, skills, provenance):
     if path.is_symlink() or not path.is_file():
         return {"type": "symlink" if path.is_symlink() else "other"}, \
             "unknown ownership: not a regular property-list file"
-    observed = {"type": "file", "sha256": sha256_file(path)}
     try:
-        with open(path, "rb") as stream:
-            plist = plistlib.load(stream)
-    except (plistlib.InvalidFileException, ValueError, OSError):
+        data = guarded_bytes(path)
+    except OSError as e:
+        return {"type": "file"}, f"unknown ownership: {shown(path)} can't be read ({e.strerror or e})"
+    observed = {"type": "file", "sha256": hashlib.sha256(data).hexdigest()}
+    try:
+        plist = plistlib.loads(data)
+    except (plistlib.InvalidFileException, ValueError):
         return observed, "unknown ownership: not a readable property list"
     # Only the label and program arguments are looked at: never the
     # environment, log paths or anything else the file holds.
@@ -313,7 +347,9 @@ def folder_inventory(skills, provenance, prefix=""):
     """The drift check's view of the chat folder, as (observed, problems):
     every captured file's hash, the excluded entries counted, and every
     missing, changed or unknown entry as a problem."""
-    result = drift_check.check(skills, provenance)
+    # Every captured file the drift check hashes is read through
+    # guarded_bytes, so a hard link or alias into private data is never opened.
+    result = drift_check.check(skills, provenance, lambda path, rel: sha256_file(path, (skills, rel)))
     problems = []
     for e in result["errors"]:
         if e["path"].startswith(prefix):
@@ -330,7 +366,10 @@ def folder_inventory(skills, provenance, prefix=""):
     for entry in provenance["captured"]:
         rel = entry["baseline_path"]
         if rel.startswith(prefix) and (skills / rel).is_file() and not (skills / rel).is_symlink():
-            files[rel] = sha256_file(skills / rel)
+            try:
+                files[rel] = sha256_file(skills / rel, (skills, rel))
+            except OSError:
+                continue  # the drift check already named it as unreadable
     return {"type": "directory", "files": files, "digest": digest(files)}, problems
 
 
@@ -439,6 +478,24 @@ def private_target(path, bases):
 IMPORTER_WINDOW = 16  # physical lines searched together, so an expression split over lines is matched
 
 
+def without_comment(line):
+    """A line with a trailing # comment dropped, outside quotes, so an
+    expression with a comment between "chat" and "scripts" still matches.
+    Searched as well as the line itself, never instead of it."""
+    quote = None
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == "\\":
+                continue
+            if ch == quote and line[i - 1] != "\\":
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#":
+            return line[:i] + "\n"
+    return line
+
+
 def imports_chat_scripts(path, checked=None):
     """Whether a script both changes the import path and names chat/scripts.
     It is read line by line, so a large script is searched whole, and each
@@ -450,6 +507,7 @@ def imports_chat_scripts(path, checked=None):
     still has a single link."""
     path_change = names_location = False
     window = collections.deque(maxlen=IMPORTER_WINDOW)
+    bare = collections.deque(maxlen=IMPORTER_WINDOW)  # the same lines with their comments dropped
     with open(path, "rb") as stream:
         if checked is not None:
             now = os.fstat(stream.fileno())
@@ -461,9 +519,10 @@ def imports_chat_scripts(path, checked=None):
         stream.seek(0)
         for raw in stream:
             window.append(raw.decode("utf-8", errors="ignore"))
-            text = "".join(window)
-            path_change = path_change or bool(SYS_PATH.search(text))
-            names_location = names_location or bool(CHAT_SCRIPTS.search(text))
+            bare.append(without_comment(window[-1]))
+            text, stripped = "".join(window), "".join(bare)
+            path_change = path_change or bool(SYS_PATH.search(text) or SYS_PATH.search(stripped))
+            names_location = names_location or bool(CHAT_SCRIPTS.search(text) or CHAT_SCRIPTS.search(stripped))
             if path_change and names_location:
                 return True
     return False
@@ -570,7 +629,7 @@ def make_plan(release, dest=None, spec_path=None):
     targets = [observe(t, skills, provenance) for t in spec["targets"]]
     staged = (Path(os.path.abspath(dest)) / RELEASES / manifest["release"]) if dest else None
     plan = {"schema": PLAN_SCHEMA, "release": manifest["release"],
-            "manifest_sha256": sha256_file(Path(release) / MANIFEST),
+            "manifest_sha256": drift_check.sha256(Path(release) / MANIFEST),
             "staged_release": shown(staged) if staged else None,
             "targets": targets, "importers": find_importers(spec, skills),
             "blocked": [f"{t['name']}: {p}" for t in targets for p in t["problems"]],
@@ -1528,6 +1587,75 @@ def check_root_contents(writer):
 LAUNCHER = re.compile(r"""^'''exec' (?:"([^"]+)"|(\S+)) "\$0" "\$@"$""")  # quoted only with spaces
 
 
+ARGV0 = "sys.argv[0]"
+
+
+def launcher_problem(text, module, attr):
+    """None when a console script is the launcher pip writes for the entry
+    point module:attr, judged by its structure (ast.parse runs nothing),
+    never by its RECORD hash: after the shebang (and, for a long path, the
+    /bin/sh exec preamble, a bare string to Python), only `import re` and
+    `import sys`, the one import of the entry point, and an
+    `if __name__ == "__main__":` block that at most rewrites sys.argv[0]
+    from itself and then exits with the entry point's result. Otherwise
+    the reason."""
+    try:
+        body = ast.parse(text).body
+    except (SyntaxError, ValueError):
+        return "it isn't valid Python"
+    if text.startswith("#!/bin/sh\n"):
+        if not (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            return "its /bin/sh preamble isn't pip's"
+        body = body[1:]
+    imports = []
+    while body and isinstance(body[0], ast.Import):
+        imports += [(a.name, a.asname) for a in body.pop(0).names]
+    if ("sys", None) not in imports or not set(imports) <= {("re", None), ("sys", None)}:
+        return "it imports something other than re and sys before the entry point"
+    first = body.pop(0) if body else None
+    if not (isinstance(first, ast.ImportFrom) and first.module == module and not first.level
+            and [(a.name, a.asname) for a in first.names] == [(attr, None)]):
+        return f"it doesn't import the entry point {module}:{attr} next"
+    guard = body[0] if len(body) == 1 else None
+    if not (isinstance(guard, ast.If) and not guard.orelse and ast.unparse(guard.test) in
+            ("__name__ == '__main__'", '__name__ == "__main__"')):
+        return "it holds more than the import and one __main__ block"
+    *rewrites, last = guard.body
+    if ast.unparse(last) != f"sys.exit({attr}())":
+        return f"its __main__ block doesn't end by exiting with {attr}()"
+    if not all(argv0_rewrite(r) for r in rewrites):
+        return "its __main__ block does more than rewrite sys.argv[0]"
+    return None
+
+
+def argv0_rewrite(node):
+    """An assignment to sys.argv[0], or an if/elif over such assignments,
+    computed only from sys.argv[0], constants, slices, its endswith and
+    removesuffix, and re.sub: what pip's launchers (across its versions) do
+    to drop a -script.pyw or .exe suffix."""
+    if isinstance(node, ast.If):
+        return safe_expression(node.test) and all(argv0_rewrite(n) for n in node.body + node.orelse)
+    return (isinstance(node, ast.Assign) and len(node.targets) == 1 and ast.unparse(node.targets[0]) == ARGV0
+            and safe_expression(node.value))
+
+
+def safe_expression(node):
+    for n in ast.walk(node):
+        if isinstance(n, ast.Call):
+            name = ast.unparse(n.func)
+            if not (name == "re.sub" or (name in (f"{ARGV0}.endswith", f"{ARGV0}.removesuffix"))):
+                return False
+        elif isinstance(n, ast.Name) and n.id not in ("sys", "re"):
+            return False
+        elif isinstance(n, ast.Attribute) and n.attr not in ("argv", "sub", "endswith", "removesuffix"):
+            return False
+        elif not isinstance(n, (ast.Call, ast.Name, ast.Attribute, ast.Subscript, ast.Slice, ast.Constant,
+                                ast.UnaryOp, ast.USub, ast.Load, ast.Compare, ast.Eq)):
+            return False
+    return True
+
+
 def interpreter_of(lines):
     """The interpreter a console script runs: its shebang's, or, when pip
     wrote the /bin/sh launcher it uses for a path too long for a shebang
@@ -1663,6 +1791,13 @@ def check_installed(inventory, env_fd, env, wheel, package):
     for located, (expected, named) in sorted(listed.items()):
         if expected and file_hash(located) != expected:
             raise Refused(f"the installed {named} no longer matches the package's RECORD")
+    for command in package["commands"]:
+        module, _, attr = entry_points[command].partition(":")
+        problem = launcher_problem(read_inside(env_fd, f"bin/{command}").decode("utf-8", errors="replace"),
+                                   module, attr)
+        if problem:
+            raise Refused(f"the staged {command} command isn't the launcher pip writes for the wheel's entry point "
+                          f"({entry_points[command]}): {problem}")
     for rel, entry in sorted(inventory.items()):
         if rel.startswith(f"{site}/plateia_chat/") and entry[0] != "dir" and rel not in listed:
             raise Refused(f"the installed package holds a file its RECORD doesn't list "
@@ -2078,6 +2213,12 @@ def run_operation(journal, writer, release, manifest, plan, report, python, spec
                f"files on {found['implementation']} {found['version']}"
 
     def complete():
+        # Checked again at the completion boundary: the environment's path
+        # against the pinned directories, and the artifacts and environment
+        # against the trusted evidence. A change since verify-environment is
+        # refused, and the operation is never recorded complete.
+        writer.path_intact(env_rel, "the completion step")
+        verify_static(writer, rel_dir, binding["manifest_sha256"], manifest, inventory_sha())
         writer.write(f"{rel_dir}/{STAGED}", (json.dumps(
             {"schema": STAGED_SCHEMA, "operation": op_id, "release": identity,
              "manifest_sha256": binding["manifest_sha256"], "interpreter": binding["interpreter"],

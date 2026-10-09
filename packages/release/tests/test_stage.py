@@ -123,6 +123,29 @@ class StageCase(unittest.TestCase):
     def journal(self):
         return [json.loads(line) for line in (self.dest / "journal.jsonl").read_text().splitlines()]
 
+    @contextlib.contextmanager
+    def never_opened(self, *paths):
+        """open and os.open fail the test on any of these files' inodes."""
+        private = {(os.stat(p).st_dev, os.stat(p).st_ino) for p in paths}
+        real_open, real_os_open = open, os.open
+
+        def refuse(path, dir_fd=None):
+            with contextlib.suppress(OSError, TypeError, ValueError):
+                st = os.stat(path, dir_fd=dir_fd) if dir_fd is not None else os.stat(path)
+                if (st.st_dev, st.st_ino) in private:
+                    raise AssertionError(f"a private inode was opened as {path}")
+
+        def guarded_open(file, *args, **kw):
+            if not isinstance(file, int):
+                refuse(file)
+            return real_open(file, *args, **kw)
+
+        def guarded_os_open(path, *args, dir_fd=None, **kw):
+            refuse(path, dir_fd)
+            return real_os_open(path, *args, dir_fd=dir_fd, **kw)
+        with mock.patch("builtins.open", guarded_open), mock.patch("os.open", guarded_os_open):
+            yield
+
     def writer(self):
         """A writer on the destination that knows what the journal's operation created."""
         writer = stage_release.Writer(self.dest, build_release.live_roots())
@@ -314,6 +337,41 @@ class BlockingTests(StageCase):
         self.before = _staging.snapshot_tree(self.home)
         self.assertNothingStaged(r"chat skill folder: unknown ownership: an entry the provenance doesn't list: "
                                  r"chat/scripts/local_patch\.py")
+
+    def test_a_hard_link_or_alias_at_a_captured_file_is_never_opened(self):
+        """Round 8's fixture: the captured chat/scripts/chatlib.py replaced by
+        a hard link to the invented private chat config; and, separately, the
+        whole chat/scripts folder moved into private state with a link left
+        in its place. With open and os.open set to fail on the private
+        inodes, the full plan never opens them, blocks with the reason named,
+        and prints no private value."""
+        config = self.home / ".config/chat/config.json"
+        chatlib = self.skills / "chat/scripts/chatlib.py"
+        moved = self.home / ".local/state/chat/scripts"
+        original = chatlib.read_bytes(), chatlib.stat().st_mode
+
+        def hard_link():
+            chatlib.unlink()
+            os.link(config, chatlib)
+            return [config], r"chat/scripts/chatlib\.py can't be read \(a file with 2 hard links, which may be private"
+
+        def folder_alias():
+            os.rename(self.skills / "chat/scripts", moved)
+            (self.skills / "chat/scripts").symlink_to(moved)
+            return [p for p in moved.rglob("*") if p.is_file()], r"reached through an alias, which may lead to private"
+        for name, act in (("hard link", hard_link), ("aliased folder", folder_alias)):
+            with self.subTest(case=name):
+                private, pattern = act()
+                with self.never_opened(*private):
+                    plan = self.plan()
+                self.assertTrue(plan["blocked"])
+                self.assertRegex("\n".join(plan["blocked"]), pattern)
+                self.assertNotIn(_staging.SECRETS[0], json.dumps(plan))
+                self.assertNotIn(_staging.SECRETS[0], stage_release.render_plan(plan))
+                if name == "hard link":
+                    chatlib.unlink()
+                    chatlib.write_bytes(original[0])
+                    chatlib.chmod(original[1])
 
     def test_a_changed_target_blocks(self):
         with open(self.skills / "chat/scripts/chatlib.py", "a") as stream:
@@ -524,6 +582,16 @@ class ImporterTests(StageCase):
                        "        / \"scripts\"\n    ),\n)\n", 0o755)
         importers = self.plan()["importers"]
         self.assertEqual(importers["unlisted"], ["~/.codex/skills/tidy/scripts/tidy"])
+        self.assertTrue(importers["complete"])
+
+    def test_an_importer_with_comments_between_its_path_parts_is_found(self):
+        """Round 8's fixture: a comment after / "chat", with / "scripts" on
+        the next line."""
+        _staging.write(self.skills / "tidy/scripts/noted.py", "import sys\nfrom pathlib import Path\n\n"
+                       "sys.path.insert(0, str(Path(__file__).resolve().parents[2] / \"chat\"  # shared skill\n"
+                       "                    / \"scripts\"))\n")
+        importers = self.plan()["importers"]
+        self.assertEqual(importers["unlisted"], ["~/.codex/skills/tidy/scripts/noted.py"])
         self.assertTrue(importers["complete"])
 
     def test_importers_behind_symlinks_are_found_once_and_cycles_end(self):
@@ -1085,6 +1153,75 @@ class EnvironmentIntegrityTests(StageCase):
                 self.assertEqual([c for c in stage_release.CALLS if c[0].endswith("/env/bin/python") and "-c" in c], [],
                                  "the environment probe ran")
                 self.assertFalse(marker.exists(), "the planted hook ran")
+                self.assertEqual(stage_release.status(self.dest)[0]["state"],
+                                 "unfinished (last: outcome install-package: failed)")
+                self.assertFalse((self.env().parent / "env-inventory.json").exists())
+                self.assertHomeUnchanged()
+
+    def test_a_change_after_verification_is_refused_at_completion(self):
+        """Round 8's fixture: right after verify-environment records ok, env
+        is swapped for a link into the invented private state; and,
+        separately, a .pth hook is added to it. The completion step checks
+        again and refuses, naming the change: no staged.json, the operation
+        unfinished, and the home unchanged."""
+        plants = (("env swapped for a link", lambda: (os.rename(self.env(), f"{self.env()}-moved"),
+                                                      os.symlink(self.home / ".local/state/chat", self.env())),
+                   r".*/env is no longer the directory staging created and checked; the completion step was not "
+                   r"run"),
+                  ("hook added", lambda: (self.site() / "zz-hook.pth").write_text("import os; " + self.payload()),
+                   r"the staged environment differs from what this operation built \(lib/python.*zz-hook\.pth\)"))
+        for name, plant, pattern in plants:
+            with self.subTest(change=name):
+                if self.dest.exists():
+                    shutil.rmtree(self.dest)
+
+                def after_verify(record, plant=plant):
+                    if record["kind"] == "outcome" and record.get("step") == "verify-environment" \
+                            and record["result"] == "ok":
+                        plant()
+                with self.assertRaisesRegex(Refused, r"complete failed: " + pattern):
+                    self.stage(crash=after_verify)
+                self.assertEqual(stage_release.status(self.dest)[0]["state"],
+                                 "unfinished (last: outcome complete: failed)")
+                self.assertFalse(os.path.lexists(self.env().parent / "staged.json"))
+                self.assertHomeUnchanged()
+
+    def test_a_rewritten_command_is_never_trusted(self):
+        """Round 8's fixture: right after pip returns, pchat keeps pip's
+        launcher lines but its body is replaced (by the entry point's import
+        and a raise, or by the original with a statement appended), and its
+        RECORD row updated to match. The launcher is judged by its
+        structure, not by RECORD: the install is refused, naming the
+        command, and nothing is recorded installed."""
+        real = stage_release.run
+
+        def raising(text):
+            lines = text.splitlines()
+            head = lines[:3] if lines[0] == "#!/bin/sh" else lines[:1]
+            return "\n".join(head) + "\nfrom plateia_chat import pchat\nraise RuntimeError('invented')\n"
+        for name, rewrite in (("raise after the import", raising),
+                              ("statement appended", lambda text: text + "import os\n")):
+            with self.subTest(rewrite=name):
+                if self.dest.exists():
+                    shutil.rmtree(self.dest)
+
+                def boundary(argv, rewrite=rewrite, **kw):
+                    result = real(argv, **kw)
+                    if "pip" in [str(a) for a in argv]:
+                        pchat = self.env() / "bin/pchat"
+                        data = rewrite(pchat.read_text()).encode()
+                        pchat.write_bytes(data)
+                        record = next(self.site().glob("plateia_chat-*.dist-info/RECORD"))
+                        rows = [line if not line.startswith("../../../bin/pchat,") else
+                                f"../../../bin/pchat,{build_release.record_hash(data)},{len(data)}"
+                                for line in record.read_text().splitlines()]
+                        record.write_text("\n".join(rows) + "\n")
+                    return result
+                with mock.patch.object(stage_release, "run", boundary):
+                    with self.assertRaisesRegex(Refused, r"install-package failed: the staged pchat command isn't the "
+                                                         r"launcher pip writes for the wheel's entry point "
+                                                         r"\(plateia_chat:pchat\): "):
+                        self.stage()
                 self.assertEqual(stage_release.status(self.dest)[0]["state"],
                                  "unfinished (last: outcome install-package: failed)")
                 self.assertFalse((self.env().parent / "env-inventory.json").exists())
