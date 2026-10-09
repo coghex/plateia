@@ -175,7 +175,9 @@ class HappyPathTests(StageCase):
         env = self.dest / "releases" / self.manifest["release"] / "env"
         site = next(env.glob("lib/python*/site-packages"))
         pchat, chatlib = env / "bin/pchat", site / "plateia_chat/scripts/chatlib.py"
-        launcher_only = "\n".join(pchat.read_text().splitlines()[:1]) + "\nraise RuntimeError('replaced')\n"
+        lines = pchat.read_text().splitlines()
+        launcher = lines[:3] if lines[0] == "#!/bin/sh" else lines[:1]  # pip's long-path launcher is 3 lines
+        launcher_only = "\n".join(launcher) + "\nraise RuntimeError('replaced')\n"
         cases = ((lambda: pchat.write_text(launcher_only), r"the staged pchat command doesn't call the wheel's "
                                                            r"entry point"),
                  (lambda: pchat.write_text(pchat.read_text() + "import os; os.environ.clear()\n"),
