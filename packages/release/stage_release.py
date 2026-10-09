@@ -74,7 +74,7 @@ JOURNAL, LOCK, RELEASES, STAGED, INVENTORY = ("journal.jsonl", "journal.lock", "
                                               "env-inventory.json")
 STEPS = ("create-release-dir", "copy-artifacts", "create-environment", "install-package",
          "verify-environment", "complete")
-IMPORTER_LIMIT = 2 << 20  # larger files aren't scripts; they are skipped, not read
+IMPORTER_LIMIT = 64 << 20  # a script larger than this is named as unsearched, and the inventory incomplete
 IMPORTER_WALK_LIMIT = 200_000  # entries searched for importers before the inventory is called incomplete
 SCRIPT_SUFFIXES = (".py", ".sh", ".bash", ".zsh")  # with the executable bit: the files searched
 
@@ -316,24 +316,71 @@ def ownership(t, skills):
     return "a directory in the chat skill folder; its captured modules match the provenance"
 
 
+def private_bases(skills):
+    """Where private data lives, which importer discovery never opens or
+    walks into, even through an alias: chat state and config, other
+    settings and state, and everything under ~/.codex and ~/.claude except
+    their skills folders (sessions, history, settings)."""
+    home = Path.home()
+    always = [chat_state(), chat_config().parent]
+    broad = [home / ".config", home / ".local/state", home / ".local/share", home / "Library", home / ".ssh",
+             home / ".gnupg", home / ".aws", home / ".netrc", home / ".codex", home / ".claude"]
+    allowed = [skills, home / ".claude/skills"]
+    real = lambda paths: [os.path.realpath(p) for p in paths]  # noqa: E731
+    return real(always), real(allowed), real(broad)
+
+
+def private_target(path, bases):
+    always, allowed, broad = bases
+    real = os.path.realpath(path)
+    under = lambda base: real == base or real.startswith(base + os.sep)  # noqa: E731
+    if any(under(b) for b in always):
+        return True
+    if any(under(b) for b in allowed):
+        return False
+    return any(under(b) for b in broad)
+
+
+def imports_chat_scripts(path):
+    """Whether a script both changes the import path and names chat/scripts,
+    read line by line so a large script is searched whole; None for a
+    file that turns out to be binary."""
+    path_change = names_location = False
+    with open(path, "rb") as stream:
+        head = stream.read(8192)
+        if b"\0" in head:
+            return None
+        stream.seek(0)
+        for raw in stream:
+            line = raw.decode("utf-8", errors="ignore")
+            path_change = path_change or bool(SYS_PATH.search(line))
+            names_location = names_location or bool(CHAT_SCRIPTS.search(line))
+            if path_change and names_location:
+                return True
+    return False
+
+
 def find_importers(spec, skills):
     """Path-bound importers of chat/scripts under the declared source roots.
 
     Symlinked folders and scripts inside a root are followed, each resolved
     folder walked once (so a cycle ends) and each resolved file counted
     once, under the first path that reaches it. Only scripts are opened (a
-    Python or shell suffix, or the executable bit), never data files. The
-    managed chat folder is skipped, however it is reached. A root, folder or
-    script that can't be read, or more entries than the walk allows, makes
+    Python or shell suffix, or the executable bit), never data files, and
+    nothing that resolves into private data (private_bases): such an alias
+    is named as excluded. The managed chat folder is skipped, however it is
+    reached. A root, folder or script that can't be read, a script over the
+    size cap, an excluded alias, or more entries than the walk allows makes
     the inventory incomplete rather than clean."""
     cfg = spec["importers"]
     managed = os.path.realpath(skills / "chat")
+    private = private_bases(skills)
     known = {os.path.realpath(expand(k["path"], skills)): (k["name"], expand(k["path"], skills))
              for k in cfg["known"]}
     found, roots, walked, seen = {}, [], set(), 0
     for text in cfg["roots"]:
         root = expand(text, skills)
-        entry = {"path": shown(root), "status": "complete", "unreadable": []}
+        entry = {"path": shown(root), "status": "complete", "unreadable": [], "excluded": []}
         roots.append(entry)
         if not os.path.lexists(root):
             entry["status"] = "absent"
@@ -344,10 +391,13 @@ def find_importers(spec, skills):
             real = os.path.realpath(folder)
             if real == managed or real in walked:
                 continue
+            if private_target(folder, private):
+                entry["excluded"].append(f"{shown(folder)} (resolves into private data; not searched)")
+                continue
             walked.add(real)
             try:
-                with os.scandir(folder) as listing:
-                    items = sorted(listing, key=lambda e: e.name)
+                with os.scandir(folder) as listing_:
+                    items = sorted(listing_, key=lambda e: e.name)
             except OSError:
                 entry["unreadable"].append(shown(folder))
                 continue
@@ -366,21 +416,24 @@ def find_importers(spec, skills):
                     if not item.is_file():
                         continue
                     st = path.stat()
-                    if st.st_size > IMPORTER_LIMIT or not (path.suffix in SCRIPT_SUFFIXES or st.st_mode & 0o111):
+                    if not (path.suffix in SCRIPT_SUFFIXES or st.st_mode & 0o111):
                         continue
                     target = os.path.realpath(path)
                     if target in found or target.startswith(managed + os.sep):
                         continue
-                    data = path.read_bytes()
+                    if private_target(path, private):
+                        entry["excluded"].append(f"{shown(path)} (resolves into private data; not opened)")
+                        continue
+                    if st.st_size > IMPORTER_LIMIT:
+                        entry["unreadable"].append(f"{shown(path)} (over {IMPORTER_LIMIT >> 20} MiB; not searched)")
+                        continue
+                    hit = imports_chat_scripts(path)
                 except OSError:
                     entry["unreadable"].append(shown(path))
                     continue
-                if b"\0" in data[:8192]:
-                    continue
-                text_ = data.decode("utf-8", errors="ignore")
-                if SYS_PATH.search(text_) and CHAT_SCRIPTS.search(text_):
+                if hit:
                     found[target] = path
-        if entry["unreadable"]:
+        if entry["unreadable"] or entry["excluded"]:
             entry["status"] = "incomplete"
     return {"roots": roots,
             "known": [{"name": name, "path": shown(path), "found": real in found}
@@ -426,6 +479,7 @@ def render_plan(plan):
         lines.append(f"  importer root {r['path']}: {r['status']}"
                      + (f" ({len(r['unreadable'])} unreadable: {', '.join(r['unreadable'][:3])})"
                         if r["unreadable"] else ""))
+        lines += [f"      excluded: {x}" for x in r.get("excluded", [])]
     for k in imp["known"]:
         lines.append(f"  known importer {k['name']}: {k['path']} ({'found' if k['found'] else 'not found'})")
     for u in imp["unlisted"]:
@@ -536,8 +590,9 @@ def observed_versions():
                                   if problem else None)
     runs, problems = set(), []
     for project in listing(Path.home() / ".local/state/project-manager", problems):
-        for run_dir in listing(project / "runs", problems) if project.is_dir() and not project.is_symlink() else ():
-            if not run_dir.is_dir() or run_dir.is_symlink():
+        # Symlinked projects and runs are followed: their snapshots count too.
+        for run_dir in listing(project / "runs", problems) if project.is_dir() else ():
+            if not run_dir.is_dir():
                 continue
             value, problem = read_field(run_dir / "state.json", "schema")
             if problem == "missing":
@@ -742,12 +797,12 @@ class Writer:
         if reason:
             raise Refused(f"{shown(self.root)} is {reason}; left unchanged")
         self.dev = st.st_dev
-        self.dirs, self.mine, self.temps = {}, {}, set()
+        self.dirs, self.mine = {}, {}
         self.record = None
 
     def load(self, records, op_id):
-        """What the journal says staging created: directories by any
-        operation here, files and temporary names by this one."""
+        """What the journal says staging created, by inode: directories by
+        any operation here, files by this one."""
         for r in records:
             if r.get("kind") == "created":
                 inode = tuple(r["inode"])
@@ -755,8 +810,6 @@ class Writer:
                     self.dirs[r["path"]] = inode
                 if r.get("op") == op_id:
                     self.mine[r["path"]] = inode
-            elif r.get("kind") == "creating" and r.get("op") == op_id:
-                self.temps.add(r["path"])
 
     def resolve(self, rel):
         parts = rel.split("/")
@@ -841,9 +894,9 @@ class Writer:
         temp_rel = (head + "/" if head else "") + f".{name}.{secrets.token_hex(6)}.tmp"
         temp = self.resolve(temp_rel)
         self.record({"kind": "creating", "path": temp_rel})  # journaled before it exists
-        self.temps.add(temp_rel)
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
         try:
+            self.note(temp_rel, os.fstat(fd), "temp")  # its inode: the evidence that lets recovery remove it
             write_all(fd, data)
             os.fsync(fd)
             made = os.fstat(fd)
@@ -871,14 +924,14 @@ class Writer:
         return path
 
     def remove(self, rel):
-        """Delete a file this operation created, or a temporary file it
-        journaled before creating (singly linked, this owner)."""
+        """Delete a file the journal records this operation created, by its
+        inode, that is still that singly linked file. A journaled intent to
+        create a name is not evidence: anything at such a name without a
+        creation record is left untouched."""
         path = self.resolve(rel)
         st = os.lstat(path)
-        temp = (rel in self.temps and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == self.uid
-                and st.st_dev == self.dev)
-        if not (temp or (stat.S_ISREG(st.st_mode) and self.owned(rel, st))):
-            self.foreign(path, st, "is not a file this operation created")
+        if not (stat.S_ISREG(st.st_mode) and self.owned(rel, st)):
+            self.foreign(path, st, "is not a file the journal records this operation created")
         os.unlink(path)
         fsync_dir(path.parent)
 

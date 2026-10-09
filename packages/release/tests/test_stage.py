@@ -387,6 +387,22 @@ class BlockingTests(StageCase):
             with self.subTest(python=python.name):
                 self.assertNothingStaged(rf"preflight refused: interpreter: {pattern}", python=python)
 
+    def test_child_runs_behind_symlinks_are_checked(self):
+        pm = self.home / ".local/state/project-manager"
+        elsewhere = self.where / "project-state"
+        _staging.write(elsewhere / "beta/runs/run-20261002T120000Z-0123456789ab/state.json",
+                       json.dumps({"schema": "childrun/99"}))
+        (pm / "beta").symlink_to(elsewhere / "beta")  # a symlinked project
+        self.before = _staging.snapshot_tree(self.home)
+        self.assertNothingStaged(r"child-runs: the existing state holds a child-runs version the release doesn't "
+                                 r"read")
+        (pm / "beta").unlink()
+        run_link = next(pm.glob("alpha/runs")) / "run-20261003T120000Z-ba9876543210"
+        run_link.symlink_to(elsewhere / "beta/runs/run-20261002T120000Z-0123456789ab")  # a symlinked run
+        self.before = _staging.snapshot_tree(self.home)
+        self.assertNothingStaged(r"child-runs: the existing state holds a child-runs version the release doesn't "
+                                 r"read")
+
     @unittest.skipIf(os.geteuid() == 0, "root reads unreadable directories")
     def test_an_inventory_that_cant_be_listed_blocks(self):
         runs = next((self.home / ".local/state/project-manager").glob("*/runs"))
@@ -503,19 +519,52 @@ class ImporterTests(StageCase):
                                                  "~/.codex/skills/unrelated/scripts/sync.py"])
         self.assertTrue(all(k["found"] for k in importers["known"]))
 
-    def test_data_files_are_not_opened(self):
-        _staging.write(self.skills / "notes-bot/state.json", '{"sys.path.insert": "chat/scripts"}\n')
-        opened = []
-        real = Path.read_bytes
+    def opened_by_discovery(self):
+        opened, real = [], stage_release.imports_chat_scripts
 
         def spy(path):
-            opened.append(path)
+            opened.append(Path(path))
             return real(path)
-        with mock.patch.object(Path, "read_bytes", spy):
+        with mock.patch.object(stage_release, "imports_chat_scripts", spy):
             importers = stage_release.find_importers(json.loads(self.spec.read_text()), self.skills)
+        return importers, opened
+
+    def test_data_files_are_not_opened(self):
+        _staging.write(self.skills / "notes-bot/state.json", '{"sys.path.insert": "chat/scripts"}\n')
+        importers, opened = self.opened_by_discovery()
         self.assertNotIn(self.skills / "notes-bot/state.json", opened)
-        self.assertNotIn(self.home / ".local/state/chat/identities.json", opened)
         self.assertEqual(importers["unlisted"], [])
+        self.assertTrue(importers["complete"])
+
+    def test_aliases_into_private_data_are_never_opened(self):
+        config = self.home / ".config/chat/config.json"
+        (self.skills / "unrelated/scripts/settings.py").symlink_to(config)
+        (self.skills / "state-view").symlink_to(self.home / ".local/state")
+        (self.home / ".claude/skills/history").symlink_to(self.home / ".claude")  # outside its skills folder
+        importers, opened = self.opened_by_discovery()
+        resolved = {os.path.realpath(p) for p in opened}
+        self.assertNotIn(os.path.realpath(config), resolved)
+        self.assertFalse(any(r.startswith(os.path.realpath(self.home / ".local/state")) for r in resolved))
+        self.assertFalse(importers["complete"])
+        excluded = [x for r in importers["roots"] for x in r["excluded"]]
+        self.assertEqual(sorted(x.split(" (")[0] for x in excluded),
+                         ["~/.claude/skills/history", "~/.codex/skills/state-view",
+                          "~/.codex/skills/unrelated/scripts/settings.py"])
+        self.assertNotIn(_staging.SECRETS[0], json.dumps(importers))
+
+    def test_a_large_script_is_searched_and_one_over_the_cap_is_named(self):
+        big = self.skills / "bulk/scripts/generated.py"
+        _staging.write(big, "# generated\n" + ("x = 1\n" * 400_000) +
+                       "import sys\nsys.path.insert(0, '../chat/scripts')\n")
+        self.assertGreater(big.stat().st_size, 2_400_000)
+        importers = self.plan()["importers"]
+        self.assertEqual(importers["unlisted"], ["~/.codex/skills/bulk/scripts/generated.py"])
+        self.assertTrue(importers["complete"])
+        with mock.patch.object(stage_release, "IMPORTER_LIMIT", 1 << 20):
+            importers = self.plan()["importers"]
+        self.assertFalse(importers["complete"])
+        self.assertIn("~/.codex/skills/bulk/scripts/generated.py (over 1 MiB; not searched)",
+                      importers["roots"][0]["unreadable"])
 
     def test_a_missing_known_importer_is_reported(self):
         (self.skills / "project-manager/scripts/report").unlink()
@@ -611,6 +660,22 @@ class RecoveryTests(StageCase):
                 self.assertEqual(summary["state"], "resumed and staged")
                 self.assertOneOperationStaged()
 
+    def test_a_file_at_a_journaled_temporary_name_without_creation_evidence_is_left(self):
+        names = []
+
+        def hook(record):
+            if record["kind"] == "creating":
+                names.append(record["path"])
+                raise stage_release.Crash("before the exclusive create")
+        with self.assertRaises(stage_release.Crash):
+            self.stage(crash=hook)
+        foreign = self.dest / names[0]
+        foreign.write_text("someone else's file\n")
+        with self.assertRaisesRegex(Refused, r"is not a file the journal records this operation created"):
+            self.stage()
+        self.assertEqual(foreign.read_text(), "someone else's file\n")
+        self.assertTrue(stage_release.status(self.dest)[0]["state"].startswith("unfinished"))
+
     def test_an_entry_staging_didnt_create_is_never_deleted(self):
         """A stray file in the artifacts directory that this operation didn't
         create is refused, not removed."""
@@ -618,8 +683,9 @@ class RecoveryTests(StageCase):
             self.stage(crash=self.crash_when(lambda r: r["kind"] == "created" and r["path"].endswith("/artifacts")))
         stray = self.dest / "releases" / self.manifest["release"] / "artifacts/notes.txt"
         stray.write_text("someone else's\n")
-        with self.assertRaisesRegex(Refused, r"notes\.txt is not a file this operation created; staging never "
-                                             r"writes through, replaces or deletes an entry it didn't create"):
+        with self.assertRaisesRegex(Refused, r"notes\.txt is not a file the journal records this operation "
+                                             r"created; staging never writes through, replaces or deletes an entry "
+                                             r"it didn't create"):
             self.stage()
         self.assertEqual(stray.read_text(), "someone else's\n")
 
