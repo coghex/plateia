@@ -261,8 +261,12 @@ class OutboxCase(unittest.TestCase):
         self.bridge._FLUSHERS.clear()
 
     def client(self):
-        transport = self.ds.LocalTransport(self.authority) if self.available else None
-        return self.ds.Client(transport, clock=self.clock)
+        case = self
+
+        class Transport:  # like a socket: each request reaches whichever authority runs now
+            def exchange(self, request):
+                return case.ds.LocalTransport(case.authority).exchange(request)
+        return self.ds.Client(Transport() if self.available else None, clock=self.clock)
 
     @contextlib.contextmanager
     def unavailable(self):
