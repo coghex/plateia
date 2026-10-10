@@ -2300,6 +2300,64 @@ Rejected alternatives:
   holder of the outbox lock** (narrowing R6). Rejected 2026-10-10: per-entry
   fallback files remove the wait instead.
 
+### D-74. PLT-14 carries #19's formats through one guarded cutover; the shared rollout is authorized after gates
+
+Owner decision, 2026-10-10 15:28 UTC: approve one focused PLT-14
+implementation that installs the shared chat transport, including #19's
+repair (D-72), through one guarded format cutover. The owner also authorized
+the rollout itself, once its gates pass. This narrows or amends the PLT-14
+entry and D-27 as follows. Everything else they say stands.
+
+- **One admitted transition.** "Out of scope: breaking migrations" is
+  narrowed to admit exactly one transition: from the D-19 baseline formats to
+  #19's formats, as an explicit activation plan declares it. A normal preflight
+  still refuses #19's release against the live formats. Any other migration
+  stays out of scope.
+- **Rollback only before the first new-format write.** D-27's first-activation
+  rollback, which restores the recorded pre-activation skills-tree targets
+  exactly, applies only until the first new-format write: the first
+  `outbox-db/1` commit, `outbox/2` fallback file or `delivery-records/2`
+  record. D-27 assumed identical state formats, and #19 ends that.
+  - After that write, an automatic return to pre-#19 code is refused, because
+    old code cannot read the new state.
+  - Recovery is then a reviewed repair, or a roll-forward that preserves the
+    newer state. Stale state is never restored.
+  - The recorded targets and backups are kept, and nothing irreplaceable is
+    deleted.
+- **Designation comes only from the bridge.** The bridge's authority alone
+  applies the activation plan's named designation list, or an explicit empty
+  list, before recovery. There is no client designation interface (#19).
+- **The live cutover.** The owner has authorized the one shared-transport
+  cutover. It happens only after:
+  - PR #20 and the PLT-14 pull request each pass current-head canonical
+    approval and CI, and are merged by the supported path;
+  - a concise, concrete private operator plan has been verified and published,
+    with references safe for the public record.
+
+  These still stop for an owner decision:
+  - any material risk or action beyond this guarded transition;
+  - a protected owner workflow that cannot be shown to be quiet at the window.
+- **Unchanged:**
+  - D-15's pinned, staged and guarded releases;
+  - D-26's seven managed targets;
+  - D-27's skills-repository handoff;
+  - #19's contract.
+
+  No security, permission, credential, drainer or plateia web-service change
+  is authorized.
+
+"Implementing a controller never authorizes live execution" (PLT-14) still
+holds for the code and its review. The live step rests on this decision, the
+merged reviewed source and the published plan.
+
+Rejected alternatives:
+
+- **Activating the pre-#19 captured code first, then migrating separately.**
+  That would mean two live windows and a second rollout of the same tools,
+  with #19's defect live in between.
+- **Code-only rollback after new-format writes.** Old code cannot consume the
+  new state; it would strand or replay work.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
@@ -2842,7 +2900,8 @@ the PR.
 - **Depends on:** PLT-12 (D-23).
 - **Ordering:** critical path for activation; independent of offline board work.
 - **Relevant decisions:** D-2, D-6, D-7, D-10, D-12, D-15, D-16, D-17, D-23,
-  D-26, D-27.
+  D-26, D-27, D-72, D-74 (one guarded #19 format cutover; rollback only before
+  the first new-format write).
 - **Acceptance signals:** unknown/modified installed files block replacement;
   concurrent upgraders cannot interleave; binding/journal crash outcomes
   reconcile reality. Latest identity counters, settings, requests, accepted
