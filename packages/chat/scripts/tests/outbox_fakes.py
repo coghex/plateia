@@ -4,6 +4,7 @@ an injected wall and monotonic clock, and invented accounts and channels only.
 No socket, server, cmux or real home is ever touched: every test module that
 imports this imports _isolation first."""
 import datetime
+from pathlib import Path
 
 CFG = {"owner": "pat", "assistants": ["sam"],
        "accounts": {a: "x" for a in ("pat", "sam", "alp-solver-2", "alp-manager", "bet-solver-1", "bet-manager",
@@ -50,7 +51,8 @@ class FakeServer:
 
     - ok: the PONG;
     - timeout: nothing, until the reader's deadline;
-    - late: nothing within the part's wait, then the PONG during the drain;
+    - late: nothing within the part's wait, then the PONG during the drain
+      (late-fail and late-error: a FAIL, or an error reply, with it);
     - error: a 4xx reply, then the PONG (an error with finality);
     - fail: a FAIL refusal, then the PONG;
     - 403: no such channel, then the PONG; nothing is committed for that part;
@@ -168,6 +170,12 @@ class FakeConn:
             return
         if answer == "late":  # nothing until the part's wait has passed; then, while draining, the answer
             self.answers.insert(0, "ok")
+            raise TimeoutError("timed out")
+        if answer == "late-fail":  # nothing within the wait; then, while draining, a FAIL and the answer
+            self.answers.insert(0, "fail")
+            raise TimeoutError("timed out")
+        if answer == "late-error":  # nothing within the wait; then, while draining, an error reply and the answer
+            self.answers.insert(0, "error")
             raise TimeoutError("timed out")
         if answer == "crash":
             raise Crash()
@@ -354,3 +362,98 @@ def in_process_authority():
             yield authority
     finally:
         authority.close()
+
+
+class SimFS:
+    """The real files under a sandboxed root, plus a model of what reached stable
+    storage: a file's content once it was fsynced, a directory's names once that
+    directory was. `power_loss()` puts the real tree back to that model, dropping
+    every change that was never synced (content and directory entries apart).
+    Built on delivery_store.FS, so every durable step the code takes is seen."""
+
+    def __init__(self, root):
+        import os
+        import delivery_store
+        self.os, self.root = os, Path(root)
+        base = delivery_store.FS()
+        self.base = base
+        self.content, self.names = {}, {}
+        for dirpath, dirnames, filenames in os.walk(self.root):  # what exists now counts as durable
+            self.names[dirpath] = {n: self._ino(Path(dirpath) / n) for n in dirnames + filenames
+                                   if not self.ignored(n)}
+            for n in filenames:
+                if not self.ignored(n):
+                    self.content[self._ino(Path(dirpath) / n)] = (Path(dirpath) / n).read_bytes()
+        self.fail = set()  # operations to fail: "link", "create", ...
+
+    @staticmethod
+    def ignored(name):
+        """SQLite keeps its own durability; locks and the socket hold no data."""
+        return name.startswith(("outbox.db", "outbox.authority.lock", "outbox.flush.lock", "outbox.lock",
+                                "outbox.sock"))
+
+    def _ino(self, path):
+        return self.os.stat(path).st_ino
+
+    # the durable steps
+    def fsync_fd(self, fd):
+        pass
+
+    def sync_file(self, path):
+        self.content[self._ino(path)] = Path(path).read_bytes()
+
+    def sync_dir(self, path):
+        path = Path(path)
+        self.names[str(path)] = {n: self._ino(path / n) for n in self.os.listdir(path) if not self.ignored(n)}
+
+    def durable(self, path):
+        self.sync_file(path)
+        self.sync_dir(Path(path).parent)
+
+    def create_excl(self, path, data):
+        if "create" in self.fail:
+            raise OSError("no space left (fake)")
+        self.base.create_excl(path, data)
+        self.content[self._ino(path)] = bytes(data)  # create_excl fsyncs its own content
+
+    def link(self, src, dst):
+        if "link" in self.fail:
+            raise OSError(1, "hard links not supported (fake)")
+        self.base.link(src, dst)
+
+    def __getattr__(self, name):  # append, rename, replace, unlink, listdir, read, exists, nlink, size, mkdir...
+        return getattr(self.base, name)
+
+    def mkdir(self, path):
+        try:
+            self.os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+        self.sync_dir(path)
+        self.sync_dir(Path(path).parent)
+
+    def power_loss(self):
+        """Every unsynced change is lost: names a directory never synced vanish or
+        come back; content never synced reverts. Directories themselves stay."""
+        import shutil
+        for dirpath in sorted(self.names, key=len):
+            d = Path(dirpath)
+            if not d.exists():
+                continue
+            durable = self.names[dirpath]
+            for n in self.os.listdir(d):
+                if (d / n).is_dir() or self.ignored(n):
+                    continue
+                if n not in durable:
+                    (d / n).unlink()
+            for n, ino in durable.items():
+                if ino in self.content:
+                    data = self.content[ino]
+                    if not (d / n).exists() or (d / n).read_bytes() != data:
+                        tmp = d / f".restore-{n}"
+                        tmp.write_bytes(data)
+                        self.os.replace(tmp, d / n)
+                elif (d / n).exists() and not (d / n).is_dir():
+                    (d / n).write_bytes(b"")
+        del shutil
+        self.__init__(self.root)  # what survives is now the durable state
