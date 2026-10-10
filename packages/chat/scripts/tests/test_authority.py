@@ -45,7 +45,8 @@ class AuthorityCase(unittest.TestCase):
         patches = [mock.patch.object(chatlib, "LOG_DIR", logs),
                    mock.patch.object(chatlib, "load_config", lambda: json.loads(json.dumps(CFG))),
                    mock.patch.object(chatlib, "post", self.post),
-                   mock.patch.object(chatlib, "outbox_append", self.fail_queue),
+                   mock.patch.object(chatlib.delivery_store, "publish_fallback", self.fail_queue),
+                   mock.patch.object(chatlib, "client_factory", self.fail_queue),
                    mock.patch.object(pchat, "who", lambda args, cfg, required=True: "bet-manager"),
                    mock.patch.object(pchat.identities, "remember", lambda *a, **k: None),
                    mock.patch.object(pchat.runstore, "silent_refusal", lambda *a, **k: None)]
@@ -57,8 +58,8 @@ class AuthorityCase(unittest.TestCase):
         self.posts.append((channel, text, account))
         return 1
 
-    def fail_queue(self, entries):
-        raise AssertionError(f"nothing may be queued: {entries}")
+    def fail_queue(self, *args, **kwargs):
+        raise AssertionError(f"nothing may be queued: {args} {kwargs}")
 
     def pchat(self, *argv):
         out, err = io.StringIO(), io.StringIO()

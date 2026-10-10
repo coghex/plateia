@@ -132,6 +132,69 @@ def unaccepted(cfg, project=None):
     return sorted(out, key=lambda u: u["at"])
 
 
+def current_dead_letters(rows):
+    """Dead letters as they stand now: each record without a version as it is,
+    and for each post entry id only its highest version, which supersedes the
+    rest (revision 8, section 3.6). The stored history is not changed."""
+    others, posts = [], {}
+    for raw in rows:
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            d = None
+        if (isinstance(d, dict) and d.get("kind") == "post" and d.get("id")
+                and isinstance(d.get("version"), int) and not isinstance(d.get("version"), bool)):
+            if d["id"] not in posts or d["version"] > posts[d["id"]]["version"]:
+                posts[d["id"]] = d
+        else:
+            others.append(d)
+    return others + list(posts.values())
+
+
+def outbox_status():
+    """The outbox, from the bridge's authority (a status request), or, while it
+    is unavailable, from its dated snapshot; with the fallback files and legacy
+    rows still waiting for it, counted read-only."""
+    paths = chatlib.delivery_store.Paths(chatlib.STATE_DIR)
+    reply = chatlib.client_factory().call("status", None)
+    lines = []
+    if reply and isinstance(reply.get("status"), dict):
+        st, source = reply["status"], f"authority epoch {reply.get('authority_epoch')}"
+    else:
+        try:
+            st = json.loads(paths.status.read_text())
+        except (OSError, ValueError):
+            st = {}
+        st = st if isinstance(st, dict) else {}  # what cannot be read is reported as unknown
+        written = st.get("written_at")
+        age = f"{int(time.time() - written)}s old" if isinstance(written, (int, float)) else "of unknown age"
+        why = st.get("unavailable") if isinstance(st.get("unavailable"), dict) else {}
+        source = (f"authority UNAVAILABLE since {why.get('since', '?')} ({why.get('reason', 'no answer')});"
+                  f" snapshot {age}")
+    lines.append(f"outbox ({source}): {st.get('waiting', '?')} waiting to post,"
+                 f" {st.get('checking', '?')} awaiting a delivery check, {st.get('held', 0)} held rows")
+    if isinstance(st.get("suspended"), list) and st["suspended"]:
+        lines.append(f"   suspended sender designations: {', '.join(map(str, st['suspended']))}")
+    for what, since in (st.get("deferred") if isinstance(st.get("deferred"), dict) else {}).items():
+        lines.append(f"   deferred ({str(what).replace('_', ' ')}): outbox.lock busy since {since}")
+    unreadable = 0
+    try:
+        files = [n for n in (os.listdir(paths.fallback) if paths.fallback.exists() else [])
+                 if chatlib.delivery_store.is_published_name(n)]
+    except OSError:
+        files, unreadable = [], unreadable + 1
+    legacy = 0
+    for f in [paths.legacy] + sorted(chatlib.STATE_DIR.glob("outbox.claimed-*.jsonl")):
+        try:
+            if f.exists():
+                legacy += sum(1 for line in f.read_text(errors="replace").splitlines() if line.strip())
+        except OSError:
+            unreadable += 1
+    lines.append(f"   waiting for the bridge to import: {len(files)} fallback files, {legacy} legacy rows"
+                 + (f"; {unreadable} file(s) or folder(s) could not be read" if unreadable else ""))
+    return lines
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ['agents']:
@@ -221,25 +284,40 @@ def main(argv=None):
                 n = chatlib.post(args.channel, text, account, cfg, cont=cont, reply_to=args.reply_to)
                 print(f"posted {n} line(s) to {args.channel} as {account}")
             except chatlib.Refused as err:  # queuing it would only be refused again
+                counts = chatlib.part_counts(err.parts or [])
+                if counts["confirmed"]:  # partly published: the bridge dead-letters it with every part's state
+                    print(f"pchat: {err}; not queued ({counts['confirmed']} of {len(err.parts)} parts were"
+                          " already posted; recorded in dead letters)", file=sys.stderr)
+                    return 2
                 print(f"pchat: {err}; not queued", file=sys.stderr)
                 return 2
-            except (chatlib.ChatError, OSError) as err:
-                # Never lose a post: queue it; the bridge posts it once chat is back.
-                chatlib.outbox_append([{"channel": args.channel, "as": account, "text": text, "cont": cont,
-                                        "reply_to": args.reply_to,
-                                        "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())}])
-                print(f"pchat: post failed ({err}); queued in the outbox for the bridge to post", file=sys.stderr)
+            except chatlib.Queued as err:
+                # Never lose a post: it is durably queued, or its unposted rest handed off, and the bridge
+                # posts it. A part the server confirmed is never queued again; one whose delivery is
+                # uncertain is checked against the record before any resend.
+                counts = chatlib.part_counts(err.parts or [])
+                if counts["confirmed"] or counts["uncertain"]:
+                    print(f"pchat: post partly sent ({err}); {counts['confirmed']} of {len(err.parts)} parts"
+                          " posted, the rest queued for the bridge"
+                          + (" (one part's delivery is checked against the record before any resend)"
+                             if counts["uncertain"] else ""), file=sys.stderr)
+                else:
+                    print(f"pchat: {err}", file=sys.stderr)
                 return 3
+            except OSError as err:
+                print(f"pchat: post failed ({err}); not queued", file=sys.stderr)
+                return 2
         elif args.cmd == "ack":
             account = who(args, cfg)
             try:
                 chatlib.ack(args.channel, args.msgid, account, cfg)
                 print(f"acknowledged {args.msgid} in {args.channel} as {account}")
-            except (chatlib.ChatError, OSError) as err:
-                chatlib.outbox_append([{"channel": args.channel, "as": account, "ack": args.msgid,
-                                        "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())}])
-                print(f"pchat: ack failed ({err}); queued in the outbox", file=sys.stderr)
+            except chatlib.Queued as err:  # durably queued: the bridge sends it
+                print(f"pchat: {err}", file=sys.stderr)
                 return 3
+            except OSError as err:
+                print(f"pchat: ack failed ({err}); not queued", file=sys.stderr)
+                return 2
         elif args.cmd == "unaccepted":
             rows = unaccepted(cfg, args.project)
             if args.json:
@@ -365,9 +443,17 @@ def main(argv=None):
                     else:
                         failed += 1
             dead = chatlib.STATE_DIR / "dead-letters.jsonl"
-            ndead = len(dead.read_text().splitlines()) if dead.exists() else 0
+            dead_rows = current_dead_letters(dead.read_text().splitlines() if dead.exists() else [])
+            ndead = len(dead_rows)
             print(f"deliveries (24h): {done} done, {waiting} checks while queued at cmux, {failed} failed attempts")
-            print(f"dead letters: {ndead}   outbox (unposted): {chatlib.outbox_pending()}")
+            print(f"dead letters: {ndead}")
+            for line in outbox_status():
+                print(line)
+            for d in dead_rows:  # a post dead-lettered partway: what went out, what didn't (its latest version)
+                if isinstance(d, dict) and d.get("kind") == "post" and d.get("parts"):
+                    c = chatlib.part_counts(d["parts"])
+                    print(f"   post to {d.get('channel')} as {d.get('as')}: {c['confirmed']} of {len(d['parts'])}"
+                          f" parts posted, {len(d['parts']) - c['confirmed']} not ({d.get('last_detail', '')[:60]})")
             rows = unaccepted(cfg)
             print(f"owner/assistant posts not yet accepted by their manager: {len(rows)}")
             for u in rows:
