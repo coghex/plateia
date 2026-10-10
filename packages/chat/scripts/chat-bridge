@@ -373,11 +373,23 @@ class Deliveries:
         interrupt then keeps ONE obligation per server message and recipient
         (owner amendment 6; code review slot 10). One already pending, in any
         phase, or recorded in the ledger, is kept as it is and nothing is added.
-        If the ledger cannot be read, a possible repeat is held, never rung."""
+        If the ledger cannot be read, a possible repeat is held, never rung.
+        Queued means saved: if the save fails, nothing of this call stays in
+        memory (an alert it raised included), and the error reaches handle()
+        before the message is logged or checkpointed, so it is handled again.
+        A new interrupt reopens acknowledgement recovery: its acknowledgement
+        may already be recorded (code review slot 11)."""
+        before = list(self.items)
         new_items = [i for i in new_items if not self._earlier_interrupt(i)]
-        if new_items:
+        if new_items or len(self.items) != len(before):
             self.items.extend(new_items)
-            self._save()
+            try:
+                self._save()
+            except BaseException:
+                self.items[:] = before
+                raise
+            if any(i["kind"] == "ring" and i.get("interrupt") for i in new_items):
+                self._acks_checked = False
 
     def _earlier_interrupt(self, item):
         if not (item["kind"] == "ring" and item.get("interrupt") and item.get("msgid") and item.get("target")):
@@ -1443,8 +1455,8 @@ class Acks:
     def add(self, msgid, entry):
         if msgid and msgid in self.seen:
             return False
-        self.seen.add(msgid)
         _append_jsonl(ACKS, entry)
+        self.seen.add(msgid)  # only once its line is written: a failed append is written again on replay
         return True
 
 

@@ -1166,13 +1166,8 @@ class AcknowledgementRecoveryTests(InterruptCase):
         self.assertEqual(self.unacknowledged_dead_letters(), [])
 
 
-class ReplayedInterruptTests(InterruptCase):
-    """Code review slot 10, finding 1: the bridge queues a message's deliveries
-    durably before it logs the message, so a failed log (or a crash between the
-    two) means the same server message is handled again on replay. An interrupt
-    keeps ONE obligation per message and recipient: the replay adds nothing, and
-    the existing item keeps its identity, intent, phase and owed work, whatever
-    its outcome so far. Another recipient of the same message stays independent."""
+class ReplayCase(InterruptCase):
+    """An interrupt message for alp-solver-2, ingested and replayed through handle()."""
 
     def message(self, text="!! @alp-solver-2 stop and read #alpha"):
         from test_bridge import privmsg
@@ -1194,6 +1189,15 @@ class ReplayedInterruptTests(InterruptCase):
 
     def rings(self, d, target="alp-solver-2"):
         return [i for i in d.items if i["kind"] == "ring" and i.get("target") == target]
+
+
+class ReplayedInterruptTests(ReplayCase):
+    """Code review slot 10, finding 1: the bridge queues a message's deliveries
+    durably before it logs the message, so a failed log (or a crash between the
+    two) means the same server message is handled again on replay. An interrupt
+    keeps ONE obligation per message and recipient: the replay adds nothing, and
+    the existing item keeps its identity, intent, phase and owed work, whatever
+    its outcome so far. Another recipient of the same message stays independent."""
 
     def test_a_replayed_interrupt_keeps_one_obligation_whatever_its_outcome(self):
         for outcome in ("deliver", "possibly acted", "held", "accept", "settled"):
@@ -1261,6 +1265,115 @@ class ReplayedInterruptTests(InterruptCase):
             self.bridge.DELIVERIES.write_text(ledger)
         self.assertEqual(self.interrupts(agent), 1, "never rung again")
         self.assertEqual([i["phase"] for i in self.rings(after)], ["held"])
+
+
+class QueuedOnlyWhenSavedTests(ReplayCase):
+    """Code review slot 11, finding 1: an interrupt is queued only once its save
+    has succeeded. A failed save leaves nothing of it in memory (nor an alert
+    raised for it), and handle() raises before the message is logged, so the
+    same bridge replays the message and queues it again: after a restart,
+    exactly one interrupt is queued, and none is lost."""
+
+    def failing_saves(self, n):
+        real, calls = self.bridge.Deliveries._save, []
+
+        def save(d):
+            calls.append(1)
+            if len(calls) <= n:
+                raise OSError(28, "no space left on device (fake)")
+            return real(d)
+        return mock.patch.object(self.bridge.Deliveries, "_save", save)
+
+    def test_a_failed_queue_save_then_a_same_instance_replay_then_a_crash(self):
+        for failures in (1, 2):
+            with self.subTest(failed_saves=failures):
+                self.fresh()
+                state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks())
+                with self.failing_saves(failures):
+                    for _ in range(failures):
+                        with self.assertRaises(OSError):
+                            self.bridge.handle(self.message(), CFG, *state)
+                        self.assertEqual(state[1].items, [], "nothing kept in memory")
+                    self.bridge.handle(self.message(), CFG, *state, replayed=True)  # the same bridge
+                logged = self.chatlib.channel_log("#alpha").read_text().splitlines()
+                self.assertEqual(len([x for x in logged if '"m-int"' in x]), 1, "logged once, after it was queued")
+                after = self.bridge.Deliveries()  # a crash before any delivery pass
+                self.assertEqual(len(self.rings(after)), 1, "exactly one interrupt, durably queued")
+                agent = self.FakeAgent()
+                self.passes(agent, 2, deliveries=after)
+                self.assertEqual(self.interrupts(agent), 1)
+
+    def test_a_failed_save_of_a_held_replay_leaves_no_alert_behind(self):
+        d = self.bridge.Deliveries()
+        self.bridge.DELIVERIES.mkdir(parents=True)  # unreadable ledger: the replay would be held, with an alert
+        try:
+            with self.failing_saves(1), self.assertRaises(OSError):
+                d.add_all([dict(self.item(), msgid="m-int")])
+        finally:
+            self.bridge.DELIVERIES.rmdir()
+        self.assertEqual(d.items, [], "neither the item nor its alert is kept")
+
+
+class AcknowledgementBeforeHistoryTests(ReplayCase):
+    """Code review slot 11, finding 2: a live acknowledgement can arrive before
+    the instruction it acknowledges is replayed from history. Queueing a new
+    interrupt reopens acknowledgement recovery, so the next pass settles it by
+    its recorded acknowledgement: never rung, no false dead letter, whether the
+    ledger could be read at ingestion or not (held)."""
+
+    def test_an_acknowledgement_before_its_instruction_is_replayed(self):
+        from test_bridge import privmsg
+        for ledger in ("readable", "unreadable"):
+            with self.subTest(ledger=ledger):
+                self.fresh()
+                state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks())
+                d = state[1]
+                agent = self.FakeAgent()
+                self.passes(agent, deliveries=d)  # the first scan: nothing pending
+                self.bridge.handle(privmsg("alp-solver-2", "[status] stopped as asked", "m-ack", channel="#alpha",
+                                           reply_to="m-int", t="2026-10-09T10:02:00.000Z"), CFG, *state)
+                if ledger == "unreadable":
+                    self.bridge.DELIVERIES.mkdir(parents=True)
+                try:
+                    self.bridge.handle(self.message(), CFG, *state, replayed=True)  # the instruction, from history
+                finally:
+                    if self.bridge.DELIVERIES.is_dir():
+                        self.bridge.DELIVERIES.rmdir()
+                self.passes(agent, 2, deliveries=d)
+                for i in d.items:
+                    i["next_at"] = 0
+                self.passes(agent, 2, deliveries=d)
+                self.assertEqual(agent.keys, [], "never rung")
+                self.assertEqual(self.rings(d), [], "settled by its acknowledgement")
+                self.assertEqual([r for r in self.dead_letters() if r.get("kind") == "ring"], [],
+                                 "no false dead letter")
+
+
+class AcknowledgementDurabilityTests(ReplayCase):
+    """The final round's bounded check: an acknowledgement counts as recorded
+    (and a replay of it as a duplicate) only once its line is written to
+    acks.jsonl, so a failed append is written again when the message is
+    replayed."""
+
+    def test_a_failed_acknowledgement_append_is_written_on_replay(self):
+        from test_bridge import privmsg
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks())
+        ack = privmsg("alp-solver-2", "[status] stopped as asked", "m-ack", channel="#alpha", reply_to="m-int",
+                      t="2026-10-09T10:02:00.000Z")
+        real, calls = self.bridge._append_jsonl, []
+
+        def append(path, entry):
+            if path == self.bridge.ACKS and not calls:
+                calls.append(1)
+                raise OSError(28, "no space left on device (fake)")
+            return real(path, entry)
+        with mock.patch.object(self.bridge, "_append_jsonl", append):
+            with self.assertRaises(OSError):
+                self.bridge.handle(ack, CFG, *state)
+            self.bridge.handle(ack, CFG, *state, replayed=True)  # the same bridge
+            self.bridge.handle(ack, CFG, *state, replayed=True)  # and once more: a duplicate now
+        lines = self.bridge.ACKS.read_text().splitlines() if self.bridge.ACKS.exists() else []
+        self.assertEqual([json.loads(x)["msgid"] for x in lines], ["m-ack"], "recorded once, when written")
 
 
 class LiveAcknowledgementRetryTests(InterruptCase):
