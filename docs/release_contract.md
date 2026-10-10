@@ -127,10 +127,11 @@ they don't refresh the source's index.
   (none for a format it only reads). Three formats carry an embedded version:
   the identity registry (`version: 1`), child runs (`schema: childrun/2`) and
   the receipt marker (`review-start-receipts-v1` in its file name). #19's
-  future implementation, which is not yet approved or live, would add three
-  more: the outbox store `outbox-db` (its `meta` schema-version row), the
-  outbox authority protocol `outbox-authority` (each frame's `v`), and the
-  `outbox/2` fallback file (its `v`). The rest get documented baseline
+  implementation, in pull request #20 (approved by the owner on 2026-10-10,
+  not yet merged or live), adds three more: the outbox store `outbox-db`
+  (its `meta` schema-version row), the outbox authority protocol
+  `outbox-authority` (each frame's `v`), and the `outbox/2` fallback file
+  (its `v`). The rest get documented baseline
   identifiers such as `channel-log/1`. The chat
   config is written as well as read: `identities.register()` adds accounts,
   identity roles and assistants to it. The inventory also lists

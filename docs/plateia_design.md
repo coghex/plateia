@@ -2265,10 +2265,23 @@ decisions.
   decision 9. **This decision approves the specification, the design and
   that test-support scope only.** Implementation, code, tests and the
   `release.json` edit still need their own owner decision.
+- **Implementation (owner decision, 2026-10-10, 13:39 UTC).** The owner
+  approved implementing revision 8 of
+  [chat_outbox_state.md](chat_outbox_state.md) on pull request #20, within the
+  scope its approval lists:
+  - the chat runtime, with `delivery_store.py`, and its tests;
+  - provenance and the guidance;
+  - `release.json`'s declarations;
+  - option A's two staging test-support files.
+
+  The code review has a budget of three launches at most. Merging,
+  installed rollout, activation and live migration each still need their own
+  owner decision.
 
 Delivery stays at-least-once with the record check, and nothing claims
-exactly-once. These decisions approve the design only: implementing it needs
-a separate owner decision, and so does activation.
+exactly-once. The 13:39 UTC decision of 2026-10-10 approves the
+implementation; the others approve the design, its scope and its review.
+Merging and activation each still need a separate owner decision.
 
 Rejected alternatives:
 

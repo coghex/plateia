@@ -1,8 +1,11 @@
 # Chat outbox state: one durable authority for partial-post delivery
 
-This is the design note for #19 and pull request #20. It is design only:
-nothing here is implemented, and implementing it needs a separate owner
-decision.
+This is the design note for #19 and pull request #20. The owner approved
+implementing it on 2026-10-10 (13:39 UTC; section 11, decision 10). Pull
+request #20 implements it: `packages/chat/scripts/delivery_store.py`, and
+the callers section 2.4 names. Merging, installing and activating it each
+need their own owner decision. Until activation, the running tools keep
+their old behaviour.
 
 This is revision 8. Revision 3 answered design review round 2. Revision 4
 aligned the note with the owner's second amendment to #19:
@@ -629,9 +632,11 @@ Then:
   any channel. "Sends nothing to the chat server" in #19's third amendment
   means no such line (the canonical issue rereview of #19's fourth
   amendment).
-- **Before any byte of the call,** it publishes the fallback file (section
-  6.4) for *X*, durably, and only then reports the post as queued (exit 3).
-  If an `attempt` request went unanswered, the file carries an A12
+- **Before any byte of the call,** it queues the whole call. A `queue`
+  request (Q0) that the authority answers as committed is enough: exit 3,
+  and no file. If that request is not answered as committed either, it
+  publishes the fallback file (section 6.4) for *X*, durably, and only then
+  exits 3. If an `attempt` request went unanswered, the file carries an A12
   attestation for that attempt.
 - **After some bytes,** it stops the call and hands off the remainder, by a
   `handoff` request if the authority answers, otherwise by a fallback file
@@ -1541,7 +1546,7 @@ before it (or before its commit) and just after it. "→" names the recovery.
 | I2 reading a line with no newline yet | — | not imported: it is that appender's own unfinished row |
 | I3: the barrier acquisition of `L_outbox` | C stays `open` → retired at a later flush | the final I2 reads through the end of C; an unterminated last line is held |
 | I3 unlink, then directory `fsync` | C present, `imports` closed → unlink only | **power loss:** C may reappear → `imports` closed → unlink only |
-| H1 (in I2) | rolled back with I2 | applied |
+| H1 (in IF) | rolled back with IF's transaction | applied |
 | `import_epoch` + 1 | the pass is not counted → another pass runs before collection | counted |
 | V1 | not indexed; the checkpoint has not moved → replayed, `INSERT OR IGNORE` | indexed |
 | the checkpoint file write | the stored `mark` disagrees with the checkpoint → V2 starts a new span (safe) | consistent |
@@ -1890,9 +1895,12 @@ Every fallback is one **fallback file**, published by section 2.1's steps:
 3. `link()` to its final name, which never replaces a file;
 4. `fsync` of `outbox.d/` and of the state directory.
 
-P exits 3, reporting the post as queued, only after step 4. No lock is taken,
-so a writer stopped at any point delays only its own call (I-12). If
-publication fails, P fails as described at the end of this section.
+A queue or handoff that the authority acknowledges as committed needs no file:
+P exits 3 at once (section 3.1, Q0 and E3). Only when no request is answered
+as committed does P publish a file, and then it exits 3 only after step 4. No
+lock is taken, so a writer stopped at any point delays only its own call
+(I-12). If publication fails, P fails as described at the end of this
+section.
 
 **When a writer publishes one, and only then** (the canonical issue
 rereview of #19's fourth amendment, correction 1):
@@ -3058,9 +3066,15 @@ The owner approved decisions 1–6 on 2026-10-09, and decisions 7 to 9 on
    This approves the specification, the design and that test-support scope
    only.
 
-Implementation is **not** approved by these decisions. Implementation, code,
-tests and the `release.json` edit need their own owner decision, and so does
-activation.
+10. **Implementation (2026-10-10, 13:39 UTC).** The owner approved
+    implementing revision 8 on pull request #20, within the scope its
+    approval lists. The code review has a budget of three launches at most.
+    Merging, installed rollout, activation and live migration each still need
+    their own owner decision, and none is approved here.
+
+Decisions 1–9 approve the design, its scope and its review. Decision 10
+approves the implementation. Merging and activation are not approved by any
+of them.
 
 ## 12. Revisions
 
@@ -3253,3 +3267,10 @@ activation.
   - **Tests:** 38–40 added.
   - **Unchanged:** everything revision 7 adopted. No resolved finding is
     reopened.
+- **Revision 8, with the implementation** (editorial; no design change):
+  - **Exit 3 (P3 of design review round 5):** the summaries in sections
+    2.4.4 and 6.4 now say that an acknowledged queue or handoff exits 3 with
+    no fallback file, as Q0 and E3 already did.
+  - **Section 5.5:** the H1 row is in IF.
+  - **The header and section 11 (decision 10)** record the owner's
+    implementation decision.
