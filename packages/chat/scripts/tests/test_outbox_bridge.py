@@ -88,8 +88,10 @@ class CoverageTests(BridgeCase):
         cfgfile = self.chatlib.STATE_DIR / "config.json"
         cfgfile.write_text("{}")
         state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks(), self.bridge.Checkpoints())
-        server = ScriptServer([join("#alpha"), privmsg("pat", "hello", "m1", channel="#alpha",
-                                                       t="2026-10-02T10:00:00Z")])
+        joined = join("#alpha")
+        joined["tags"]["time"] = "2026-10-02T09:59:00.000Z"  # the server's time: coverage begins (V2)
+        server = ScriptServer([joined, privmsg("pat", "hello", "m1", channel="#alpha",
+                                               t="2026-10-02T10:00:00Z")])
         with mock.patch.object(self.chatlib, "CONFIG_PATH", cfgfile), \
                 mock.patch.object(self.chatlib, "login", lambda *a, **k: server), \
                 mock.patch.object(self.bridge, "_cmux", lambda *a: (0, "{}", "")), \
@@ -219,7 +221,9 @@ class ServerEvidenceTests(CatchUpIndexFailureTests):
         ticks = iter(range(10 ** 6))
         clock = lambda: 1_000_000.0 + 20 * next(ticks)  # noqa: E731  (each check is 20 s later: LIST is due)
         first = privmsg("sam", "first", "m1", channel="#new", t="2026-10-02T10:00:00.000Z")
-        server = self.run_script([join("#new"), dict(first, tags=dict(first["tags"]))], state, cov,
+        joined = join("#new")
+        joined["tags"]["time"] = "2026-10-02T09:59:00.000Z"
+        server = self.run_script([joined, dict(first, tags=dict(first["tags"]))], state, cov,
                                  failing={"m1"}, clock=clock)
         asked = [x for x in server.sent if x.startswith("CHATHISTORY")]
         self.assertEqual(len(asked), 1, "replayed on the same connection")
@@ -227,11 +231,53 @@ class ServerEvidenceTests(CatchUpIndexFailureTests):
         self.assertNotIn("#new", cov.live, "coverage stops at the failure")
         self.assertEqual(self.sql("SELECT through FROM coverage WHERE channel = '#new'")[0]["through"], None)
         state = state[:3] + (self.bridge.Checkpoints(),)  # a reconnect, after a restart: from the durable file
-        server = self.run_script([join("#new"), batch("b2", "#new"), in_batch("b2", dict(first, tags=dict(first["tags"]))),
+        server = self.run_script([joined, batch("b2", "#new"), in_batch("b2", dict(first, tags=dict(first["tags"]))),
                                   batch("b2", None)], state, cov)
         [again] = [x for x in server.sent if x.startswith("CHATHISTORY")]
         self.assertEqual(again, asked[0], "the reconnect asks from the same boundary, not after the failed message")
         self.assertEqual([m["msgid"] for m in self.sql("SELECT msgid FROM messages")], ["m1"], "indexed at last")
+
+
+class JoinWithoutServerTimeTests(CatchUpIndexFailureTests):
+    """Round A follow-up (class: local substitutes): a replay boundary or
+    coverage is never derived from local time. A JOIN without a readable server
+    time gives its channel no coverage, and a boundary from before anything it
+    can hold, so a failed first index is never skipped, however far ahead the
+    local clock runs."""
+
+    EPOCH = "CHATHISTORY AFTER #new timestamp=1970-01-01T00:00:00.000Z 1000"
+
+    def test_a_failed_first_index_after_an_untimed_join_is_never_skipped_and_proves_nothing(self):
+        from test_bridge import batch, in_batch, join, privmsg
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks(), self.bridge.Checkpoints())
+        cov = self.bridge.Coverage(self.authority)
+        ticks = iter(range(10 ** 6))
+        ahead = lambda: 4_000_000_000.0 + 20 * next(ticks)  # noqa: E731  (a local clock far ahead of the server)
+        first = privmsg("sam", "first", "m1", channel="#new", t="2026-10-02T10:00:00.000Z")
+        with mock.patch.object(self.bridge.time, "time", ahead):
+            server = self.run_script([join("#new"), dict(first, tags=dict(first["tags"]))], state, cov,
+                                     failing={"m1"})
+        self.assertEqual([x for x in server.sent if x.startswith("CHATHISTORY")], [self.EPOCH])
+        self.assertEqual(self.sql("SELECT * FROM coverage WHERE channel = '#new'"), [], "no coverage from local time")
+        self.assertNotIn("#new", cov.live)
+        state = state[:3] + (self.bridge.Checkpoints(),)  # a reconnect, after a restart
+        with mock.patch.object(self.bridge.time, "time", ahead):
+            server = self.run_script([join("#new"), batch("b2", "#new"),
+                                      in_batch("b2", dict(first, tags=dict(first["tags"]))), batch("b2", None)],
+                                     state, cov)
+        self.assertEqual([x for x in server.sent if x.startswith("CHATHISTORY")], [self.EPOCH])
+        self.assertEqual([m["msgid"] for m in self.sql("SELECT msgid FROM messages")], ["m1"], "indexed at last")
+
+    def test_a_timed_join_takes_its_boundary_from_the_server_alone(self):
+        from test_bridge import join
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks(), self.bridge.Checkpoints())
+        cov = self.bridge.Coverage(self.authority)
+        timed = join("#new")
+        timed["tags"]["time"] = "2026-10-02T10:00:00.000Z"
+        with mock.patch.object(self.bridge.time, "time", lambda: 4_000_000_000.0):
+            self.run_script([timed], state, cov)
+        self.assertEqual(state[3].marks["#new"], "timestamp=2026-10-02T09:59:55.000Z", "A seconds before the join")
+        self.assertEqual(len(self.sql("SELECT * FROM coverage WHERE channel = '#new'")), 1)
 
 
 class NoThread:

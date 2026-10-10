@@ -1410,7 +1410,10 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
                             # index is replayed from here, never from after the message it missed
                             mark = boundary_mark(msg["tags"].get("time"))
                             checkpoints.set(ch, mark)
-                            coverage.begin(ch, None, mark)
+                            if mark == EPOCH_MARK:  # no server time: no coverage from this join (V2)
+                                log(f"joined {ch} without a server time; no coverage from this join")
+                            else:
+                                coverage.begin(ch, None, mark)
                         log(f"joined {ch}" + (f" (catching up after {cur[:30]})" if cur else ""))
                 elif cmd == "BATCH":
                     ref = msg["params"][0]
@@ -1481,11 +1484,19 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
                     ask(k, f"CHATHISTORY AFTER {k} {mark} {HISTORY_PAGE}")
 
 
+EPOCH_MARK = "timestamp=1970-01-01T00:00:00.000Z"  # before anything a channel can hold
+
+
 def boundary_mark(server_time):
-    """A CHATHISTORY timestamp mark A seconds before a join (its server time,
-    else now): every message the bridge can receive after the join is after it,
-    and replaying a little more than needed is harmless (V1 is idempotent)."""
-    t = (delivery_store.parse_iso(server_time) or time.time()) - delivery_store.A
+    """A CHATHISTORY timestamp mark A seconds before a join, from its server
+    time alone: every message the bridge can receive after the join is after
+    it, and replaying a little more than needed is harmless (V1 is idempotent).
+    Never from the local clock: without a readable server time, the mark is
+    EPOCH_MARK, which no message can precede."""
+    t = delivery_store.parse_iso(server_time)
+    if t is None:
+        return EPOCH_MARK
+    t -= delivery_store.A
     return f"timestamp={time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t))}.{int(t % 1 * 1000):03d}Z"
 
 
