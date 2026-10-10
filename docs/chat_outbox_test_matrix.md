@@ -5,7 +5,7 @@ item 20) requires. It maps every requirement, acceptance item, binding
 correction and spec addition of #19, design revision 9's tests 1–48
 ([`chat_outbox_state.md`](chat_outbox_state.md), section 9), owner
 amendment 6, and the code reviews' findings, to the named tests that assert
-them, with a status for each. It describes PR #20 at `e4dc48a`.
+them, with a status for each. It describes PR #20 at `ab79c93`.
 
 How to read it:
 - Each row's **Requirement** or **Item** column (for design tests, the
@@ -265,6 +265,17 @@ All failed first at `5aec2b8` except where the note says control.
 | L4 | An ordinary wake-up keeps its documented baseline: a replay may duplicate it, never lose it | bridge.ReplayedInterruptTests.test_an_ordinary_wake_up_keeps_its_baseline | COVERED | A control. |
 | L5 | A live acknowledgement whose settling fails in the ledger is settled by a later pass of the same bridge once the ledger works, with its owed work kept: no replay, no second interrupt or acknowledgement, no false dead letter | bridge.LiveAcknowledgementRetryTests.test_a_live_acknowledgement_is_settled_after_a_transient_ledger_failure (with and without an owed announcement) | COVERED | |
 
+## 16. Code review 6103073520 (slot 11) and the bounded check
+
+All failed first at `e4dc48a`.
+
+| ID | Item | Tests | Status | Note |
+|---|---|---|---|---|
+| M1 | An interrupt is queued only once its save succeeds: a failed save keeps nothing of it in memory, the message is not logged or checkpointed, and the same bridge's replay queues it again, so after a crash exactly one interrupt is queued and none is lost | bridge.QueuedOnlyWhenSavedTests.test_a_failed_queue_save_then_a_same_instance_replay_then_a_crash (one and two failed saves) | COVERED | |
+| M2 | A failed save of a held replay leaves no alert behind | bridge.QueuedOnlyWhenSavedTests.test_a_failed_save_of_a_held_replay_leaves_no_alert_behind | COVERED | Bounded check. |
+| M3 | An acknowledgement recorded before its instruction is replayed from history settles the interrupt once it is queued: never rung, no false dead letter, with a readable ledger and with an unreadable one (held) | bridge.AcknowledgementBeforeHistoryTests.test_an_acknowledgement_before_its_instruction_is_replayed | COVERED | |
+| M4 | An acknowledgement counts as recorded only once its line is written, so a failed append is written when the message is replayed | bridge.AcknowledgementDurabilityTests.test_a_failed_acknowledgement_append_is_written_on_replay | COVERED | Bounded check. |
+
 ## Counts
 
 | Section | COVERED | PARTIAL | MISSING |
@@ -284,16 +295,17 @@ All failed first at `5aec2b8` except where the note says control.
 | 13. Scope approval 6102156233: the binding correction and two additions | 3 | 0 | 0 |
 | 14. Code review 6102471519 (slot 9) and the final re-check | 8 | 0 | 0 |
 | 15. Code review 6102730761 (slot 10) | 5 | 0 | 0 |
-| **Total (154 rows)** | **154** | **0** | **0** |
+| 16. Code review 6103073520 (slot 11) and the bounded check | 4 | 0 | 0 |
+| **Total (158 rows)** | **158** | **0** | **0** |
 
 History: at `97db1bf`, before amendment 6's round, 104 of the then 130 rows
 were COVERED, 15 PARTIAL and 11 MISSING. That round closed them and added
 section 13. The final round added design tests 41–48 as their own rows in
-section 11, and section 14. The recovery round added section 15.
+section 11, and section 14. The recovery rounds added sections 15 and 16.
 
 ## Appendix A. The test methods of every class named above
 
-Generated from the test tree at `e4dc48a`. A module named on its own (such as `rb` or `sil`) stands
+Generated from the test tree at `ab79c93`. A module named on its own (such as `rb` or `sil`) stands
 for all of its classes, listed here.
 
 ### `resend`: `packages/chat/scripts/tests/test_outbox_resend.py`
@@ -346,6 +358,8 @@ for all of its classes, listed here.
 
 ### `bridge`: `packages/chat/scripts/tests/test_outbox_bridge.py`
 
+- **AcknowledgementBeforeHistoryTests**: `test_an_acknowledgement_before_its_instruction_is_replayed`
+- **AcknowledgementDurabilityTests**: `test_a_failed_acknowledgement_append_is_written_on_replay`
 - **AcknowledgementRecoveryTests**: `test_every_recipient_of_one_interrupt_is_recovered_after_a_failed_settling_save`, `test_a_failed_read_is_retried_at_a_later_pass_and_a_malformed_line_is_skipped`
 - **AlertIdentityTests**: `test_two_recipients_alerts_are_each_dead_lettered`
 - **AnnounceTests**: `test_with_its_requests_failing_it_publishes_a_fallback_file_without_outbox_lock`, `test_with_nothing_durable_the_flag_stays_unset_and_a_repeat_is_one_entry`, `test_deliveries_saves_held_announced_only_after_the_announcement_is_durable`, `test_a_crash_after_e1_and_before_a1_is_adopted_after_the_restart_and_sent_once`, `test_an_ordinary_post_killed_after_e1_is_still_abandoned`
@@ -363,6 +377,7 @@ for all of its classes, listed here.
 - **JoinWithoutServerTimeTests**: `test_a_failed_first_index_after_an_untimed_join_is_never_skipped_and_proves_nothing`, `test_a_timed_join_takes_its_boundary_from_the_server_alone`, `test_a_failed_index_mid_catch_up_never_restores_completeness_or_moves_the_checkpoint`, `test_a_successful_replay_restores_completeness_from_the_preserved_checkpoint`
 - **LiveAcknowledgementRetryTests**: `test_a_live_acknowledgement_is_settled_after_a_transient_ledger_failure`
 - **OwedAnnouncementExpiryTests**: `test_an_owed_announcement_survives_the_expiry_and_a_restart`
+- **QueuedOnlyWhenSavedTests**: `test_a_failed_queue_save_then_a_same_instance_replay_then_a_crash`, `test_a_failed_save_of_a_held_replay_leaves_no_alert_behind`
 - **ReplayedInterruptTests**: `test_a_replayed_interrupt_keeps_one_obligation_whatever_its_outcome`, `test_another_recipient_of_the_same_message_stays_independent`, `test_an_ordinary_wake_up_keeps_its_baseline`, `test_a_replay_with_an_unreadable_ledger_is_never_rung`
 - **ServerEvidenceTests**: `test_a_late_message_without_server_time_never_proves_absence`, `test_a_failed_first_index_without_a_checkpoint_is_replayed_and_never_skipped`, `test_a_failed_index_mid_catch_up_never_restores_completeness_or_moves_the_checkpoint`, `test_a_successful_replay_restores_completeness_from_the_preserved_checkpoint`
 - **StartupCleanupTests**: `test_a_failed_sync_of_the_database_files_releases_everything`, `test_a_failed_bind_or_thread_start_releases_everything`, `test_a_dead_authority_thread_is_not_running_and_is_replaced`
