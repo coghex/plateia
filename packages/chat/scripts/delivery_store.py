@@ -1522,9 +1522,12 @@ class Authority:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
         old = os.umask(0o177)  # the socket is created 0600: only this user may connect
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             listener.bind(path)
+        except BaseException:  # nothing half-bound is left behind: the next pass binds again
+            listener.close()
+            raise
         finally:
             os.umask(old)
         if os.stat(path).st_mode & 0o777 != 0o600:
@@ -1918,9 +1921,29 @@ class Importer:
     def _sha(self, data):
         return hashlib.sha256(data).hexdigest()
 
+    def unreadable(self, name, err):
+        """A file the import cannot list, sync or read: it is kept, retried at
+        every flush, and raises one content-free alert; nothing else waits for it."""
+        self.log(f"outbox: {name} cannot be read ({err!r:.100}); kept, and retried at the next flush")
+        try:
+            self.authority.run_tx(lambda s: s.raise_alert(
+                f"held:{name}:unreadable", "held", name,
+                "a queued outbox file could not be read; it is kept and retried; see pchat status"))
+        except (Conflict, sqlite3.Error):
+            pass
+
+    def _listdir(self, path):
+        try:
+            return self.fs.listdir(path)
+        except OSError as err:
+            self.unreadable(Path(path).name, err)
+            return []
+
     def import_fallback_files(self):
-        """At most IMPORT_MAX published files, oldest name first. Returns how many."""
-        names = sorted(n for n in self.fs.listdir(self.paths.fallback) if is_published_name(n))
+        """At most IMPORT_MAX published files, oldest name first. Returns how many.
+        A file that cannot be synced or read is kept, with an alert, and every
+        other file and entry proceeds."""
+        names = sorted(n for n in self._listdir(self.paths.fallback) if is_published_name(n))
         if self.pass_names is None:
             self.pass_names = set(names)
         count = 0
@@ -1930,6 +1953,9 @@ class Importer:
                 self.fs.durable(path)
                 data = self.fs.read(path)
             except FileNotFoundError:
+                continue
+            except OSError as err:  # kept: its obligation is not lost, and it blocks nothing else
+                self.unreadable(name, err)
                 continue
             sha = self._sha(data)
             try:
@@ -1941,48 +1967,65 @@ class Importer:
                 break  # not run: try again at the next flush
             if outcome == "changed":
                 self.authority.run_tx(lambda s, name=name, sha=sha: s.hold_changed(name, sha))
-            self.fs.unlink(path)
-            self.fs.sync_dir(self.paths.fallback)
+            try:
+                self.fs.unlink(path)
+                self.fs.sync_dir(self.paths.fallback)
+            except OSError as err:  # imported: the next flush finds its imports row and removes it
+                self.log(f"outbox: {name} imported but not removed ({err!r:.80})")
+                continue
             self.pass_names.discard(name)
             count += 1
             if outcome not in ("imported", "noop"):
                 self.log(f"outbox: fallback file {name}: {outcome}")
-        if not (self.pass_names & set(self.fs.listdir(self.paths.fallback))):
+        if not (self.pass_names & set(self._listdir(self.paths.fallback))):
             self.authority.run_tx(lambda s: s.complete_pass())
             self.pass_names = None
         return count
 
     def clean_staging(self):
         """A tmp/ file is removed only once its writer is gone, or once published."""
-        for name in self.fs.listdir(self.paths.staging):
+        for name in self._listdir(self.paths.staging):
             path = self.paths.staging / name
             try:
                 if self.fs.nlink(path) > 1:
                     self.fs.unlink(path)
                     continue
-            except FileNotFoundError:
-                continue
+            except OSError:
+                continue  # cleanup only: tried again at the next flush
             tag = name.split(".")
             if len(tag) >= 3 and tag[1].isdigit():
                 writer = {"boot": tag[0], "pid": int(tag[1]), "start": tag[2].replace("_", " ")}
                 if self.authority.probes.gone(writer) is True:
-                    self.fs.unlink(path)
+                    try:
+                        self.fs.unlink(path)
+                    except OSError:
+                        pass
 
     def claim_legacy(self):
         """I1: rename a non-empty outbox.jsonl to a never-used claim name, WITHOUT
         outbox.lock; then a durable sync of every claim file present."""
         legacy = self.paths.legacy
-        if self.fs.exists(legacy) and self.fs.size(legacy):
-            name = f"outbox.claimed-{time.time_ns()}-{secrets.token_hex(4)}.jsonl"
-            self.fs.rename(legacy, self.paths.state / name)
-            self.fs.sync_dir(self.paths.state)
-        claims = self.claim_list()
-        for name in claims:
-            self.fs.durable(self.paths.state / name)
+        try:
+            if self.fs.exists(legacy) and self.fs.size(legacy):
+                name = f"outbox.claimed-{time.time_ns()}-{secrets.token_hex(4)}.jsonl"
+                self.fs.rename(legacy, self.paths.state / name)
+                self.fs.sync_dir(self.paths.state)
+        except OSError as err:  # outbox.jsonl stays where it is, claimed at a later flush
+            self.unreadable("outbox.jsonl", err)
+        claims = []
+        for name in self.claim_list():
+            try:
+                self.fs.durable(self.paths.state / name)
+            except FileNotFoundError:
+                continue
+            except OSError as err:  # never imported before its durable sync; kept, with an alert
+                self.unreadable(name, err)
+                continue
+            claims.append(name)
         return claims
 
     def claim_list(self):
-        return sorted(n for n in self.fs.listdir(self.paths.state)
+        return sorted(n for n in self._listdir(self.paths.state)
                       if n.startswith("outbox.claimed-") and n.endswith(".jsonl"))
 
     def _import_row(self, name):
@@ -2003,12 +2046,18 @@ class Importer:
                     data = self.fs.read(path)
                 except FileNotFoundError:
                     break
+                except OSError as err:  # kept, with an alert; the other claims and entries go on
+                    self.unreadable(name, err)
+                    break
                 row = self._import_row(name)
                 if row is None:
                     return
                 if row.get("state") == "closed":
-                    self.fs.unlink(path)  # I3's unlink, replayed
-                    self.fs.sync_dir(self.paths.state)
+                    try:
+                        self.fs.unlink(path)  # I3's unlink, replayed
+                        self.fs.sync_dir(self.paths.state)
+                    except OSError as err:
+                        self.log(f"outbox: {name} retired but not removed ({err!r:.80})")
                     break
                 offset, ordinal = row.get("offset", 0), row.get("lines", 0)
                 if row and self._sha(data[:offset]) != row.get("sha256"):
@@ -2038,8 +2087,11 @@ class Importer:
                 if n is CANCELLED:
                     return
                 if final:
-                    self.fs.unlink(path)
-                    self.fs.sync_dir(self.paths.state)
+                    try:
+                        self.fs.unlink(path)
+                        self.fs.sync_dir(self.paths.state)
+                    except OSError as err:  # closed: the next flush removes it
+                        self.log(f"outbox: {name} retired but not removed ({err!r:.80})")
                     break
                 if len(take) == len(complete):
                     break

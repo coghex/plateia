@@ -384,6 +384,50 @@ class PublicationTests(FilesCase):
         self.assertIn("cannot be written", said)
 
 
+class UnreadableFileTests(FilesCase):
+    """Code review slot 1, finding 2: a file the importer cannot read or sync is
+    kept, with an alert, and never stops another entry's attempt."""
+
+    def test_an_unreadable_fallback_file_never_blocks_other_entries(self):
+        import os
+        self.ds.publish_fallback(self.fs, self.authority.paths, dict(self.row("[status] stuck"), id="u" * 32),
+                                 clock=self.clock)
+        [bad] = self.fallback_files()
+        os.chmod(bad, 0)
+        self.server.refuse_login = {"sam"}
+        self.post("[status] other", channel="#beta", account="sam")
+        self.server.refuse_login = set()
+        try:
+            deliveries = self.bridge.Deliveries()
+            self.flush(deliveries)
+            self.flush(deliveries)
+            self.assertEqual(self.published_texts(), ["[status] other"], "the other entry flows")
+            self.assertTrue(bad.exists(), "the obligation is kept")
+            alerts = [a for a in self.alerts() if a["ref"] == bad.name]
+            self.assertEqual(len(alerts), 1)
+            self.assertEqual(len([i for i in deliveries.items if i.get("alert_key") == alerts[0]["alert_key"]]), 1)
+        finally:
+            os.chmod(bad, 0o600)
+        self.flush()
+        self.assertEqual(sorted(self.published_texts()), ["[status] other", "[status] stuck"])
+
+    def test_an_unreadable_legacy_claim_never_blocks_other_entries(self):
+        import os
+        claim = self.legacy(self.row("[status] old"), name="outbox.claimed-5-z.jsonl")
+        os.chmod(claim, 0)
+        self.server.refuse_login = {"sam"}
+        self.post("[status] other", channel="#beta", account="sam")
+        self.server.refuse_login = set()
+        try:
+            self.flush()
+            self.assertEqual(self.published_texts(), ["[status] other"])
+            self.assertEqual(len([a for a in self.alerts() if a["ref"] == claim.name]), 1)
+        finally:
+            os.chmod(claim, 0o600)
+        self.flush()
+        self.assertEqual(sorted(self.published_texts()), ["[status] old", "[status] other"])
+
+
 class ImportBoundaryTests(FilesCase):
     """Test 34: crashes at each import step, fairness, passes, and legacy claims in several reads."""
 

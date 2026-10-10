@@ -94,6 +94,120 @@ class CoverageTests(BridgeCase):
         self.assertIsNotNone(self.span())
 
 
+class CatchUpIndexFailureTests(BridgeCase):
+    """Code review slot 1, finding 1: a message whose index fails during a
+    catch-up invalidates that catch-up; its checkpoint stays before the
+    message until a replay indexes it, and no coverage is restored meanwhile."""
+
+    class OneShot:
+        """One scripted connection that resumes where a read left off, then drops."""
+
+        def __init__(self, script):
+            self.script, self.sent = list(script), []
+
+        def send(self, line):
+            self.sent.append(line)
+
+        def lines(self, timeout=None):
+            import chatlib
+            while self.script:
+                yield self.script.pop(0)
+            raise chatlib.ChatError("connection dropped")
+
+    def run_script(self, script, state, cov, failing=(), clock=None):
+        cfgfile = self.chatlib.STATE_DIR / "config.json"
+        cfgfile.write_text("{}")
+        server = self.OneShot(script)
+        real = self.bridge.index_message
+
+        def index(entry, authority=None):
+            return False if entry.get("msgid") in failing else real(entry, authority)
+        patches = [mock.patch.object(self.chatlib, "CONFIG_PATH", cfgfile),
+                   mock.patch.object(self.chatlib, "login", lambda *a, **k: server),
+                   mock.patch.object(self.bridge, "_cmux", lambda *a: (0, "{}", "")),
+                   mock.patch.object(self.bridge, "index_message", index)]
+        if clock:
+            patches.append(mock.patch.object(self.bridge.time, "time", clock))
+        for p in patches:
+            p.start()
+        try:
+            with self.assertRaises(self.chatlib.ChatError):
+                self.bridge.run(CFG, *state, coverage=cov)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return server
+
+    def setup_channel(self):
+        from test_bridge import privmsg
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks(), self.bridge.Checkpoints())
+        self.bridge.handle(privmsg("pat", "before", "m0", channel="#alpha", t="2026-10-02T09:00:00Z"), CFG,
+                           *state[:3])
+        return state, self.bridge.Coverage(self.authority)
+
+    def test_a_failed_index_mid_catch_up_never_restores_completeness_or_moves_the_checkpoint(self):
+        from test_bridge import batch, in_batch, join, privmsg
+        state, cov = self.setup_channel()
+        self.run_script([join("#alpha"), batch("b1", "#alpha"),
+                         in_batch("b1", privmsg("sam", "missed", "m1", channel="#alpha", t="2026-10-02T10:00:00Z")),
+                         batch("b1", None)], state, cov, failing={"m1"})
+        self.assertNotIn("#alpha", cov.live)
+        self.assertEqual(self.sql("SELECT * FROM coverage"), [], "no span may begin from an invalid catch-up")
+        self.assertEqual(state[3].marks.get("#alpha"), "msgid=m0", "the checkpoint stays before the message")
+        self.server.plan = ["error"]  # an uncertain attempt with finality, in that channel
+        self.post("missed", account="sam")
+        self.server.published.clear()
+        self.clock.advance(60)
+        self.flush()
+        self.assertEqual(self.states(), ["uncertain"], "absence is never proved without a complete record")
+
+    def test_a_successful_replay_restores_completeness_from_the_preserved_checkpoint(self):
+        from test_bridge import batch, in_batch, join, privmsg
+        state, cov = self.setup_channel()
+        ticks = iter(range(10 ** 6))
+        clock = lambda: 1_000_000.0 + 20 * next(ticks)  # noqa: E731  (each check is 20 s later: LIST is due)
+        missed = privmsg("sam", "missed", "m1", channel="#alpha", t="2026-10-02T10:00:00Z")
+        server = self.run_script([join("#alpha"), batch("b1", "#alpha"), in_batch("b1", dict(missed)),
+                                  batch("b1", None)], state, cov, failing={"m1"}, clock=clock)
+        asked = [x for x in server.sent if x.startswith("CHATHISTORY")]
+        self.assertEqual(asked, ["CHATHISTORY AFTER #alpha msgid=m0 1000"] * 2,
+                         "the join's catch-up, then a replay from the preserved mark at the next LIST")
+        self.run_script([join("#alpha"), batch("b2", "#alpha"),
+                         in_batch("b2", privmsg("sam", "missed", "m1", channel="#alpha", t="2026-10-02T10:00:00Z")),
+                         batch("b2", None)], state, cov)
+        self.assertIn("#alpha", cov.live)
+        self.assertEqual(state[3].marks.get("#alpha"), "msgid=m1")
+
+
+class FailedBindTests(BridgeCase):
+    """Code review slot 1, finding 3: a start whose bind fails is finished at the next pass."""
+
+    def test_a_failed_bind_is_retried_and_the_thread_started_at_the_next_pass(self):
+        attempts, threads = [], []
+
+        def bind(authority_self):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise OSError("address in use (fake)")
+            return True
+        with mock.patch.object(self.bridge, "OUTBOX_AUTHORITY", None), \
+                mock.patch.object(self.ds.Authority, "bind", bind), \
+                mock.patch.object(self.ds.Authority, "run_in_thread",
+                                  lambda a: threads.append(1) or setattr(a, "thread", object())), \
+                mock.patch.object(self.bridge, "log", lambda m: None):
+            self.authority.close()  # free the sandbox's authority lock for the bridge's own
+            first = self.bridge.ensure_authority()
+            second = self.bridge.ensure_authority()
+            try:
+                self.assertIs(first, second)
+                self.assertEqual((len(attempts), len(threads)), (2, 1))
+                self.assertIsNone(second.unavailable)
+            finally:
+                second.thread = None
+                second.close()
+        self.authority = self.new_authority()
+
+
 class FakeSock:
     """A socket that answers nothing useful: only unrelated lines, forever."""
 

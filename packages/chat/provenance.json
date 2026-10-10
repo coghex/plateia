@@ -295,14 +295,14 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
       "capture": "changed",
-      "sha256": "f7f04621b9221191f64a33a36fc9987139518724f78f3a82deabdae8e1763a4d",
+      "sha256": "1e8ec31e312057e5ff599bbdc15e4822e440f9562314ad155c0583696519c6f0",
       "changes": [
         {
           "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
           "reason": "Deliberate deviation from c572bad, by owner decision on PR #16's first review: a catch-up cut short leaves the checkpoint behind, so after a restart more than 5,000 replayed messages would be logged again and an accepted request queued again (PLT-15 requirement 8). The running bridge keeps the baseline behavior until activation."
         },
         {
-          "change": "The bridge runs the outbox authority (delivery_store.Authority: the only opener of outbox.db, on its own thread, serving outbox.sock) and its flush: it imports fallback files and the legacy outbox without outbox.lock, ends gone writers' attempts, abandons (E8) or, for its own announcements, adopts (E9) their entries, reconciles from current state (R1, R2), dead-letters after 24 hours with a content-free alert row, gives every eligible entry its attempt, and retires claims and writes dead letters under a bounded outbox.lock. It indexes every verified message (V1) before its checkpoint moves, keeps record coverage in the authority, writes the pending queue, ledger and dead letters durably, and announces with a derived entry id, saving held_announced only once the announcement is durable. The file-based claimed-outbox, reservation and attribution state is removed.",
+          "change": "The bridge runs the outbox authority (delivery_store.Authority: the only opener of outbox.db, on its own thread, serving outbox.sock; a start that failed part-way is finished at the next pass) and its flush: it imports fallback files and the legacy outbox without outbox.lock, ends gone writers' attempts, abandons (E8) or, for its own announcements, adopts (E9) their entries, reconciles from current state (R1, R2), dead-letters after 24 hours with a content-free alert row, gives every eligible entry its attempt, and retires claims and writes dead letters under a bounded outbox.lock. It indexes every verified message (V1) before its checkpoint moves; a failed index invalidates any catch-up of that channel, which completes nothing until a replay from the preserved checkpoint indexes it; keeps record coverage in the authority, writes the pending queue, ledger and dead letters durably, and announces with a derived entry id, saving held_announced only once the announcement is durable. The file-based claimed-outbox, reservation and attribution state is removed.",
           "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
         }
       ]

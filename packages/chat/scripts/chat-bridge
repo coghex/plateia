@@ -1281,12 +1281,27 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
         coverage.lost(ch)
         log(f"left {ch}; its record is incomplete until a catch-up after rejoining")
 
+    invalid = {}  # channel -> where its replay starts: a catch-up invalidated by a failed index
+
+    def invalidate(ch):
+        """V4 for a failed index: the channel is incomplete, any catch-up still open
+        for it (or asked for) completes nothing, and its checkpoint stays before the
+        message, until a replay from that checkpoint indexes it (asked at the next LIST)."""
+        k = ch.lower()
+        complete.discard(k)
+        pager.abandon(ch)
+        stale[k] = asked.get(k, 0)
+        coverage.lost(ch)
+        if k not in invalid:
+            invalid[k] = started.get(k) or checkpoints.marks.get(k)
+            log(f"{ch}: a message could not be indexed; its record is incomplete until a replay")
+        started.pop(k, None)
+
     def privmsg(m, history):
         indexed = handle(m, cfg, record, deliveries, acks, replayed=history)
         ch, mid = m["params"][0], m["tags"].get("msgid")
         if indexed is False:  # V4: a failed index stops coverage; the checkpoint stays before it
-            coverage.lost(ch)
-            complete.discard(ch.lower())
+            invalidate(ch)
             return
         if not history and mid and ch.lower() in complete:
             checkpoints.set(ch, f"msgid={mid}")
@@ -1349,6 +1364,7 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
                             log(f"catch-up page full; next: {nxt[:60]}")
                         elif target:  # the last page: the log is complete through its newest message
                             complete.add(target.lower())
+                            invalid.pop(target.lower(), None)
                             mark = Record.cursor(target)
                             checkpoints.set(target, mark)
                             coverage.begin(target, started.get(target.lower()), mark)
@@ -1390,18 +1406,28 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
         if time.time() > next_list:
             conn.send("LIST")
             next_list = time.time() + 10
+            for k, mark in list(invalid.items()):  # replay an invalidated catch-up, one request at a time
+                if k in joined and not asked.get(k) and mark:
+                    started[k] = mark
+                    ask(k, f"CHATHISTORY AFTER {k} {mark} {HISTORY_PAGE}")
 
 
 def ensure_authority():
-    """Start this bridge's outbox authority, or retry a start that failed (section 2.4.1)."""
+    """Start this bridge's outbox authority, or finish a start that failed part-way
+    (section 2.4.1): each step not yet done (open, bind, the thread) is retried
+    at the next pass, so a failed bind never leaves clients unserved for good."""
     global OUTBOX_AUTHORITY
-    if OUTBOX_AUTHORITY is not None and OUTBOX_AUTHORITY.running:
-        return OUTBOX_AUTHORITY
     authority = OUTBOX_AUTHORITY or delivery_store.Authority(chatlib.STATE_DIR, log=log)
+    if authority.running and authority.thread is not None:
+        OUTBOX_AUTHORITY = authority
+        return authority
     try:
-        authority.start()
-        authority.bind()
+        if not authority.running:
+            authority.start()
+        if authority.listener is None and not getattr(authority, "bridge_only", False):
+            authority.bridge_only = not authority.bind()  # a socket path over the limit: the bridge alone
         authority.run_in_thread()
+        authority.unavailable = None
         log(f"outbox authority running, epoch {authority.epoch}")
     except (delivery_store.Unavailable, OSError) as err:
         reason = str(err)
