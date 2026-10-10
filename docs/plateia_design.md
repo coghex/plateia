@@ -2196,6 +2196,44 @@ decisions.
   10.1. **This decision approves the design, its scope and its review only.**
   Implementation, code, tests and the `release.json` edit still need their
   own owner decision.
+- **Per-entry fallback files and the review's corrections (owner decision,
+  2026-10-10, 11:31 UTC).** The canonical issue review of #19's third
+  amendment found that a fallback row already durable in the shared outbox
+  file still waited for a client stopped while holding the outbox lock. The
+  owner approved the manager's repair instead of narrowing R6:
+  - **One fallback file per entry.** A queueing caller, the bridge's own
+    `announce` included, publishes one complete, immutable fallback file per
+    entry. That is exclusive creation, a durable write, a link that never
+    replaces, and directory syncs.
+  - **No lock on import.** The bridge imports published files, and the
+    legacy outbox's rows, without the outbox lock. A stopped writer can delay
+    only its own unfinished publication.
+  - **The files are boundaries,** not a second authority. The bridge-private
+    fallback file is replaced by these files.
+  - **R6 preserved** over the database and over every already durable
+    obligation, with no exemption, lock stealing, lease or killing of
+    holders. The bridge-only authority, the queueing while it is unavailable,
+    and the `outbox-authority/1` interface all stand.
+  - **The review's five corrections:**
+    - acceptance 11 ignores generated manifest fields;
+    - the future guidance explains queueing while the authority cannot
+      answer;
+    - the future release suite may build and install isolated invented
+      fixtures;
+    - a writer's no-byte statement survives the bridge ending its attempt
+      first;
+    - a bridge announcement whose entry exists but whose content was never
+      sent is still delivered after a restart. Ordinary dead direct callers
+      keep D1.
+  - **Review budget.** At most five further review launches, shared by #19's
+    canonical issue review and the design review. The unused design round 5
+    is one of them.
+
+  The design is revision 7 of
+  [chat_outbox_state.md](chat_outbox_state.md), sections 3.3, 6.3, 6.4, I-12
+  and 10.1. **This decision approves the specification, the design and their
+  review only.** Implementation, code, tests and the `release.json` edit
+  still need their own owner decision.
 
 Delivery stays at-least-once with the record check, and nothing claims
 exactly-once. These decisions approve the design only: implementing it needs
@@ -2214,6 +2252,9 @@ Rejected alternatives:
   concurrently written authority.
 - **A separate authority daemon.** It is a new service, and posts would still
   queue while it is down.
+- **Exempting already durable fallback rows that wait behind a stopped
+  holder of the outbox lock** (narrowing R6). Rejected 2026-10-10: per-entry
+  fallback files remove the wait instead.
 
 ## Open questions
 

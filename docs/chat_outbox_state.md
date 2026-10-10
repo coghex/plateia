@@ -4,7 +4,7 @@ This is the design note for #19 and pull request #20. It is design only:
 nothing here is implemented, and implementing it needs a separate owner
 decision.
 
-This is revision 6. Revision 3 answered design review round 2. Revision 4
+This is revision 7. Revision 3 answered design review round 2. Revision 4
 aligned the note with the owner's second amendment to #19:
 
 - the release-packaging scope;
@@ -27,9 +27,29 @@ behaviour change** the owner accepted (section 2.4.4). Revision 6 also bounds
 the bridge's own `announce` fallback, and applies R2's message accounting to
 every part.
 
+Revision 7 adopts the owner's second decision of 2026-10-10, made after the
+canonical issue review of #19's third amendment. That review found that a
+fallback row already durable in `outbox.jsonl` still waited for a client
+stopped while holding `outbox.lock`.
+
+- **One fallback file per entry.** A queueing caller now publishes one
+  complete, immutable fallback file per entry, and the bridge imports
+  published files without taking `outbox.lock`. A stopped writer can delay
+  only its own unfinished publication (sections 2.1, 6.3 and 6.4, and
+  I-12).
+- **Legacy `outbox.jsonl`.** It is still read, without the lock too. The
+  lock only decides when a claimed file may be deleted.
+- **The review's five corrections** are carried as well:
+  - a writer's no-byte statement now survives the bridge ending its attempt
+    first (A12, section 3.3);
+  - an `announce` whose entry exists but whose bytes were never sent is
+    still delivered after a restart (E9, section 6.4);
+  - acceptance 11's comparison, the guidance, and the release suite's
+    fixture builds are corrected (sections 8 and 10.1).
+
 Section 12 lists what changed and why. The owner's decisions of 2026-10-09 and
 2026-10-10 are recorded in section 11, and in D-73 of
-[plateia_design.md](plateia_design.md). The 2026-10-10 decision approves the
+[plateia_design.md](plateia_design.md). The 2026-10-10 decisions approve the
 design, its scope and its review only. Implementation, code, tests and the
 `release.json` edit still need their own owner decision.
 
@@ -106,6 +126,8 @@ Every example uses invented data: projects `alpha` and `beta`, the owner
 | `QUEUE_MAX` | 256 | Complete client requests waiting to run. A request beyond it gets an immediate `busy` reply, with no transaction. |
 | `IPC_WAIT` | 5 s | A client's absolute deadline for one request: connect, send, and read the whole reply. |
 | `AUTH_WAIT` | 5 s | A bridge thread's absolute deadline for its in-process request to **begin**. A request that has not begun by then is cancelled, never run later (section 2.4.3). |
+| `IMPORT_MAX` | 256 | The most fallback files one flush imports, oldest name first. The rest wait for the next flush (section 6.3). |
+| `LINES_MAX` | 1,000 | The most legacy lines one import request reads from one claim file (section 6.3). |
 
 PR #20's `SETTLE` bound is **not used**: absence needs attempt-specific
 finality (section 5.2), not a settling time.
@@ -127,6 +149,13 @@ finality (section 5.2), not a settling time.
 - **Client.** A process other than the bridge that causes transitions:
   `pchat post`, `pchat ack`, or `agentcli.notify` inside its host. A client
   never opens the database; it sends **requests** to the authority.
+- **Fallback file.** One complete, immutable file in `outbox.d/` that
+  carries one call's queued entry, or its handoff, when the authority did
+  not answer as committed (section 6.4). It is **published** once its name
+  appears in `outbox.d/`, and only complete, durable content is ever
+  published (section 2.1).
+- **Legacy row.** A line of `outbox.jsonl`, or of a claim file, in the old
+  tools' format (section 6.2). This release writes none.
 - **Writer.** The flow holding an attempt's connection. It is identified by
   the boot id, the pid, the process start time, and a connection id that
   includes the local TCP port and the server's address.
@@ -186,8 +215,14 @@ for any other thread or process (section 2.4.3).
 
 **Not a second authority.** These are boundaries, not sources of truth:
 
-- **Imports.** `outbox.jsonl` and `outbox.claimed-*.jsonl` (section 6), and
-  the bridge's private fallback file `outbox.bridge.jsonl` (section 6.4).
+- **Imports.**
+  - The fallback files in `outbox.d/` (section 6.4). Every queueing caller
+    writes these, the bridge's `announce` included.
+  - The legacy `outbox.jsonl` and its claim files
+    `outbox.claimed-*.jsonl` (sections 6.2 and 6.3).
+
+  A fallback file is deleted only after the database holds its content, so
+  it is never the only record of anything the database has decided.
 - **Exports.**
   - `dead-letters.jsonl`;
   - the owner alert, which goes on the bridge's pending-delivery queue,
@@ -217,12 +252,29 @@ before anything depends on it.
 - **Replace:** write a temporary file, `fsync` it, rename it into place, then
   `fsync` the directory.
 - **Rename or unlink:** the change, then `fsync` of the directory.
+- **Publish** (a fallback file, section 6.4):
+  1. create a new file under `outbox.d/tmp/` with exclusive creation
+     (`O_CREAT | O_EXCL`), under a name that carries the writer's identity;
+  2. write the whole content, then `fsync` the file;
+  3. link it to its final name in `outbox.d/` with `link()`, which fails
+     if that name exists and so never replaces a file. On that failure,
+     choose a new final name and link again;
+  4. `fsync` `outbox.d/`, then `fsync` the state directory, which also
+     makes `outbox.d/`'s own entry durable, whoever created it;
+  5. remove the `tmp/` name. This is cleanup only.
+
+  A published name therefore always holds complete content that was durable
+  before the name appeared. It is never written again. Only the bridge
+  removes it, after importing it (section 6.3).
 - **Recovery.** A record found already present, in any file, is durably
   synced (file and directory) before anything is acknowledged or marked on
   the strength of it. Seeing a record proves only that it is visible, not
   that it is durable.
 - **The state directory.** The chat state directory exists before cutover. If
-  this code ever creates it, the parent directory is synced too.
+  this code ever creates it, the parent directory is synced too. The bridge
+  creates `outbox.d/` and `outbox.d/tmp/` at authority startup, and a client
+  that finds them missing creates them. Either way it syncs the parent
+  afterwards.
 
 So no acknowledgement (`pchat` exit 3 for a queued post) and no export mark is
 ever committed for a record whose content or directory entry could still be
@@ -243,12 +295,14 @@ The columns listed are the minimum the proofs rely on.
 | `attributions` | `msgid` | `attempt_id` (UNIQUE), and when it was made. |
 | `messages` | `msgid` | The channel, the account, the exact text and the server time, for verified messages only. |
 | `coverage` | channel | `since`, `through` and `mark`, as PR #20 keeps them. |
-| `imports` | claim file name | The line count, the content sha256, the epoch, and when it was imported. A name in this table is never used again. |
+| `imports` | file name: a claim file, or a fallback file | `state` (`open` or `closed`); the lines imported so far, and the byte offset after the last of them; the sha256 of those imported bytes; the epoch; and when the file was first seen and last imported. A fallback file's row is `closed` with its one import. A claim file's row stays `open` until the claim is retired (section 6.3). A name in this table is never used again. |
 | `held` | (file name, ordinal), or the file name alone | The raw row, or a reference to the file, and why it was held. |
 
 **What an entry row holds:**
 
-- its kind (`post` or `ack`) and origin;
+- its kind (`post` or `ack`) and origin. The origin is `announce` only when
+  the bridge's own in-process E1 or Q0 created the entry; no client request
+  and no import can set it (E9);
 - the account, the channel, the original text, `cont`, `reply_to` and its
   written-at time;
 - `owner_kind` (`direct` or `outbox`), and the owner's writer identity for a
@@ -264,8 +318,8 @@ The columns listed are the minimum the proofs rely on.
 
 | Actor | Who | May do |
 |---|---|---|
-| **P** (direct writer, a client) | a `pchat post` or `pchat ack` process; the `agentcli.notify` flow inside its host process | Never opens the database. By request to the authority (section 2.4): create its entry, or queue it before any byte (Q0); cause its own attempts' transitions; hand its entry to the outbox. When the authority is unavailable: append a fallback row (section 6.4). It sends its own bytes. |
-| **B** (bridge) | the single `chatbridge` service process | Run the authority, the only opener of the database (section 2.4). Index messages and advance coverage. Import and apply handoffs. Flush outbox entries. Post its own `announce` lines, as a flow of B with its own entry and attempts. Reconcile. End attempts of a gone writer or a closed connection. Make entries terminal. Export (X1, X2). Collect evidence. Suspend designations. |
+| **P** (direct writer, a client) | a `pchat post` or `pchat ack` process; the `agentcli.notify` flow inside its host process | Never opens the database. By request to the authority (section 2.4): create its entry, or queue it before any byte (Q0); cause its own attempts' transitions; hand its entry to the outbox. When the authority does not answer as committed: publish a fallback file (section 6.4). It sends its own bytes. It never takes `L_outbox`. |
+| **B** (bridge) | the single `chatbridge` service process | Run the authority, the only opener of the database (section 2.4). Index messages and advance coverage. Import fallback files and legacy rows, and apply handoffs. Flush outbox entries. Post its own `announce` lines, as a flow of B with its own entry and attempts, and adopt an earlier bridge process's unfinished announcements (E9). Reconcile. End attempts of a gone writer or a closed connection. Make entries terminal. Export (X1, X2). Collect evidence. Suspend designations. |
 | **S** (status) | `pchat status` | Read only: a `status` request, or the snapshot when the authority is unavailable (section 2.4.5). |
 | **O** (owner) | the owner, by explicit decision | Designate an account or lift a suspension. Only at a separately approved activation (section 11). |
 
@@ -274,7 +328,7 @@ The columns listed are the minimum the proofs rely on.
 | `TX` | A `BEGIN IMMEDIATE` transaction, run only by the authority thread. Every row condition is checked inside the transaction that changes the row. |
 | `L_auth` | The non-blocking flock `outbox.authority.lock`, taken by the bridge before it opens the database and held for the authority's lifetime (section 2.4.1). A second bridge cannot take it, and so never opens the database or binds the socket. |
 | `L_flush` | The non-blocking flock `outbox.flush.lock`. One flusher at a time, held for the whole flush, including import and export. This lock exists at PR #20's head `e658bb8`, but **not** on master `a12d99c`, whose `flush_outbox` takes no flush lock. The implementation adds it, and declares it in the new `outbox-db` format's path (section 10.1). |
-| `L_outbox` | The flock `outbox.lock`, which exists on master (`chatlib.py`'s `_outbox_locked`) and at `e658bb8`. It orders every write to `outbox.jsonl`, claims, imports, and every write to `dead-letters.jsonl` (section 3.6). The bridge acquires it only with a bounded wait, and never on the authority thread. Only a client's own fallback append waits as today (below). |
+| `L_outbox` | The flock `outbox.lock`, which exists on master (`chatlib.py`'s `_outbox_locked`) and at `e658bb8`. In this design it orders only two things: every write to `dead-letters.jsonl` (section 3.6), and the **retirement** of a legacy claim file (section 6.3). No client of this release takes it, and **no import waits for it**. The old tools take it to append to `outbox.jsonl` (`chatlib.py:391` on master). The bridge acquires it only with a bounded wait, and never on the authority thread. |
 | **owner** | The acting flow's writer identity equals the row's. |
 | **gone**, **conn-closed** | Section 5.4. |
 
@@ -282,22 +336,30 @@ The columns listed are the minimum the proofs rely on.
 trying a non-blocking lock until the absolute deadline `LOCK_WAIT`. If the
 deadline passes:
 
-- **The bridge** skips only the steps that need `L_outbox` in this flush:
-  claim and import (I1–I3), X1, and `Deliveries`' dead-letter appends. It
-  continues with all other work: every eligible database entry's attempts
+- **The bridge** skips, in this flush, only the steps that need `L_outbox`:
+  - the retirement (I3) of legacy claim files;
+  - X1;
+  - `Deliveries`' dead-letter appends.
+
+  It continues with everything else, including **every import**: fallback
+  files (IF), the legacy claim (I1) and the legacy rows (I2), all without
+  `L_outbox` (section 6.3). Then every eligible database entry's attempts
   (E4, A1–A5), reconciliation, A8 and A8c, E7, alerts (X2, which needs only
   `L_flush`), and collection. The skipped steps run at a later flush.
-  `pchat status` shows that import or export is deferred because the lock is
-  busy, and since when.
-- **A client's fallback append** is the one acquisition that waits for the
-  lock as today. Only that client's own call waits, and no other flow depends
-  on it. Giving up instead could leave a post unqueued where today it is
-  queued, and #19's requirement 9 forbids reducing delivery preservation
-  (section 6.4).
-- **No bridge flow ever appends to `outbox.jsonl`.** The bridge's own
-  `announce` fallback goes to its private file `outbox.bridge.jsonl`, which
-  needs no `L_outbox` (section 6.4). This is design review round 4's first
-  finding.
+  `pchat status` shows that retirement or export is deferred because the
+  lock is busy, and since when.
+- **No client of this release takes `L_outbox`.** A client queues by
+  publishing a fallback file, which needs no lock (section 6.4). The canonical
+  issue review of #19's third amendment found that revision 6's fallback
+  append to `outbox.jsonl` left an already durable row waiting behind a
+  stopped lock holder. That append is gone.
+- **No bridge flow appends to `outbox.jsonl`.** The bridge's own
+  `announce` falls back to a fallback file too (section 6.4).
+- **Who can still hold `L_outbox`:** the bridge itself, for those bounded
+  steps, and old tools outside this release, such as a legacy `pchat`
+  appending a row. A holder stopped mid-append delays only its own row,
+  which has no newline yet, and the deletion of claim files. It never
+  delays the import of any complete row or published file (I-12).
 
 **No lock is ever stolen.** Nobody breaks, removes or ignores another
 process's `L_outbox` or `L_flush`, and nobody ends a writer's attempt or
@@ -320,7 +382,7 @@ any instant.
 | `pchat post` (`pchat:223-247`, `chatlib.py:432`) | Q0, E1, A1–A5 with E6, E3, E5, A12 | request over the socket |
 | `pchat ack` (`pchat:251-257`, `chatlib.py:566`) | Q0, E1, A1–A5, A11, E5, A12 | request |
 | `agentcli.notify` (`agentcli.py:17-38`) | as `pchat post` | request |
-| the bridge's `announce` (`chat-bridge:678-690`, called from `Deliveries.process` at `:428` and `:446`) | as `pchat post` | in-process request |
+| the bridge's `announce` (`chat-bridge:678-690`, called from `Deliveries.process` at `:428` and `:446`) | as `pchat post`; after a bridge restart, E9 adopts its unfinished entry | in-process request; a fallback file when the request is not answered as committed |
 | the bridge's flush, import, reconciliation, evidence, alerts and collection | every other transition | in-process request |
 | `pchat status` | none | `status` request, or the snapshot |
 
@@ -366,8 +428,12 @@ The bridge starts its authority in this order:
      and limit, and queue without trying to connect.
 
 Until step 3 commits, the bridge makes no database write. V1 fails safely
-(V4: coverage stops, and the record replays later), and `announce` uses its
-private fallback (section 6.4).
+(V4: coverage stops, and the record replays later), and `announce` publishes
+a fallback file (section 6.4).
+
+After step 3, and before the socket is bound, the bridge makes sure
+`outbox.d/` and `outbox.d/tmp/` exist, syncing the state directory if it
+creates them (section 2.1).
 
 #### 2.4.2 Requests
 
@@ -423,7 +489,7 @@ directory. The tests fake these credentials (section 9).
 | `attempt` | A1 for (*X*, *n*), naming the expected current generation *g* and a fresh random `a1_nonce` | A1's guard; creates generation *g* + 1. If that attempt exists with this writer and `a1_nonce`: `replay`. Otherwise `conflict`. |
 | `outcome` | A2, A3 with E6, A4 or A5, naming the attempt, its `a1_nonce`, the outcome, `final_at` and the detail | The attempt is `writing`, with this writer and `a1_nonce`. If it is already in that outcome, with the same fields: `replay`. Otherwise `conflict`, which changes nothing. |
 | `retire` | A11 | A11's guard; `replay` if this writer's attempt is already `retired`. |
-| `void` | A12 | A12's guard (section 3.3); `replay` if already `void`. |
+| `void` | A12 | A12's guard (section 3.3), which also accepts an attempt that A8 or A8c has already ended; `replay` if already `void`. |
 | `handoff` | E3, with at most one A12 or one attested outcome in the same `TX` (section 6.4) | E3's guard, and the attestation's own guard; `replay` if *X* is already `outbox`. |
 | `done` | E5 | E5's guard; `replay` if `done`. |
 | `query` | none | Returns *X*'s entry, its parts, and this writer's attempts. |
@@ -433,8 +499,8 @@ A1's `written_at` is the authority's clock at that commit. The client sends a
 part's lines only while holding that part's committed `attempt` reply, so
 every byte follows `written_at` (C-1 is unchanged: one machine, one clock).
 
-**No op lets a client cause a bridge transition.** E2, H1, E4, E7, E8,
-A6–A10, V1–V4, I0–I3, X1, X2, G1, alert rows and suspensions are the
+**No op lets a client cause a bridge transition.** E2, H1, E4, E7, E8, E9,
+A6–A10, V1–V4, IF, I1–I3, X1, X2, G1, alert rows and suspensions are the
 bridge's own, through in-process requests.
 
 **Epochs.** `authority_epoch` grows by one at each authority start. Within one
@@ -486,7 +552,9 @@ for a socket, a flock, another thread or another process.
 **Bounded work.** A client request touches only the rows its frame names,
 within `FRAME_MAX`. The bridge splits its own work into bounded requests:
 
-- one claim file per import request;
+- one fallback file per import request, and at most `IMPORT_MAX` per
+  flush;
+- at most `LINES_MAX` legacy lines per import request;
 - one reconciliation component per request;
 - at most 1,000 rows per collection request.
 
@@ -535,19 +603,19 @@ Then:
 
 - **It never sends a byte without a committed `attempt` reply.** Lines go out
   only while it holds the committed reply for that part.
-- **Before any byte of the call,** it appends the fallback row (section 6.4)
-  for *X*, durably, and only then reports the post as queued (exit 3). If an
-  `attempt` request went unanswered, the row carries an A12 attestation for
-  that attempt.
+- **Before any byte of the call,** it publishes the fallback file (section
+  6.4) for *X*, durably, and only then reports the post as queued (exit 3).
+  If an `attempt` request went unanswered, the file carries an A12
+  attestation for that attempt.
 - **After some bytes,** it stops the call and hands off the remainder, by a
-  `handoff` request if the authority answers, otherwise by the fallback
-  handoff row. Then it exits 3, as today.
+  `handoff` request if the authority answers, otherwise by a fallback file
+  that carries the handoff. Then it exits 3, as today.
 - **An observed outcome whose `outcome` request goes unanswered** is
   retried, as the same replay-safe request, until `PART_WAIT` after the
   outcome was observed. Then it travels as an attested outcome in the
   handoff (section 6.4).
-- **Nothing is reported as queued before its row is durable** (section 2.1,
-  I-5).
+- **Nothing is reported as queued before its file is published and
+  durable** (section 2.1, I-5).
 
 **MATERIAL BEHAVIOUR CHANGE, accepted by the owner on 2026-10-10.** Today a
 direct post reaches the chat server whether or not the bridge runs. Under
@@ -561,7 +629,8 @@ The authority is unavailable while the bridge is stopped or restarting,
 refusing its database or socket, or overloaded past `IPC_WAIT`.
 
 Delivery preservation is not reduced. Nothing is lost, R9's obligations
-hold, and the queued rows are durable and imported idempotently by *X*. But
+hold, and the fallback files are durable and imported idempotently by *X*,
+without any lock a client could hold (section 6.3). But
 those posts are delayed, and invisible in the channel, until the bridge
 returns, so this design does **not** claim to be equivalent to today.
 
@@ -582,7 +651,8 @@ No smaller design keeps direct sending with one authority and no new service:
 - entries waiting to post, and entries awaiting a delivery check (R8);
 - held rows;
 - suspended designations;
-- deferred import or export;
+- fallback files and legacy rows not yet imported, and deferred claim
+  retirement or export;
 - the authority epoch.
 
 If the authority is unavailable, `pchat status` reads `outbox-status.json`
@@ -595,9 +665,12 @@ holds:
 - the epoch;
 - the reason for any unavailability, and since when.
 
-`pchat status` shows the snapshot's age, and counts, read-only, the fallback
-rows waiting in `outbox.jsonl` and `outbox.bridge.jsonl`. The snapshot is
-diagnostic, and nothing decides from it.
+`pchat status` shows the snapshot's age. It also counts, read-only:
+
+- the fallback files published in `outbox.d/`;
+- the legacy rows waiting in `outbox.jsonl` and in claim files.
+
+The snapshot is diagnostic, and nothing decides from it.
 
 ## 3. State and transition tables
 
@@ -620,22 +693,23 @@ with the row's.
 
 | # | From | To | Actor | Guard | Durable write (one `TX`) | After commit |
 |---|---|---|---|---|---|---|
-| Q0 | (none) | `open`, `outbox`, no parts | P (`queue` request), or B for `announce` | Entry *X* does not exist. The failure came before any byte was written: no connection, a failed login or setup, or a failed E1. Silent-run refusal is checked first and commits nothing. | `INSERT` entry *X* with the post's or ack's legacy fields and no parts. If *X* already exists, because an E1 whose reply was lost had in fact landed, nothing is inserted, and P runs E3 on *X* instead. If this `TX` is not answered as committed, P makes the durable fallback append (section 6.4); B's `announce` uses its private file. | exit 3, as today: the whole post is queued once |
+| Q0 | (none) | `open`, `outbox`, no parts | P (`queue` request), or B for `announce` | Entry *X* does not exist. The failure came before any byte was written: no connection, a failed login or setup, or a failed E1. Silent-run refusal is checked first and commits nothing. | `INSERT` entry *X* with the post's or ack's legacy fields and no parts. If *X* already exists, because an E1 whose reply was lost had in fact landed, nothing is inserted, and P runs E3 on *X* instead. If this `TX` is not answered as committed, P publishes a fallback file (section 6.4), and so does B's `announce`. | exit 3, as today: the whole post is queued once |
 | E1 | (none) | `open`, `direct` | P (`create`), or B for `announce` | after logging in | `INSERT` entry *X*, and its parts as `unsent`, fixed now from the connection's capabilities. An ack has one pseudo-part. | A1 for part 0 |
-| E2 | (none) | `open`, `outbox` | B, by import | `L_flush` + `L_outbox` | The entry with its occurrence identity, committed with the `imports` row. | I3 |
+| E2 | (none) | `open`, `outbox` | B, by import | `L_flush` | The entry with its occurrence identity, committed with the `imports` row. | the file's removal (section 6.3) |
 | E3 | `open`, `direct` | `open`, `outbox` | P, owner (`handoff`) | — | `owner_kind = 'outbox'` (the handoff), with at most one A12 or attested outcome (section 6.4). | exit 3, as today |
-| H1 | `open`, `direct`; or `abandoned` with `abandon_epoch = import_epoch` | `open`, `outbox` | B, by importing a handoff row | `L_flush` + `L_outbox`. The row's entry id **and** writer identity equal the entry's. | `owner_kind = 'outbox'`, and `state = 'open'` again if it was `abandoned`. | none |
+| H1 | `open`, `direct`; or `abandoned` with `import_epoch ≤ abandon_epoch + 1` | `open`, `outbox` | B, by importing a fallback file that carries a handoff | `L_flush`. The file's entry id **and** writer identity equal the entry's. | `owner_kind = 'outbox'`, and `state = 'open'` again if it was `abandoned`. | none |
 | E4 | `open`, `outbox`, parts not yet fixed | the same, with parts | B | `L_flush`; no parts exist | The fixed parts, `unsent`. A legacy post's "(delayed; written …)" marker is fixed here, once. | A1 |
 | E5 | `open` | `done` | P, owner; or B | every part is `confirmed` | `done` | none |
 | E6 | `open` | `terminal` (refused) | the writer recording A3 | — | The terminal reason, in A3's `TX`; `export_version = 1`. | X1 |
 | E7 | `open` or `abandoned` | `terminal` (undecided) | B | Some part's attempt, `writing` or `ended`, is undecided more than `UNDECIDED_MAX` after its `written_at`. | Terminal; `export_version = 1`; the alert row `outbox:<entry id>` (section 3.6). An `ended` attempt becomes `dead` (A10). A `writing` attempt is **left** `writing`. | X1, X2 |
-| E8 | `open`, `direct` | `abandoned` | B | The owner is **gone**, and none of its attempts is `writing` (A8 first). | `abandoned`, `abandon_epoch = import_epoch`. Its unsent remainder is not adopted (D1). Its unknown parts still go to E7. | none |
+| E8 | `open`, `direct`, origin not `announce` | `abandoned` | B | The owner is **gone**, and none of its attempts is `writing` (A8 first). | `abandoned`, `abandon_epoch = import_epoch`. Its unsent remainder is not adopted (D1). Its unknown parts still go to E7. | none |
+| E9 | `open`, `direct`, origin `announce` | `open`, `outbox` | B | The owner, an earlier bridge process, is **gone**, and none of its attempts is `writing` (A8 first). | `owner_kind = 'outbox'`: the bridge adopts its own earlier announcement, so its unsent parts are flushed (section 6.4). | the flush |
 
 **One identity per call.** Each `pchat post`, `pchat ack` or `notify` call
 generates one random entry id *X* before its first request. An `announce`
 derives *X* from its pending item's key and its reason (section 6.4), so a
-re-raised announce is the same call. E1, Q0, E3 and the fallback row all name
-*X*, and `entries.id` is the primary key.
+re-raised announce is the same call. E1, Q0, E3 and every fallback file of
+the call name *X*, and `entries.id` is the primary key.
 So whichever creation lands first wins, and every later attempt to create *X*
 is a no-op or a handoff, never a second obligation. Two separate calls, even
 with identical text, have distinct ids, so they stay distinct occurrences
@@ -643,9 +717,14 @@ with identical text, have distinct ids, so they stay distinct occurrences
 
 `done` and `terminal` are final. An `abandoned` entry leaves only by:
 
-- H1, before the next import pass completes (I-7 explains why that is the
-  only window in which a handoff row can exist); or
+- H1, until the second import pass after its abandonment completes (I-7
+  explains why that is the only window in which a handoff file can exist);
+  or
 - E7.
+
+An `announce` entry is never abandoned. When the bridge process that owns it
+is gone, E9 hands it to the outbox instead, so its unsent parts are still
+delivered. That keeps D1 for ordinary direct callers only (section 6.4).
 
 ### 3.2 Part
 
@@ -659,9 +738,10 @@ with identical text, have distinct ids, so they stay distinct occurrences
 | P6 | `uncertain` | `confirmed`, msgid set | A6 |
 | P7 | `uncertain` | `unsent` | A7, proved absence |
 | P8 | `confirmed` | `confirmed`, msgid set | A9 |
+| P9 | `uncertain` | `unsent` | A12 on an attempt that A8 or A8c had already ended: its writer's attestation that no byte was sent (section 3.3) |
 
 `confirmed` and `refused` are final. A post's part returns to `unsent` only by
-P4 or P7.
+P4, P7 or P9.
 
 ### 3.3 Attempt
 
@@ -679,20 +759,64 @@ P4 or P7.
 | A9 | `confirmed` | `confirmed` + attribution | B | R1, in its `TX` | An attribution. | none |
 | A10 | `ended` | `dead` | B | E7 | — | none |
 | A11 | `ended` (an ack) | `retired` | the entry's owner (P for `direct`; B for `outbox`) | The attempt is an ack's, and it is `ended` | `retired`, and the pseudo-part goes back to `unsent`, in one `TX`. A1's guard counts only `writing` and `ended`, so the retry is now allowed. | Then A1 for the retry, as today (section 8). |
-| A12 | `writing` | `void` | the attempt's own writer's attestation: P's `void` or `handoff` request or fallback row (section 6.4), or B's in-process request for its own attempt whose A1 result was unknown | The attempt is `writing`; its writer identity, generation and `a1_nonce` equal the attestation's; and the attestation says the writer never received a known committed result for this attempt's A1, and so sent nothing. | `void`, `ended_at`; the part goes back to `unsent`. | none: no byte of it was ever sent |
+| A12 | `writing`; or `ended` by A8 or A8c (`end_kind` `writer_gone` or `connection_closed`) | `void` | the attempt's own writer's attestation: P's `void` or `handoff` request or fallback file (section 6.4), or B's in-process request or fallback file for its own attempt whose A1 result it did not accept | **All of:** the attempt is `writing`, or `ended` by A8 or A8c, never by A5 and never in a later state; its entry id, part, generation, writer identity and `a1_nonce` equal the attestation's; it is the part's current generation, and the part is `inflight` or `uncertain`; no attribution names it; the entry is `open`, or H1 reopens it in the same `TX`; and the attestation says the writer sent no byte of this attempt. | `void`; `ended_at` if unset; the part goes back to `unsent` (P4 from `inflight`, P9 from `uncertain`). | none: no byte of it was ever sent |
 
 `delivered`, `absent`, `refused`, `rejected`, `dead`, `retired` and `void` are
 final. A `dead` attempt remains evidence (section 7).
 
-**Why A12 is safe.** A client sends a part's lines only while it holds the
-committed `attempt` reply for that part (section 2.4.4). A writer that never
-received that reply has therefore sent nothing for that attempt. Only that
-writer can say so: the attestation must match the attempt's writer identity,
-generation and the random `a1_nonce` that only the writer and the database
-hold. A12 is never inferred from a missing reply, a timeout or a gone writer.
-Without an attestation, such an attempt stays `writing` until A8 or A8c, as
-before. A `void` attempt published nothing, so it is not a reconciliation
-member (section 7.2).
+**Why A12 is safe.** A writer sends a part's lines only while it holds a
+committed `attempt` reply for that part that it accepted (section 2.4.4). It
+accepts no missing, `error` or lower-epoch reply (section 2.4.2). A writer
+that accepted no such reply has therefore sent nothing for that attempt.
+
+Only that writer can say so. The attestation must match the attempt's writer
+identity, generation, and the random `a1_nonce` that only the writer and the
+database hold. A12 is never inferred from a missing reply, a timeout or a gone
+writer. Without an attestation, such an attempt stays `writing` until A8 or
+A8c, and then `ended`, as before. A `void` attempt published nothing, so it
+is not a reconciliation member (section 7.2).
+
+**When recovery runs first** (the canonical issue review of #19's third
+amendment). Take an A1 that commits, but whose reply is lost. The writer
+closes its chat connection, and A8c, or A8 after it exits, ends the attempt
+without finality. Only then is its handoff, carrying the attestation,
+imported. A12 still applies, from `ended`, so the call keeps one deliverable
+obligation instead of an UNKNOWN part. This is sound for three reasons:
+
+- **What the attestation states.** It concerns the writer's own sends, and
+  A8 and A8c change none of them. They record only that the bridge could no
+  longer prove whether anything was sent.
+- **Fencing is unchanged.** A closed connection or a gone process cannot
+  send. Voiding says only that nothing was sent before, which the writer
+  alone knows.
+- **Finality is unchanged.** A12 is not an absence verdict. R2 never
+  decides an attempt without finality, and nothing here infers absence from
+  the record.
+
+The guard admits only A8's and A8c's ends. A5 is the writer's own record that
+it wrote and then closed, so an attempt ended by A5 is never voided. An
+attempt already `delivered`, `absent` or `dead`, or one with an attribution,
+has been decided and is never voided. An entry already `terminal` stays
+terminal, so an attestation arriving after E7's 24 hours changes nothing.
+
+**Epochs.** No epoch condition is needed, and none is applied. The statement
+is about the writer's own sends, which no authority restart changes. The
+writer identity already separates bridge processes, so a restarted bridge
+can never attest for its predecessor's attempts. The epoch's role is earlier:
+a writer that saw a reply with a lower epoch did not accept it (section
+2.4.2), sent nothing on it, and may attest so.
+
+**Every unaccepted A1 gets an attestation.** Whenever a writer holds an A1
+whose result it did not accept, it sends nothing for that attempt, and makes
+its attestation durable:
+
+- **in order of preference:** by a `void` request, by the `handoff` that ends
+  its call, or else by a fallback file (section 6.4);
+- **the bridge too,** for its own `announce` and flush attempts, by
+  in-process request or else by a fallback file;
+- **a crash first:** if the writer crashes before any of these is durable,
+  the attempt stays as A8 leaves it, UNKNOWN. That is conservative, and it
+  makes no unsupported absence claim.
 
 **Attested outcomes.** A writer whose `outcome` request was never answered
 may carry that outcome (A2, A3, A4 or A5, with its `final_at` and detail) in
@@ -700,7 +824,9 @@ its handoff (section 6.4). The authority applies it under exactly the
 `outcome` request's guard: the attempt is still `writing`, with the same
 writer, generation and `a1_nonce`. It is the same statement the writer would
 have made by request, only made durable another way. If the attempt has
-already moved, for example by A8, the attestation changes nothing.
+already moved, for example by A8, an attested outcome changes nothing. It
+is not applied from `ended` as A12 is: an observed outcome without the
+writer's commit stays as A8 left it, decided by R1 or E7.
 
 ### 3.4 Evidence and coverage
 
@@ -715,10 +841,10 @@ already moved, for example by A8, the attestation changes nothing.
 
 | # | Change | Actor | Guard | Durable write or effect |
 |---|---|---|---|---|
-| I0 | Import the bridge's private fallback | B | `L_flush`, and the bridge's in-process fallback mutex | A durable sync of `outbox.bridge.jsonl` (file and directory), then its rows applied by *X* in one `TX` (section 6.4), then the file unlinked and the directory synced. A crash in between re-imports by *X*: a no-op. |
-| I1 | Claim | B | `L_flush` + `L_outbox` | Rename `outbox.jsonl` to a new unique `outbox.claimed-<ns>-<random>.jsonl`. The new name is not in `imports` and does not exist on disk. Then a durable sync of **every** claim file present: the new one, and any left by an earlier pass, a crash, or the old tools before cutover (F3; design round 3). |
-| I2 | Import | B | `L_flush` + `L_outbox`; `TX`; only after I1's durable sync of that claim file | The occurrences, held rows, handoffs (H1), any alert row (section 6.2) and the `imports` row, in **one** `TX` (section 6). After the last file of a pass, `import_epoch` + 1, in that pass's last `TX`. |
-| I3 | Unlink | B | after I2 commits | Unlink the claim file, then `fsync` the directory. |
+| IF | Import a fallback file | B | `L_flush`; `TX`. **No `L_outbox`.** | At most `IMPORT_MAX` published files per flush, oldest name first. For each: a durable sync of the file and `outbox.d/`; then, in **one** `TX`, the file applied by its *X* (section 6.4) with its closed `imports` row; then the file unlinked and `outbox.d/` synced. A crash in between re-imports by *X* or finds the `imports` row: a no-op (section 6.3). |
+| I1 | Claim the legacy outbox | B | `L_flush`. **No `L_outbox`.** | Rename a non-empty `outbox.jsonl` to a new unique `outbox.claimed-<ns>-<random>.jsonl`. The new name is not in `imports` and does not exist on disk. Then a durable sync of **every** claim file present: the new one, and any left by an earlier pass, a crash, or the old tools before cutover (F3; design round 3). |
+| I2 | Import legacy rows | B | `L_flush`; `TX`; only after I1's durable sync of that claim file. **No `L_outbox`.** | The complete lines after the claim's imported offset, at most `LINES_MAX`: their occurrences, held rows and any alert row (section 6.2), with the claim's `imports` row advanced, in **one** `TX`. The prefix already imported must be unchanged, or the claim is held (section 6.3). |
+| I3 | Retire a claim file | B | `L_outbox` acquired within `LOCK_WAIT` at some moment **after** B first recorded the claim, then a final I2 that reads through the end of the file | That final I2 also closes the `imports` row. Then the claim file is unlinked and the directory synced. |
 | X1 | Export a dead letter | B | `L_outbox`, acquired within `LOCK_WAIT` | Section 3.6. |
 | X2 | Export an alert row | B only | `L_flush` | Section 3.6. |
 | G1 | Collect evidence | B | `L_flush`; `TX` | The deletions I-7 allows. |
@@ -774,11 +900,11 @@ can raise it only once:
 | Kind | Raised by, in the same `TX` | `alert_key` | Example text (content-free) |
 |---|---|---|---|
 | `undecided` | E7 | `outbox:<entry id>` | "an outbox post from alp-solver-2 to #alpha could not be confirmed for 24 h; dead-lettered" |
-| `held` | I2, or the hold of a changed claim file (section 6.3) | `held:<claim file name>`, or `held:<claim file name>:<sha256>` for a changed file | "queued outbox rows could not be imported and are held; see pchat status" |
+| `held` | I2 or IF, or the hold of a changed claim file or fallback file (section 6.3) | `held:<file name>`, or `held:<file name>:<sha256>` for a changed file | "queued outbox rows could not be imported and are held; see pchat status" |
 | `suspended` | the V1 that suspends a designation (section 7.4) | `suspended:<account>:<suspension_seq>` | "sender designation of alp-solver-2 suspended: an unexplained message in #alpha" |
 
-A claim file name is never reused, an entry reaches E7 once, and
-`suspension_seq` increases by exactly one in the `TX` that suspends. So each
+A claim file or fallback file name is never reused, an entry reaches E7 once,
+and `suspension_seq` increases by exactly one in the `TX` that suspends. So each
 event has exactly one key, and a crash before that `TX` commits leaves no row
 and no event, both of which happen again together.
 
@@ -846,7 +972,9 @@ is closed or its writer is gone.
   request connection, a `busy` reply or a missing reply never moves an
   attempt. The authority closing an incomplete request ends a request that
   committed nothing, and touches no attempt. A12 moves an attempt only on
-  its own writer's attestation that no byte was sent (section 3.3).
+  its own writer's attestation that no byte was sent, including one that A8
+  or A8c has already ended (section 3.3). That is a statement about bytes
+  already sent, never permission to send more, so the fence is unchanged.
 
 ### I-3. Confirmed parts are never resent
 
@@ -881,7 +1009,8 @@ discards a committed obligation.
   exists, P hands it off (E3), so the existing E1 entry is kept and no second
   obligation is created; if the `attempt` request went unanswered, the
   handoff carries an A12 attestation, so an A1 that did land becomes `void`
-  instead of uncertain. Otherwise P queues by Q0.
+  instead of uncertain, even if A8 or A8c ended it first (section 3.3).
+  Otherwise P queues by Q0.
 - **A2–A5 fail, or their reply is missing:** the writer closes the chat
   connection if it is still open, keeps the observed outcome in memory, and
   retries the same replay-safe request:
@@ -894,14 +1023,15 @@ discards a committed obligation.
   it absent, and only R1 or E7 resolve it.
   - A refusal whose A3 never committed is therefore UNKNOWN. It is never
     retried, and is dead-lettered after 24 hours (N6, an owner decision).
-- **E3 fails:** the handoff fallback (section 6.4), applied by H1.
-- **Q0 fails, or the authority is unavailable** (section 2.4.4): the durable
-  fallback append (section 6.4). P reports the post
-  as queued (exit 3) only after a durable sync of `outbox.jsonl`, file **and**
-  directory, so a power loss cannot remove a row P has acknowledged, even when
-  another process created the file and never synced the directory (design
-  round 3). If the append cannot be made durable, P fails as today when the
-  outbox cannot be written; it never reports a queued post that is not
+- **E3 fails:** a fallback file carrying the handoff (section 6.4), applied
+  by H1.
+- **Q0 fails, or the authority is unavailable** (section 2.4.4): a fallback
+  file (section 6.4). P reports the post as queued (exit 3) only after the
+  file is published: its content synced before its name appeared, then
+  `outbox.d/` and the state directory synced (section 2.1). So a power loss
+  cannot remove a file P has acknowledged, whoever created `outbox.d/` (design
+  round 3). If the file cannot be published durably, P fails as today when
+  the outbox cannot be written. It never reports a queued post that is not
   durable.
 - **Never:** a post's original whole text is never requeued after a byte was
   written. That is round-5 finding 2.
@@ -954,11 +1084,16 @@ The component includes everything R1 and R2 may count for U:
      including when recovery found the record already present (sections 2.1
      and 3.6). So a mark implies that the diagnostics survive a power loss,
      and collection never removes the only durable copy;
-   - if abandoned, `import_epoch > abandon_epoch`. An import pass has then
-     completed that started after the writer was proven gone. Every handoff
-     row that writer could have written was durable before it died, so that
-     pass claimed it and applied H1. After that pass, H1 can never apply to
-     the entry, and its progress is no longer reopenable (F4);
+   - if abandoned, `import_epoch ≥ abandon_epoch + 2`. Passes run one at a
+     time (section 6.3), and E8 committed while `import_epoch` was
+     `abandon_epoch`. So the pass that completed second after E8 started
+     after E8, which was after the writer was proven gone. Every fallback
+     file that writer could have published was durable before it died, so
+     that pass's listing included it, and the pass imported it and applied
+     H1. After that pass, H1 can never apply to the entry, and its progress
+     is no longer reopenable (F4). A pass may span flushes, because each
+     flush imports at most `IMPORT_MAX` files, so the pass in progress at E8
+     does not count;
    - none of its attempts is `writing`, `ended`, or `dead` with an open
      window;
    - none of its attempts belongs to any dependency component;
@@ -1004,28 +1139,41 @@ write runs on the bridge's authority thread, and no client ever holds a
 database lock (section 2.4). A client paused at any point, inside or between
 its requests, delays a bridge request by at most one client transaction.
 
-**Locks are bounded too** (design round 3). The flush waits for `L_outbox` at
-most `LOCK_WAIT` per step, and nothing that delivers a database entry needs
-`L_outbox` (section 2.3). No bridge flow waits for `L_outbox` without a
-deadline: `announce`'s fallback uses the bridge's private file (section 6.4).
+**No queued obligation waits for a lock** (the canonical issue review of
+#19's third amendment; I-12). Every import, whether of fallback files,
+the legacy claim or legacy rows, runs without `L_outbox`. A stopped process
+can delay only its own unfinished publication (section 6.3).
 
-- **A process paused while holding `L_outbox`**, for example a client paused
-  inside its fallback append, costs the flush at most `LOCK_WAIT`. The flush
-  skips import and export for that pass, and still attempts every eligible
-  database entry, reconciles, applies E7, and exports alerts.
+**Locks are bounded too** (design round 3). The flush waits for `L_outbox` at
+most `LOCK_WAIT` per step. It needs `L_outbox` only to retire a claim file
+and to write dead letters, and nothing that imports or delivers an entry
+needs it (section 2.3). No bridge flow waits for `L_outbox` without a
+deadline: `announce` falls back to a fallback file (section 6.4).
+
+- **A process paused while holding `L_outbox`**, for example an old tool
+  stopped inside its append to `outbox.jsonl`, costs the flush at most
+  `LOCK_WAIT`. The flush still imports every published fallback file and
+  every complete legacy row, gives every eligible entry its attempt,
+  reconciles, applies E7, and exports alerts.
 - **The paused holder keeps everything it owns.** Its lock, its connection
   and its attempts are untouched. When it resumes it finishes its step; if it
   dies, the kernel releases its flock.
-- **What waits.** Rows still in `outbox.jsonl`, and dead-letter files, wait
-  for the lock, because claiming a file that a writer may be appending to
-  could lose that writer's row. They are durable, shown in `pchat status` as
-  deferred, and imported or written at the first flush after the holder
-  releases the lock. Nothing is lost, resent or decided while they wait.
+- **What waits.** Only these:
+  - the holder's own row, which has no newline yet;
+  - the deletion of claim files, already imported;
+  - the writing of dead letters: X1's, and `Deliveries`' own.
+
+  None of them is a queued obligation that another entry's attempt depends
+  on. What they record is durable meanwhile, in the database, the claim
+  files or `pending.json`. It is shown in `pchat status` as deferred, and
+  retired or written at the first flush after the holder releases the lock.
+  Nothing is lost, resent or decided while they wait.
 
 `L_flush` is held only by the single bridge, so no other process can delay a
 flush through it. The database's lock is held only by the authority (section
 2.4.1), so no other process can delay a flush through that either. Revision
-5's C-8 exemption is removed: R6 holds without it.
+5's C-8 exemption stays removed: R6 holds without it, over the database and
+over every already durable fallback file and legacy row.
 
 ### I-11. A paused client cannot stall the authority
 
@@ -1058,11 +1206,57 @@ entry its attempt.
   attempt is fenced by I-2: it is ended only by A8 or A8c, or by its own
   A12. Nobody kills it, steals from it, gives it a lease or checks before
   sending.
+- **A client stopped while publishing a fallback file** holds no lock
+  either. Its unfinished file sits under `outbox.d/tmp/`, which the bridge
+  never reads, so it delays only its own call (I-12).
 
 **What remains** is the speed of local storage (C-10), which every writer of
 any design depends on. It is not caused by any client, entry or lock holder.
 
 Section 5.6, case 11, gives a schedule.
+
+### I-12. A queued obligation never waits for another writer
+
+An obligation that is already durable, whether a published fallback file or
+a complete legacy row, is imported and attempted whatever any other process
+is doing. A stopped writer, client or old tool, delays only its own
+unfinished publication.
+
+**Why it holds.**
+
+- **Publication is atomic and needs no lock** (section 2.1). A fallback file
+  is written whole under `outbox.d/tmp/`, synced, then linked to its final
+  name. Before the link, the bridge does not see it. After the link, its
+  content is complete and durable. A writer stopped before its link delays
+  only its own call. A writer stopped after it has already published.
+- **Import takes no lock a writer could hold** (section 6.3). IF, I1 and I2
+  hold only `L_flush`, which only the bridge takes, and they wait for no
+  client, file lock or socket.
+- **A legacy appender can delay only its own row.** The old tools append a
+  whole line while holding `L_outbox` (`chatlib.py:391` on master). The
+  bridge claims and reads without that lock, and imports only lines that
+  end in a newline. A row whose newline is not yet written is that
+  appender's own unfinished publication. A line appended to the claim file
+  after the rename, by an appender that opened `outbox.jsonl` earlier, is
+  read at a later flush. The lock is needed only to know that no such
+  appender remains, before the claim file is deleted (I3).
+- **The work is bounded and fair.** Each flush imports at most `IMPORT_MAX`
+  fallback files, oldest name first, and at most `LINES_MAX` lines per
+  claim file per request. A file's name begins with its publication time,
+  so a file waits only behind files published before it, or at most `A`
+  after it (C-1), never behind an unbounded stream of later ones.
+- **Import is idempotent and frozen** (section 6.5):
+  - a fallback file is never written after publication;
+  - a claim file's imported prefix is checked unchanged before each read;
+  - every creation is keyed by *X* or by occurrence;
+  - a file is deleted only after its `TX` commits.
+
+  So an interrupted or repeated import never loses or duplicates owed work.
+
+**What remains** is local storage (C-10, C-11), as for every writer of any
+design.
+
+Section 5.6, case 9, gives a schedule.
 
 ### How each round-5 finding is closed
 
@@ -1208,6 +1402,27 @@ Anything these do not establish stays undecided.
     any design, and nothing else can.
   - **A paused client is never counted under C-10.** I-11 shows it cannot
     delay the authority at all.
+- **C-11, the fallback directory's storage.** The chat state directory,
+  `outbox.d/` and `outbox.d/tmp/` lie on one local POSIX filesystem, used by
+  one user, that provides:
+  - **exclusive creation** (`O_CREAT | O_EXCL`);
+  - **`link()`, atomic and never replacing.** It fails if the target name
+    exists;
+  - **`rename()`, atomic within the directory;**
+  - **durable `fsync`** of files and directories: `F_FULLFSYNC` on macOS,
+    `os.fsync` elsewhere (section 2.1);
+  - **directory listing**, which shows every name whose link has returned.
+
+  APFS and the usual Linux filesystems provide these.
+  - **Without hard links,** publication fails. The writer then fails as today
+    when the outbox cannot be written, and never reports a queued post.
+  - **No fallback to `rename()`.** It could replace a published file, so
+    nothing falls back to it.
+  - **What the implementation checks.** It checks these on its own platforms
+    in its tests (section 9, test 33).
+  - **No assumption about other writers.** None is made about processes
+    outside this design that write into `outbox.d/`. An unreadable file there
+    is held, never guessed (section 6.3).
 
 ### 5.4 Gone writers and closed connections
 
@@ -1241,14 +1456,17 @@ before it (or before its commit) and just after it. "→" names the recovery.
 |---|---|---|
 | login, or connection setup (bounded by `LOGIN_WAIT`) | nothing durable, nothing sent | → Q0 on *X* if P is still running |
 | Q0 `TX` | nothing durable, as today | `open`, `outbox` *X* → flushed |
-| Q0 `TX` landed, but its reply was lost or `error` | — | *X* exists. P's fallback row names *X*, so its import is a no-op, never a second entry. |
-| Q0 fallback append, then the durable sync (file, then directory) | nothing durable and nothing acknowledged, as today. A power loss before the directory `fsync` is the same: P has not exited 3 yet. | durable → P exits 3 → imported as *X* (section 6.4) |
-| Q0 fallback append to an `outbox.jsonl` another process created and never directory-synced | — | P's durable sync covers the directory entry too, so the row survives a power loss after exit 3 (design round 3). |
-| E1 | nothing durable, nothing sent → Q0 on *X* | `open`, `direct` *X*, all `unsent` → if P is still running, E3 hands *X* off. If the writer is gone, E8, nothing unknown → retired as today. |
+| Q0 `TX` landed, but its reply was lost or `error` | — | *X* exists. P's fallback file names *X*, so its import is a no-op, never a second entry. |
+| Q0 fallback file: exclusive create under `tmp/`, write, `fsync` | nothing published, nothing acknowledged. A leftover `tmp/` file is never imported, and is removed only once its writer is gone (section 6.4). | the same: still unpublished |
+| the file's `link()` to its final name | as above | **published:** visible, complete and durable in content. The bridge may import it even though P has not exited 3. A power loss before the directory `fsync` may drop the name, but P has not exited 3 yet. |
+| the `fsync` of `outbox.d/`, then of the state directory | as above | durable → P exits 3 → imported as *X* (section 6.4) |
+| a fallback file in an `outbox.d/` that another process created and never synced into the state directory | — | P's publication syncs the state directory too, so the file survives a power loss after exit 3 (design round 3). |
+| E1 | nothing durable, nothing sent → Q0 on *X* | `open`, `direct` *X*, all `unsent` → if P is still running, E3 hands *X* off. If the writer is gone, E8, nothing unknown → retired as today. For B's `announce`, E9 instead: adopted and delivered (section 6.4). |
 | E1 landed, but its reply was lost or `error` | — | P's retry of `create` gets `replay`, or its `queue` finds *X* → E3 on *X*: one obligation |
 | A1 | the previous state → Q0 if nothing was written, else E3 | `writing` → A8 → `uncertain`, no finality → R1 or E7 |
 | A1 landed, its reply lost; P alive | — | P sends nothing for it. Its `attempt` retry gets `replay` and it proceeds, or it hands off with an A12 attestation → `void`, part `unsent` → delivered by B. |
 | A1 landed, its reply lost; P dies before any handoff | — | `writing` → A8 → uncertain, no finality → R1 or E7. Conservative: nothing proves the absence of bytes. |
+| A1 landed, its reply lost; P closes its connection; A8c (or A8 after P exits) ends the attempt before P's handoff is imported | — | the handoff's attestation applies A12 from `ended` → `void`, part `unsent` → delivered by B, once (section 3.3; the canonical issue review of #19's third amendment). |
 | sending lines and PING | `writing` → A8 | same |
 | `PART_WAIT` and the drain | `writing` → A8 | same |
 | close | `writing` → A8 | `writing` → A8, or A8c while the host lives |
@@ -1258,8 +1476,8 @@ before it (or before its commit) and just after it. "→" names the recovery.
 | A4 | `writing` → A8 → UNKNOWN → E7 | `unsent` → retried by the owner, or E8 |
 | A5 | `writing` → A8, no finality | `ended`, with `final_at` as observed |
 | A11 (ack) | `ended` ack → A11 next time | `retired`, `unsent` → A1 retry |
-| E3 | `direct` → gone → E8, or H1 if the fallback row is durable | `outbox` |
-| the fallback handoff append and its durable sync | E8 → remainder not adopted (D1). A power loss before the directory `fsync` is the same. | durable → H1 at the next pass |
+| E3 | `direct` → gone → E8, or H1 if the handoff's fallback file is published | `outbox` |
+| the handoff's fallback file, from exclusive create to the directory `fsync` | unpublished → E8 → remainder not adopted (D1). A power loss before the directory `fsync` is the same. | published and durable → H1, within the two passes after E8 (I-7) |
 | E5 | all parts confirmed → B sets `done` | `done` |
 
 #### Requests and the authority
@@ -1272,7 +1490,7 @@ before it (or before its commit) and just after it. "→" names the recovery.
 | the authority (the bridge) crashes mid-`TX` | SQLite rolls it back; clients see EOF, and the next epoch answers their replays | — |
 | the authority's start transaction | no epoch change; no socket; clients queue | the epoch has grown; the socket is bound next |
 | a client after a restart | — | its next reply has a higher epoch → `query`, then continue from the state shown |
-| a fallback or handoff row with an attestation, then the client dies | the row is not durable: no attestation → the attempt stays `writing` → A8 | durable → imported **before** A8 runs in that flush (section 6.3), so the attestation applies first |
+| a fallback file with an attestation, then the client dies | not published: no attestation → the attempt stays `writing` → A8 | published → imported at the start of the next flush, normally **before** A8 (section 6.3). If A8 or A8c ran first, A12 still applies from `ended` (section 3.3). |
 
 #### Bridge side
 
@@ -1284,20 +1502,27 @@ before it (or before its commit) and just after it. "→" names the recovery.
 | E7 | → E7 again | `terminal` → X1, X2 |
 | a late outcome on a terminal entry | — | `export_version` + 1 → X1 writes version *v* + 1 |
 | E8 | as before | `abandoned`, `abandon_epoch` |
-| I1 rename | `outbox.jsonl` intact | claim file C |
+| E9 (an `announce` of a gone bridge process) | `open`, `direct` → E9 again at the next flush | `outbox` → flushed: its unsent parts are delivered, its uncertain ones follow R1, R2 or E7 |
+| IF: the durable sync of a fallback file F | F unchanged → imported later | the same |
+| IF: its `TX` | rolled back → F imported again later, by *X* | applied, with F's closed `imports` row |
+| IF: unlink F, then `fsync` `outbox.d/` | F present; its `imports` row matches → unlink only | **power loss:** F may reappear → its `imports` row matches → unlink only |
+| two fallback files for the same *X* | — | the second applies nothing new: *X* exists (section 6.4) |
+| I1 rename (no `L_outbox`) | `outbox.jsonl` intact | claim file C. An old appender that opened `outbox.jsonl` before the rename may still append to C; I2 reads that line later. |
 | I1 directory `fsync` | **power loss:** `outbox.jsonl` may reappear and C vanish. No I2 has committed, so it is simply claimed again under a new name. | C durable → I2 |
 | a claim file left by an earlier pass, a crash, or the old tools, possibly never synced | — | I1 makes a durable sync of it before its I2, so an import never commits from a claim whose directory entry could vanish. |
-| I2 | no rows, no `imports` row → C imported again with the same occurrence ids | rows and the `imports` row for C → I3 |
-| I3 unlink, then directory `fsync` | C present, `imports` matches → unlink | **power loss:** C may reappear → `imports` matches → unlink only |
+| I2 | no rows; C's `imports` row unadvanced → the same lines read again, with the same occurrence ids | rows, and C's `imports` row advanced past them |
+| I2 reading a line with no newline yet | — | not imported: it is that appender's own unfinished row |
+| I3: the barrier acquisition of `L_outbox` | C stays `open` → retired at a later flush | the final I2 reads through the end of C; an unterminated last line is held |
+| I3 unlink, then directory `fsync` | C present, `imports` closed → unlink only | **power loss:** C may reappear → `imports` closed → unlink only |
 | H1 (in I2) | rolled back with I2 | applied |
 | `import_epoch` + 1 | the pass is not counted → another pass runs before collection | counted |
 | V1 | not indexed; the checkpoint has not moved → replayed, `INSERT OR IGNORE` | indexed |
 | the checkpoint file write | the stored `mark` disagrees with the checkpoint → V2 starts a new span (safe) | consistent |
 | V2, V3 | the old span | the new span |
 | a bridge restart | the live set is empty → coverage advances only after a catch-up | — |
-| I0: the private fallback append, then its durable sync | the obligation is still in `pending.json` with `held_announced` unset → raised again with the same *X* | durable → imported by *X* at the next pass |
-| I0: the import `TX`, then the unlink | the rows are re-read → applied by *X*: no-op | unlinked |
-| `Deliveries` saves `held_announced` | the flag is unset → the announce is raised again with the same *X*: a no-op | saved, after the announce's entry or row was durable |
+| `announce`'s fallback file, from exclusive create to the directory `fsync` | unpublished; `held_announced` unset → raised again with the same *X* | published → imported by *X* at the next flush |
+| `announce`'s E1 committed, A1 not | — | `open`, `direct`, origin `announce`. If the bridge lives, it hands *X* off (E3) or publishes a fallback file. After a restart, E9 adopts *X*. Either way its parts are delivered once (section 6.4). |
+| `Deliveries` saves `held_announced` | the flag is unset → the announce is raised again with the same *X*: it finds the existing obligation and adds none | saved, after the announce's obligation was durable (section 6.4) |
 | X1 append | → X1 again | **power loss before the `fsync`:** the line may vanish; the mark is unset → X1 again. A crash with the line present: X1 finds it, makes a durable sync (file, then directory), then marks. |
 | X1 creates `dead-letters.jsonl`, appends and `fsync`s the file, then crashes before the directory `fsync` | — | The mark is unset. The next X1 finds the line, `fsync`s the file **and the directory**, and only then marks. A power loss after the mark keeps the record (design round 3). |
 | X1 mark | the record is durable, the mark unset → X1 finds it, syncs the file and directory, marks | done |
@@ -1328,35 +1553,60 @@ before it (or before its commit) and just after it. "→" names the recovery.
      refreshed record, and only then may G1 collect anything.
 4. **A hung bridge.** A second bridge skips the flush while the first holds
    `L_flush`. When the first exits, A8 applies.
-5. **Handoff versus abandonment.** P confirms part 0, then E3 fails. P makes
-   the handoff row durable and exits. B commits E8 before its next pass,
-   with `abandon_epoch = e`.
-   - That next pass claims the row, and H1 reopens the entry, because the
-     epoch is still `e` and the ids match.
-   - G1 could not have collected part 0 in between: `import_epoch` was not
-     yet greater than `e`.
-   - An unrelated killed post wrote no row, so after the pass it stays
-     abandoned and becomes collectible.
+5. **Handoff versus abandonment.** P confirms part 0, then E3 fails. P
+   publishes a fallback file carrying the handoff, and exits. B commits E8,
+   with `abandon_epoch = e`, while a pass is in progress whose listing
+   missed the file.
+   - That pass completes (`import_epoch` = *e* + 1). The next pass lists the
+     file, and H1 reopens the entry, because `import_epoch ≤ e + 1` and the
+     ids match.
+   - G1 could not have collected part 0 in between: `import_epoch` had not
+     reached *e* + 2.
+   - An unrelated killed post published no file, so after those passes it
+     stays abandoned and becomes collectible.
 6. **`pchat status` during a flush.** Its `status` request runs in one read
    `TX` on the authority, between other transactions.
 7. **Two bridge exports.** X1 runs only on B. An X1 retried after a crash
    finds the line present, makes it durable, and sets the mark.
 8. **`Deliveries` writes a delivery dead letter during X1.** `L_outbox`
    serializes them, so no two appends interleave.
-9. **A paused `L_outbox` holder (design round 3).** `alp-solver-2`'s direct
-   post P is refused: A3 and E6 commit. P acquires `L_outbox` for X1 and
-   pauses. Meanwhile `sam` has an open outbox entry for `#beta` in the
-   database.
-   - B's flush takes `L_flush`, then tries `L_outbox` for import until
-     `LOCK_WAIT` passes. It skips import and export for this pass.
-   - B still gives `sam`'s entry its attempt in the same flush, reconciles,
-     applies any E7, and exports alert rows with X2.
-   - P's lock and connection are untouched. When P resumes, it finishes X1;
-     if it never resumes and dies, its flock is released. The next flush
-     after either imports and exports as usual.
-10. **A client appending while the bridge waits.** P holds `L_outbox`
-    for a fallback append. B's claim waits at most `LOCK_WAIT`, then defers;
-    P's row is claimed by the next flush, never lost and never split.
+9. **A stopped `L_outbox` holder, with durable obligations behind it (design
+   round 3; the canonical issue review of #19's third amendment).** An old
+   tool's `pchat`, outside this release, is stopped while it holds
+   `L_outbox`, half-way through appending a row for `pat` to `outbox.jsonl`.
+   Already durable are:
+   - `sam`'s fallback file for `#beta` in `outbox.d/`, published while
+     `sam`'s bridge was restarting;
+   - a complete legacy row for `alp-solver-2` in `outbox.jsonl`, appended
+     before the stop.
+
+   B's flush takes `L_flush`, and does this without `L_outbox`:
+   - IF imports `sam`'s file;
+   - I1 renames `outbox.jsonl` to a claim C;
+   - I2 imports `alp-solver-2`'s row, and stops before `pat`'s half row,
+     which has no newline.
+
+   Both new entries get their attempts in the same flush, with every other
+   eligible entry. Then:
+   - B tries `L_outbox` for I3 and X1 until `LOCK_WAIT` passes, and defers
+     only those;
+   - it reconciles, applies any E7, and exports alert rows with X2.
+
+   The stopped tool's lock, connection and file are untouched.
+   - **When it resumes,** it finishes `pat`'s row, in C, because it opened
+     `outbox.jsonl` before the rename. The next flush's I2 imports that row.
+     A later flush acquires `L_outbox` and retires C.
+   - **If it never resumes and dies,** its flock is released. The next flush
+     retires C, and holds the unterminated half row.
+10. **A client stopped while publishing.** `pat`'s `pchat post` finds the
+    authority unavailable. It writes its fallback file under `outbox.d/tmp/`
+    and is stopped before the `link()`. The bridge never reads `tmp/`, and
+    every published file and entry flows as usual. `pat` has not exited 3,
+    so nothing is reported. When `pat` resumes, it links, syncs, exits 3, and
+    the next flush imports the file. If `pat` dies instead, nothing was
+    published or reported, as when today's `pchat` is killed before its
+    append. Its `tmp/` file is removed once `pat` is proved gone (section
+    6.4).
 11. **A paused client (design round 4, finding 2).** `pat`'s `pchat post` to
     `#alpha`, and `sam`'s queued entry for `#beta`, on an injected clock:
 
@@ -1367,7 +1617,7 @@ before it (or before its commit) and just after it. "→" names the recovery.
     | 0.2–1.0 | stopped | sends `sam`'s part, gets the PONG; A2 and E5 commit |
     | 2.0 | stopped | `REQ_WAIT`: the connection closes; nothing of `pat`'s call committed |
     | 9.0 | resumes, and sees EOF | — |
-    | 9.0–14.0 | resends `create` with the same *X*: `ok`; continues. If unanswered within `IPC_WAIT`: Q0's fallback row, then exit 3 | served like any request |
+    | 9.0–14.0 | resends `create` with the same *X*: `ok`; continues. If unanswered within `IPC_WAIT`: Q0's fallback file, then exit 3 | served like any request |
 
     The same holds when `pat` stops at other points:
     - **after a complete frame:** its `TX` runs and commits. Its reply waits
@@ -1378,16 +1628,16 @@ before it (or before its commit) and just after it. "→" names the recovery.
 
     In every case `sam`'s entry is delivered in the same flush.
 12. **Announce during a lock holder and a storage fault (design round 4,
-    finding 1).** A client holds `L_outbox` and is stopped. The bridge's
+    finding 1).** An old tool holds `L_outbox` and is stopped. The bridge's
     `announce` for a held instruction fails before any byte, and its Q0
     in-process request fails.
-    - `announce` appends the row for *X* to `outbox.bridge.jsonl`, under the
-      in-process mutex, and syncs it durably. It never touches `L_outbox`.
+    - `announce` publishes a fallback file for *X*, by section 2.1's steps.
+      It never touches `L_outbox`.
     - `Deliveries` then saves `held_announced`.
-    - The same flush delivers `sam`'s unrelated entry, and I0 imports the
-      announce at the next pass.
-    - If the private append fails too, the flag stays unset, and the next
-      pass raises the same *X* again.
+    - The same flush delivers `sam`'s unrelated entry. The next flush's IF
+      imports the announcement, and it is delivered once.
+    - If the publication fails too, the flag stays unset, and the next pass
+      raises the same *X* again.
 13. **A bridge restart in the middle of a direct post.** `alp-solver-2` has
     part 0 confirmed. The bridge restarts while it sends part 1.
     - Its `outcome` request for part 1 meets a refused connection, and is
@@ -1398,6 +1648,42 @@ before it (or before its commit) and just after it. "→" names the recovery.
 
     Had the new authority not answered by `PART_WAIT`, it would have handed
     off with the attested outcome, and exited 3.
+14. **Recovery before the handoff (correction (d) of the canonical issue
+    review of #19's third amendment).** `alp-solver-2`'s `pchat post` sends
+    `attempt` for part 1 of *X*. The authority commits A1, generation 1, with
+    nonce `n1`, but the reply is lost to a bridge restart.
+    - `pchat` retries until `IPC_WAIT` with no answer, so it sends nothing. It
+      closes its chat connection, publishes a fallback file for *X* that
+      carries the handoff and the attestation (*X*, 1, 1, `n1`, "no byte
+      sent"), exits 3, and is gone.
+    - The new bridge's first flush runs A8c (or A8) on that attempt before it
+      lists the file, because the file landed after the flush's listing: the
+      attempt is `ended`, the part `uncertain`.
+    - The next flush's IF imports the file: H1 hands *X* off, and A12 applies
+      from `ended`, because the identity, generation and nonce match and no
+      attribution exists. The attempt is `void`, and the part is `unsent`.
+    - B delivers part 1 once. Part 0, confirmed earlier, is never resent.
+
+    With a wrong nonce, another writer, a newer generation, an attempt ended
+    by the writer's own A5, an attempt already `delivered`, `absent` or
+    `dead`, or a `terminal` entry, the file changes nothing beyond H1.
+15. **An announcement whose entry exists but was never sent (correction (e)
+    of the canonical issue review of #19's third amendment).** The bridge
+    raises an announcement for a held instruction. Its *X* is derived from
+    the instruction's key and reason. E1 commits *X* (`open`, `direct`,
+    origin `announce`), and the bridge is killed before A1.
+    - The new bridge process starts. Its flush finds *X* `open` and `direct`,
+      owned by a gone bridge process with no `writing` attempt, so E9 hands
+      it to the outbox. The same flush gives part 0 its A1, and delivers the
+      announcement once.
+    - `held_announced` was unset, so `Deliveries` raises the same
+      announcement, with the same *X*. It finds *X* existing and owned by the
+      outbox, adds no second obligation, and saves the flag.
+    - Had the flag been saved after E1, before the kill, E9 would still
+      deliver *X*: the entry is the obligation, and its existence alone never
+      suppresses its unsent parts.
+    - An ordinary `pchat post` killed after E1 is still abandoned (E8, D1),
+      as before.
 
 ## 6. Importing the old outbox
 
@@ -1421,26 +1707,45 @@ implementation starts from:
   are stopped **only** at the separately approved activation, before the first
   live import. Until then, plateia's copy touches no live state.
 
-A claim file the old code may have rewritten is imported once, as it stands
-under the locks.
+A claim file the old code may have rewritten before cutover is imported as
+it stands. After the rename, this design never rewrites a claim file. An old
+appender can still add whole lines to the end of one (section 6.3), so I2
+reads a claim incrementally, and checks that what it already imported is
+unchanged.
+
+**The legacy boundary after cutover.**
+
+- **This release writes no legacy row.** Its clients and its bridge queue
+  only by fallback files (section 6.4), and none of them takes `L_outbox`
+  to queue.
+- **It still reads legacy rows, as `outbox/1`.** That covers rows left at
+  cutover, and rows that a program outside this release appends later. The
+  bridge reads them without `L_outbox` (section 6.3), so a row already in
+  `outbox.jsonl` is never stuck behind a stopped appender.
+- **No old format is dropped,** and none needs an exemption.
 
 ### 6.2 Supported formats and the hold policy
 
 Import supports exactly:
 
-- the running tools' text post rows: `channel`, `as`, `text`, and optionally
-  `cont`, `reply_to` and `at`;
-- their ack rows: `channel`, `as`, `ack` and `at`;
-- this design's fallback rows (section 6.4).
+- in `outbox.jsonl` and claim files (`outbox/1`):
+  - the running tools' text post rows: `channel`, `as`, `text`, and
+    optionally `cont`, `reply_to` and `at`;
+  - their ack rows: `channel`, `as`, `ack` and `at`;
+- in `outbox.d/` (`outbox/2`): this design's fallback files (section 6.4).
 
 **Anything else is held** in `held`, with its raw text, and shown in `pchat
 status`. Each claim file that holds anything raises **one** content-free
 alert row, keyed by the claim file's name, in the same I2 `TX` as its held
 rows (section 3.6). Held rows include:
 
-- rows with `parts`, `terminal`, or any `id` that is not a fallback row's.
-  These are PR #20 formats, which never ran live;
-- unreadable lines.
+- in `outbox.jsonl` or a claim file, rows with `parts`, `terminal`, `id`,
+  or `fallback`. These are PR #20's formats, or revision 6's fallback row,
+  and none of them ever ran live;
+- unreadable lines, including an unterminated last line when a claim is
+  retired;
+- in `outbox.d/`, an unreadable or invalid file. It is held under its file
+  name, with its raw content, and then removed like an imported file.
 
 **PR #20's side files are never imported:** `outbox-reserved.jsonl`,
 `outbox-attributed.jsonl` and `record-coverage.json`. If any exists at
@@ -1453,146 +1758,256 @@ and it is delivered as #19 R3 requires ("as today").
 
 ### 6.3 The fenced import
 
-The import runs only in B's flush, holding `L_flush` and `L_outbox`, and does
-only local work. It runs at the **start** of each flush, before A8, A8c and
-reconciliation, so a durable attestation (section 6.4) is applied before A8
-could end its attempt without finality. Each claim file is one in-process
-request to the authority (section 2.4.3).
+The import runs only in B's flush, holding `L_flush`, and **never takes
+`L_outbox`**. It does only local work. It runs at the **start** of each flush,
+before A8, A8c and reconciliation, so a durable attestation (section 6.4) is
+normally applied before A8 could end its attempt without finality. If A8 or
+A8c ran first, A12 still applies from `ended` (section 3.3). Each file, or
+each batch of at most `LINES_MAX` legacy lines, is one in-process request to
+the authority (section 2.4.3).
 
-- **The private fallback first (I0).** Holding `L_flush` and the bridge's
-  in-process fallback mutex, but not `L_outbox`, import
-  `outbox.bridge.jsonl` (section 6.4).
+**1. Fallback files (IF).**
 
-0. **Acquire `L_outbox`** within `LOCK_WAIT`. If it is not acquired, skip
-   the rest of the import this flush (section 2.3).
+1. **List** the published names in `outbox.d/`, never `tmp/`, and sort them.
+   A name is `<t>-<X>-<r>.json`: the writer's publication time in
+   nanoseconds, zero-padded to 20 digits, then the entry id, then a random
+   suffix. So name order is publication order, up to the clock allowance
+   `A` (C-1).
+2. **Take** the oldest `IMPORT_MAX` names not yet imported in this flush.
+   The rest wait for the next flush, so none waits behind files published
+   later.
+3. **For each file F:**
+   1. If `imports` has F's name with F's sha256, it was imported and its
+      removal was interrupted: go to step 6.
+   2. If `imports` has F's name with another sha256, something outside this
+      design wrote it. In one `TX`, hold it with its alert row
+      `held:<name>:<sha256>`, unless that row exists, then go to step 6.
+   3. Make a durable sync of F, and of `outbox.d/` (section 2.1). A file a
+      crashed writer linked but never synced is thereby made durable before
+      anything relies on it.
+   4. Read F whole, and compute its sha256.
+   5. **Import**, in one `TX`:
+      - apply F by its *X* (section 6.4). If it is unreadable or invalid,
+        hold it instead, with its alert row `held:<name>`;
+      - insert F's `imports` row, `closed`.
+   6. **Remove** F: unlink it, then `fsync` `outbox.d/`.
+
+**2. The pass and `import_epoch`.** A pass is the set of names that step 1
+listed when the pass began. It ends when every one of them has been removed,
+which may take several flushes. Its last `TX` increments `import_epoch`. If
+the listing was empty, a `TX` of its own does. Passes run one at a time, and
+a bridge restart abandons the pass in progress, uncounted. I-7 relies on
+this.
+
+**3. Legacy rows (I1, I2, I3).**
+
 1. **Claim (I1).** Rename a non-empty `outbox.jsonl` to a new, never-used
-   claim name. List every `outbox.claimed-*.jsonl`, and make a durable sync
-   of each one (file, then directory), including claims left by an earlier
-   pass, a crash, or the old tools before cutover.
-2. **Read** each claim file whole, with its sha256 and line count.
-3. **Check** for an `imports` row with that name:
-   - **the same hash:** go to step 6;
-   - **a different hash:** in one `TX`, record the file in `held` and raise
-     its alert row `held:<name>:<sha256>`, unless that row already exists.
-     Neither import nor unlink it.
-4. **Import (I2)** in one `TX`, for each line ordinal `i`:
-   - **The occurrence id is always derived** from (claim file name, `i`),
-     for example `sha256(name + ":" + i)`, and is UNIQUE. An explicit id
-     never replaces it.
-   - **A text or ack row** becomes an `open`, `outbox` entry (E2).
-   - **A fallback row** is applied by its entry id *X* (section 6.4).
-   - **Any other row** is held.
-   - **Record the import:** insert the `imports` row (name, line count,
-     sha256, epoch).
-5. **Commit.** At the end of the pass, increment `import_epoch` in that
-   pass's last `TX`.
-6. **Unlink (I3)**, then `fsync` the directory.
+   claim name, **without** `L_outbox`. List every `outbox.claimed-*.jsonl`,
+   and make a durable sync of each one (file, then directory). That includes
+   claims left by an earlier pass, a crash, or the old tools before
+   cutover. A claim name enters `imports` (`open`, nothing imported yet) in
+   the first I2 `TX` that reads it.
+2. **Import (I2)**, for each open claim C, in requests of at most
+   `LINES_MAX` lines:
+   1. **Check the prefix.** Read C from the start. The bytes up to C's
+      imported offset must have the sha256 its `imports` row records. If
+      they do not, something outside this design rewrote C. In one `TX`,
+      hold the file with its alert row `held:<name>:<sha256>`, unless that
+      row exists. Import nothing more from C, and never unlink it.
+   2. **Take** the complete lines after the offset, up to the last newline.
+      A last line without a newline is not read: an appender may still be
+      writing it.
+   3. **Import them**, in one `TX`, for each line ordinal `i`:
+      - **The occurrence id is always derived** from (claim file name, `i`),
+        for example `sha256(name + ":" + i)`, and is UNIQUE. An explicit id
+        never replaces it.
+      - **A text or ack row** becomes an `open`, `outbox` entry (E2).
+      - **Any other row** is held, with C's one alert row (section 6.2).
+      - **Advance** C's `imports` row: the line count, the new offset, the
+        sha256 of the bytes through it, and the epoch.
+3. **Retire (I3)** C once it is **quiet**:
+   1. **The barrier.** B has acquired `L_outbox`, within `LOCK_WAIT`, at
+      some moment after it first recorded C. It may release the lock at
+      once.
+   2. **A final I2,** after that acquisition, reads C through its end, holds
+      an unterminated last line as unreadable, and closes C's `imports` row
+      in the same `TX`.
+   3. **Unlink** C, then `fsync` the directory.
 
-### 6.4 Fallback rows
+**Why the barrier suffices.** An old appender opens `outbox.jsonl` by name only
+while holding `L_outbox`, and closes it before releasing the lock
+(`chatlib.py:391` on master). So any appender that could still write to C
+held the lock when C was renamed, and released it before B's later
+acquisition. After the barrier, nothing can add to C. The claiming itself
+needs no lock:
 
-Every client fallback append is a durable append under `L_outbox`, which P
-waits for as today (section 2.3): the line, then `fsync` of `outbox.jsonl`,
-then `fsync` of the directory, always (section 2.1). P exits 3, reporting the
-post as queued, only after that sync. If the sync fails, P fails as described
-at the end of this section.
+- a line appended to C after the rename is complete when its appender
+  releases the lock, and I2 reads it at a later flush;
+- an appender that takes the lock after the rename opens a new
+  `outbox.jsonl`.
 
-**When P appends one.** When its `queue` or `handoff` request is not answered
-as committed: the authority is unavailable, or the reply is missing, `busy`
-or `error` (section 2.4.4).
+**What a stopped holder of `L_outbox` delays:** its own unterminated row, and
+I3's deletion of claim files. Never the import of a complete row, or of any
+published fallback file (I-12).
 
-There is one fallback row shape, for both Q0 and E3. It holds:
+**The old tools' flush** is stopped at activation, before the first live
+import (section 6.1). If one ran anyway, it would claim and deliver rows
+itself, which cutover forbids.
 
+### 6.4 Fallback files
+
+Every fallback is one **fallback file**, published by section 2.1's steps:
+
+1. exclusive creation under `outbox.d/tmp/`;
+2. the whole content, then `fsync`;
+3. `link()` to its final name, which never replaces a file;
+4. `fsync` of `outbox.d/` and of the state directory.
+
+P exits 3, reporting the post as queued, only after step 4. No lock is taken,
+so a writer stopped at any point delays only its own call (I-12). If
+publication fails, P fails as described at the end of this section.
+
+**When a writer publishes one.** When its `queue` or `handoff` request is not
+answered as committed: the authority is unavailable, or the reply is missing,
+`busy` or `error` (section 2.4.4). Also, when it must make an attestation
+durable and no request is answered (section 3.3). A call publishes at most one
+fallback file, because publishing one ends the call.
+
+**Its name** is `<t>-<X>-<r>.json` (section 6.3): the publication time, the
+entry id *X*, and a random suffix. If `link()` finds the name taken, the writer
+draws a new suffix. The obligation's identity is *X*, which is fixed per call
+(section 3.1). The name only identifies the occurrence, and is never reused.
+
+There is one fallback file shape, for both Q0 and E3. It holds, as one JSON
+object:
+
+- `v: "outbox/2"`;
 - the post's or ack's legacy fields;
-- `fallback: true`;
 - the call's entry id *X*;
-- P's writer identity, when P had a connection;
+- the writer identity, when the writer had a connection;
+- `epoch_seen`, the highest authority epoch the writer saw in the call. It
+  is recorded for diagnosis, and gates nothing (section 3.3);
 - **at most one attestation** (section 3.3), naming the attempt by (*X*,
   *n*, generation, `a1_nonce`). It is either:
-  - `void`: P never received that attempt's committed `attempt` reply; or
-  - an outcome P observed but could not commit: A2, A3, A4 or A5, with its
-    `final_at` and detail.
+  - `void`: the writer sent no byte of that attempt, because it accepted no
+    committed `attempt` reply for it;
+  - an outcome the writer observed but could not commit: A2, A3, A4 or A5,
+    with its `final_at` and detail.
 
-  An attempt still `writing` is the last one P made, and P makes no further
-  attempt once it hands off, so one attestation is enough.
+  An attempt still `writing` is the last one the writer made, and it makes
+  no further attempt once it hands off, so one attestation is enough.
 
-Import applies the row by *X*, never by occurrence:
+Import applies the file by *X*, never by occurrence:
 
 - **Entry *X* exists and is `open`, `direct`, or `abandoned` with H1's
   guard:** apply H1. The existing E1 entry and its progress are kept. In the
-  same `TX`, apply the attestation, if any, under its guard (A12, or the
-  `outcome` request's guard). If its guard fails, because the attempt has
-  already moved, the attestation changes nothing.
-- **Entry *X* exists and is already `outbox`, `done` or `terminal`:** a no-op.
-  This includes a Q0 commit that reported failure but had landed. Nothing is
-  merged, and no second entry is created.
-- **Entry *X* exists, and H1's identity guard fails:** hold the row.
+  same `TX`, apply the attestation, if any, under its guard: A12's (section
+  3.3), which also accepts an attempt that A8 or A8c has ended, or the
+  `outcome` request's. If its guard fails, the attestation changes nothing.
+- **Entry *X* exists and is already `open`, `outbox`:** H1 is a no-op, and
+  the attestation, if any, is applied under the same guard. This includes a
+  Q0 or E3 commit that reported failure but had landed. It also includes an
+  attestation for an attempt of the bridge's own flush.
+- **Entry *X* exists and is `done` or `terminal`:** a no-op. These are final.
+- **Entry *X* exists, is `direct` or `abandoned`, and H1's guard fails** (its
+  identity, or its epoch check): hold the file.
 - **Entry *X* does not exist:** E1 never committed, so by I-1 nothing of this
   call was sent. Import inserts entry *X* (`open`, `outbox`, no parts),
-  delivering the whole post once, as today. The row's occurrence (file,
-  ordinal) is recorded with it.
+  delivering the whole post once, as today. The file's occurrence (its name)
+  is recorded with it.
 
 Every creation is an `INSERT` on the primary key *X*, so an ambiguous commit
 that becomes visible later, whether E1's or Q0's, collides with the import's
-insert instead of duplicating it. Legacy rows from the old tools carry no *X*,
-and keep their occurrence-derived ids (section 6.3).
+insert instead of duplicating it. Two fallback files with the same *X*, such
+as a repeated announcement's, are one obligation for the same reason. Legacy
+rows from the old tools carry no *X*, and keep their occurrence-derived ids
+(section 6.3).
 
-If a fallback append fails too, P fails as it does today when the outbox
-cannot be written. Whatever already committed still prevents a blind resend.
+**Unfinished publications.** A file under `tmp/` is never imported. Its name
+carries its writer's identity (boot id, pid, start time). The bridge removes
+it only once that writer is **gone** (section 5.4), never by age, and never
+while the writer is merely stopped. A `tmp/` file with a second link was
+already published, so its `tmp/` name may be removed at any time.
 
-**The bridge's own fallback (`announce`).** The bridge never appends to
+If publication fails too, P fails as it does today when the outbox cannot be
+written. Whatever already committed still prevents a blind resend.
+
+**The bridge's own fallback (`announce`).** The bridge queues exactly as a
+client does, by a fallback file in `outbox.d/`. It never appends to
 `outbox.jsonl`, and so never waits for `L_outbox` (design review round 4,
-finding 1).
+finding 1). Revision 6's bridge-private file `outbox.bridge.jsonl`, its
+mutex, and its import I0 are removed. IF imports these files like any
+other.
 
 - **Identity.** An `announce` call's *X* is derived from its pending item's
   key and its reason, for example `sha256(key + ":" + reason)`. A re-raised
   announce is therefore the same obligation, never a second one.
-- **Already recorded.** If *X* already exists when an announce is raised,
-  for example after a crash before `held_announced` was saved, the
-  obligation is already durable. Nothing more is sent, and the flag is
-  saved.
-- **The fallback.** `announce` follows section 2.4.4's rules through
-  in-process requests. It queues by Q0 before any byte, and hands off by E3
-  after some. When that Q0 or E3 request fails, or is cancelled, it appends
-  the same fallback row shape for *X* to the bridge-private
-  `outbox.bridge.jsonl`. It does this under an in-process mutex shared only
-  with I0, and follows it with a durable sync of the file and the directory.
-  An in-process request is either cancelled before `BEGIN`, having
-  committed nothing, or returns its result. Only an `error` leaves its
-  commit unknown, and a fallback row by *X* is safe either way, because
-  import applies it by *X*. `announce`, like a client, sends a part's bytes
-  only after a known committed A1. If an A1 result is unknown, no byte
-  follows it. At its next pass the bridge, which is that attempt's own
-  writer and holds its `a1_nonce`, applies A12 to it if it landed. The same
-  rule covers the bridge's own flush attempts.
-- **Its import, I0,** at the start of each flush, under the same mutex:
-  1. a durable sync of the file;
-  2. one in-process request that applies every row by *X*, by the rules
-     above;
-  3. the unlink of the file, then a directory `fsync`.
+- **The rules.** `announce` follows section 2.4.4's rules through in-process
+  requests:
+  - it queues by Q0 before any byte, and hands off by E3 after some;
+  - when that Q0 or E3 request fails, or is cancelled, it publishes the
+    fallback file for *X*;
+  - an in-process request is either cancelled before `BEGIN`, having
+    committed nothing, or returns its result. Only an `error` leaves its
+    commit unknown, and a fallback file by *X* is safe either way, because
+    import applies it by *X*;
+  - like a client, `announce` sends a part's bytes only after an A1 it
+    accepted. If an A1 result is unknown, no byte follows it, and the bridge
+    records its attestation (section 3.3).
+- **A durable entry is an obligation, not proof of sending** (correction (e)
+  of the canonical issue review of #19's third amendment). When an
+  announcement is raised and *X* already exists, the bridge never treats its
+  existence alone as delivery. It acts on *X*'s state:
+  - **`open`, `outbox`:** the flush owes it. Nothing more is sent now.
+  - **`open`, `direct`, owned by this bridge process:** an earlier raise of
+    this process stopped part-way. It hands *X* off by E3, or publishes a
+    fallback file.
+  - **`open`, `direct`, owned by a gone bridge process:** E9 adopts it, in
+    this request or at the next flush.
+  - **`done` or `terminal`:** delivered, or dead-lettered with its alert.
+    Nothing more is sent.
 
-  A crash in between re-imports by *X*, which is a no-op.
-- **`held_announced`.** `Deliveries` saves its flag only after the announce's
-  entry is durable: committed in the database, or in the private file. If
-  neither can be written, the flag stays unset, the instruction stays in
-  `pending.json`, and the next pass raises the same *X* again. Nothing is
-  dropped, and nothing is reported before it is durable.
+  In every case, the unsent parts have exactly one owner that will deliver
+  them, and no second entry is made.
+- **E9.** An `announce` entry is never abandoned. When its owning bridge
+  process is gone, A8 ends its `writing` attempts, and then E9 makes it an
+  outbox entry. The flush delivers its unsent parts in order, after its
+  earlier parts are confirmed. Uncertain parts follow R1, R2 or E7 as usual.
+  E8 and D1 are unchanged for every other direct entry, so a killed `pchat`
+  still does not have its remainder adopted.
+- **`held_announced`.** `Deliveries` saves its flag only after the
+  announcement's obligation is durable: *X* committed in the database, in
+  any state above, or its fallback file published. If neither can be
+  written, the flag stays unset, the instruction stays in `pending.json`,
+  and the next pass raises the same *X* again. Nothing is dropped, and
+  nothing is reported before it is durable. A flag saved after E1 alone is
+  safe, because E9 delivers *X* even if the bridge then crashes.
 - **No unbounded wait.** Each in-process request is bounded by `AUTH_WAIT`
-  and C-10. The private append waits only for the in-process mutex, which I0
-  holds only for local file work. The chat setup and send of `announce` keep
-  their absolute deadlines (section 5.1).
+  and C-10. Publication takes no lock (C-11). The chat setup and send of
+  `announce` keep their absolute deadlines (section 5.1).
 
 ### 6.5 Why the import is idempotent and keeps occurrences
 
-- **A crash, or power loss, before the commit** leaves no rows. The file is
-  durable under its claim name, so the next pass derives the same occurrence
-  ids.
-- **After the commit** the claim name is durable, so a power loss cannot bring
-  back `outbox.jsonl` with rows already imported. A reappearing claim file
-  matches its `imports` row, so only the unlink remains.
-- **A changed hash** is held, never merged.
-- **Every line** is its own occurrence: duplicates are kept, never dropped as
-  replays.
-- **Claim names** are never reused.
+- **A crash, or power loss, before an import commits** leaves no rows. The
+  fallback file, or the claim's unimported lines, are still there. A claim
+  file is durable under its claim name, so the next pass derives the same
+  occurrence ids.
+- **After the commit,** the `imports` row is durable. A reappearing fallback
+  file matches its closed row, so only its removal remains. A claim file
+  continues after its recorded offset. A power loss cannot bring back
+  `outbox.jsonl` with lines already imported, because the claim name was
+  durable before I2.
+- **Frozen inputs.** A published fallback file is never written again. A
+  claim's imported prefix is checked against its recorded sha256 before
+  every read. A changed fallback file or claim prefix is held, never merged.
+- **By *X*.** Every fallback file applies by its *X*, so a duplicate file, or
+  a commit that became visible late, never makes a second entry.
+- **Every legacy line** is its own occurrence: duplicates are kept, never
+  dropped as replays.
+- **Names** of claim files and fallback files are never reused.
+- **Removal follows the commit.** A file is unlinked only after the `TX` that
+  holds its content commits, so the database holds every obligation before
+  its file goes.
 
 ## 7. Reconciliation rules
 
@@ -1816,17 +2231,20 @@ posted on the issue. The mapping is to the amended issue.
 | R3, fixed parts; legacy rows as today | E1 and E4; section 6.2. |
 | R4, durable progress | A1 before bytes; A2 or A5 before the next part; A8 and A8c; I-5. A failure before any write queues the whole post once (Q0 on *X*, as today). An existing E1 entry is kept, and handed off by E3. |
 | R5, reconciliation, as amended (D2, N6, N7) | R1, R2, R3, E7, X1 and X2. |
-| R6, independent flow | I-10 and I-11; the bridge as the only database writer (section 2.4), so a paused client holds no database lock; bounded requests and fair turns (section 2.4.3); bounded setup (section 5.1); bounded lock acquisition (section 2.3), so a paused `L_outbox` holder cannot stop database entries from flowing; `announce`'s private fallback (section 6.4). No exemption: C-8 is removed. |
+| R6, independent flow | I-10, I-11 and I-12. **The database:** the bridge is its only writer (section 2.4), so a paused client holds no database lock; requests are bounded and turns fair (section 2.4.3). **Already durable obligations:** fallback files are published atomically and imported without `L_outbox`, and legacy rows are claimed and read without it (sections 6.3 and 6.4), so a stopped lock holder or publisher delays only its own unfinished publication. Setup is bounded (section 5.1), and so is lock acquisition (section 2.3). `announce` falls back to a fallback file (section 6.4). No exemption: C-8 stays removed. |
 | R7, refusals | A3 and E6; N6 for a refusal that could not be recorded. |
-| R8, visibility | `pchat status` from the authority: waiting to post, awaiting a check, held rows, suspended designations, and import or export deferred by a busy lock. While the authority is unavailable, the dated snapshot and the waiting fallback rows (section 2.4.5). |
+| R8, visibility | `pchat status` from the authority: waiting to post, awaiting a check, held rows, suspended designations, fallback files and legacy rows not yet imported, and claim retirement or export deferred by a busy lock. While the authority is unavailable, the dated snapshot and the waiting fallback files and legacy rows (section 2.4.5). |
 | R9, no exactly-once; delivery preservation | Stated here. A transport failure before any part is written still queues the whole post once. **Changed by the owner's 2026-10-10 decision:** while the authority is unavailable, a post, ack or notice is queued in full instead of sent, and delivered when the bridge returns (section 2.4.4). Nothing is lost, and it is not claimed equivalent to today. |
-| R10–R11, R13 | Unchanged. |
+| R10, R13 | Unchanged. |
+| R11, guidance | In the implementation's pull request, `packages/chat/SKILL.md` also explains, in plain words with invented examples, that posts, acknowledgements and notices are queued while the bridge's authority cannot answer, **even when the chat server is reachable**, and are delivered when it returns (correction (b) of the canonical issue review of #19's third amendment). That file is read by agents and by `test_skill_guidance.py`, so it changes only in that pull request, never by `docs-push`, and it is not changed now. |
 | R12, contract documentation | Satisfied by D-72 and D-73, which are updated as needed. No new D-number. |
 | R14, the SQLite authority | Sections 2–7. The bridge is its only opener and writer (section 2.4; the 2026-10-10 decision). |
 | R15, release packaging (second amendment) | Section 10.1, including the new read-write `outbox-authority` interface, which extends B1 under the 2026-10-10 decision. |
 | Acceptance 1, 2, 4–6, 8–10 | Behavior unchanged. For acceptance 2, the test designates its fake account (D2). |
 | Acceptance 3 | As amended (AD-2, corrected by the second amendment). The fixture gives part 3 a **non-refusal** error reply together with its matching completion PONG, complete coverage, and no unexplained message. Companion checks: a late PONG without an error is A2, confirmed and not resent; a FAIL is A3, dead-lettered and not retried; a bare timeout, crash or broken connection never proves absence. |
 | Acceptance 7 | As amended (AD-1): the test recovers the SQLite crash state, with the same assertions. |
+| Acceptance 11 | As corrected (section 10.1): the comparison excludes normally generated fields, and the release suite's isolated fixture builds and installs are allowed. |
+| Acceptance 12 (third amendment), with the fourth amendment's additions | Tests 25–37 (section 9). |
 
 **Narrowings inside UNKNOWN.** Each of these ends as UNKNOWN, never as a
 resend:
@@ -1924,15 +2342,15 @@ differ.
     - a failed login;
     - a failed E1;
     - a crash before and after Q0;
-    - Q0's fallback append, and power loss on either side of its `fsync`;
+    - Q0's fallback file, and power loss on either side of each step of its
+      publication;
     - **an E1 commit that reports failure but lands.** P finds *X* and hands
       it off. Restart, then import.
-    - **a Q0 commit that reports failure but lands, then a fallback row.**
+    - **a Q0 commit that reports failure but lands, then a fallback file.**
       Import, restart, import again: one entry *X*.
 
     Each queues the whole post once, as today. Two separate calls with
-    identical text are still two entries. For `announce`, the fallback is the
-    private file (test 29).
+    identical text are still two entries. For `announce`, see test 29.
 19. **Collection, then delayed reconciliation.** A confirmed attempt K has no
     msgid, and its message lies before the window of an unresolved attempt U,
     but K's window overlaps U's. Run G1 when K's message is older than
@@ -1950,7 +2368,7 @@ differ.
 21. **Release packaging (future, under R15).** The release inventory test ties
     markers in the shipped code to the new format entries:
     - `outbox.db` to the outbox store format, read and written;
-    - the fallback rows to the outbox format version, read and written;
+    - the fallback files to the outbox format version, read and written;
     - versioned post dead letters to the delivery records version;
     - each new host probe to its read-only format.
 
@@ -1966,13 +2384,16 @@ differ.
     - A changed hash is held.
     - Unsupported rows are held, with one alert row for their claim file
       (test 24).
-    - **Fallback rows, by section 6.4's single shape.** A fallback row whose
-      entry *X* does not exist creates *X* (`open`, `outbox`, no parts) and
-      delivers the whole post once. A fallback row whose *X* exists as
-      `open`, `direct` (or `abandoned`, within H1's guard) with a matching
-      writer identity applies H1. A fallback row whose *X* exists but fails
-      H1's identity guard is held. A fallback row whose *X* is already
-      `outbox`, `done` or `terminal` is a no-op.
+    - **Fallback files, by section 6.4's single shape.** A file whose entry
+      *X* does not exist creates *X* (`open`, `outbox`, no parts) and
+      delivers the whole post once. A file whose *X* exists as `open`,
+      `direct` (or `abandoned`, within H1's guard) with a matching writer
+      identity applies H1. A file whose *X* exists but fails H1's guard is
+      held. A file whose *X* is already `outbox` applies only its
+      attestation, under its guard. A file whose *X* is `done` or `terminal`
+      is a no-op.
+    - A legacy row with `fallback`, `id`, `parts` or `terminal` in
+      `outbox.jsonl` is held.
 15. **Collection.** Messages near unresolved attempts are kept. Attributions
     go with their messages. Terminal rows stay until their current version is
     exported. Open-window dead attempts are kept.
@@ -1980,8 +2401,9 @@ differ.
     disconnect, a stale reply, a failed V1, a checkpoint mismatch, a restart.
 17. **Independent flow.** Another account, and the same account with another
     text, flow while one entry is undecided, refused or failing, while
-    `L_outbox` is held by a paused process (test 23), and while a client is
-    stopped at any point of a request (test 25).
+    `L_outbox` is held by a paused process (tests 23 and 32), while a client
+    is stopped at any point of a request (test 25), and while a writer is
+    stopped in the middle of publishing (test 33).
 18. **Unchanged paths.**
     - Legacy and ack entries.
     - A slow but confirmed post.
@@ -2003,10 +2425,10 @@ differ.
       line is present.
     - **`Deliveries`' dead letters.** The same schedule for a delivery dead
       letter: the item stays pending until the line is durable.
-    - **Fallback.** Another process creates `outbox.jsonl` without a
-      directory `fsync`. P's Q0 fallback appends to it, syncs file and
-      directory, exits 3. Power loss: the row is present and is imported as
-      *X*.
+    - **Fallback.** Another process creates `outbox.d/` without syncing
+      the state directory. P publishes its Q0 fallback file there, syncs
+      `outbox.d/` and the state directory, and exits 3. Power loss: the
+      file is present and is imported as *X*.
     - **Recovered claims.** A claim file left unsynced by a crashed pass, or
       by the old tools, is synced before its I2. Power loss after I2: no
       occurrence is lost or duplicated.
@@ -2014,18 +2436,19 @@ differ.
       removed lose the record, so the test can detect the defect.
 23. **A paused lock holder (design round 3, finding 2).** With a fake lock
     table and an injected monotonic clock:
-    - A fake P holds `L_outbox` and never releases it. B's flush tries for
-      `LOCK_WAIT`, skips import and export, and in the same flush delivers an
-      unrelated open database entry for `#beta`, applies an E7 that falls
-      due, and exports its alert row. `pchat status` shows import deferred.
-    - B never removes or breaks the lock, and never ends P's attempt or
-      connection.
-    - P releases the lock: the next flush imports and exports as usual. P
-      dies instead: the lock is released with it, and the next flush does
-      the same.
-    - A second direct writer's fallback append waits for the lock as today,
-      and exits 3 only after its row is durable, once the holder releases
-      it. The flush is not delayed by that waiting writer.
+    - A fake old-tool process holds `L_outbox` and never releases it. B's
+      flush still runs IF, I1 and I2. It gives an unrelated open database
+      entry for `#beta` its attempt, applies an E7 that falls due, and exports
+      its alert row. It tries `L_outbox` only for I3 and X1, for at most
+      `LOCK_WAIT`. `pchat status` shows retirement and export deferred.
+    - B never removes or breaks the lock, and never ends the holder's
+      attempt or connection.
+    - The holder releases the lock: the next flush retires the claim and
+      exports as usual. It dies instead: the lock is released with it, and
+      the next flush does the same.
+    - No client of this release ever waits for `L_outbox`: a fake `pchat`
+      queueing while the authority is unavailable publishes its fallback file
+      and exits 3 while the lock is held.
     - The flush's total time stays within the sum of its absolute deadlines
       while the lock is held.
 24. **Alerts, exactly one per event (design round 3, finding 3).** For each
@@ -2080,13 +2503,16 @@ differ.
 
     No reply is ever produced before its `COMMIT`. The fake connection
     records the order.
-27. **A12 and attested outcomes.** A `void` or attested outcome applies only
-    with the same writer, generation and `a1_nonce`, and only to an attempt
-    still `writing`. A wrong nonce, another writer, a newer generation, or an
-    attempt already ended by A8 each change nothing. A client whose A1 reply
-    was lost sends no byte, and its handoff makes the attempt `void`, so the
-    part is delivered by B, once. The import of a durable attestation runs
-    before A8 in the same flush.
+27. **A12 and attested outcomes.** A `void` applies only with the same
+    writer, generation and `a1_nonce`, to an attempt still `writing` or
+    ended by A8 or A8c, with no attribution, in an `open` entry (or one H1
+    reopens in the same `TX`). An attested outcome applies only to an attempt
+    still `writing`. A wrong nonce, another writer, a newer generation, an
+    attempt ended by A5, or one already `delivered`, `absent` or `dead`, or a
+    `terminal` entry, each change nothing. A client whose A1 reply was lost
+    sends no byte, and its handoff makes the attempt `void`, so the part is
+    delivered by B, once. The import of a durable attestation normally runs
+    before A8 in the same flush. Test 35 covers the case where it does not.
 28. **Authority unavailable: the material change.** For `pchat post`, `pchat
     ack` and `notify`, test each of these:
     - no socket;
@@ -2099,23 +2525,23 @@ differ.
     - no reply within `IPC_WAIT`.
 
     In each, the call sends no byte without a committed `attempt` reply, and
-    queues the whole call (exit 3) only after its fallback row is durable,
-    file and directory. After the bridge returns, it is delivered once.
+    queues the whole call (exit 3) only after its fallback file is published
+    and durable (section 2.1). After the bridge returns, it is delivered once.
     Mid-post, the remainder is handed off, and confirmed parts are never
-    resent. A Q0 that landed with its reply lost, plus its fallback row, is
+    resent. A Q0 that landed with its reply lost, plus its fallback file, is
     one entry.
-29. **Announce fallback (design round 4, finding 1).** A fake client holds
-    `L_outbox` and never releases it. `announce`'s in-process E1 and Q0
-    fail before any byte.
-    - The row for *X* goes durably to `outbox.bridge.jsonl`, without
+29. **Announce fallback (design round 4, finding 1).** A fake old tool holds
+    `L_outbox` and never releases it. `announce`'s in-process E1 and Q0 fail
+    before any byte.
+    - `announce` publishes a fallback file for *X* in `outbox.d/`, without
       touching `L_outbox`.
     - `held_announced` is saved only afterwards.
-    - `sam`'s unrelated entry is delivered in the same flush, and I0 imports
-      the announce once at the next pass.
-    - With the private append failing too, the flag stays unset, and the
-      next pass raises the same *X*: one entry.
-    - A crash between the append and the flag, or between I0's `TX` and its
-      unlink, still gives one entry.
+    - `sam`'s unrelated entry is delivered in the same flush, and IF imports
+      the announcement once at the next flush.
+    - With the publication failing too, the flag stays unset, and the next
+      pass raises the same *X*: one entry.
+    - A crash between the publication and the flag, or between IF's `TX` and
+      the unlink, still gives one entry.
     - The flush's time stays within its absolute deadlines.
 30. **Message accounting on every part (design round 4, finding 3).**
     - A single-line `Y` with finality, complete coverage and no match, plus
@@ -2138,6 +2564,91 @@ differ.
       audit hook on the `sqlite3.connect` event while the client paths run.
     - The connection works on Python 3.10, with no `autocommit` attribute.
 
+Tests 32–37 are the fourth amendment's future regressions. Like every test
+above, they are specifications for the implementation, not runs. None is
+written or run now.
+
+32. **Already durable obligations behind a stopped lock holder.** A fake old
+    tool holds `L_outbox`, stopped half-way through a row, with no newline.
+    Already durable are a published fallback file for `sam`'s `#beta` post
+    and a complete legacy row for `alp-solver-2`. In the same flush:
+    - IF imports the file, and I1 and I2 import the complete row;
+    - both entries get their attempts and are delivered;
+    - the half row is not imported.
+
+    Retirement and X1 wait at most `LOCK_WAIT`. Then the holder appends the
+    rest of its row into the claim file, after the rename. The next flush
+    imports it once. A later flush, after acquiring the lock, retires the
+    claim. A variant where the holder dies holds the half row as unreadable
+    at retirement. In no variant is an obligation lost or doubled.
+33. **Publications.** With a fake filesystem that can drop unsynced changes,
+    and an injected clock:
+    - **A writer stopped before `link()`:** its `tmp/` file is never
+      imported; every other file and entry flows; nothing is reported.
+    - **A crash after `link()` and before the directory `fsync`:** the file
+      may be imported; after a power loss it may vanish, but the writer had
+      not exited 3.
+    - **A power loss after exit 3:** the file is present.
+    - **Two files with the same *X*,** for example a repeated announcement:
+      one entry.
+    - **A taken name:** `link()` fails, a new suffix is drawn, and nothing
+      is replaced.
+    - **A `tmp/` file of a gone writer** is removed. That of a stopped
+      writer is kept.
+    - **A filesystem without hard links:** the publication fails, and no exit
+      3 is reported.
+    - **An unreadable published file** is held with one alert row.
+34. **Import and crash boundaries.**
+    - **Crashes:** before IF's `TX`, after it and before the unlink, and
+      after the unlink and before the directory `fsync`. No obligation is
+      lost or doubled.
+    - **Fair and bounded:** with more than `IMPORT_MAX` files and a steady
+      inflow of new ones, every file is imported, oldest first, and none
+      waits behind files published after it.
+    - **Passes:** `import_epoch` grows only when a pass's whole listing is
+      imported. An E8 in the middle of a pass is followed by H1 for the
+      writer's handoff file, and the entry is not collected before
+      `import_epoch ≥ abandon_epoch + 2`.
+    - **Legacy claims:** a claim read in several requests keeps its
+      occurrence ids. A changed imported prefix holds the claim. A claim is
+      never unlinked before a barrier acquisition that followed its first
+      import.
+35. **A no-byte attestation that recovery overtakes (correction (d)).** A1
+    commits, and its reply is lost. The client closes its chat connection,
+    and A8c ends the attempt (and, in a variant, the client exits and A8
+    does). Then the client's handoff arrives with the matching `void`
+    attestation, once by `handoff` request and once by fallback file. The
+    attempt becomes `void`, the part `unsent`, and B delivers it once.
+    Negative controls, each changing nothing beyond H1:
+    - a wrong nonce, writer or generation;
+    - an attempt ended by A5;
+    - an attempt already `delivered`, `absent` or `dead`;
+    - an attempt with an attribution;
+    - a `terminal` entry.
+36. **An announcement after E1 and before A1 (correction (e)).** The bridge
+    is killed after an announcement's E1 commits, before A1, with
+    `held_announced` unset and, in a variant, already saved.
+    - After the restart, E9 adopts *X*, and the announcement is delivered
+      once.
+    - The re-raised announcement, with the same *X*, finds the obligation
+      and adds no second entry. Its flag is then saved.
+    - A variant with the old bridge's A1 committed and its result unknown
+      keeps that part UNKNOWN unless its attestation was made durable.
+    - An ordinary `pchat post` killed after E1 is still abandoned (E8), with
+      its remainder not adopted (D1).
+37. **Release packaging and guidance, as corrected (corrections (a)–(c)).**
+    These are future release-suite and guidance tests.
+    - **Acceptance 11's comparison** ignores the normally generated
+      source, builder, release, artifact and hash fields, and passes across
+      two commits. It fails when any declarative entry other than those
+      section 10.1 lists changes.
+    - **`test_skill_guidance.py`** checks that `SKILL.md` explains queueing
+      while the bridge's authority cannot answer, even with the chat server
+      reachable.
+    - **The release suite's builds and installs** use only invented fixture
+      releases in isolated temporary directories, under
+      `_support.py`/`test_install.py`'s existing isolation.
+
 ## 10. Feasibility and risks
 
 **Feasibility.** Everything uses the standard library's `sqlite3`, `os.fsync`,
@@ -2158,9 +2669,11 @@ It replaces the file state with the database layer, and adds:
 - bounded lock acquisition and the `alerts` table;
 - the minimal release metadata (section 10.1);
 - the authority thread, its socket protocol and the clients' request layer
-  (section 2.4), and the bridge's private fallback (section 6.4).
+  (section 2.4);
+- fallback files and their lock-free import, the incremental legacy import,
+  E9, and A12 from `ended` (sections 3, 6.3 and 6.4).
 
-That is about 1,500 to 3,000 changed lines, including tests.
+That is about 1,800 to 3,500 changed lines, including tests.
 
 ### 10.1 Release packaging (second amendment, R15)
 
@@ -2189,10 +2702,15 @@ in the same PR #20, makes these minimal declarations in
     `outbox-db/1` means a bridge-exclusive database: `writer_model =
     'bridge-exclusive/1'` (section 2.4.1). No earlier `outbox-db` was ever
     shipped, so nothing is renumbered.
-- **The `outbox` format** (`outbox.jsonl`, `outbox.lock`, claim files, and the
-  bridge's private `outbox.bridge.jsonl`). Its write version moves to
-  `outbox/2`, which adds the fallback row with its optional attestation
-  (section 6.4); it reads `outbox/1` and `outbox/2`.
+- **The `outbox` format.** Its path lists `outbox.jsonl`, `outbox.lock`, the
+  claim files, and the fallback directory `outbox.d/` with its staging
+  directory `outbox.d/tmp/`. Revision 6's `outbox.bridge.jsonl` is no longer
+  listed: the bridge uses fallback files too.
+  - It writes `outbox/2`: the per-entry fallback file, with its optional
+    attestation (section 6.4).
+  - It reads `outbox/1` (the legacy rows in `outbox.jsonl` and claim files)
+    and `outbox/2`.
+  - This release never writes `outbox/1`.
 - **A new `wire` format, `outbox-authority`: the read-write interface the
   owner approved on 2026-10-10.** It covers the request protocol on
   `$CHAT_STATE/outbox.sock` between the clients (`pchat`, `agentcli`) and the
@@ -2222,14 +2740,36 @@ Nothing else in the release changes: the builder, verification, staging, other
 format entries, the skill, and the package version policy. If declaring these
 needs any builder change, the implementer stops and asks.
 
-**Acceptance 11's "unchanged".** Following correction 1 of the approving issue
-rereview, acceptance 11 is read as: everything in `release.json` and the built
-manifest except exactly the changes listed above is byte-for-byte unchanged.
-Those changes are:
+**Fixture builds and installs** (correction (c) of the canonical issue review
+of #19's third amendment):
 
-- the edits to the `outbox` and `delivery-records` entries, `package.files`
-  and the interpreter note;
-- the new `outbox-db`, `outbox-authority` and host-interface entries.
+- **What the exclusion covers.** The exclusion of building, staging,
+  installing and activating a release covers **operational** releases only.
+- **What it allows.** The future implementation's release suite may build
+  and install **invented fixture releases** in isolated temporary
+  directories, as acceptance 11 and the local release-suite gate require.
+  These are `packages/release/tests/_support.py:54-72` and
+  `test_install.py:43-61`.
+- **What it does not allow.** No operational build, staging, install or
+  activation. And nobody runs any of it now, not the manager, not the
+  solver, and not a reviewer.
+
+**Acceptance 11's "unchanged".** Following correction 1 of the approving issue
+rereview, and correction (a) of the canonical issue review of #19's third
+amendment, acceptance 11 is read this way:
+
+- **What may change.** Only these:
+  - the edits to the `outbox` and `delivery-records` entries,
+    `package.files` and the interpreter note;
+  - the new `outbox-db`, `outbox-authority` and host-interface entries.
+- **What is not compared.** The fields the builder generates from the
+  commit, the payload and the build environment
+  (`packages/release/build_release.py:300-336`): the source, builder,
+  release, artifact and hash fields. The test does not require identical
+  manifests across different source commits.
+- **What stays the same.** Everything else, in `release.json` and in the
+  built manifest's declarative content: every other format entry, the
+  package version policy, and the release behaviour.
 
 The format-marker test also ties the shipped code's protocol version string
 to `outbox-authority`.
@@ -2242,7 +2782,10 @@ quiescent, and belongs to activation:
 - any other writer is refused, by the exclusive lock and the `writer_model`
   check (section 2.4.1, C-9), so a mixed old writer that uses SQL directly
   cannot join;
-- old tools that only append `outbox.jsonl` stay an import boundary.
+- old tools that only append `outbox.jsonl` stay an import boundary. The
+  bridge reads their rows without `L_outbox`, and needs the lock only to
+  delete a claim file (section 6.3). Their flush, which claims and delivers
+  rows itself, must be stopped.
 
 No live migration is claimed.
 
@@ -2272,10 +2815,18 @@ rollback compatibility.
   one full flush of the disk. Every wait stays within its absolute deadline.
 - **Threads.** The bridge gains one thread. Only that thread touches SQLite,
   and shared helpers are made thread-safe (section 2.4.3).
+- **Hard links.** Fallback publication needs `link()` on the state
+  directory's filesystem (C-11). Without it, a post that cannot reach the
+  authority fails as today when the outbox cannot be written, instead of
+  queueing.
+- **Leftover files.** A claim file waits for the lock barrier before
+  deletion, and a stopped writer's `tmp/` file stays until it is gone. Both
+  cost only disk space, and `pchat status` shows them.
 
 ## 11. Owner decisions (2026-10-09 and 2026-10-10)
 
-The owner approved these on 2026-10-09. They are recorded as D-73 in
+The owner approved decisions 1–6 on 2026-10-09, and decisions 7 and 8 on
+2026-10-10. They are recorded as D-73 in
 [plateia_design.md](plateia_design.md), and as an amendment to #19.
 
 1. **A stdlib SQLite authority.** One SQLite database, through Python's
@@ -2336,6 +2887,34 @@ The owner approved these on 2026-10-09. They are recorded as D-73 in
      review round 5. There is no further round.
 
    This approves the design, its scope and its review only.
+
+8. **Per-entry fallback files and the review's corrections (2026-10-10,
+   11:31 UTC).** The canonical issue review of #19's third amendment found
+   that a fallback row already durable in `outbox.jsonl` still waited for a
+   client stopped while holding `outbox.lock`. The owner approved the
+   manager's repair, with five further review rounds at most:
+   - **Per-entry fallback files.** A queueing caller publishes one complete,
+     immutable fallback file per entry, and the bridge imports published
+     files, and legacy rows, without `outbox.lock`. A stopped writer delays
+     only its own unfinished publication (sections 6.3 and 6.4, I-12).
+   - **R6 is preserved** over the database and over already durable
+     fallback obligations. It is not narrowed: no exemption, lock stealing,
+     lease, or killing of holders. Everything decision 7 adopted stands.
+   - **The five corrections:**
+     - (a) acceptance 11's comparison excludes generated fields (section
+       10.1);
+     - (b) future guidance on queueing while the authority cannot answer
+       (section 8, R11);
+     - (c) isolated fixture builds and installs for the future release suite
+       (section 10.1);
+     - (d) a no-byte attestation that survives recovery (A12, section 3.3);
+     - (e) an announcement's durable entry is an obligation, not proof of
+       sending (E9, section 6.4).
+   - **Review budget.** At most five further review launches, shared by the
+     canonical issue review of #19 and the design review. The unused design
+     round 5 is one of them, not a sixth.
+
+   This approves the specification, the design and their review only.
 
 Implementation is **not** approved by these decisions. Implementation, code,
 tests and the `release.json` edit need their own owner decision, and so does
@@ -2424,7 +3003,7 @@ activation.
   - **Tests:** 22–24 added; 9, 14 and 17 updated.
 - **Design review round 4** requested changes on revision 5, with three
   findings.
-- **Revision 6** (this revision) adopts the owner's 2026-10-10 decision
+- **Revision 6** (`6dfc420`) adopts the owner's 2026-10-10 decision
   (section 11, decision 7), which answers all three:
   - **A paused client stalls the database (P1).** The bridge is now the only
     process that opens or writes the database. Clients send bounded,
@@ -2456,3 +3035,50 @@ activation.
     quiescent cutover that refuses any other writer.
   - **Tests.** 25–31 added; 11 and 17 and the setup updated.
   - **Revision 5's history** above mentions C-8. Revision 6 removes it.
+- **The canonical issue review of #19's third amendment** requested changes
+  on revision 6. Its open decision: a fallback row already durable in
+  `outbox.jsonl` waited for a client stopped while holding `outbox.lock`. It
+  also made five corrections and additions.
+- **Revision 7** (this revision) adopts the owner's decision of 2026-10-10,
+  11:31 UTC (section 11, decision 8):
+  - **Per-entry fallback files (the open decision).** Every queueing caller,
+    the bridge's `announce` included, publishes one complete, immutable file
+    in `outbox.d/`, by exclusive creation, `fsync`, a `link()` that never
+    replaces, and directory syncs (section 2.1). IF imports published files
+    without `L_outbox`, at most `IMPORT_MAX` per flush, oldest first. Legacy
+    `outbox.jsonl` is claimed and read without the lock, incrementally, and
+    the lock is only a barrier before a claim file is deleted (section 6.3).
+    No client takes `L_outbox`. Revision 6's fallback append,
+    `outbox.bridge.jsonl`, its mutex and I0 are removed. Sections 2.1–2.3,
+    3.1, 3.5, 6.1–6.5, I-5, I-7, I-10 and I-11 are updated, and I-12 and C-11
+    are new. H1 and collection now count two import passes after E8, because
+    a pass may span flushes.
+  - **(a)–(c)** in sections 8 and 10.1.
+  - **(d)** A12 also applies to an attempt that A8 or A8c has ended, under
+    exact identity, nonce, generation and state guards. P9 is new (section
+    3.3).
+  - **(e)** E9 adopts a gone bridge process's `announce` entries, and an
+    existing entry never suppresses unsent parts (sections 3.1 and 6.4). E8
+    and D1 are unchanged for every other direct entry.
+  - **Section 5:** the crash tables, and cases 9, 10, 12, 14 and 15.
+  - **Tests:** 32–37 added; 11, 14, 17, 21–23 and 27–29 updated.
+  - **Reassessment.** Nothing earlier is weakened, and no classification is
+    lowered:
+
+    | Item | Revision 7 |
+    |---|---|
+    | F1, fragments; R2 condition 5 on every part | Unchanged (sections 5.3 and 7.3). |
+    | F2, ack retry | Unchanged (A11). |
+    | F3, durable claims | Kept: I1 still makes every claim durable before I2. Claiming no longer needs `L_outbox`, and retirement waits for the barrier (section 6.3). |
+    | F4, reopenable progress | Kept, with two passes after E8, because a pass may span flushes (I-7). |
+    | F5, export durability | Unchanged. Publication adds the same file-then-directory rule (section 2.1). |
+    | F6, late outcomes | Unchanged. |
+    | F7, failures before E1 | Kept: Q0, or a fallback file, for every caller. |
+    | I-1 to I-4, I-6, I-8, I-9 | Unchanged. A `void` attempt published nothing, so I-3 and I-4 are untouched. |
+    | I-2, fencing | Unchanged. A12 from `ended` records past sends, and permits none (section 3.3). |
+    | I-5, storage errors | Fallback files replace the fallback append (section 6.4). |
+    | I-7, collection | Two passes after E8 (above). |
+    | I-10, I-11 | Strengthened: no import waits for any lock. I-12 is new. |
+    | C-9, C-10 | Unchanged. C-11 states the fallback directory's storage. |
+    | Third amendment's acceptance 12, items 1–6 | Tests 25, 26, 28, 29, 30 and 31, with 29 now using fallback files. |
+    | The canonical approval's clarifications | Unchanged: the implementation gate, no designation interface, SQLite and sockets inside the test sandbox only, the release suite among the local gates, and failing-first evidence that shows the defect. |
