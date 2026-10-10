@@ -119,6 +119,22 @@ class GuidanceTests(unittest.TestCase):
         self.assertEqual(types | {"interrupt"}, set(pchat.TYPES))
         self.assertRegex(SKILL, r"--type\s+interrupt")
 
+    def test_the_queueing_guidance_describes_19s_behaviour(self):
+        """#19 requirement 11: the "No lost posts" paragraph and "When chat is down"
+        say that only the unposted remainder is queued, that an uncertain part is
+        checked against the record first, and that posts, acks and notices queue
+        while the bridge cannot answer, even with the chat server reachable."""
+        lost = SKILL.split("- **No lost posts.**", 1)[1].split("\n- **", 1)[0]
+        down = SKILL.split("## When chat is down", 1)[1].split("\n## ", 1)[0]
+        flat = lambda text: " ".join(text.split())  # noqa: E731
+        lost, down = flat(lost), flat(down)
+        self.assertIn("only the unposted remainder is queued", lost)
+        self.assertIn("checks it against the channel record before any resend", lost)
+        self.assertIn("`pchat post`, `pchat ack` and an agent's notices queue instead of sending, even when the "
+                      "chat server itself is reachable", lost)
+        self.assertIn("only the bridge is down, even if the chat server answers", down)
+        self.assertIn("checked against the channel record before any resend", down)
+
     def test_the_check_catches_a_missing_option(self):
         self.assertNotIn("--no-such-option", PCHAT["post"])
         self.assertIsNone(resolve(["agent", "no-such-subcommand"])[1])

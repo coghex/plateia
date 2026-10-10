@@ -16,7 +16,7 @@
       "files": [
         "chat/SKILL.md"
       ],
-      "summary": "workflow: bound machine quiet to timing measurements — adds the 7-line \"Timing reservations\" paragraph to chat/SKILL.md",
+      "summary": "workflow: bound machine quiet to timing measurements \u2014 adds the 7-line \"Timing reservations\" paragraph to chat/SKILL.md",
       "carried_in": "PLT-15 (#12)"
     }
   ],
@@ -55,15 +55,15 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "262d42bf09af99eac65e19ef4e50ec6fea7d7072969c8308d3ff58848c94e272",
       "capture": "changed",
-      "sha256": "664eda3e8f06735d0fe8eda6fb1a5438242a3f87b903c53be46df9d332482288",
+      "sha256": "dbe730f9ae1b0a94033380f448cadfb7d359bf30993d38dba1e25fda14779cd0",
       "changes": [
         {
           "change": "`pchat agent who`'s 'outside cmux use --as ... explicitly' hint names the chat config's assistant identity (the identity whose role is assistant), or ACCOUNT if none, instead of a fixed account name.",
           "reason": "Resolve the assistant's name at runtime (requirement 3); the message is unchanged for a config whose assistant identity is the account the baseline named."
         },
         {
-          "change": "notify() queues only the unconfirmed remainder of a notice that failed partway, and dead-letters, with its parts, any notice the server refused instead of queueing it again.",
-          "reason": "Every caller that feeds the outbox must keep partial progress (#19 review amendment). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
+          "change": "notify() posts through the outbox authority like pchat post (origin notify): a notice that cannot be recorded is queued durably, its unposted remainder handed off, and a refusal reported; nothing is queued for a silent run.",
+          "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
     },
@@ -99,15 +99,15 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "d5fd3bca06e139c3f61dfb6d34ef56947255c0b723fb9778c6da3afea874e8d0",
       "capture": "changed",
-      "sha256": "f8d6414585f829982e8ff86f67d69c9d85e09b174aa837e94c101e59d307a650",
+      "sha256": "04537ec9ffccee9f01ece8156607a015c627dcc6736be9b89f189e6be4dd2982",
       "changes": [
         {
           "change": "The config example in the module docstring shows placeholder owner and assistant names.",
           "reason": "Remove real account names (requirement 3); docstring only, no behaviour change."
         },
         {
-          "change": "post() writes a post one part at a time (a draft/multiline batch, or a line) and confirms each against an absolute per-part deadline before the next; an error reply never counts as confirmation and a refusal outranks channel recreation; each part has a stable key, and each confirmed part records its confirmation time and is reserved (reserve()) before anything else, whoever called; a failure raises PostIncomplete (or Refused) carrying every part's state (confirmed, uncertain or unsent); parts are fixed on the first write and a retry resends exactly those that are not confirmed, never re-split; queued_entry() keeps only the unconfirmed remainder; outbox_summary(), outbox_flushing() and dead_letter_post() support the bridge and pchat status.",
-          "reason": "A long post whose completion timed out after the server had committed it was queued whole and reposted on every outbox flush, each copy with new msgids (#19). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
+          "change": "post() and ack() commit each part's attempt with the bridge's outbox authority (delivery_store) before any of its bytes, record each part's outcome (confirmed, refused, rejected, or ended without or with finality after an absolute wait and a bounded drain), and on a failure hand off the unconfirmed remainder or queue the whole call; with no committed answer they publish one immutable fallback file per call instead, and raise Queued only once it is durable. Login and channel creation have absolute deadlines. A silent run's post is refused and never queued in any form. outbox_append(), outbox_claim(), outbox_summary(), reserve() and queued_entry() are removed: this release writes no outbox.jsonl row.",
+          "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
     },
@@ -138,11 +138,11 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "edf4615c95b572c9b677994bfb65da9d2158513dca4d2ec943ed11d86a558227",
       "capture": "changed",
-      "sha256": "00f8df70161714f7b9cf59499dcc6fa815412d3c2aa6b1bd2c695cabbf2bf25a",
+      "sha256": "62b23d14ec24010bcef943395f6b95391e94c135f1f4c7b9b1b8e10a2a220d63",
       "changes": [
         {
-          "change": "pchat post queues only the unconfirmed remainder of a post that failed partway and says how many parts were posted; a refusal after some parts were published is recorded in dead letters with its parts; pchat status reports outbox posts awaiting a delivery check and each partly published dead-lettered post's progress.",
-          "reason": "pchat queued the whole text on any failure, including a completion timeout after the server had committed the post (#19). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
+          "change": "pchat post and pchat ack exit 3 only once the call is durably queued or handed off (by an acknowledged request, or a fallback file); a refusal after some parts were published is reported, and the bridge dead-letters it with its parts; pchat status reads the outbox authority's status, or its dated snapshot while the authority is unavailable, and counts fallback files and legacy rows waiting for it.",
+          "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
     },
@@ -271,11 +271,15 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "b10abf6868762cf26f9b4461f113307a371f7227a6a6a6c62f6b3c21549ce35b",
       "capture": "changed",
-      "sha256": "694432cfe66650c879aa78aa1ff680e1cf38f6398abcb215865e2d44fb779f61",
+      "sha256": "ec18c5162a56f78b53a82837dc83cc1c4d28be5ed35f1a36b0e57ed0f2cea7a5",
       "changes": [
         {
           "change": "Invented names: every real project name and agent-name prefix in fixtures is replaced by an invented one (projects alpha, beta, gamma, delta; prefixes alp, bet).",
           "reason": "Remove real project and agent-name data from fixtures (requirement 3)."
+        },
+        {
+          "change": "A silent run's post is checked never to be queued in any form (no fallback file, no create, queue or handoff request to the outbox authority); its acknowledgement is still queued, and an entry queued before the run keeps its delivery.",
+          "reason": "These tests encoded the replaced outbox.jsonl queue (#19, requirement 10 and the fifth amendment's E5); their protection is kept. Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
     },
@@ -291,15 +295,15 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
       "capture": "changed",
-      "sha256": "9f5ba56cfb72ccf0fffbea5481ccfaa3a25567ac4b22bb527ae91cdc0e713a4c",
+      "sha256": "f7f04621b9221191f64a33a36fc9987139518724f78f3a82deabdae8e1763a4d",
       "changes": [
         {
           "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
           "reason": "Deliberate deviation from c572bad, by owner decision on PR #16's first review: a catch-up cut short leaves the checkpoint behind, so after a restart more than 5,000 replayed messages would be logged again and an accepted request queued again (PLT-15 requirement 8). The running bridge keeps the baseline behavior until activation."
         },
         {
-          "change": "flush_outbox rewrites each claimed file after every change and removes it only when empty, so a crash leaves exactly what is still owed; a part caught mid-write is uncertain and is reconciled against the channel record (delivered, absent only over a record known complete through a sync well after the write, else undecided, dead-lettered with a content-free owner alert after a day) instead of being resent; each part needs its own logged message written no earlier than the part, and a msgid once counted (kept in outbox-attributed.jsonl) is never counted again; every part the server confirmed without our learning its msgid -- reserved by key by whoever posted it (outbox-reserved.jsonl, read afresh for each check and pruned once too old to compete) or still pending -- keeps a message of its own within its write-to-confirmation window, counted once per key, so one message never satisfies two parts; absence needs the record complete over every such window; giving up on an entry is marked durably before it is dead-lettered and retired, so a crash can neither make it retryable nor strand it, and a server refusal is always terminal; announce() queues only the unconfirmed remainder; run() tracks where each channel's record is complete (record-coverage.json) and syncs with a PING before each flush; leaving a channel (KICK or PART) stops its interval until a catch-up after rejoining, and a catch-up still open, or still to be answered, when it was left completes nothing.",
-          "reason": "Stop the outbox reposting committed parts of a long post on every flush, and never resend a part that may already be in the channel without proof of absence (#19). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
+          "change": "The bridge runs the outbox authority (delivery_store.Authority: the only opener of outbox.db, on its own thread, serving outbox.sock) and its flush: it imports fallback files and the legacy outbox without outbox.lock, ends gone writers' attempts, abandons (E8) or, for its own announcements, adopts (E9) their entries, reconciles from current state (R1, R2), dead-letters after 24 hours with a content-free alert row, gives every eligible entry its attempt, and retires claims and writes dead letters under a bounded outbox.lock. It indexes every verified message (V1) before its checkpoint moves, keeps record coverage in the authority, writes the pending queue, ledger and dead letters durably, and announces with a derived entry id, saving held_announced only once the announcement is durable. The file-based claimed-outbox, reservation and attribution state is removed.",
+          "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
     },
@@ -330,11 +334,15 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "fdd9f514078f0c0739c1c1bc24805228b3ab4687dae45a16f5f4db3dce63100a",
       "capture": "changed",
-      "sha256": "2896fe5eac6820c43d6cd088c25504475fcf49fd624b97128f107346ea64df04",
+      "sha256": "a423d79934a1b2104148de59b1bedb027878cb5ca9d2345e86cbc1a74ac4775d",
       "changes": [
         {
           "change": "Invented names: every real account, project name, agent-name prefix and channel in fixtures is replaced by an invented one (owner pat, assistant sam; projects nova, alpha, gamma, delta, epsilon, zeta; prefixes nov, alp, gam, del, eps, zet). The beta/bet of the core slice's tests is nova/nov here because the bridge sorts the accounts it wakes and one routing test's expected order depends on the prefix sorting after \"manager\".",
           "reason": "Remove real account, project and agent-name data from fixtures (PLT-15 requirement 3)."
+        },
+        {
+          "change": "The outbox tests keep their intent on the new paths (a post queued mid-flush, now a fallback file, goes out at the next flush; a claim left by a crash is imported and delivered while a failing entry stays owed; a tag and a reply survive the outbox), the multiline send tests and the catch-up tests run against an in-process outbox authority, and the shared outbox fakes are imported.",
+          "reason": "These tests encoded the replaced file-based outbox (#19, requirement 10 and the fifth amendment's E5). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
     },
@@ -400,7 +408,7 @@
       "source_commit": "8ff325ee307b92e53157594e570235bc9f2f5229",
       "effective_sha256": "e5eda84d2d8b8773ef5b4660b40f1dee0e2545d2db764d5d0e1b20929d7fe438",
       "capture": "changed",
-      "sha256": "82866dd6ca185a07e8e39216db0754cc8d0a70fe64eea45da2852cf55b701327",
+      "sha256": "1b240b32ed4d9806cfae9f976dfbfa81aa1b4c49f74ae3946c46ad95fb910698",
       "changes": [
         {
           "change": "Where the guidance named the owner's or the global assistant's account, it now says where that account is configured (`owner` and `assistants` in the chat config); examples that used the owner's or assistant's account use `<assistant>` / `@<owner>`.",
@@ -411,8 +419,8 @@
           "reason": "No real project names, channels or messages in the guidance (PLT-15 requirement 3)."
         },
         {
-          "change": "\"No lost posts\" and \"When chat is down\" describe partial posts: only the unposted remainder is queued, an uncertain part is checked against the record before any resend, and the guarantee is not exactly-once.",
-          "reason": "The guidance must match the behavior agents see from pchat post (#19). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70). The running tools keep the baseline behavior until activation (D-23)."
+          "change": "\"No lost posts\" and \"When chat is down\" describe partial posts (only the unposted remainder is queued, an uncertain part is checked against the record before any resend, not exactly-once) and that posts, acks and notices queue while the bridge cannot answer, even when the chat server is reachable.",
+          "reason": "The guidance must match the behavior agents see from pchat (#19 requirement 11, and its fourth amendment's D5(b)). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
         }
       ],
       "external_references": [
@@ -476,8 +484,40 @@
       "purpose": "Message-ID deduplication after acceptance recovery, across a crash, a restart and a restart after a cut-short catch-up of six full pages (PLT-15 requirement 8)."
     },
     {
+      "path": "packages/chat/scripts/delivery_store.py",
+      "purpose": "The outbox's one SQLite authority (#19): the store and its transitions, reconciliation, the bridge-only authority server and its request protocol, clients, fallback files and the lock-free import (design revision 8)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/outbox_fakes.py",
+      "purpose": "Shared fakes for the outbox tests: a chat server that commits before it answers, an injected clock, invented processes, an in-process authority and a filesystem model that drops unsynced changes."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_outbox_regressions.py",
+      "purpose": "#19's failing-first regressions: the whole-post repost, a failed confirmation record and a stopped outbox.lock holder, run against the code before and after the fix."
+    },
+    {
       "path": "packages/chat/scripts/tests/test_outbox_resend.py",
-      "purpose": "Partial-post delivery (#19): per-part confirmation, remainder-only queueing, record reconciliation, crash and restart recovery, independent delivery, refusals and the one-day dead letter, against a fake server with an injected clock."
+      "purpose": "#19's acceptance 1-10 and design revision 8's posting scenarios against a fake server and an in-process authority."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_outbox_store.py",
+      "purpose": "The outbox authority's rules: attribution, finality, fragments, accounting on every part, collection, alerts, A12 and attested outcomes (#19)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_outbox_files.py",
+      "purpose": "The outbox's file boundaries: fallback files, the legacy claim and durable exports, with power losses and a stopped lock holder (#19)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_outbox_authority.py",
+      "purpose": "The bridge-only authority and its request protocol over socketpairs: stopped clients, floods, replays, epochs, unavailability and the one opener (#19)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_outbox_bridge.py",
+      "purpose": "The bridge's outbox side: coverage and indexing, bounded setup, its announcements and E9, and the authority thread (#19)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_outbox_crashes.py",
+      "purpose": "A crash at every boundary of design revision 8's section 5.5, one case per row (#19)."
     }
   ]
 }

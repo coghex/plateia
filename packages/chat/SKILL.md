@@ -150,10 +150,17 @@ pchat status                                         # server, bridge, delivery 
   (`"replayed": true` in the log). It resumes from `checkpoints.json`, the
   point through which each channel's log is known complete, so a catch-up cut
   short is picked up again rather than skipped.
-- **No lost posts.** If `pchat post` can't reach the server, it writes the post
-  to `~/.local/state/chat/outbox.jsonl` and exits with code 3. The bridge posts
-  it within a minute of chat coming back, marked "delayed". Don't write the
-  outbox by hand.
+- **No lost posts.** If `pchat post` can't reach the server, it queues the post
+  durably for the bridge and exits with code 3. The bridge posts it within a
+  minute of chat coming back, marked "delayed". Don't write the outbox by hand.
+  - The bridge keeps the record of every post and acknowledgement it owes.
+    Before each part of a post, `pchat` asks the bridge to record it. So while
+    the bridge can't answer (it is stopped, restarting or overloaded), `pchat
+    post`, `pchat ack` and an agent's notices queue instead of sending, even
+    when the chat server itself is reachable: exit code 3, and the bridge
+    sends them when it is back. For example, `pchat post '#alpha' "[status]
+    build green"` exits 3 while the bridge restarts, and appears in `#alpha`
+    a minute later, marked "delayed".
   - A long post goes out in parts, each confirmed by the server before the
     next. If it fails partway, only the unposted remainder is queued: say parts
     1 and 2 of a 3-part `[question alpha-20261009-1]` were confirmed, then only
@@ -256,9 +263,12 @@ The server authenticates every account, and each log entry records
 ## When chat is down
 
 `pchat post` queues the post in the outbox itself (exit code 3) and the bridge
-posts it once chat is back, so carry on with your work. If the post failed
-partway, pchat says how many parts were already posted; only the rest is
-queued, so don't post it again yourself. If `pchat status`
+posts it once chat is back, so carry on with your work. The same happens when
+only the bridge is down, even if the chat server answers: a post, an ack or a
+notice waits for the bridge rather than going out unrecorded. If the post
+failed partway, pchat says how many parts were already posted; only the rest is
+queued, so don't post it again yourself. A part whose delivery is uncertain is
+checked against the channel record before any resend. If `pchat status`
 still shows the server or bridge down after a few minutes, tell the owner
 some other way: through your manager, or in your session.
 
