@@ -927,6 +927,26 @@ class InterruptIntentTests(InterruptCase):
                 self.assertEqual([i["phase"] for i in after.items if i["kind"] == "ring"], ["held"])
                 self.assertEqual(len(self.alerts(after.items)), 1, "one content-free owner alert")
 
+    def test_a_crash_after_the_evidence_never_interrupts_again(self):
+        """Test 42's last boundary: killed after the submission's ledger line, before anything else."""
+        calls = []
+
+        def announce(*a):
+            calls.append(1)
+            if len(calls) == 1:
+                raise Crash()
+            return True
+        first = self.FakeAgent()
+        self.queued()
+        with mock.patch.object(self.bridge, "announce", announce), self.assertRaises(Crash):
+            self.passes(first)
+        second = self.FakeAgent()
+        with mock.patch.object(self.bridge, "announce", announce):
+            after = self.passes(second, 2)
+        self.assertEqual(self.interrupts(first, second), 1, "never rung again")
+        self.assertEqual([i["phase"] for i in after.items if i["kind"] == "ring"], ["accept"], "by its ledger line")
+        self.assertEqual(len(calls), 2, "the owed announcement, made once after the restart")
+
     def test_a_crash_before_the_intent_is_retried_as_today(self):
         self.queued()
         with self.assertRaises(Crash):
@@ -1066,7 +1086,8 @@ class InterruptOutcomeTests(InterruptCase):
         cases = {"another intent": dict(good, intent="j" * 32), "another target": dict(good, target="sam"),
                  "another surface": dict(good, surface="T"), "no intent": {k: v for k, v in good.items()
                                                                             if k != "intent"},
-                 "not ok": dict(good, ok=False), "unreadable": None, "exact": good}
+                 "not ok": dict(good, ok=False), "unreadable": None, "exact": good,
+                 "a reminder's line": {"msgid": "m-int", "kind": "ring", "ok": True, "detail": "reminder 1 of 2"}}
         for name, line in cases.items():
             with self.subTest(case=name):
                 self.fresh()
@@ -1086,6 +1107,83 @@ class InterruptOutcomeTests(InterruptCase):
                 self.assertEqual(agent.keys, [], "never rung again")
                 want = "accept" if name == "exact" else "held"
                 self.assertEqual([i["phase"] for i in after.items if i["kind"] == "ring"], [want])
+
+
+class AcknowledgementRecoveryTests(InterruptCase):
+    """Code review slot 9, findings 1 and 2: an acknowledgement already in
+    acks.jsonl settles its interrupt after a restart for EVERY recipient of one
+    message, and recovery that could not read the file is tried again at a
+    later pass, keeping the valid records around a malformed line."""
+
+    def delivered(self, target):
+        return dict(self.item(), target=target, phase="accept", attempt=1, next_at=self.bridge.time.time() + 600,
+                    intent_id=f"{target}-intent", intent_surface="S", intent_session=None, delivered_announced=True)
+
+    def expire_and_pass(self, d):
+        for i in d.items:
+            i["next_at"] = 0
+        self.passes(self.FakeAgent(), 2, deliveries=d)
+
+    def unacknowledged_dead_letters(self):
+        return [r for r in self.dead_letters() if r.get("msgid") == "m-int" and r.get("kind") == "ring"]
+
+    def test_every_recipient_of_one_interrupt_is_recovered_after_a_failed_settling_save(self):
+        d = self.bridge.Deliveries()
+        d.items = [self.delivered("alp-solver-2"), self.delivered("alp-solver-3")]
+        d._save()
+        acks = self.bridge.Acks()
+
+        def save(_d):
+            raise OSError(28, "no space left on device (fake)")
+        with mock.patch.object(self.bridge.Deliveries, "_save", save):
+            for n, target in enumerate(("alp-solver-2", "alp-solver-3")):
+                self.bridge.accepted(CFG, d, acks, msgid=f"m-ack-{n}", reply_to="m-int", sender=target,
+                                     channel="#alpha", at="2026-10-09T00:00:00Z", how="reply")
+        after = self.bridge.Deliveries()  # a restart: neither settling was saved
+        self.assertEqual(sorted(i["target"] for i in after.items), ["alp-solver-2", "alp-solver-3"])
+        self.passes(self.FakeAgent(), deliveries=after)
+        self.expire_and_pass(after)
+        self.assertEqual([i for i in after.items if i["kind"] == "ring"], [], "both recipients settled")
+        self.assertEqual(self.unacknowledged_dead_letters(), [], "no false unacknowledged dead letter")
+
+    def test_a_failed_read_is_retried_at_a_later_pass_and_a_malformed_line_is_skipped(self):
+        d = self.bridge.Deliveries()
+        d.items = [self.delivered("alp-solver-2")]
+        d._save()
+        self.bridge.ACKS.mkdir(parents=True)  # the first read fails
+        try:
+            after = self.bridge.Deliveries()
+            self.passes(self.FakeAgent(), deliveries=after)
+            self.assertEqual([i["phase"] for i in after.items], ["accept"], "not yet recovered")
+        finally:
+            self.bridge.ACKS.rmdir()
+        ack = {"at": "2026-10-09T00:00:00Z", "msgid": "m-ack", "reply_to": "m-int", "by": "alp-solver-2",
+               "channel": "#alpha", "project": "alpha", "how": "reply"}
+        self.bridge.ACKS.write_text('{"half a line\n' + json.dumps(ack) + "\n")
+        self.passes(self.FakeAgent(), deliveries=after)  # a later pass of the same process
+        self.expire_and_pass(after)
+        self.assertEqual([i for i in after.items if i["kind"] == "ring"], [], "recovered at the later pass")
+        self.assertEqual(self.unacknowledged_dead_letters(), [])
+
+
+class AlertIdentityTests(InterruptCase):
+    """The final round's re-check: an owner alert's dead-letter identity carries
+    its recipient and the alert itself, so the alerts for two recipients of one
+    message (or two alerts for one) are never collapsed into one record."""
+
+    def test_two_recipients_alerts_are_each_dead_lettered(self):
+        d = self.bridge.Deliveries()
+        for target in ("alp-solver-2", "alp-solver-3"):
+            d._alert(dict(self.item(), target=target), f"delivery to {target} failed (fake)")
+        d._alert(dict(self.item(), target="alp-solver-3"), "alp-solver-3 has not taken a post (fake)")
+        with mock.patch.object(self.bridge, "push_owner", lambda cfg, item: (False, "unreachable (fake)")):
+            for _ in range(len(self.bridge.BACKOFF) + 2):
+                for i in d.items:
+                    i["next_at"] = 0
+                self.passes(self.FakeAgent(), deliveries=d)
+        self.assertEqual(d.items, [])
+        pushes = [r for r in self.dead_letters() if r.get("msgid") == "m-int" and r.get("kind") == "push"]
+        self.assertEqual(len(pushes), 3, "one dead-letter record per alert")
 
 
 class OwedAnnouncementExpiryTests(InterruptCase):

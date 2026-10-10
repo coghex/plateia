@@ -1223,9 +1223,11 @@ class Store:
         self.raise_alert(f"held:{name}:{sha}", "held", name,
                          "queued outbox rows could not be imported and are held; see pchat status")
 
-    def import_legacy(self, name, start_ordinal, lines, new_offset, prefix_sha, close=False):
+    def import_legacy(self, name, start_ordinal, lines, new_offset, prefix_sha, close=False, unterminated=None):
         """I2: complete legacy lines of claim `name` from `start_ordinal`, and the
-        claim's imports row advanced (or closed), in one transaction."""
+        claim's imports row advanced (or closed), in one transaction. At the
+        final read, an `unterminated` last line is held as unreadable, never
+        imported, even when it is valid JSON (section 6.3)."""
         epoch = int(self.meta("import_epoch") or 0)
         known = self.con.execute("SELECT * FROM imports WHERE name = ?", (name,)).fetchone()
         if known is not None and known["state"] == "closed":
@@ -1258,11 +1260,14 @@ class Store:
                                    origin="ack" if clean.get("ack") else "legacy",
                                    occ=(name, i, hashlib.sha256(raw.encode() if isinstance(raw, str) else raw)
                                         .hexdigest()))
+        if unterminated is not None:
+            self.hold(name, start_ordinal + len(lines), unterminated, "unterminated last line: unreadable")
+        count = len(lines) + (unterminated is not None)
         self.con.execute("UPDATE imports SET lines = ?, offset = ?, sha256 = ?, epoch = ?, last_import = ?,"
                          " state = ? WHERE name = ?",
-                         (start_ordinal + len(lines), new_offset, prefix_sha, epoch, self.clock(),
+                         (start_ordinal + count, new_offset, prefix_sha, epoch, self.clock(),
                           "closed" if close else "open", name))
-        return len(lines)
+        return count
 
     def complete_pass(self):
         self.set_meta("import_epoch", int(self.meta("import_epoch") or 0) + 1)
@@ -2257,6 +2262,11 @@ class Importer:
         if outcome == "changed":  # its exact bytes are held first; a hold that fails or never runs keeps the file
             if self.authority.run_tx(lambda s: s.hold_changed(name, sha, data)) is CANCELLED:
                 return CANCELLED
+        try:
+            if self.fs.read(path) != data:  # rewritten since it was read: kept, and held by its bytes at the next pass
+                return outcome
+        except FileNotFoundError:
+            return outcome
         self.fs.unlink(path)  # a failure keeps it: the next try finds its imports row and removes it
         self.fs.sync_dir(self.paths.fallback)
         self.pass_names.discard(name)
@@ -2351,6 +2361,11 @@ class Importer:
         if row is None:
             return CANCELLED
         if row.get("state") == "closed":
+            if len(data) != row.get("offset") or self._sha(data) != row.get("sha256"):
+                # not the bytes its import committed: rewritten outside this design. Held with its exact
+                # bytes and alerted, never merged, and kept (owner amendment 6, F2(b); code review slot 9)
+                self.authority.run_tx(lambda s: s.hold_changed(name, self._sha(data), data))
+                return None
             try:
                 self.fs.unlink(path)  # I3's unlink, replayed
                 self.fs.sync_dir(self.paths.state)
@@ -2369,8 +2384,9 @@ class Importer:
         final = (barrier_at is not None and row.get("first_seen") is not None
                  and row["first_seen"] < barrier_at and len(take) == len(complete))
         lines = [x.decode(errors="replace") for x in take]
+        unterminated = None
         if final and tail[cut:]:
-            lines.append(tail[cut:].decode(errors="replace"))  # an unterminated last line: held
+            unterminated = tail[cut:].decode(errors="replace")  # held as unreadable, whatever it holds (I2)
             new_offset = len(data)
         if not lines and not final:
             if not row:
@@ -2379,13 +2395,16 @@ class Importer:
         try:
             n = self.authority.run_tx(lambda s, lines=lines, new_offset=new_offset, final=final:
                                       s.import_legacy(name, ordinal, lines, new_offset,
-                                                      self._sha(data[:new_offset]), close=final))
+                                                      self._sha(data[:new_offset]), close=final,
+                                                      unterminated=unterminated))
         except Conflict:
             return None
         if n is CANCELLED:
             return CANCELLED
         if final:
             try:
+                if self.fs.read(path) != data:  # rewritten since it was read: kept, held at the next pass (I3)
+                    return None
                 self.fs.unlink(path)
                 self.fs.sync_dir(self.paths.state)
             except OSError as err:  # closed: the next flush removes it

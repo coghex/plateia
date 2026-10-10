@@ -5,6 +5,7 @@ export made durable. A filesystem model drops whatever was never synced, to
 stand in for a power loss; a held flock stands in for a stopped old tool.
 Invented data only, under _isolation."""
 import fcntl
+import hashlib
 import json
 import os
 import sqlite3
@@ -720,6 +721,25 @@ class ChangedFallbackTests(FilesCase):
                          "held once, with its exact bytes")
         self.assertEqual(self.published_texts(), ["[status] original"], "the original obligation, once")
 
+    def test_a_changed_file_keeps_import_fair_and_its_pass_accounting(self):
+        """Test 47's last clause: fairness and import_epoch behave as in test 34."""
+        path = self.imported_but_kept()
+        path.write_bytes(b"changed")
+        self.fs.durable(path)
+        for n in range(3):
+            self.ds.publish_fallback(self.fs, self.authority.paths, dict(self.row(f"[status] later {n}"), id=f"{n}" * 32),
+                                     clock=self.clock)
+        epoch = int(self.tx(lambda s: s.meta("import_epoch")) or 0)
+        with mock.patch.object(self.ds, "IMPORT_MAX", 2):
+            self.importer.import_fallback_files()
+            self.assertEqual(len(self.fallback_files()), 2, "two per flush, the oldest (the changed file) first")
+            self.importer.import_fallback_files()
+        self.assertEqual(self.fallback_files(), [])
+        self.assertEqual(sorted(e["text"] for e in self.entries()),
+                         ["[status] later 0", "[status] later 1", "[status] later 2", "[status] original"])
+        self.assertEqual(int(self.tx(lambda s: s.meta("import_epoch"))), epoch + 1, "one pass, completed once")
+        self.assertEqual(len(self.sql("SELECT * FROM held")), 1)
+
     def test_a_failed_or_cancelled_hold_keeps_the_file(self):
         for how in ("fails", "cancelled"):
             with self.subTest(how=how):
@@ -745,6 +765,104 @@ class ChangedFallbackTests(FilesCase):
                 self.importer.import_fallback_files()  # a later flush, with the hold working
                 self.assertFalse(path.exists())
                 self.assertEqual(len(self.sql("SELECT * FROM held")), 1)
+
+
+class LegacyClaimIntegrityTests(FilesCase):
+    """Code review slot 9, findings 3 and 4 (design section 6.3, I2 and I3): a
+    closed claim's removal is replayed only while its bytes are the ones its
+    import committed; a rewritten one is held with its exact bytes, alerted, and
+    kept. Every unterminated last line is held as unreadable at the final read,
+    even when it happens to be valid JSON."""
+
+    NAME = "outbox.claimed-9-z.jsonl"
+
+    def final_import(self):
+        self.importer.import_legacy([self.NAME], barrier_at=T0 - 1)  # first seen, after this barrier
+        self.clock.advance(1)
+        self.importer.import_legacy([self.NAME], barrier_at=self.clock())  # the final read, and I3
+
+    def closed_but_kept(self):
+        path = self.legacy(self.row("[status] one"), name=self.NAME)
+        real = self.fs.unlink
+
+        def unlink(p):
+            if Path(p) == path:
+                raise PermissionError(13, "permission denied (fake)")
+            return real(p)
+        with mock.patch.object(self.fs, "unlink", unlink):
+            self.final_import()
+        self.assertEqual(self.sql("SELECT state FROM imports WHERE name = ?", self.NAME)[0]["state"], "closed")
+        self.assertTrue(path.exists(), "closed, but its removal failed")
+        return path
+
+    def test_a_rewritten_closed_claim_is_held_with_its_bytes_and_kept(self):
+        path = self.closed_but_kept()
+        changed = (json.dumps(self.row("[status] rewritten")) + "\n").encode()
+        path.write_bytes(changed)
+        self.fs.durable(path)
+        for _ in range(2):
+            self.importer.import_legacy([self.NAME], barrier_at=self.clock())
+        self.assertTrue(path.exists(), "a changed claim is never deleted")
+        held = self.sql("SELECT raw FROM held WHERE file = ?", self.NAME)
+        self.assertEqual([bytes(h["raw"]) if not isinstance(h["raw"], str) else h["raw"] for h in held], [changed])
+        key = f"held:{self.NAME}:{hashlib.sha256(changed).hexdigest()}"
+        self.assertEqual(len([a for a in self.alerts() if a["alert_key"] == key]), 1, "one alert")
+        self.assertEqual([e["text"] for e in self.entries()], ["[status] one"], "never merged")
+
+    def test_an_unchanged_closed_claim_is_still_removed(self):
+        path = self.closed_but_kept()
+        self.importer.import_legacy([self.NAME], barrier_at=self.clock())
+        self.assertFalse(path.exists())
+        self.assertEqual(self.sql("SELECT * FROM held"), [])
+
+    def rewritten_after_commit(self, path, changed):
+        """A run_tx that rewrites `path` just after the transaction it ran commits."""
+        real = self.authority.run_tx
+
+        def run_tx(fn):
+            out = real(fn)
+            if path.exists() and path.read_bytes() != changed and "hold_changed" not in fn.__code__.co_names:
+                path.write_bytes(changed)
+            return out
+        return mock.patch.object(self.authority, "run_tx", run_tx)
+
+    def test_a_claim_rewritten_between_its_final_import_and_its_removal_is_held(self):
+        path = self.legacy(self.row("[status] one"), name=self.NAME)
+        self.importer.import_legacy([self.NAME], barrier_at=T0 - 1)
+        self.clock.advance(1)
+        changed = b"rewritten between the import and the removal"
+        with self.rewritten_after_commit(path, changed):
+            self.importer.import_legacy([self.NAME], barrier_at=self.clock())
+        self.assertTrue(path.exists(), "not removed: its bytes are not the ones committed")
+        self.importer.import_legacy([self.NAME], barrier_at=self.clock())
+        self.assertTrue(path.exists())
+        held = self.sql("SELECT raw FROM held WHERE file = ?", self.NAME)
+        self.assertEqual([bytes(h["raw"]) if not isinstance(h["raw"], str) else h["raw"] for h in held], [changed])
+
+    def test_a_fallback_file_rewritten_between_its_import_and_its_removal_is_held(self):
+        self.ds.publish_fallback(self.fs, self.authority.paths, dict(self.row("[status] original"), id="o" * 32),
+                                 clock=self.clock)
+        [path] = self.fallback_files()
+        changed = b"rewritten between the import and the removal"
+        with self.rewritten_after_commit(path, changed):
+            self.importer.import_fallback_files()
+        self.assertTrue(path.exists(), "not removed: its bytes are not the ones committed")
+        self.importer.import_fallback_files()
+        self.assertFalse(path.exists(), "removed once its exact bytes are held (F2(b))")
+        held = self.sql("SELECT raw FROM held WHERE file = ?", path.name)
+        self.assertEqual([bytes(h["raw"]) if not isinstance(h["raw"], str) else h["raw"] for h in held], [changed])
+
+    def test_an_unterminated_last_line_is_held_even_when_it_is_valid_json(self):
+        for tail in (json.dumps(self.row("[status] no newline")).encode(), b"{not json"):
+            with self.subTest(tail=tail[:12]):
+                self.fresh()
+                path = self.legacy(self.row("[status] whole"), name=self.NAME, raw=tail)
+                self.final_import()
+                self.assertEqual([e["text"] for e in self.entries()], ["[status] whole"], "nothing deliverable from it")
+                held = self.sql("SELECT ordinal, raw, why FROM held WHERE file = ?", self.NAME)
+                self.assertEqual([(h["ordinal"], h["raw"]) for h in held], [(1, tail.decode(errors="replace"))])
+                self.assertIn("unterminated", held[0]["why"])
+                self.assertFalse(path.exists(), "the database holds it: the claim is retired")
 
 
 class StagingIdentityTests(FilesCase):

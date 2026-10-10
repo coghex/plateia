@@ -456,7 +456,8 @@ class Deliveries:
     def _dead(self, item, detail, cfg, reason=None):
         """Give up on a delivery. Every dead-lettered wake-up tells the owner,
         without the message text; a dead-lettered push only logs, so it can't loop."""
-        key = f"delivery:{item['kind']}:{item['msgid']}:{item.get('target') or item.get('project') or ''}"
+        key = (f"delivery:{item['kind']}:{item['msgid']}:"
+               f"{item.get('target') or item.get('about') or item.get('project') or ''}")
         with delivery_store.flock(chatlib.STATE_DIR / "outbox.lock", wait=delivery_store.LOCK_WAIT) as held:
             if not held:  # the item stays pending, unchanged; the dead letter is tried again later
                 log(f"{item['kind']} dead letter deferred: outbox.lock busy")
@@ -474,7 +475,10 @@ class Deliveries:
             self._alert(item, f"delivery to {_recipient(item)} {reason or 'failed: ' + detail[:80]}")
 
     def _alert(self, item, text):
-        self.items.append({"kind": "push", "msgid": item["msgid"], "channel": item["channel"],
+        # "about" is the alert's own identity (its recipient, and which alert): several recipients of one
+        # message, or several alerts for one, never share a dead-letter record
+        about = f"{_recipient(item)}:{hashlib.sha256(text.encode()).hexdigest()[:12]}"
+        self.items.append({"kind": "push", "msgid": item["msgid"], "channel": item["channel"], "about": about,
                            "sender": "chatbridge", "project": None, "attempt": 0, "next_at": 0, "text": text})
 
     def accept(self, msgid, by, how, cfg):
@@ -541,25 +545,34 @@ class Deliveries:
         return changed
 
     def recovered_acknowledgements(self, cfg):
-        """At the first pass of a process: an interrupt whose acknowledgement is
-        already in acks.jsonl, but whose settling was never saved, is settled."""
+        """Once per process, at the first pass that can read acks.jsonl: an
+        interrupt whose acknowledgement is already there, but whose settling was
+        never saved, is settled. Each recipient of one message by its own
+        acknowledgement; a malformed line is skipped, and a read or settling that
+        fails is tried again at the next pass."""
         if getattr(self, "_acks_checked", False):
             return False
-        self._acks_checked = True
-        pending = {i["msgid"]: i for i in self.items if i["kind"] == "ring" and i.get("interrupt")
-                   and i.get("phase") in ("accept", "held")}
+        pending = {(i["msgid"], i.get("target")): i for i in self.items if i["kind"] == "ring"
+                   and i.get("interrupt") and i.get("phase") in ("accept", "held")}
         if not pending:
+            self._acks_checked = True
             return False
         try:
-            rows = [json.loads(x) for x in ACKS.read_text().splitlines() if x.strip()] if ACKS.exists() else []
-        except (OSError, ValueError):
+            lines = ACKS.read_text().splitlines() if ACKS.exists() else []
+        except (OSError, ValueError) as err:
+            log(f"acknowledgements not read ({err!r:.80}); read again next pass")
             return False
         changed = False
-        for row in rows:
-            item = pending.get(row.get("reply_to")) if isinstance(row, dict) else None
-            if item is not None and item in self.items and row.get("by") == item.get("target"):
+        for raw in lines:
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue
+            item = pending.get((row.get("reply_to"), row.get("by"))) if isinstance(row, dict) else None
+            if item is not None and item in self.items:
                 self.accept(item["msgid"], row["by"], row.get("how") or "recovered", cfg)
                 changed = True
+        self._acks_checked = True
         return changed
 
     def process(self, cfg):
