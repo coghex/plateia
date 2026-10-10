@@ -2277,11 +2277,46 @@ decisions.
   The code review has a budget of three launches at most. Merging,
   installed rollout, activation and live migration each still need their own
   owner decision.
+- **Interrupt intent (owner decision, 2026-10-10, 20:25 UTC; #19's owner
+  amendment 6).** The eighth code review of pull request #20 showed that a
+  failed state save, followed at once by a crash, could make the bridge
+  interrupt an agent a second time. The owner approved a narrow scope change,
+  for interrupts only:
+  - **Intent before action.** The bridge durably records its intent before
+    the first physical step that may affect an agent: the stop key or the
+    typed prompt. If it cannot, it takes no step.
+  - **Intent is not delivery.** It means started, possibly acted.
+  - **Unknown is held.** An unknown or partial outcome is held for
+    reconciliation, with its recovery identity, and never repeated
+    automatically. Only surviving, exact-identity, unambiguous proof settles
+    it. Missing, stale, mismatched or unreadable proof stays unknown.
+  - **A pause over a duplicate.** The owner accepts a possible pause in
+    place of a duplicate interrupt.
+  - **What stays.** Target, session, surface and request identity, the draft
+    and dialog guards, acknowledgement, truthful dead letters and finality.
+    Ordinary wake-ups keep their baseline, and no exactly-once is claimed.
+  - **No new mechanism.** The states live in the existing pending record.
+    No new service, file, journal, protocol or command is added.
+  - **The review's three findings** are corrections within the existing
+    contract:
+    - an owed announcement survives the acknowledgement wait;
+    - a changed fallback file's exact content is kept before its removal;
+    - the required negative-reconciliation and same-account tests.
+  - **Budget.** One canonical issue review of the amendment. Then, only if
+    it approves, at most two further correction and code-review rounds,
+    stopping at the first approval.
+
+  It supersedes #19's exclusion of wake-up and recovery semantics only for
+  this interrupt-specific durability correction. The design is revision 9 of
+  [chat_outbox_state.md](chat_outbox_state.md), section 3.7, section 6.3 and
+  tests 41–48. **This decision approves the scope change and its review.**
+  Merging and activation still need their own owner decisions.
 
 Delivery stays at-least-once with the record check, and nothing claims
 exactly-once. The 13:39 UTC decision of 2026-10-10 approves the
-implementation; the others approve the design, its scope and its review.
-Merging and activation each still need a separate owner decision.
+implementation, and the 20:25 UTC decision a scope change for interrupts;
+the others approve the design, its scope and its review. Merging and
+activation each still need a separate owner decision.
 
 Rejected alternatives:
 
@@ -2299,6 +2334,10 @@ Rejected alternatives:
 - **Exempting already durable fallback rows that wait behind a stopped
   holder of the outbox lock** (narrowing R6). Rejected 2026-10-10: per-entry
   fallback files remove the wait instead.
+- **Repeating an interrupt whose outcome is unknown.** A second interrupt can
+  stop a turn the agent started after the first one, and submit the
+  instruction twice. Rejected 2026-10-10 (20:25 UTC): it is held instead, at
+  the cost of a possible pause.
 
 ### D-74. PLT-14 carries #19's formats through one guarded cutover; the shared rollout is authorized after gates
 

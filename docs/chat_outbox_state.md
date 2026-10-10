@@ -7,7 +7,7 @@ the callers section 2.4 names. Merging, installing and activating it each
 need their own owner decision. Until activation, the running tools keep
 their old behaviour.
 
-This is revision 8. Revision 3 answered design review round 2. Revision 4
+This is revision 9. Revision 3 answered design review round 2. Revision 4
 aligned the note with the owner's second amendment to #19:
 
 - the release-packaging scope;
@@ -64,6 +64,27 @@ canonical issue rereview of #19's fourth amendment. It adds three things:
   - what "send nothing" means while the authority is unavailable.
 - **Its three release and test additions** (sections 2.4.4, 6.4, 8 and
   10.1).
+
+Revision 9 adopts the owner's fourth decision of 2026-10-10 (20:25 UTC),
+amendment 6 to #19, made after the eighth code review of pull request #20.
+It is narrow and specific to interrupts:
+
+- **Durable interrupt intent.** The bridge durably records its intent to
+  interrupt an agent before the first physical step that may affect it. That
+  step is a stop key or a typed prompt. If the intent cannot be recorded, the
+  step is not taken (section 3.7).
+- **Unknown outcomes are held, never repeated.** Intent means "started,
+  possibly acted", never delivered. After a crash, a failure or an unknown
+  completion, the interrupt is held for reconciliation and never repeated
+  automatically. The owner accepts a possible pause in place of a duplicate
+  interrupt.
+- **That review's three findings,** as corrections within the existing
+  contract:
+  - an announcement still owed when the acknowledgement wait expires;
+  - the exact content of a changed fallback file is kept before its removal
+    (section 6.3);
+  - the required negative-reconciliation and same-account tests (section 9,
+    tests 41–48).
 
 Section 12 lists what changed and why. The owner's decisions of 2026-10-09 and
 2026-10-10 are recorded in section 11, and in D-73 of
@@ -962,6 +983,88 @@ pending and in the ledger before an item is added, and it is delivered at
 least once. Its text names only accounts, channels and file names, never a
 message's content.
 
+### 3.7 Interrupt intent (owner amendment 6)
+
+An interrupt is a wake-up that stops an agent's turn and types an instruction
+into its prompt. #19 left wake-ups out of scope, and the bridge's other
+wake-ups keep their baseline: a crash can duplicate a wake-up, never lose
+one. For interrupts only, the owner's 2026-10-10 decision (section 11,
+decision 11) replaces that baseline with the rule below. A duplicate
+interrupt can stop a turn the agent started after the first one, and submit
+the instruction twice.
+
+**The physical boundaries.** One interrupt attempt crosses at most three, in
+order:
+
+1. **the stop:** the key that stops a running turn, sent only when one runs;
+2. **the typing:** the instruction typed into an empty prompt;
+3. **the submission:** the key that submits it, sent only when the whole
+   draft on screen matches the instruction.
+
+Checks that only read the screen or the session's state cross none. An
+attempt that crosses none, or proves it crossed none, is **no action**.
+
+**The states of an interrupt item.** They are kept in the item's existing
+`pending.json` record (a durable replace, section 3.6). No new file, service,
+journal, protocol or command is added. Each state carries the item's
+recovery identity: its message id, its target, the target's session and
+surface, and its request.
+
+| State | Meaning | Next |
+|---|---|---|
+| `deliver` | No physical step of this item has been taken since its last durable state. | The read-only checks; then `intent`. |
+| `intent` | The bridge has durably recorded that it is about to take a physical step, with a fresh intent id. It means **started, possibly acted**: never delivered, never accepted. | The attempt, then one of the three below. |
+| `accept` | **Delivered:** the attempt proved its submission, the screen's evidence that the prompt was sent. The bridge waits for the acknowledgement, as before. | `settled` on acknowledgement or dead letter. |
+| `held` | **Unknown or partial:** a step may have been taken, and no submission is proved. That covers a crash while in `intent`, a stop without typing, typing without proved submission, and any failure after the first key. | Reconciliation only; never another attempt. |
+| `settled` | Acknowledged, or dead-lettered, while its ledger line or announcement is still owed. Never due. | Removed once nothing is owed. |
+
+**The rules.**
+
+- **Intent before action.** `intent` is saved durably before the first
+  physical step. If that save fails, no step is taken, and the item stays in
+  `deliver` and is tried at a later pass. The read-only checks (a dialog, a
+  draft, a browsing view) run before the intent, and leave the item in
+  `deliver` as today.
+- **The outcome of an attempt.** It returns which boundaries it crossed:
+  - **none,** proved: back to `deliver`, saved;
+  - **the submission, proved:** `accept`, with its ledger line and
+    announcement owed, and retried until durable;
+  - **anything else:** `held`.
+
+  Each is saved durably. A failed save is retried at every pass, and
+  recovery never needs it: see below.
+- **Recovery.** On restart, an item found in `intent` is `held`. It is never
+  moved back to `deliver`, and no step is repeated.
+- **Reconciliation of a held item.** Only surviving, exact-identity,
+  unambiguous proof of success settles it:
+  - a durable ledger line recording that this intent id's submission was
+    proved, for the same target, session and surface, moves it to `accept`;
+  - the recipient's acknowledgement or reply to the item's message moves it
+    to `settled` (accepted), as for any delivered interrupt.
+
+  Missing, stale, mismatched or unreadable proof is **unknown**. That
+  includes a line for another intent id or target, a line from a reminder,
+  and an `ok` line without an intent id. It is never success, and never
+  permission to repeat.
+- **What a held item does.** It is never rung again. It raises one
+  content-free owner alert. When the acknowledgement wait expires, it is
+  dead-lettered truthfully, as "outcome unknown; not repeated". The
+  dead-letter record keeps its recovery identity and which boundaries it may
+  have crossed.
+- **Owed work is separate.** The ledger line, the announcement and the save
+  are each owed and retried on their own (section 3.6, C5), across
+  acknowledgement and dead-lettering (`settled`). None of them is ever a
+  reason to ring again.
+- **What stays.** The target, session, surface and request identity, the
+  draft and dialog guards, the acknowledgement, truthful dead letters and
+  finality are unchanged. A proved no-action stays distinct from a partial
+  stop or submission, and both from delivered-but-not-acknowledged.
+
+**What it does not claim.** No exactly-once. A crash in `intent` before any
+step leaves a held interrupt that was never acted on: the owner's accepted
+cost is that pause, until the acknowledgement or the dead letter, in place of
+a possible duplicate. Ordinary wake-ups and phone pushes are unchanged.
+
 ## 4. Invariants and proofs
 
 ### I-1. Intent before bytes
@@ -1812,8 +1915,11 @@ the authority (section 2.4.3).
    1. If `imports` has F's name with F's sha256, it was imported and its
       removal was interrupted: go to step 6.
    2. If `imports` has F's name with another sha256, something outside this
-      design wrote it. In one `TX`, hold it with its alert row
-      `held:<name>:<sha256>`, unless that row exists, then go to step 6.
+      design wrote it. In one `TX`, hold it, **with its exact bytes**, and
+      its alert row `held:<name>:<sha256>`, unless that row exists. Go to
+      step 6 only once that `TX` has committed; a hold that fails or is
+      cancelled keeps F. Its changed content is never merged or replayed
+      (owner amendment 6, a correction).
    3. Make a durable sync of F, and of `outbox.d/` (section 2.1). A file a
       crashed writer linked but never synced is thereby made durable before
       anything relies on it.
@@ -2287,6 +2393,7 @@ posted on the issue. The mapping is to the amended issue.
 | Acceptance 7 | As amended (AD-1): the test recovers the SQLite crash state, with the same assertions. |
 | Acceptance 11 | As corrected (section 10.1): the comparison excludes normally generated fields, and the release suite's isolated fixture builds and installs are allowed. |
 | Acceptance 12 (third amendment), with the fourth and fifth amendments' additions | Tests 25–40 (section 9). |
+| Owner amendment 6: interrupt intent, and the eighth code review's three findings | Section 3.7, section 6.3's changed-file hold, and tests 41–48 (section 9). The requirement-to-test matrix maps every requirement, acceptance item, binding addition and correction, and tests 1–48, to named tests. |
 
 **Narrowings inside UNKNOWN.** Each of these ends as UNKNOWN, never as a
 resend:
@@ -2722,6 +2829,57 @@ specifications, not runs.
 
     No case is weakened to pass.
 
+Tests 41–48 are owner amendment 6's. They too are specifications. Fakes
+stand in for the interrupt path's screen, keys and session state, on an
+injected clock, with invented data.
+
+41. **Intent before action.** The intent is durable before the stop key, the
+    typing or the submission key. With the intent's save failing, no key is
+    sent, and the item is tried again at a later pass.
+42. **A crash at every interrupt boundary.** A crash before the intent; after
+    it and before the stop; after the stop; after the typing; after the
+    submission and before its evidence is saved; after the evidence. After
+    restart, every case from the intent on is held, never rung again. A
+    crash before the intent is retried as today.
+43. **Save failures after delivery.**
+    - **One failed save, then a crash at once,** before any later pass.
+    - **Every save failing through the crash.**
+    - **A surviving ledger line** for the same intent id, target, session and
+      surface: reconciled as delivered, with no ring.
+    - **No surviving proof:** held, no ring, one owner alert, settled by the
+      acknowledgement or dead-lettered truthfully.
+44. **Three distinct outcomes.** A proved no-action (a dialog, a draft or a
+    browsing view seen before the intent; or no key sent) is retried as
+    today. A partial step (a stop sent, then typing failed; typing without
+    proved submission) is held. A proved submission waits for the
+    acknowledgement.
+45. **Proof that is not proof.** A ledger line for another intent id,
+    another target or surface, a reminder's line, an `ok` line without an
+    intent id, and an unreadable ledger, each leave the item held.
+46. **An owed announcement at the acknowledgement wait.** The announcement
+    fails, and keeps failing, through the expiry: the item is dead-lettered
+    truthfully, its announcement stays owed and is retried until durable,
+    across a restart, with the same entry id, and the interrupt is never
+    rung again. The normal acknowledgement and dead-letter paths are
+    unchanged.
+47. **A changed fallback file.** A file is imported, its removal fails, and
+    its content is then changed outside this design, both as valid text and
+    as bytes that do not decode. The next import holds the exact changed
+    bytes with one alert, and removes the file only after that `TX`
+    commits. With the hold's `TX` failing or cancelled, the file stays. A
+    restart and a power loss at each step lose nothing. The original
+    obligation is unchanged, and fairness and `import_epoch` behave as in
+    test 34.
+48. **Reconciliation's negative cases, and the same account.** Through the
+    caller and the flush:
+    - a message with the part's text from the wrong account, from an
+      unverified sender, in the wrong channel, or from before the attempt's
+      window never makes the part delivered or attributed, and never permits
+      a blind resend;
+    - another queued entry of the same account, with another text, gets its
+      bounded attempt in the same flush while the first entry is uncertain,
+      and while it is failing, on both transports.
+
 ## 10. Feasibility and risks
 
 **Feasibility.** Everything uses the standard library's `sqlite3`, `os.fsync`,
@@ -3072,9 +3230,32 @@ The owner approved decisions 1–6 on 2026-10-09, and decisions 7 to 9 on
     Merging, installed rollout, activation and live migration each still need
     their own owner decision, and none is approved here.
 
+11. **Interrupt intent (2026-10-10, 20:25 UTC; #19's owner amendment 6).**
+    After the eighth code review of pull request #20, the owner approved a
+    narrow scope change for interrupts only:
+    - **Intent before action.** The bridge durably records its intent before
+      the first physical step that may affect an agent; without it, the step
+      is not taken.
+    - **Intent is not delivery.** It means started, possibly acted.
+    - **Unknown is held.** An unknown or partial outcome is held for
+      reconciliation, and never repeated automatically. Only surviving,
+      exact-identity, unambiguous proof reconciles it.
+    - **A pause over a duplicate.** The owner accepts a possible pause in
+      place of a duplicate interrupt.
+    - **The eighth review's three findings** are corrections within the
+      existing contract (sections 3.7 and 6.3, tests 46–48).
+    - **No exactly-once claim,** and no new service, file, journal, protocol
+      or command (section 3.7).
+    - **The budget:** one canonical issue review of the amendment; then, only
+      if it approves, at most two further correction and code-review rounds,
+      stopping at the first approval.
+
+    It supersedes #19's exclusion of wake-up and recovery semantics only for
+    this interrupt-specific durability correction. Everything else stands.
+
 Decisions 1–9 approve the design, its scope and its review. Decision 10
-approves the implementation. Merging and activation are not approved by any
-of them.
+approves the implementation. Decision 11 approves a scope change and its
+review. Merging and activation are not approved by any of them.
 
 ## 12. Revisions
 
@@ -3274,3 +3455,19 @@ of them.
   - **Section 5.5:** the H1 row is in IF.
   - **The header and section 11 (decision 10)** record the owner's
     implementation decision.
+- **Revision 9** (this revision) adopts the owner's decision of 2026-10-10,
+  20:25 UTC (section 11, decision 11; #19's owner amendment 6):
+  - **Interrupt intent (section 3.7).** It is durable before the first
+    physical step, and an unknown or partial outcome is held for
+    reconciliation, never repeated. The states are kept in the existing
+    pending record.
+  - **The eighth code review's three findings:**
+    - an owed announcement survives the acknowledgement wait (section 3.7,
+      `settled`);
+    - a changed fallback file's exact bytes are held before its removal
+      (section 6.3);
+    - the negative-reconciliation and same-account tests (test 48).
+  - **Section 8** gains a mapping row, and **section 9** gains tests 41–48.
+  - **Unchanged:** everything revision 8 adopted, every ordinary wake-up's
+    baseline, and #19's IRC delivery rules. No resolved finding is reopened,
+    and no test is relaxed.
