@@ -145,7 +145,8 @@ class PausedClientTests(AuthorityCase):
         for c in self.conns:
             c.close()
         self.conns.clear()
-        self.authority.peers.clear()
+        for peer in list(self.authority.peers.values()):
+            self.authority._drop(peer)
         with mock.patch.object(self.ds, "QUEUE_MAX", 1):
             a, b = self.conn(), self.conn()
             a.send(self.create("e" * 32))
@@ -397,6 +398,19 @@ class OneOpenerTests(AuthorityCase):
         a.close()
         Path(db).unlink()
         self.authority = self.new_authority()
+
+    def test_a_file_that_is_not_a_database_is_refused_and_the_lock_released(self):
+        self.authority.close()
+        db = self.authority.paths.db
+        for suffix in ("", "-wal", "-shm"):
+            Path(str(db) + suffix).unlink(missing_ok=True)
+        Path(db).write_bytes(b"not a database at all, just bytes" * 100)
+        a = self.ds.Authority(self.chatlib.STATE_DIR, clock=self.clock, probes=self.probes)
+        with self.assertRaises(self.ds.Unavailable):
+            a.start()
+        self.assertIsNone(a.lock_file)
+        Path(db).unlink()
+        self.authority = self.new_authority()  # the same process can start it once the file is gone
 
     def test_the_modes_read_back_exclusive_and_wal_and_no_autocommit_is_used(self):
         con = self.authority.store.con

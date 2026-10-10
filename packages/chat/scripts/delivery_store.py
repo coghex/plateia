@@ -610,11 +610,11 @@ class Store:
                     raise Unavailable("database without writer_model bridge-exclusive/1: refused")
                 self.epoch = int(self.meta("authority_epoch") or 0) + 1
                 self.set_meta("authority_epoch", self.epoch)
-        except sqlite3.OperationalError as err:
+        except sqlite3.Error as err:  # busy, locked by another opener, not a database, unreadable
             con.close()
             self.con = None
             raise Unavailable(f"database busy or unreadable: {err}") from None
-        except Unavailable:
+        except BaseException:
             con.close()
             self.con = None
             raise
@@ -1498,10 +1498,11 @@ class Authority:
             raise Unavailable(self.unavailable[0]) from None
         try:
             self.store.open()
-        except Unavailable as err:
+        except BaseException as err:  # opened and bound nothing: the lock is released for the next try
             fcntl.flock(f, fcntl.LOCK_UN)
             f.close()
-            self.unavailable = (str(err), self.unavailable[1] if self.unavailable else self.clock())
+            if isinstance(err, Unavailable):
+                self.unavailable = (str(err), self.unavailable[1] if self.unavailable else self.clock())
             raise
         self.lock_file = f
         self.unavailable = None

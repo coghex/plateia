@@ -171,6 +171,9 @@ class FakeConn:
         if answer == "late":  # nothing until the part's wait has passed; then, while draining, the answer
             self.answers.insert(0, "ok")
             raise TimeoutError("timed out")
+        if answer == "late-crash":  # nothing within the wait; then the reader is killed while draining
+            self.answers.insert(0, "crash")
+            raise TimeoutError("timed out")
         if answer == "late-fail":  # nothing within the wait; then, while draining, a FAIL and the answer
             self.answers.insert(0, "fail")
             raise TimeoutError("timed out")
