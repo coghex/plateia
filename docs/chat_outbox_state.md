@@ -4,7 +4,7 @@ This is the design note for #19 and pull request #20. It is design only:
 nothing here is implemented, and implementing it needs a separate owner
 decision.
 
-This is revision 5. Revision 3 answered design review round 2. Revision 4
+This is revision 6. Revision 3 answered design review round 2. Revision 4
 aligned the note with the owner's second amendment to #19:
 
 - the release-packaging scope;
@@ -16,8 +16,22 @@ recovery path, bounded lock acquisition, durable alert identities, the
 baseline of the code it describes, and the fallback test. It also carries the
 approving issue rereview's corrections.
 
-Section 12 lists what changed and why. The owner's decisions of 2026-10-09 are
-recorded in section 11, and in D-73 of [plateia_design.md](plateia_design.md).
+Revision 6 adopts the owner's decision of 2026-10-10 after design review
+round 4. **The bridge is the only process that opens the database.** Every
+other caller asks it, over a local socket, to apply its transitions, and still
+sends its own bytes to the chat server (section 2.4). So a paused client can
+never hold a database lock, R6 holds as approved, and revision 5's C-8
+exception is removed. While the bridge's authority is unavailable, posts,
+acknowledgements and notices are queued durably instead of sent: a **material
+behaviour change** the owner accepted (section 2.4.4). Revision 6 also bounds
+the bridge's own `announce` fallback, and applies R2's message accounting to
+every part.
+
+Section 12 lists what changed and why. The owner's decisions of 2026-10-09 and
+2026-10-10 are recorded in section 11, and in D-73 of
+[plateia_design.md](plateia_design.md). The 2026-10-10 decision approves the
+design, its scope and its review only. Implementation, code, tests and the
+`release.json` edit still need their own owner decision.
 
 ## Background
 
@@ -37,6 +51,8 @@ reads it as start-of-flush snapshots, and prunes it by wall-clock age.
 
 This note replaces the split state with one SQLite database:
 
+- only the bridge opens it; every other caller asks the bridge to write
+  (section 2.4);
 - every transport caller records its intent there before sending any byte;
 - reconciliation decides inside one transaction, from the current state;
 - evidence is kept while anything depends on it.
@@ -66,7 +82,7 @@ Every example uses invented data: projects `alpha` and `beta`, the owner
 8. [Mapping to #19](#8-mapping-to-19)
 9. [Future tests](#9-future-tests)
 10. [Feasibility and risks](#10-feasibility-and-risks)
-11. [Owner decisions (2026-10-09)](#11-owner-decisions-2026-10-09)
+11. [Owner decisions (2026-10-09 and 2026-10-10)](#11-owner-decisions-2026-10-09-and-2026-10-10)
 12. [Revisions](#12-revisions)
 
 ## 1. Terms and constants
@@ -80,8 +96,16 @@ Every example uses invented data: projects `alpha` and `beta`, the owner
 | `CHANNEL_WAIT` | 15 s | The absolute deadline for creating or joining a channel and seeing the bridge in it, after a 403 (section 5.1). |
 | `UNDECIDED_MAX` | 24 h | How long a part may stay undecided, counted from its attempt's write. Then it is dead-lettered. |
 | `GC_MARGIN` | 1 h | The extra age before evidence may be collected (I-7). |
-| `LOCK_WAIT` | 5 s | The absolute deadline for the bridge, or a direct writer's optional export, to acquire `L_outbox` (section 2.3). |
-| `BUSY_WAIT` | 5 s | SQLite's busy timeout: the most any transaction waits for the database's write lock (section 2.1, C-8). |
+| `LOCK_WAIT` | 5 s | The absolute deadline for the bridge to acquire `L_outbox` (section 2.3). |
+| `OPEN_WAIT` | 5 s | SQLite's busy timeout on the authority's one connection. It bounds only the bridge's attempt, at startup, to take the database's exclusive lock (sections 2.4.1 and C-9). Once the authority runs, no other connection exists, and no transaction waits for a lock. |
+| `FRAME_MAX` | 1 MiB | The largest request frame the authority reads (section 2.4.2). |
+| `REPLY_MAX` | 64 KiB | The largest reply frame, including `status`. |
+| `REQ_WAIT` | 2 s | From accepting a client connection to holding its complete request frame. Then the authority closes the connection (section 2.4.3). |
+| `RESP_WAIT` | 2 s | From a reply being ready to its last byte being written. Then the authority closes the connection. |
+| `CONN_MAX` | 32 | Open client connections. A connection beyond it is accepted and closed at once. |
+| `QUEUE_MAX` | 256 | Complete client requests waiting to run. A request beyond it gets an immediate `busy` reply, with no transaction. |
+| `IPC_WAIT` | 5 s | A client's absolute deadline for one request: connect, send, and read the whole reply. |
+| `AUTH_WAIT` | 5 s | A bridge thread's absolute deadline for its in-process request to **begin**. A request that has not begun by then is cancelled, never run later (section 2.4.3). |
 
 PR #20's `SETTLE` bound is **not used**: absence needs attempt-specific
 finality (section 5.2), not a settling time.
@@ -98,6 +122,11 @@ finality (section 5.2), not a settling time.
 - **Attempt.** One try at sending one part over one connection, numbered by a
   per-part generation. Only an attempt can produce a message.
 - **Text key.** (account, channel case-folded, exact text).
+- **Authority.** The bridge's authority thread: the only holder of the only
+  connection to the database (section 2.4).
+- **Client.** A process other than the bridge that causes transitions:
+  `pchat post`, `pchat ack`, or `agentcli.notify` inside its host. A client
+  never opens the database; it sends **requests** to the authority.
 - **Writer.** The flow holding an attempt's connection. It is identified by
   the boot id, the pid, the process start time, and a connection id that
   includes the local TCP port and the server's address.
@@ -120,34 +149,45 @@ finality (section 5.2), not a settling time.
 ### 2.1 One database
 
 All durable outbox state lives in one SQLite database, `outbox.db`, in the
-chat state directory, using Python's standard `sqlite3`. It replaces:
+chat state directory, using Python's standard `sqlite3`. **Only the bridge
+opens it**, through one connection held by its authority thread (section 2.4).
+It replaces:
 
 - the progress inside claimed outbox files;
 - `outbox-reserved.jsonl`;
 - `outbox-attributed.jsonl`;
 - `record-coverage.json`.
 
-**Settings:**
+**Settings** (on the authority's one connection, in this order):
 
+- `locking_mode=EXCLUSIVE`, set before the first access to the database, so
+  the connection keeps its file lock until it closes and SQLite uses no
+  shared-memory index (section 2.4.1);
 - WAL journal mode;
 - `synchronous=FULL`, so a commit survives a power loss. On macOS, where
   `fsync` alone does not reach the disk, also `fullfsync` and
   `checkpoint_fullfsync`;
-- the busy timeout `BUSY_WAIT`;
+- the busy timeout `OPEN_WAIT`, which matters only at startup (C-9);
 - **the database's own files are durable too.** SQLite's unix VFS syncs the
   directory when it creates a journal or WAL file. The implementation checks
   that for the SQLite it ships with. Otherwise it makes a durable sync of
   `outbox.db` and `outbox.db-wal` itself after opening, before the first
   commit anything relies on;
-- every write is a `BEGIN IMMEDIATE` transaction, so each decision is read
-  and applied in one serialized transaction.
+- every write is a `BEGIN IMMEDIATE` transaction, run by the authority thread
+  only, so each decision is read and applied in one serialized transaction.
+  The connection is opened with `isolation_level=None`, and the transaction
+  is controlled by explicit `BEGIN IMMEDIATE`, `COMMIT` and `ROLLBACK`. That
+  works on Python 3.10, and does not use 3.12's `Connection.autocommit`.
 
 **No network I/O inside a transaction.** Logging in, sending, waiting,
-draining and closing all happen between transactions.
+draining and closing all happen between transactions. **Nor any other wait:**
+no transaction contains a socket read or write, a file-lock wait, or a wait
+for any other thread or process (section 2.4.3).
 
 **Not a second authority.** These are boundaries, not sources of truth:
 
-- **Imports.** `outbox.jsonl` and `outbox.claimed-*.jsonl` (section 6).
+- **Imports.** `outbox.jsonl` and `outbox.claimed-*.jsonl` (section 6), and
+  the bridge's private fallback file `outbox.bridge.jsonl` (section 6.4).
 - **Exports.**
   - `dead-letters.jsonl`;
   - the owner alert, which goes on the bridge's pending-delivery queue,
@@ -155,6 +195,10 @@ draining and closing all happen between transactions.
 
   Each is written after its terminal state commits, by the protocol in
   section 3.6.
+- **The status snapshot.** `outbox-status.json`, which the bridge replaces
+  after each pass for `pchat status` to read while the authority is
+  unavailable (section 2.4.5). It is diagnostic only: nothing decides from
+  it.
 - **The chat record.** The channel logs stay the chat record that other
   readers use. For the outbox, the bridge also indexes verified messages into
   the database (V1), so evidence and coverage are ordered with outbox state.
@@ -190,12 +234,12 @@ The columns listed are the minimum the proofs rely on.
 
 | Table | Key | Holds |
 |---|---|---|
-| `meta` | name | The schema version, the cutover marker (section 6.1), and `import_epoch`, the number of completed import passes. |
+| `meta` | name | The schema version; `writer_model`, which is always `bridge-exclusive/1` (section 2.4.1); the cutover marker (section 6.1); `import_epoch`, the number of completed import passes; and `authority_epoch`, the number of authority starts (section 2.4.2). |
 | `accounts` | account | `designated_at`, `suspended_at`, why it was suspended, and `suspension_seq`, the number of suspensions so far (R1, section 7.4). |
 | `alerts` | `alert_key` | One row per alert event: its kind (`undecided`, `held` or `suspended`), what it refers to, its content-free text, when it was raised, and `exported_at` (NULL until X2 completes). See section 3.6. |
 | `entries` | `id` | See below. Entry rows are **never deleted** (I-7), so a missing id always means no entry was ever created. |
 | `parts` | (`entry_id`, `n`) | The kind, the wire lines, the server-visible text, `multi_line`, `state` (`unsent`, `inflight`, `uncertain`, `confirmed` or `refused`), the current generation, and the msgid once attributed. |
-| `attempts` | `id` | `entry_id`, `n`, `generation`, the text key, `multi_line`, the writer identity, `conn_id`, `state`, `written_at`, `final_at` (NULL without finality), `ended_at`, `end_kind` (`closed`, `writer_gone` or `connection_closed`), and a detail. UNIQUE (`entry_id`, `n`, `generation`). `state` is one of `writing`, `confirmed`, `refused`, `rejected`, `ended`, `delivered`, `absent`, `dead` or `retired` (an ack only). |
+| `attempts` | `id` | `entry_id`, `n`, `generation`, the text key, `multi_line`, the writer identity, `conn_id`, `a1_nonce` (section 2.4.2), `state`, `written_at`, `final_at` (NULL without finality), `ended_at`, `end_kind` (`closed`, `writer_gone` or `connection_closed`), and a detail. UNIQUE (`entry_id`, `n`, `generation`). `state` is one of `writing`, `confirmed`, `refused`, `rejected`, `ended`, `delivered`, `absent`, `dead`, `retired` (an ack only) or `void` (A12). |
 | `attributions` | `msgid` | `attempt_id` (UNIQUE), and when it was made. |
 | `messages` | `msgid` | The channel, the account, the exact text and the server time, for verified messages only. |
 | `coverage` | channel | `since`, `through` and `mark`, as PR #20 keeps them. |
@@ -220,22 +264,23 @@ The columns listed are the minimum the proofs rely on.
 
 | Actor | Who | May do |
 |---|---|---|
-| **P** (direct writer) | a `pchat post` or `pchat ack` process; the `agentcli.notify` flow inside its host process; the bridge flow running `announce` | Create its entry, or queue it before any connection exists (Q0). Write its own attempts. Hand its entry to the outbox. Export a dead letter. |
-| **B** (bridge) | the single `chatbridge` service process | Index messages and advance coverage. Import and apply handoffs. Flush outbox entries. Reconcile. End attempts of a gone writer or a closed connection. Make entries terminal. Export. Collect evidence. Suspend designations. |
-| **S** (status) | `pchat status` | Read only. |
+| **P** (direct writer, a client) | a `pchat post` or `pchat ack` process; the `agentcli.notify` flow inside its host process | Never opens the database. By request to the authority (section 2.4): create its entry, or queue it before any byte (Q0); cause its own attempts' transitions; hand its entry to the outbox. When the authority is unavailable: append a fallback row (section 6.4). It sends its own bytes. |
+| **B** (bridge) | the single `chatbridge` service process | Run the authority, the only opener of the database (section 2.4). Index messages and advance coverage. Import and apply handoffs. Flush outbox entries. Post its own `announce` lines, as a flow of B with its own entry and attempts. Reconcile. End attempts of a gone writer or a closed connection. Make entries terminal. Export (X1, X2). Collect evidence. Suspend designations. |
+| **S** (status) | `pchat status` | Read only: a `status` request, or the snapshot when the authority is unavailable (section 2.4.5). |
 | **O** (owner) | the owner, by explicit decision | Designate an account or lift a suspension. Only at a separately approved activation (section 11). |
 
 | Guard | What it is |
 |---|---|
-| `TX` | A `BEGIN IMMEDIATE` transaction. Every row condition is checked inside the transaction that changes the row. |
+| `TX` | A `BEGIN IMMEDIATE` transaction, run only by the authority thread. Every row condition is checked inside the transaction that changes the row. |
+| `L_auth` | The non-blocking flock `outbox.authority.lock`, taken by the bridge before it opens the database and held for the authority's lifetime (section 2.4.1). A second bridge cannot take it, and so never opens the database or binds the socket. |
 | `L_flush` | The non-blocking flock `outbox.flush.lock`. One flusher at a time, held for the whole flush, including import and export. This lock exists at PR #20's head `e658bb8`, but **not** on master `a12d99c`, whose `flush_outbox` takes no flush lock. The implementation adds it, and declares it in the new `outbox-db` format's path (section 10.1). |
-| `L_outbox` | The flock `outbox.lock`, which exists on master (`chatlib.py`'s `_outbox_locked`) and at `e658bb8`. It orders every write to `outbox.jsonl`, claims, imports, and every write to `dead-letters.jsonl` (section 3.6). The bridge and every export acquire it only with a bounded wait; only a direct writer's own fallback append waits as today (below). |
+| `L_outbox` | The flock `outbox.lock`, which exists on master (`chatlib.py`'s `_outbox_locked`) and at `e658bb8`. It orders every write to `outbox.jsonl`, claims, imports, and every write to `dead-letters.jsonl` (section 3.6). The bridge acquires it only with a bounded wait, and never on the authority thread. Only a client's own fallback append waits as today (below). |
 | **owner** | The acting flow's writer identity equals the row's. |
 | **gone**, **conn-closed** | Section 5.4. |
 
-**Bounded lock acquisition.** The bridge, and a direct writer's export,
-acquire `L_outbox` by repeatedly trying a non-blocking lock until the
-absolute deadline `LOCK_WAIT`. If the deadline passes:
+**Bounded lock acquisition.** The bridge acquires `L_outbox` by repeatedly
+trying a non-blocking lock until the absolute deadline `LOCK_WAIT`. If the
+deadline passes:
 
 - **The bridge** skips only the steps that need `L_outbox` in this flush:
   claim and import (I1–I3), X1, and `Deliveries`' dead-letter appends. It
@@ -244,17 +289,315 @@ absolute deadline `LOCK_WAIT`. If the deadline passes:
   `L_flush`), and collection. The skipped steps run at a later flush.
   `pchat status` shows that import or export is deferred because the lock is
   busy, and since when.
-- **A direct writer's export (X1)** is left to the bridge.
-- **A direct writer's fallback append** is the one acquisition that waits
-  for the lock as today. Only that writer's own call waits, and no other flow
-  depends on it. Giving up instead could leave a post unqueued where today it
-  is queued, and #19's requirement 9 forbids reducing delivery preservation
+- **A client's fallback append** is the one acquisition that waits for the
+  lock as today. Only that client's own call waits, and no other flow depends
+  on it. Giving up instead could leave a post unqueued where today it is
+  queued, and #19's requirement 9 forbids reducing delivery preservation
   (section 6.4).
+- **No bridge flow ever appends to `outbox.jsonl`.** The bridge's own
+  `announce` fallback goes to its private file `outbox.bridge.jsonl`, which
+  needs no `L_outbox` (section 6.4). This is design review round 4's first
+  finding.
 
 **No lock is ever stolen.** Nobody breaks, removes or ignores another
 process's `L_outbox` or `L_flush`, and nobody ends a writer's attempt or
 connection because it holds a lock. A holder that resumes finishes its step;
 a holder that dies releases the flock with its process.
+
+### 2.4 Routing: the bridge is the only writer
+
+Revision 5 let every caller open the database. Design review round 4 showed
+the consequence: a client stopped by the operating system inside its own
+`BEGIN IMMEDIATE` transaction blocks every bridge write, so an unrelated
+entry gets no attempt until that client resumes or dies. Revision 5 called
+that C-8 and exempted it from R6. The owner rejected the exemption
+(2026-10-10). Revision 6 removes the cause instead: **no process but the
+bridge ever opens the database**, so no client can hold a database lock at
+any instant.
+
+| Caller (source at PR #20's head `e658bb8`) | Transitions it causes | Route |
+|---|---|---|
+| `pchat post` (`pchat:223-247`, `chatlib.py:432`) | Q0, E1, A1–A5 with E6, E3, E5, A12 | request over the socket |
+| `pchat ack` (`pchat:251-257`, `chatlib.py:566`) | Q0, E1, A1–A5, A11, E5, A12 | request |
+| `agentcli.notify` (`agentcli.py:17-38`) | as `pchat post` | request |
+| the bridge's `announce` (`chat-bridge:678-690`, called from `Deliveries.process` at `:428` and `:446`) | as `pchat post` | in-process request |
+| the bridge's flush, import, reconciliation, evidence, alerts and collection | every other transition | in-process request |
+| `pchat status` | none | `status` request, or the snapshot |
+
+Clients keep their own connections to the chat server, and send their own
+bytes. Only their database writes move.
+
+#### 2.4.1 Startup and the exclusive opener
+
+The bridge starts its authority in this order:
+
+1. **Take `L_auth`** (`outbox.authority.lock`) without blocking. If another
+   process holds it, this bridge opens nothing, binds nothing, logs it and
+   exits.
+2. **Open `outbox.db`** with the settings of section 2.1, setting
+   `locking_mode=EXCLUSIVE` before anything reads the database. Read back
+   `PRAGMA locking_mode` and `PRAGMA journal_mode`. Anything other than
+   `exclusive` and `wal` closes the connection; the authority is then
+   unavailable.
+3. **The start transaction.** One `BEGIN IMMEDIATE` transaction, under the
+   busy timeout `OPEN_WAIT`:
+   - creates the schema, with `writer_model = 'bridge-exclusive/1'`, if the
+     database is new;
+   - otherwise requires `writer_model = 'bridge-exclusive/1'`. A database
+     without it was made by other code, and is refused, never adopted or
+     rewritten;
+   - increments `authority_epoch`.
+
+   Its commit takes the database file's exclusive lock, which the connection
+   holds until it closes. From then on, any other process that opens the file
+   gets `SQLITE_BUSY` at once, and holds nothing.
+4. **If step 2 or 3 fails**, because the lock is held (C-9), the database is
+   refused, or storage fails, the bridge closes the connection and binds
+   nothing. It records "authority unavailable", the reason, and since when,
+   in its log and the status snapshot, and tries again at the next pass. It
+   never deletes, renames or breaks another holder's lock.
+5. **Bind the socket** `$CHAT_STATE/outbox.sock`. Holding `L_auth`, it
+   removes a stale socket file, binds with `umask 077`, checks the mode is
+   `0600`, and listens.
+   - **Path limit.** An AF_UNIX path may hold at most 103 bytes on macOS
+     and 107 on Linux. If the absolute path is longer, the bridge binds
+     nothing. Its authority serves the bridge alone, every client call queues
+     (section 2.4.4), and the status says why. Clients compute the same path
+     and limit, and queue without trying to connect.
+
+Until step 3 commits, the bridge makes no database write. V1 fails safely
+(V4: coverage stops, and the record replays later), and `announce` uses its
+private fallback (section 6.4).
+
+#### 2.4.2 Requests
+
+**Framing.** A client opens a connection, sends one frame, reads one reply
+frame, and closes. A frame is a 4-byte big-endian length, then a UTF-8 JSON
+object, at most `FRAME_MAX` for a request and `REPLY_MAX` for a reply.
+
+**A request** carries:
+
+- `v`, the protocol version, `outbox-authority/1`;
+- `op`;
+- `request_id`, random per request;
+- `writer`: boot id, pid, process start time, and `conn_id` when the call has
+  a chat connection;
+- the op's arguments.
+
+**A reply** carries `v`, the same `request_id`, `authority_epoch`, a
+`result`, and the op's data. The result is one of:
+
+- `ok`: the transaction committed;
+- `replay`: the requested change had already committed, and the reply
+  restates it;
+- `conflict`: the guard failed, and nothing changed;
+- `refused`: the request was invalid, of an unknown version, or from the
+  wrong peer, and no transaction ran;
+- `busy`: `QUEUE_MAX` was reached, and no transaction ran;
+- `error`: the transaction failed. Whether it committed is **unknown**, and
+  the client treats the reply as missing.
+
+**Replies follow a durable commit.** The authority writes `ok` or `replay`
+only after `COMMIT` has returned, under `synchronous=FULL` and the full
+flush. So a reply never reports a change that a crash or power loss could
+undo.
+
+**Peer check.** On accepting a connection, the authority reads the peer's
+uid from the socket: `LOCAL_PEERCRED` (`getpeereid`) on macOS, `SO_PEERCRED`
+on Linux.
+
+- A different uid, or one that cannot be read, closes the connection unread.
+- Where the platform also gives the peer's pid, a request whose
+  `writer.pid` differs is `refused`.
+
+This checks that a request speaks for its own sender. It is not a security
+boundary: any process of the same user can already read and write the state
+directory. The tests fake these credentials (section 9).
+
+**Ops.** Every op is idempotent, against the current rows:
+
+| `op` | Transition | Guard, and when it is a `replay` |
+|---|---|---|
+| `create` | E1 for entry *X*, with its fixed parts | *X* does not exist. If *X* exists with this writer and the same parts: `replay`, with its state. Otherwise `conflict`. |
+| `queue` | Q0 for *X* | *X* does not exist. If it exists: `replay`, with its state (a `direct` *X* is then handed off, as Q0 says). |
+| `attempt` | A1 for (*X*, *n*), naming the expected current generation *g* and a fresh random `a1_nonce` | A1's guard; creates generation *g* + 1. If that attempt exists with this writer and `a1_nonce`: `replay`. Otherwise `conflict`. |
+| `outcome` | A2, A3 with E6, A4 or A5, naming the attempt, its `a1_nonce`, the outcome, `final_at` and the detail | The attempt is `writing`, with this writer and `a1_nonce`. If it is already in that outcome, with the same fields: `replay`. Otherwise `conflict`, which changes nothing. |
+| `retire` | A11 | A11's guard; `replay` if this writer's attempt is already `retired`. |
+| `void` | A12 | A12's guard (section 3.3); `replay` if already `void`. |
+| `handoff` | E3, with at most one A12 or one attested outcome in the same `TX` (section 6.4) | E3's guard, and the attestation's own guard; `replay` if *X* is already `outbox`. |
+| `done` | E5 | E5's guard; `replay` if `done`. |
+| `query` | none | Returns *X*'s entry, its parts, and this writer's attempts. |
+| `status` | none | The status summary (section 2.4.5). |
+
+A1's `written_at` is the authority's clock at that commit. The client sends a
+part's lines only while holding that part's committed `attempt` reply, so
+every byte follows `written_at` (C-1 is unchanged: one machine, one clock).
+
+**No op lets a client cause a bridge transition.** E2, H1, E4, E7, E8,
+A6–A10, V1–V4, I0–I3, X1, X2, G1, alert rows and suspensions are the
+bridge's own, through in-process requests.
+
+**Epochs.** `authority_epoch` grows by one at each authority start. Within one
+call, a client:
+
+- keeps the highest epoch it has seen, and treats a reply with a lower one
+  as missing;
+- after a reply whose epoch is higher than an earlier one in the same call,
+  sends `query` before its next mutation, and continues only from the state
+  that reply shows.
+
+A higher epoch means the authority restarted. A reply with a lower epoch
+could only be a dead authority's buffered reply. Even that reply is true,
+because it followed a durable commit, but the client does not build on it.
+Every mutation is conditional and safe to replay, so a stale assumption is
+never applied.
+
+**A missing reply proves nothing.** It is never taken as evidence of a
+commit, of a failure, of absence, or of an ended attempt.
+
+#### 2.4.3 The authority thread
+
+**One thread, one connection.** The authority thread owns the only
+connection to `outbox.db`. No other thread of the bridge, and no other
+process, calls SQLite on it.
+
+**Its loop** uses `selectors` over:
+
+- the listening socket;
+- the client sockets, all non-blocking;
+- a wake-up pipe for the in-process queue.
+
+Each turn, it:
+
+1. accepts connections, and closes any beyond `CONN_MAX` at once;
+2. reads the bytes available, and closes a connection whose frame exceeds
+   `FRAME_MAX`, or is still incomplete `REQ_WAIT` after its accept;
+3. checks each complete frame (peer, version, shape), and queues it. A frame
+   beyond `QUEUE_MAX` gets `busy`;
+4. runs at most **one** in-process request and **one** client request,
+   alternating, in arrival order;
+5. writes the reply bytes the sockets accept, and closes a connection after
+   its last byte, or `RESP_WAIT` after its reply was ready.
+
+**A transaction begins only for a complete, validated request, and ends
+(`COMMIT` or `ROLLBACK`) before its reply is written.** No transaction waits
+for a socket, a flock, another thread or another process.
+
+**Bounded work.** A client request touches only the rows its frame names,
+within `FRAME_MAX`. The bridge splits its own work into bounded requests:
+
+- one claim file per import request;
+- one reconciliation component per request;
+- at most 1,000 rows per collection request.
+
+**In-process requests.** Each bridge thread has at most one outstanding. A
+request's state moves from `queued` to `running` to `done`, or from `queued`
+to `cancelled`, under one mutex:
+
+- the authority moves it to `running` just before `BEGIN`;
+- the caller cancels it if it is still `queued` at `AUTH_WAIT`;
+- a cancelled request committed nothing. The caller treats it as a failed
+  `TX`: it sends nothing, and tries again at a later pass;
+- once it is `running`, the caller waits for `done`. The transaction's
+  duration then depends on local storage only (C-10), never on another actor.
+
+**The bridge's threads.**
+
+- **The main thread** runs IRC, `Deliveries`, the flush and `announce`. It
+  never calls SQLite.
+- **The authority thread** never talks to the chat server, never waits for
+  `L_outbox` or `L_flush`, and never blocks on a client socket.
+- **Shared helpers** that both threads use, such as the bridge's log, are
+  made thread-safe.
+
+**Memory** is bounded by `CONN_MAX` × (`FRAME_MAX` + `REPLY_MAX`), plus the
+queues.
+
+**Fair progress.** A bridge request waits behind at most one client
+transaction. Every client request is answered within `REQ_WAIT`, plus at
+most `QUEUE_MAX` client transactions and as many bridge transactions, plus
+`RESP_WAIT`. Otherwise it is refused or closed,
+and the client queues (section 2.4.4). I-11 gives the proof, and section 5.6,
+case 11, gives a schedule.
+
+#### 2.4.4 When the authority is unavailable
+
+A client treats the authority as **unavailable** when:
+
+- the socket path exceeds the limit;
+- the connection fails;
+- it is refused;
+- the reply is `busy` or `error`;
+- no complete reply arrives within `IPC_WAIT`. It then closes the
+  connection, and reads nothing after that.
+
+Then:
+
+- **It never sends a byte without a committed `attempt` reply.** Lines go out
+  only while it holds the committed reply for that part.
+- **Before any byte of the call,** it appends the fallback row (section 6.4)
+  for *X*, durably, and only then reports the post as queued (exit 3). If an
+  `attempt` request went unanswered, the row carries an A12 attestation for
+  that attempt.
+- **After some bytes,** it stops the call and hands off the remainder, by a
+  `handoff` request if the authority answers, otherwise by the fallback
+  handoff row. Then it exits 3, as today.
+- **An observed outcome whose `outcome` request goes unanswered** is
+  retried, as the same replay-safe request, until `PART_WAIT` after the
+  outcome was observed. Then it travels as an attested outcome in the
+  handoff (section 6.4).
+- **Nothing is reported as queued before its row is durable** (section 2.1,
+  I-5).
+
+**MATERIAL BEHAVIOUR CHANGE, accepted by the owner on 2026-10-10.** Today a
+direct post reaches the chat server whether or not the bridge runs. Under
+this design, while the authority is unavailable:
+
+- posts, acknowledgements and notices are queued in full instead of sent;
+- `pchat` exits 3 instead of 0;
+- the bridge delivers them when it returns.
+
+The authority is unavailable while the bridge is stopped or restarting,
+refusing its database or socket, or overloaded past `IPC_WAIT`.
+
+Delivery preservation is not reduced. Nothing is lost, R9's obligations
+hold, and the queued rows are durable and imported idempotently by *X*. But
+those posts are delayed, and invisible in the channel, until the bridge
+returns, so this design does **not** claim to be equivalent to today.
+
+No smaller design keeps direct sending with one authority and no new service:
+
+- **A client that opens SQLite while the bridge is down** brings C-8 back the
+  moment the bridge restarts behind its transaction.
+- **A client-side journal** would be a second, concurrently written
+  authority.
+- **A separate authority daemon** is a new service, and still queues while it
+  is down.
+
+#### 2.4.5 Status
+
+`pchat status` sends a `status` request. The reply gives, within
+`REPLY_MAX`:
+
+- entries waiting to post, and entries awaiting a delivery check (R8);
+- held rows;
+- suspended designations;
+- deferred import or export;
+- the authority epoch.
+
+If the authority is unavailable, `pchat status` reads `outbox-status.json`
+instead. The bridge replaces that file atomically (a temporary file, then a
+rename) after each pass, and whenever its authority becomes unavailable. It
+holds:
+
+- the same summary;
+- the time it was written;
+- the epoch;
+- the reason for any unavailability, and since when.
+
+`pchat status` shows the snapshot's age, and counts, read-only, the fallback
+rows waiting in `outbox.jsonl` and `outbox.bridge.jsonl`. The snapshot is
+diagnostic, and nothing decides from it.
 
 ## 3. State and transition tables
 
@@ -262,6 +605,12 @@ Every transition is a conditional update inside one `TX`:
 `UPDATE … WHERE id = ? AND state = ? [AND generation = ?]`. A change that
 matches no row has no effect, and the actor stops work on that attempt or
 entry.
+
+**Who applies them.** Every `TX` below runs on the authority thread (section
+2.4). The *Actor* column names who causes the transition: P by a request
+over the socket (section 2.4.2), B by an in-process request. "Owner" checks
+compare the request's writer identity, and for an attempt its `a1_nonce`,
+with the row's.
 
 **Export version.** Any change to a part or attempt of a `terminal` entry
 (A2–A5, A8 or A8c on an attempt still `writing`) increments the entry's
@@ -271,10 +620,10 @@ entry.
 
 | # | From | To | Actor | Guard | Durable write (one `TX`) | After commit |
 |---|---|---|---|---|---|---|
-| Q0 | (none) | `open`, `outbox`, no parts | P | Entry *X* does not exist. The failure came before any byte was written: no connection, a failed login or setup, or a failed E1. Silent-run refusal is checked first and commits nothing. | `INSERT` entry *X* with the post's or ack's legacy fields and no parts. If *X* already exists, because an E1 that reported failure had in fact landed, nothing is inserted, and P runs E3 on *X* instead. If this `TX` fails, P makes the durable fallback append (section 6.4). | exit 3, as today: the whole post is queued once |
-| E1 | (none) | `open`, `direct` | P | after logging in | `INSERT` entry *X*, and its parts as `unsent`, fixed now from the connection's capabilities. An ack has one pseudo-part. | A1 for part 0 |
+| Q0 | (none) | `open`, `outbox`, no parts | P (`queue` request), or B for `announce` | Entry *X* does not exist. The failure came before any byte was written: no connection, a failed login or setup, or a failed E1. Silent-run refusal is checked first and commits nothing. | `INSERT` entry *X* with the post's or ack's legacy fields and no parts. If *X* already exists, because an E1 whose reply was lost had in fact landed, nothing is inserted, and P runs E3 on *X* instead. If this `TX` is not answered as committed, P makes the durable fallback append (section 6.4); B's `announce` uses its private file. | exit 3, as today: the whole post is queued once |
+| E1 | (none) | `open`, `direct` | P (`create`), or B for `announce` | after logging in | `INSERT` entry *X*, and its parts as `unsent`, fixed now from the connection's capabilities. An ack has one pseudo-part. | A1 for part 0 |
 | E2 | (none) | `open`, `outbox` | B, by import | `L_flush` + `L_outbox` | The entry with its occurrence identity, committed with the `imports` row. | I3 |
-| E3 | `open`, `direct` | `open`, `outbox` | P, owner | — | `owner_kind = 'outbox'` (the handoff). | exit 3, as today |
+| E3 | `open`, `direct` | `open`, `outbox` | P, owner (`handoff`) | — | `owner_kind = 'outbox'` (the handoff), with at most one A12 or attested outcome (section 6.4). | exit 3, as today |
 | H1 | `open`, `direct`; or `abandoned` with `abandon_epoch = import_epoch` | `open`, `outbox` | B, by importing a handoff row | `L_flush` + `L_outbox`. The row's entry id **and** writer identity equal the entry's. | `owner_kind = 'outbox'`, and `state = 'open'` again if it was `abandoned`. | none |
 | E4 | `open`, `outbox`, parts not yet fixed | the same, with parts | B | `L_flush`; no parts exist | The fixed parts, `unsent`. A legacy post's "(delayed; written …)" marker is fixed here, once. | A1 |
 | E5 | `open` | `done` | P, owner; or B | every part is `confirmed` | `done` | none |
@@ -282,9 +631,11 @@ entry.
 | E7 | `open` or `abandoned` | `terminal` (undecided) | B | Some part's attempt, `writing` or `ended`, is undecided more than `UNDECIDED_MAX` after its `written_at`. | Terminal; `export_version = 1`; the alert row `outbox:<entry id>` (section 3.6). An `ended` attempt becomes `dead` (A10). A `writing` attempt is **left** `writing`. | X1, X2 |
 | E8 | `open`, `direct` | `abandoned` | B | The owner is **gone**, and none of its attempts is `writing` (A8 first). | `abandoned`, `abandon_epoch = import_epoch`. Its unsent remainder is not adopted (D1). Its unknown parts still go to E7. | none |
 
-**One identity per call.** Each `pchat post`, `pchat ack`, `notify` or
-`announce` call generates one random entry id *X* before its first `TX`. E1,
-Q0, E3 and the fallback row all name *X*, and `entries.id` is the primary key.
+**One identity per call.** Each `pchat post`, `pchat ack` or `notify` call
+generates one random entry id *X* before its first request. An `announce`
+derives *X* from its pending item's key and its reason (section 6.4), so a
+re-raised announce is the same call. E1, Q0, E3 and the fallback row all name
+*X*, and `entries.id` is the primary key.
 So whichever creation lands first wins, and every later attempt to create *X*
 is a no-op or a handoff, never a second obligation. Two separate calls, even
 with identical text, have distinct ids, so they stay distinct occurrences
@@ -303,7 +654,7 @@ with identical text, have distinct ids, so they stay distinct occurrences
 | P1 | `unsent` | `inflight` | A1 (generation + 1) |
 | P2 | `inflight` | `confirmed` | A2 |
 | P3 | `inflight` | `refused` | A3 |
-| P4 | `inflight` | `unsent` | A4, the server's rejection before acceptance; or A11, an ack's retry |
+| P4 | `inflight` | `unsent` | A4, the server's rejection before acceptance; A11, an ack's retry; or A12, an attempt that wrote no byte |
 | P5 | `inflight` | `uncertain` | A5, A8 or A8c |
 | P6 | `uncertain` | `confirmed`, msgid set | A6 |
 | P7 | `uncertain` | `unsent` | A7, proved absence |
@@ -328,9 +679,28 @@ P4 or P7.
 | A9 | `confirmed` | `confirmed` + attribution | B | R1, in its `TX` | An attribution. | none |
 | A10 | `ended` | `dead` | B | E7 | — | none |
 | A11 | `ended` (an ack) | `retired` | the entry's owner (P for `direct`; B for `outbox`) | The attempt is an ack's, and it is `ended` | `retired`, and the pseudo-part goes back to `unsent`, in one `TX`. A1's guard counts only `writing` and `ended`, so the retry is now allowed. | Then A1 for the retry, as today (section 8). |
+| A12 | `writing` | `void` | the attempt's own writer's attestation: P's `void` or `handoff` request or fallback row (section 6.4), or B's in-process request for its own attempt whose A1 result was unknown | The attempt is `writing`; its writer identity, generation and `a1_nonce` equal the attestation's; and the attestation says the writer never received a known committed result for this attempt's A1, and so sent nothing. | `void`, `ended_at`; the part goes back to `unsent`. | none: no byte of it was ever sent |
 
-`delivered`, `absent`, `refused`, `rejected`, `dead` and `retired` are final.
-A `dead` attempt remains evidence (section 7).
+`delivered`, `absent`, `refused`, `rejected`, `dead`, `retired` and `void` are
+final. A `dead` attempt remains evidence (section 7).
+
+**Why A12 is safe.** A client sends a part's lines only while it holds the
+committed `attempt` reply for that part (section 2.4.4). A writer that never
+received that reply has therefore sent nothing for that attempt. Only that
+writer can say so: the attestation must match the attempt's writer identity,
+generation and the random `a1_nonce` that only the writer and the database
+hold. A12 is never inferred from a missing reply, a timeout or a gone writer.
+Without an attestation, such an attempt stays `writing` until A8 or A8c, as
+before. A `void` attempt published nothing, so it is not a reconciliation
+member (section 7.2).
+
+**Attested outcomes.** A writer whose `outcome` request was never answered
+may carry that outcome (A2, A3, A4 or A5, with its `final_at` and detail) in
+its handoff (section 6.4). The authority applies it under exactly the
+`outcome` request's guard: the attempt is still `writing`, with the same
+writer, generation and `a1_nonce`. It is the same statement the writer would
+have made by request, only made durable another way. If the attempt has
+already moved, for example by A8, the attestation changes nothing.
 
 ### 3.4 Evidence and coverage
 
@@ -345,18 +715,20 @@ A `dead` attempt remains evidence (section 7).
 
 | # | Change | Actor | Guard | Durable write or effect |
 |---|---|---|---|---|
+| I0 | Import the bridge's private fallback | B | `L_flush`, and the bridge's in-process fallback mutex | A durable sync of `outbox.bridge.jsonl` (file and directory), then its rows applied by *X* in one `TX` (section 6.4), then the file unlinked and the directory synced. A crash in between re-imports by *X*: a no-op. |
 | I1 | Claim | B | `L_flush` + `L_outbox` | Rename `outbox.jsonl` to a new unique `outbox.claimed-<ns>-<random>.jsonl`. The new name is not in `imports` and does not exist on disk. Then a durable sync of **every** claim file present: the new one, and any left by an earlier pass, a crash, or the old tools before cutover (F3; design round 3). |
 | I2 | Import | B | `L_flush` + `L_outbox`; `TX`; only after I1's durable sync of that claim file | The occurrences, held rows, handoffs (H1), any alert row (section 6.2) and the `imports` row, in **one** `TX` (section 6). After the last file of a pass, `import_epoch` + 1, in that pass's last `TX`. |
 | I3 | Unlink | B | after I2 commits | Unlink the claim file, then `fsync` the directory. |
-| X1 | Export a dead letter | P or B | `L_outbox`, acquired within `LOCK_WAIT` | Section 3.6. |
+| X1 | Export a dead letter | B | `L_outbox`, acquired within `LOCK_WAIT` | Section 3.6. |
 | X2 | Export an alert row | B only | `L_flush` | Section 3.6. |
 | G1 | Collect evidence | B | `L_flush`; `TX` | The deletions I-7 allows. |
+| X3 | Write the status snapshot | B | none | Section 2.4.5. Diagnostic only. |
 
 ### 3.6 Export and sink protocol
 
 **Every writer of `dead-letters.jsonl` follows the same protocol under
-`L_outbox`** (F5). The writers are X1 (P or B) and the bridge's existing
-delivery dead letters (`Deliveries._dead`).
+`L_outbox`** (F5). The writers are X1 and the bridge's existing delivery
+dead letters (`Deliveries._dead`), both of B.
 
 1. Acquire `L_outbox` within the writer's deadline (section 2.3). If it is
    not acquired, write nothing and mark nothing; the export stays pending.
@@ -443,7 +815,10 @@ queues the call.
 
 **Why it holds.** Posting and acknowledging both go through the attempt
 protocol, including today's separate `chatlib.ack` send. A1 is the only way
-to obtain an attempt, and its writer sends only after the commit.
+to obtain an attempt, and its writer sends only after the commit. A client
+sends only while it holds the committed `attempt` reply, which the authority
+writes only after `COMMIT` has returned (section 2.4.2). A missing, late or
+`error` reply means no bytes.
 
 **Consequence.** Any message an attempt produces carries a time of at least
 `written_at − A` (C-1).
@@ -467,6 +842,11 @@ is closed or its writer is gone.
 - Checks before sending, and leases, cannot close the gap between a check and
   the send. The fence therefore relies only on two facts: a closed socket
   cannot send, and a dead process cannot send.
+- **Routing changes no fence** (section 2.4). A request timeout, a closed
+  request connection, a `busy` reply or a missing reply never moves an
+  attempt. The authority closing an incomplete request ends a request that
+  committed nothing, and touches no attempt. A12 moves an attempt only on
+  its own writer's attestation that no byte was sent (section 3.3).
 
 ### I-3. Confirmed parts are never resent
 
@@ -497,14 +877,17 @@ discards a committed obligation.
 
 **Why it holds.**
 
-- **A1 fails:** nothing is written. If entry *X* exists, P hands it off
-  (E3), so the existing E1 entry is kept and no second obligation is created.
-  Otherwise P queues by Q0.
-- **A2–A5 fail:** the writer closes the connection if it is still open, keeps
-  the observed outcome in memory, and retries the commit:
+- **A1 fails, or its reply is missing:** P sends nothing. If entry *X*
+  exists, P hands it off (E3), so the existing E1 entry is kept and no second
+  obligation is created; if the `attempt` request went unanswered, the
+  handoff carries an A12 attestation, so an A1 that did land becomes `void`
+  instead of uncertain. Otherwise P queues by Q0.
+- **A2–A5 fail, or their reply is missing:** the writer closes the chat
+  connection if it is still open, keeps the observed outcome in memory, and
+  retries the same replay-safe request:
   - within the call, up to `PART_WAIT`;
-  - then the bridge retries at the start of each flush, and `pchat` and
-    `agentcli` retry at each later `chatlib` call and at process exit.
+  - then a client carries it as an attested outcome in its handoff (section
+    6.4), and the bridge retries its own at the start of each flush.
 - **The commit never lands:** the attempt stays `writing`, until A8 (writer
   gone) or A8c (connection closed, for example in a long-lived `agentcli`
   host) ends it **without finality**. It is then `uncertain`, R2 never calls
@@ -512,7 +895,8 @@ discards a committed obligation.
   - A refusal whose A3 never committed is therefore UNKNOWN. It is never
     retried, and is dead-lettered after 24 hours (N6, an owner decision).
 - **E3 fails:** the handoff fallback (section 6.4), applied by H1.
-- **Q0 fails:** the durable fallback append (section 6.4). P reports the post
+- **Q0 fails, or the authority is unavailable** (section 2.4.4): the durable
+  fallback append (section 6.4). P reports the post
   as queued (exit 3) only after a durable sync of `outbox.jsonl`, file **and**
   directory, so a power loss cannot remove a row P has acknowledged, even when
   another process created the file and never synced the directory (design
@@ -615,15 +999,20 @@ absolute deadlines that unrelated traffic cannot extend:
 - `PART_WAIT + DRAIN_WAIT` per part;
 - `CHANNEL_WAIT` for one channel recreation.
 
+**No client can stall the authority** (design round 4; I-11). Every database
+write runs on the bridge's authority thread, and no client ever holds a
+database lock (section 2.4). A client paused at any point, inside or between
+its requests, delays a bridge request by at most one client transaction.
+
 **Locks are bounded too** (design round 3). The flush waits for `L_outbox` at
 most `LOCK_WAIT` per step, and nothing that delivers a database entry needs
-`L_outbox` (section 2.3).
+`L_outbox` (section 2.3). No bridge flow waits for `L_outbox` without a
+deadline: `announce`'s fallback uses the bridge's private file (section 6.4).
 
-- **A process paused while holding `L_outbox`**, for example a direct writer
-  that committed a refusal and paused inside X1, costs the flush at most
-  `LOCK_WAIT`. The flush skips import and export for that pass, and still
-  attempts every eligible database entry, reconciles, applies E7, and
-  exports alerts.
+- **A process paused while holding `L_outbox`**, for example a client paused
+  inside its fallback append, costs the flush at most `LOCK_WAIT`. The flush
+  skips import and export for that pass, and still attempts every eligible
+  database entry, reconciles, applies E7, and exports alerts.
 - **The paused holder keeps everything it owns.** Its lock, its connection
   and its attempts are untouched. When it resumes it finishes its step; if it
   dies, the kernel releases its flock.
@@ -634,8 +1023,46 @@ most `LOCK_WAIT` per step, and nothing that delivers a database entry needs
   releases the lock. Nothing is lost, resent or decided while they wait.
 
 `L_flush` is held only by the single bridge, so no other process can delay a
-flush through it. The database's own write lock is bounded by `BUSY_WAIT`;
-C-8 states what a process stopped inside a transaction can and cannot do.
+flush through it. The database's lock is held only by the authority (section
+2.4.1), so no other process can delay a flush through that either. Revision
+5's C-8 exemption is removed: R6 holds without it.
+
+### I-11. A paused client cannot stall the authority
+
+A client that stops at any point, whether before, during or after a request,
+or while sending its bytes, never prevents the bridge from giving every other
+entry its attempt.
+
+**Why it holds.**
+
+- **The client holds no lock the authority needs.** It never opens the
+  database (section 2.4), so it holds no SQLite lock. The authority never
+  waits for `L_outbox`, `L_flush` or any flock of a client.
+- **A transaction never waits for a client.** It begins only for a complete,
+  validated request, and ends before its reply is written (section 2.4.3).
+- **Reading is bounded.** An incomplete frame costs only its buffer, until
+  `REQ_WAIT`, when the connection closes with nothing committed. A frame
+  over `FRAME_MAX` closes it at once.
+- **Writing is bounded.** Replies go to non-blocking sockets. A client that
+  stops reading costs only its buffered reply, until `RESP_WAIT`. The
+  transaction committed before the reply, and a lost reply is recovered by
+  replay (section 2.4.2).
+- **Queues are bounded.** `CONN_MAX` and `QUEUE_MAX` cap clients, and the
+  excess is refused at once, without a transaction. Each request is bounded
+  work.
+- **The bridge is never starved.** The authority alternates between the
+  in-process queue and client requests, so a bridge request waits behind at
+  most one client transaction, and each bridge request either begins within
+  `AUTH_WAIT` or is cancelled, never run late.
+- **The paused client keeps everything it owns.** Its committed `writing`
+  attempt is fenced by I-2: it is ended only by A8 or A8c, or by its own
+  A12. Nobody kills it, steals from it, gives it a lease or checks before
+  sending.
+
+**What remains** is the speed of local storage (C-10), which every writer of
+any design depends on. It is not caused by any client, entry or lock holder.
+
+Section 5.6, case 11, gives a schedule.
 
 ### How each round-5 finding is closed
 
@@ -756,26 +1183,31 @@ Anything these do not establish stays undecided.
   - It is monitored, and suspended on the first message the record shows is
     unexplained (section 7.4).
   - It is never assumed for an account that is not designated.
-- **C-8, the database's single writer.** SQLite serializes writers: a process
-  holding a write transaction makes every other writer wait. This note
-  bounds and limits that, and does not assume it away:
-  - **Transactions are short and local.** No transaction contains network
-    I/O, a file lock wait, or any other wait (section 2.1). A writer that is
-    waiting on the network, draining, paused between steps, or holding
-    `L_outbox` holds no database lock. Every pause the proofs consider,
-    including a paused writer after A1 and a paused `L_outbox` holder, is
-    outside a transaction.
-  - **Waits are bounded.** Every transaction waits at most `BUSY_WAIT`. If
-    the bridge's transaction cannot start, it commits nothing, sends nothing
-    (I-1), logs it, and tries again at the next flush. Nothing is lost,
-    resent or decided.
-  - **What remains.** A process stopped by the operating system, or by a
-    debugger, *inside* one of these short transactions blocks every database
-    write until it resumes or dies. When it dies, SQLite rolls its
-    transaction back. That is a host-level stall of the single authority the
-    owner chose (section 11, decision 1), not an entry's state. No entry that
-    is uncertain, waiting, failing, refused or paused can cause it, so it
-    does not contradict I-10. It is never resolved by breaking the lock.
+- **C-8 is removed** (revision 6). Revision 5 exempted, from R6, a client
+  stopped inside its own database transaction. In this design no client opens
+  the database (section 2.4), so there is no such client and no exemption.
+- **C-9, who opens the database.** Only the bridge's authority opens
+  `outbox.db`. Every program this release ships follows that rule, and a
+  future test checks that no client module opens it (section 9, test 31).
+  - **While the authority runs,** it holds the file's exclusive lock (section
+    2.4.1). Any other opener gets `SQLITE_BUSY` at once and holds nothing.
+  - **While the bridge is down,** a program outside this design (a person's
+    `sqlite3` shell, say) could open the file and keep a lock. The bridge's
+    start then fails within `OPEN_WAIT`. Status reports "authority
+    unavailable: database busy", and the start is retried each pass. Clients
+    queue meanwhile (section 2.4.4). Nothing breaks or removes that lock.
+  - **This is not an R6 exemption.** No actor of this design (P, B, S or O)
+    can be that process. It is the same class of event as someone stopping
+    the bridge or deleting the state directory: outside the system, and
+    visible.
+- **C-10, local storage.** On a healthy host, each SQLite commit and each
+  file sync of the state directory completes in bounded time.
+  - The authority thread waits for nothing else: no client, no flock after
+    startup, no socket, no other thread (section 2.4.3).
+  - So a stuck storage device can stall it, as it would stall any storage of
+    any design, and nothing else can.
+  - **A paused client is never counted under C-10.** I-11 shows it cannot
+    delay the authority at all.
 
 ### 5.4 Gone writers and closed connections
 
@@ -809,16 +1241,19 @@ before it (or before its commit) and just after it. "→" names the recovery.
 |---|---|---|
 | login, or connection setup (bounded by `LOGIN_WAIT`) | nothing durable, nothing sent | → Q0 on *X* if P is still running |
 | Q0 `TX` | nothing durable, as today | `open`, `outbox` *X* → flushed |
-| Q0 `TX` reported failure but landed | — | *X* exists. P's fallback row names *X*, so its import is a no-op, never a second entry. |
+| Q0 `TX` landed, but its reply was lost or `error` | — | *X* exists. P's fallback row names *X*, so its import is a no-op, never a second entry. |
 | Q0 fallback append, then the durable sync (file, then directory) | nothing durable and nothing acknowledged, as today. A power loss before the directory `fsync` is the same: P has not exited 3 yet. | durable → P exits 3 → imported as *X* (section 6.4) |
 | Q0 fallback append to an `outbox.jsonl` another process created and never directory-synced | — | P's durable sync covers the directory entry too, so the row survives a power loss after exit 3 (design round 3). |
 | E1 | nothing durable, nothing sent → Q0 on *X* | `open`, `direct` *X*, all `unsent` → if P is still running, E3 hands *X* off. If the writer is gone, E8, nothing unknown → retired as today. |
-| E1 reported failure but landed | — | P finds *X* before Q0 → E3 on *X*: one obligation |
+| E1 landed, but its reply was lost or `error` | — | P's retry of `create` gets `replay`, or its `queue` finds *X* → E3 on *X*: one obligation |
 | A1 | the previous state → Q0 if nothing was written, else E3 | `writing` → A8 → `uncertain`, no finality → R1 or E7 |
+| A1 landed, its reply lost; P alive | — | P sends nothing for it. Its `attempt` retry gets `replay` and it proceeds, or it hands off with an A12 attestation → `void`, part `unsent` → delivered by B. |
+| A1 landed, its reply lost; P dies before any handoff | — | `writing` → A8 → uncertain, no finality → R1 or E7. Conservative: nothing proves the absence of bytes. |
 | sending lines and PING | `writing` → A8 | same |
 | `PART_WAIT` and the drain | `writing` → A8 | same |
 | close | `writing` → A8 | `writing` → A8, or A8c while the host lives |
 | A2 | `writing` → A8 → uncertain, never `unsent` | `confirmed` |
+| an outcome landed, its reply lost | — | P's replay gets `replay`; or its handoff's attested outcome is a no-op, because the attempt has moved |
 | A3 + E6 | `writing` → A8 → UNKNOWN (N6), never retried → E7 | `terminal` → X1 |
 | A4 | `writing` → A8 → UNKNOWN → E7 | `unsent` → retried by the owner, or E8 |
 | A5 | `writing` → A8, no finality | `ended`, with `final_at` as observed |
@@ -826,6 +1261,18 @@ before it (or before its commit) and just after it. "→" names the recovery.
 | E3 | `direct` → gone → E8, or H1 if the fallback row is durable | `outbox` |
 | the fallback handoff append and its durable sync | E8 → remainder not adopted (D1). A power loss before the directory `fsync` is the same. | durable → H1 at the next pass |
 | E5 | all parts confirmed → B sets `done` | `done` |
+
+#### Requests and the authority
+
+| Boundary | Crash just before | Crash just after |
+|---|---|---|
+| a client sends part of a frame | nothing committed; the connection closes at `REQ_WAIT` | — |
+| the authority's `TX` for a request | rolled back; no reply → the client retries, or queues or hands off | committed; the reply is written next |
+| the reply is written | committed; the client sees EOF → it replays the same request on a new connection: `replay` | the client has it |
+| the authority (the bridge) crashes mid-`TX` | SQLite rolls it back; clients see EOF, and the next epoch answers their replays | — |
+| the authority's start transaction | no epoch change; no socket; clients queue | the epoch has grown; the socket is bound next |
+| a client after a restart | — | its next reply has a higher epoch → `query`, then continue from the state shown |
+| a fallback or handoff row with an attestation, then the client dies | the row is not durable: no attestation → the attempt stays `writing` → A8 | durable → imported **before** A8 runs in that flush (section 6.3), so the attestation applies first |
 
 #### Bridge side
 
@@ -848,6 +1295,9 @@ before it (or before its commit) and just after it. "→" names the recovery.
 | the checkpoint file write | the stored `mark` disagrees with the checkpoint → V2 starts a new span (safe) | consistent |
 | V2, V3 | the old span | the new span |
 | a bridge restart | the live set is empty → coverage advances only after a catch-up | — |
+| I0: the private fallback append, then its durable sync | the obligation is still in `pending.json` with `held_announced` unset → raised again with the same *X* | durable → imported by *X* at the next pass |
+| I0: the import `TX`, then the unlink | the rows are re-read → applied by *X*: no-op | unlinked |
+| `Deliveries` saves `held_announced` | the flag is unset → the announce is raised again with the same *X*: a no-op | saved, after the announce's entry or row was durable |
 | X1 append | → X1 again | **power loss before the `fsync`:** the line may vanish; the mark is unset → X1 again. A crash with the line present: X1 finds it, makes a durable sync (file, then directory), then marks. |
 | X1 creates `dead-letters.jsonl`, appends and `fsync`s the file, then crashes before the directory `fsync` | — | The mark is unset. The next X1 finds the line, `fsync`s the file **and the directory**, and only then marks. A power loss after the mark keeps the record (design round 3). |
 | X1 mark | the record is durable, the mark unset → X1 finds it, syncs the file and directory, marks | done |
@@ -887,9 +1337,10 @@ before it (or before its commit) and just after it. "→" names the recovery.
      yet greater than `e`.
    - An unrelated killed post wrote no row, so after the pass it stays
      abandoned and becomes collectible.
-6. **`pchat status` during a flush.** It reads one snapshot.
-7. **P exports while B does.** `L_outbox` serializes them. The second finds
-   the line present, makes it durable, and sets the mark.
+6. **`pchat status` during a flush.** Its `status` request runs in one read
+   `TX` on the authority, between other transactions.
+7. **Two bridge exports.** X1 runs only on B. An X1 retried after a crash
+   finds the line present, makes it durable, and sets the mark.
 8. **`Deliveries` writes a delivery dead letter during X1.** `L_outbox`
    serializes them, so no two appends interleave.
 9. **A paused `L_outbox` holder (design round 3).** `alp-solver-2`'s direct
@@ -903,9 +1354,50 @@ before it (or before its commit) and just after it. "→" names the recovery.
    - P's lock and connection are untouched. When P resumes, it finishes X1;
      if it never resumes and dies, its flock is released. The next flush
      after either imports and exports as usual.
-10. **A direct writer appending while the bridge waits.** P holds `L_outbox`
+10. **A client appending while the bridge waits.** P holds `L_outbox`
     for a fallback append. B's claim waits at most `LOCK_WAIT`, then defers;
     P's row is claimed by the next flush, never lost and never split.
+11. **A paused client (design round 4, finding 2).** `pat`'s `pchat post` to
+    `#alpha`, and `sam`'s queued entry for `#beta`, on an injected clock:
+
+    | t (s) | `pat`'s `pchat post` | the bridge |
+    |---|---|---|
+    | 0.0 | connects, sends half of its `create` frame, and is stopped (SIGSTOP) | holds a partial buffer; no `TX` |
+    | 0.1 | stopped | the flush asks for A1 on `sam`'s entry; the authority runs it at once |
+    | 0.2–1.0 | stopped | sends `sam`'s part, gets the PONG; A2 and E5 commit |
+    | 2.0 | stopped | `REQ_WAIT`: the connection closes; nothing of `pat`'s call committed |
+    | 9.0 | resumes, and sees EOF | — |
+    | 9.0–14.0 | resends `create` with the same *X*: `ok`; continues. If unanswered within `IPC_WAIT`: Q0's fallback row, then exit 3 | served like any request |
+
+    The same holds when `pat` stops at other points:
+    - **after a complete frame:** its `TX` runs and commits. Its reply waits
+      in the socket buffer, or is dropped at `RESP_WAIT`, and `pat`'s replay
+      gets `replay`;
+    - **after its A1 reply, while sending:** it owns a `writing` attempt and
+      no lock, and I-2 fences it.
+
+    In every case `sam`'s entry is delivered in the same flush.
+12. **Announce during a lock holder and a storage fault (design round 4,
+    finding 1).** A client holds `L_outbox` and is stopped. The bridge's
+    `announce` for a held instruction fails before any byte, and its Q0
+    in-process request fails.
+    - `announce` appends the row for *X* to `outbox.bridge.jsonl`, under the
+      in-process mutex, and syncs it durably. It never touches `L_outbox`.
+    - `Deliveries` then saves `held_announced`.
+    - The same flush delivers `sam`'s unrelated entry, and I0 imports the
+      announce at the next pass.
+    - If the private append fails too, the flag stays unset, and the next
+      pass raises the same *X* again.
+13. **A bridge restart in the middle of a direct post.** `alp-solver-2` has
+    part 0 confirmed. The bridge restarts while it sends part 1.
+    - Its `outcome` request for part 1 meets a refused connection, and is
+      retried until the new authority answers at a higher epoch.
+    - It sends `query`, sees its attempt still `writing`, and replays the
+      outcome: `ok`.
+    - Its `attempt` for part 2 then proceeds.
+
+    Had the new authority not answered by `PART_WAIT`, it would have handed
+    off with the attested outcome, and exited 3.
 
 ## 6. Importing the old outbox
 
@@ -962,10 +1454,17 @@ and it is delivered as #19 R3 requires ("as today").
 ### 6.3 The fenced import
 
 The import runs only in B's flush, holding `L_flush` and `L_outbox`, and does
-only local work.
+only local work. It runs at the **start** of each flush, before A8, A8c and
+reconciliation, so a durable attestation (section 6.4) is applied before A8
+could end its attempt without finality. Each claim file is one in-process
+request to the authority (section 2.4.3).
+
+- **The private fallback first (I0).** Holding `L_flush` and the bridge's
+  in-process fallback mutex, but not `L_outbox`, import
+  `outbox.bridge.jsonl` (section 6.4).
 
 0. **Acquire `L_outbox`** within `LOCK_WAIT`. If it is not acquired, skip
-   the whole import this flush (section 2.3).
+   the rest of the import this flush (section 2.3).
 1. **Claim (I1).** Rename a non-empty `outbox.jsonl` to a new, never-used
    claim name. List every `outbox.claimed-*.jsonl`, and make a durable sync
    of each one (file, then directory), including claims left by an earlier
@@ -991,19 +1490,38 @@ only local work.
 
 ### 6.4 Fallback rows
 
-Every fallback append is a durable append under `L_outbox`, which P waits
-for as today (section 2.3): the line, then `fsync` of `outbox.jsonl`, then
-`fsync` of the directory, always (section 2.1). P exits 3, reporting the post
-as queued, only after that sync. If the sync fails, P fails as described at
-the end of this section.
+Every client fallback append is a durable append under `L_outbox`, which P
+waits for as today (section 2.3): the line, then `fsync` of `outbox.jsonl`,
+then `fsync` of the directory, always (section 2.1). P exits 3, reporting the
+post as queued, only after that sync. If the sync fails, P fails as described
+at the end of this section.
 
-There is one fallback row shape, for both Q0 and E3. It holds the post's or
-ack's legacy fields, plus `fallback: true`, the call's entry id *X*, and P's
-writer identity when P had a connection. P appends it when Q0's or E3's `TX`
-cannot commit. Import applies it by *X*, never by occurrence:
+**When P appends one.** When its `queue` or `handoff` request is not answered
+as committed: the authority is unavailable, or the reply is missing, `busy`
+or `error` (section 2.4.4).
+
+There is one fallback row shape, for both Q0 and E3. It holds:
+
+- the post's or ack's legacy fields;
+- `fallback: true`;
+- the call's entry id *X*;
+- P's writer identity, when P had a connection;
+- **at most one attestation** (section 3.3), naming the attempt by (*X*,
+  *n*, generation, `a1_nonce`). It is either:
+  - `void`: P never received that attempt's committed `attempt` reply; or
+  - an outcome P observed but could not commit: A2, A3, A4 or A5, with its
+    `final_at` and detail.
+
+  An attempt still `writing` is the last one P made, and P makes no further
+  attempt once it hands off, so one attestation is enough.
+
+Import applies the row by *X*, never by occurrence:
 
 - **Entry *X* exists and is `open`, `direct`, or `abandoned` with H1's
-  guard:** apply H1. The existing E1 entry and its progress are kept.
+  guard:** apply H1. The existing E1 entry and its progress are kept. In the
+  same `TX`, apply the attestation, if any, under its guard (A12, or the
+  `outcome` request's guard). If its guard fails, because the attempt has
+  already moved, the attestation changes nothing.
 - **Entry *X* exists and is already `outbox`, `done` or `terminal`:** a no-op.
   This includes a Q0 commit that reported failure but had landed. Nothing is
   merged, and no second entry is created.
@@ -1020,6 +1538,48 @@ and keep their occurrence-derived ids (section 6.3).
 
 If a fallback append fails too, P fails as it does today when the outbox
 cannot be written. Whatever already committed still prevents a blind resend.
+
+**The bridge's own fallback (`announce`).** The bridge never appends to
+`outbox.jsonl`, and so never waits for `L_outbox` (design review round 4,
+finding 1).
+
+- **Identity.** An `announce` call's *X* is derived from its pending item's
+  key and its reason, for example `sha256(key + ":" + reason)`. A re-raised
+  announce is therefore the same obligation, never a second one.
+- **Already recorded.** If *X* already exists when an announce is raised,
+  for example after a crash before `held_announced` was saved, the
+  obligation is already durable. Nothing more is sent, and the flag is
+  saved.
+- **The fallback.** `announce` follows section 2.4.4's rules through
+  in-process requests. It queues by Q0 before any byte, and hands off by E3
+  after some. When that Q0 or E3 request fails, or is cancelled, it appends
+  the same fallback row shape for *X* to the bridge-private
+  `outbox.bridge.jsonl`. It does this under an in-process mutex shared only
+  with I0, and follows it with a durable sync of the file and the directory.
+  An in-process request is either cancelled before `BEGIN`, having
+  committed nothing, or returns its result. Only an `error` leaves its
+  commit unknown, and a fallback row by *X* is safe either way, because
+  import applies it by *X*. `announce`, like a client, sends a part's bytes
+  only after a known committed A1. If an A1 result is unknown, no byte
+  follows it. At its next pass the bridge, which is that attempt's own
+  writer and holds its `a1_nonce`, applies A12 to it if it landed. The same
+  rule covers the bridge's own flush attempts.
+- **Its import, I0,** at the start of each flush, under the same mutex:
+  1. a durable sync of the file;
+  2. one in-process request that applies every row by *X*, by the rules
+     above;
+  3. the unlink of the file, then a directory `fsync`.
+
+  A crash in between re-imports by *X*, which is a no-op.
+- **`held_announced`.** `Deliveries` saves its flag only after the announce's
+  entry is durable: committed in the database, or in the private file. If
+  neither can be written, the flag stays unset, the instruction stays in
+  `pending.json`, and the next pass raises the same *X* again. Nothing is
+  dropped, and nothing is reported before it is durable.
+- **No unbounded wait.** Each in-process request is bounded by `AUTH_WAIT`
+  and C-10. The private append waits only for the in-process mutex, which I0
+  holds only for local file work. The chat setup and send of `announce` keep
+  their absolute deadlines (section 5.1).
 
 ### 6.5 Why the import is idempotent and keeps occurrences
 
@@ -1125,9 +1685,12 @@ All of these must hold:
 3. `K_c` can be fully matched into `M`. If not, the verdict is undecided and
    an anomaly is logged.
 4. **Every** message of `M` inside `Y`'s window is forced to `K_c`.
-5. **If `Y` is multi-line:** every unattributed message of the same account
-   and channel inside `Y`'s window, of **any** text other than *k*, is forced
-   to the confirmed attempts of its own text key (section 7.2).
+5. **For every part, single-line or multi-line:** every unattributed message
+   of the same account and channel inside `Y`'s window, of **any** text other
+   than *k*, is forced to the confirmed attempts of its own text key (section
+   7.2). This is #19's first amendment, A3: every message from the same
+   account in that channel inside the span is accounted for (design review
+   round 4, finding 3).
 
 Then `Y` becomes `absent` (A7), and its part goes back to `unsent`.
 
@@ -1150,6 +1713,12 @@ Then `Y` becomes `absent` (A7), and its part goes back to `unsent`.
   - `g` is not forced either: forced messages belong to confirmed attempts
     (section 7.2), and `g` belongs to `Y`. So condition 5 fails. If `g`
     happens to have text *k*, condition 4 already fails.
+- **Single-line parts.** The argument needs condition 5 only for a
+  multi-line `Y`, because a single-line `Y` can publish nothing but `m_Y`
+  (C-4). Condition 5 still applies to it, because A3 requires every message
+  to be accounted for. A single-line part with one unexplained message of
+  another text in its window therefore stays UNKNOWN. That is more
+  conservative, never less.
 - **No assumption about untracked producers.** The argument makes none. An
   extra message is never forced, so it can only block absence.
 
@@ -1162,6 +1731,14 @@ and "south". During `Y`'s window, the record shows:
 The first message blocks condition 5, so `Y` is undecided. Blank lines,
 joined pieces, reordering, or any other shape are treated the same way, with
 no model needed.
+
+**Single-line example.** `alp-solver-2`'s single-line part `Y`, "deploy
+done", has finality and complete coverage, and no "deploy done" appears.
+But the record shows an unattributed "beta status" from that account in
+`#alpha` inside `Y`'s window, which no confirmed attempt accounts for.
+Condition 5 fails, so `Y` stays UNKNOWN and is never resent. Had that message
+been attributed, or forced to a confirmed "beta status" attempt, `Y` would be
+absent and resent once.
 
 #### R3, UNDECIDED: everything else
 
@@ -1198,7 +1775,7 @@ applies to any entry, whether direct, outbox or abandoned. It is never resent.
 - **What stays UNKNOWN.** Each of these is visible, never resent, and
   dead-lettered with its text and progress after 24 hours:
   - indistinguishable identical text;
-  - an unexplained same-account message near a multi-line part;
+  - an unexplained same-account message near any part;
   - missing finality, including a bare timeout;
   - a live writer;
   - incomplete coverage.
@@ -1239,14 +1816,14 @@ posted on the issue. The mapping is to the amended issue.
 | R3, fixed parts; legacy rows as today | E1 and E4; section 6.2. |
 | R4, durable progress | A1 before bytes; A2 or A5 before the next part; A8 and A8c; I-5. A failure before any write queues the whole post once (Q0 on *X*, as today). An existing E1 entry is kept, and handed off by E3. |
 | R5, reconciliation, as amended (D2, N6, N7) | R1, R2, R3, E7, X1 and X2. |
-| R6, independent flow | I-10; bounded setup (section 5.1); bounded lock acquisition (section 2.3), so a paused `L_outbox` holder cannot stop database entries from flowing. C-8 states the database's single-writer limit. |
+| R6, independent flow | I-10 and I-11; the bridge as the only database writer (section 2.4), so a paused client holds no database lock; bounded requests and fair turns (section 2.4.3); bounded setup (section 5.1); bounded lock acquisition (section 2.3), so a paused `L_outbox` holder cannot stop database entries from flowing; `announce`'s private fallback (section 6.4). No exemption: C-8 is removed. |
 | R7, refusals | A3 and E6; N6 for a refusal that could not be recorded. |
-| R8, visibility | `pchat status` from the database: waiting to post, awaiting a check, held rows, suspended designations, and import or export deferred by a busy lock. |
-| R9, no exactly-once | Stated here. |
+| R8, visibility | `pchat status` from the authority: waiting to post, awaiting a check, held rows, suspended designations, and import or export deferred by a busy lock. While the authority is unavailable, the dated snapshot and the waiting fallback rows (section 2.4.5). |
+| R9, no exactly-once; delivery preservation | Stated here. A transport failure before any part is written still queues the whole post once. **Changed by the owner's 2026-10-10 decision:** while the authority is unavailable, a post, ack or notice is queued in full instead of sent, and delivered when the bridge returns (section 2.4.4). Nothing is lost, and it is not claimed equivalent to today. |
 | R10–R11, R13 | Unchanged. |
 | R12, contract documentation | Satisfied by D-72 and D-73, which are updated as needed. No new D-number. |
-| R14, the SQLite authority | Sections 2–7. |
-| R15, release packaging (second amendment) | Section 10.1. |
+| R14, the SQLite authority | Sections 2–7. The bridge is its only opener and writer (section 2.4; the 2026-10-10 decision). |
+| R15, release packaging (second amendment) | Section 10.1, including the new read-write `outbox-authority` interface, which extends B1 under the 2026-10-10 decision. |
 | Acceptance 1, 2, 4–6, 8–10 | Behavior unchanged. For acceptance 2, the test designates its fake account (D2). |
 | Acceptance 3 | As amended (AD-2, corrected by the second amendment). The fixture gives part 3 a **non-refusal** error reply together with its matching completion PONG, complete coverage, and no unexplained message. Companion checks: a late PONG without an error is A2, confirmed and not resent; a FAIL is A3, dead-lettered and not retried; a bare timeout, crash or broken connection never proves absence. |
 | Acceptance 7 | As amended (AD-1): the test recovers the SQLite crash state, with the same assertions. |
@@ -1255,10 +1832,9 @@ posted on the issue. The mapping is to the amended issue.
 resend:
 
 - **N1:** R1 needs an exact count, with no live writer and no dead member.
-- **N2/N8:** an unexplained same-account message near a multi-line part
-  blocks R2. An unconfirmed multi-line attempt blocks R1 for its account and
-  channel inside its window. For an attempt without finality, that window
-  never closes.
+- **N2/N8:** an unexplained same-account message near any part blocks R2. An
+  unconfirmed multi-line attempt blocks R1 for its account and channel inside
+  its window. For an attempt without finality, that window never closes.
 - **N4:** a timed-out call returns up to `DRAIN_WAIT` later.
 - **N5:** a dead member, or one without finality, keeps an open window.
 
@@ -1280,6 +1856,15 @@ of this note.
 - a fake process and socket table;
 - a fake filesystem layer that can drop changes that were not `fsync`ed, to
   simulate power loss;
+- the authority driven in-process, or over `socket.socketpair()`. That
+  connects nothing, and `_isolation` refuses every `socket.connect`
+  (`tests/_isolation.py:53-54`). A test that needs a real AF_UNIX connect
+  needs a provenance-recorded `_isolation.py` change first;
+- faked peer credentials, boot id, process and socket probes; `ps` and
+  `lsof` stay refused commands (`tests/_isolation.py:19-21`);
+- every database a test opens is proved to lie under `_isolation.CHAT_STATE`
+  (the canonical approval's clarification). Designation rows are set before
+  the authority starts, or through an in-process request;
 - `_isolation`;
 - invented data only.
 
@@ -1346,7 +1931,8 @@ differ.
       Import, restart, import again: one entry *X*.
 
     Each queues the whole post once, as today. Two separate calls with
-    identical text are still two entries.
+    identical text are still two entries. For `announce`, the fallback is the
+    private file (test 29).
 19. **Collection, then delayed reconciliation.** A confirmed attempt K has no
     msgid, and its message lies before the window of an unresolved attempt U,
     but K's window overlaps U's. Run G1 when K's message is older than
@@ -1393,8 +1979,9 @@ differ.
 16. **Coverage.** Each of these stops coverage, and R2 waits: KICK or PART, a
     disconnect, a stale reply, a failed V1, a checkpoint mismatch, a restart.
 17. **Independent flow.** Another account, and the same account with another
-    text, flow while one entry is undecided, refused or failing, and while
-    `L_outbox` is held by a paused process (test 23).
+    text, flow while one entry is undecided, refused or failing, while
+    `L_outbox` is held by a paused process (test 23), and while a client is
+    stopped at any point of a request (test 25).
 18. **Unchanged paths.**
     - Legacy and ack entries.
     - A slow but confirmed post.
@@ -1453,6 +2040,103 @@ differ.
     - a second unexplained message while already suspended: no new row;
       a later suspension after the owner lifts the first: a new row with
       the next `suspension_seq`.
+25. **A paused client (design round 4, finding 2).** On an injected clock,
+    with `sam`'s queued `#beta` entry due in the same flush, a fake client
+    stops:
+    - before connecting;
+    - after half a frame;
+    - after a complete frame;
+    - while its reply is unread;
+    - after its A1 reply;
+    - while sending its part.
+
+    In every case `sam`'s entry is delivered in that flush, and no `TX` waits
+    for the client. Nothing commits for an incomplete frame, and the
+    connection closes at `REQ_WAIT`. An unread reply is dropped at
+    `RESP_WAIT`, and the client's replay gets `replay`. A client stopped
+    after A1 keeps its `writing` attempt: it is never ended, voided or
+    retried by time.
+
+    **Floods:** `CONN_MAX` + 1 connections, and `QUEUE_MAX` + 1 complete
+    requests, get closed or `busy` at once, with no `TX`. Bridge requests
+    still run at every other turn.
+
+    **Cancellation:** an in-process request still queued at `AUTH_WAIT` is
+    cancelled and never runs.
+
+    **A negative control:** the same schedule with a client holding a real
+    `BEGIN IMMEDIATE` on a sandboxed database shows the stall that this
+    design removes.
+26. **Requests at every crash point.** One case per row of section 5.5's
+    request table:
+    - each op's reply lost after its commit, then a replay: `replay`, with
+      the same state;
+    - an `error` reply treated as missing;
+    - a `conflict` that changes nothing;
+    - an authority restart between two requests of one call. The higher
+      epoch makes the client `query`, then continue;
+    - a reply with a lower epoch, which is ignored;
+    - two separate calls with identical text: two entries.
+
+    No reply is ever produced before its `COMMIT`. The fake connection
+    records the order.
+27. **A12 and attested outcomes.** A `void` or attested outcome applies only
+    with the same writer, generation and `a1_nonce`, and only to an attempt
+    still `writing`. A wrong nonce, another writer, a newer generation, or an
+    attempt already ended by A8 each change nothing. A client whose A1 reply
+    was lost sends no byte, and its handoff makes the attempt `void`, so the
+    part is delivered by B, once. The import of a durable attestation runs
+    before A8 in the same flush.
+28. **Authority unavailable: the material change.** For `pchat post`, `pchat
+    ack` and `notify`, test each of these:
+    - no socket;
+    - a socket path over the limit;
+    - a refused connect;
+    - a wrong peer uid;
+    - an unknown version;
+    - `busy`;
+    - `error`;
+    - no reply within `IPC_WAIT`.
+
+    In each, the call sends no byte without a committed `attempt` reply, and
+    queues the whole call (exit 3) only after its fallback row is durable,
+    file and directory. After the bridge returns, it is delivered once.
+    Mid-post, the remainder is handed off, and confirmed parts are never
+    resent. A Q0 that landed with its reply lost, plus its fallback row, is
+    one entry.
+29. **Announce fallback (design round 4, finding 1).** A fake client holds
+    `L_outbox` and never releases it. `announce`'s in-process E1 and Q0
+    fail before any byte.
+    - The row for *X* goes durably to `outbox.bridge.jsonl`, without
+      touching `L_outbox`.
+    - `held_announced` is saved only afterwards.
+    - `sam`'s unrelated entry is delivered in the same flush, and I0 imports
+      the announce once at the next pass.
+    - With the private append failing too, the flag stays unset, and the
+      next pass raises the same *X*: one entry.
+    - A crash between the append and the flag, or between I0's `TX` and its
+      unlink, still gives one entry.
+    - The flush's time stays within its absolute deadlines.
+30. **Message accounting on every part (design round 4, finding 3).**
+    - A single-line `Y` with finality, complete coverage and no match, plus
+      one unexplained "beta status" message from the same account in `#alpha`
+      inside `Y`'s window: UNKNOWN, never resent, dead-lettered at 24 hours.
+    - The same with that message attributed, or forced to a confirmed "beta
+      status" attempt: ABSENT, and resent once.
+    - Both cases repeated for a multi-line `Y`, as a control.
+31. **One opener.**
+    - A second connection to the sandboxed database, while the authority
+      runs, gets `SQLITE_BUSY` at once.
+    - A foreign holder at startup makes the start fail within `OPEN_WAIT`:
+      no socket, status says why, the lock is untouched, and the start is
+      retried next pass.
+    - A database without `writer_model = 'bridge-exclusive/1'` is refused.
+    - A second bridge cannot take `L_auth`.
+    - `PRAGMA locking_mode` and `journal_mode` read back `exclusive` and
+      `wal`.
+    - No client module opens `outbox.db`. Test this statically, and with an
+      audit hook on the `sqlite3.connect` event while the client paths run.
+    - The connection works on Python 3.10, with no `autocommit` attribute.
 
 ## 10. Feasibility and risks
 
@@ -1472,9 +2156,11 @@ It replaces the file state with the database layer, and adds:
 - durable file writes;
 - the import epoch;
 - bounded lock acquisition and the `alerts` table;
-- the minimal release metadata (section 10.1).
+- the minimal release metadata (section 10.1);
+- the authority thread, its socket protocol and the clients' request layer
+  (section 2.4), and the bridge's private fallback (section 6.4).
 
-That is about 1,000 to 2,000 changed lines, including tests.
+That is about 1,500 to 3,000 changed lines, including tests.
 
 ### 10.1 Release packaging (second amendment, R15)
 
@@ -1486,18 +2172,38 @@ in the same PR #20, makes these minimal declarations in
 `packages/release/release.json`:
 
 - **A new `state` format for the SQLite authority.**
-  - Path: `$CHAT_STATE/outbox.db`, with its `-wal` and `-shm` files, and
-    every other new lock or state file the implementation ships. That
-    includes the flush lock `outbox.flush.lock` (`L_flush`), which master
-    does not have (section 2.3). This follows correction 2 of the approving
-    issue rereview, and matches how `release.json` already lists
-    `outbox.lock` and `identities.lock` in their formats' paths. It adds no
-    version.
+  - Path: `$CHAT_STATE/outbox.db`, with its `-wal` file (and `-shm`, should
+    SQLite ever create one), and every other new lock or state file the
+    implementation ships. That includes:
+    - the flush lock `outbox.flush.lock` (`L_flush`), which master does not
+      have (section 2.3);
+    - the authority lock `outbox.authority.lock` (`L_auth`);
+    - the socket `outbox.sock`;
+    - the status snapshot `outbox-status.json` (section 2.4).
+
+    This follows correction 2 of the approving issue rereview, and matches how
+    `release.json` already lists `outbox.lock` and `identities.lock` in their
+    formats' paths. It adds no version.
   - Read and write versions: `outbox-db/1`.
   - Its version is embedded in the `meta` table's schema-version row.
-- **The `outbox` format** (`outbox.jsonl`, `outbox.lock`, claim files). Its
-  write version moves to `outbox/2`, which adds the fallback row; it reads
-  `outbox/1` and `outbox/2`.
+    `outbox-db/1` means a bridge-exclusive database: `writer_model =
+    'bridge-exclusive/1'` (section 2.4.1). No earlier `outbox-db` was ever
+    shipped, so nothing is renumbered.
+- **The `outbox` format** (`outbox.jsonl`, `outbox.lock`, claim files, and the
+  bridge's private `outbox.bridge.jsonl`). Its write version moves to
+  `outbox/2`, which adds the fallback row with its optional attestation
+  (section 6.4); it reads `outbox/1` and `outbox/2`.
+- **A new `wire` format, `outbox-authority`: the read-write interface the
+  owner approved on 2026-10-10.** It covers the request protocol on
+  `$CHAT_STATE/outbox.sock` between the clients (`pchat`, `agentcli`) and the
+  bridge's authority, including the peer credentials read from that socket.
+  - It reads `outbox-authority/1` and writes `outbox-authority/1`, with an
+    embedded version, the frame's `v` field.
+  - A peer of an unknown version is refused, and the client queues.
+
+  Amendment 2's B1 allowed only **read-only** host interfaces. This
+  read-write format is outside that allowance. It is added by the owner's
+  2026-10-10 decision, and by #19's third amendment that records it.
 - **The `delivery-records` format.** Versioned post dead letters (`version`,
   `supersedes`) write `delivery-records/2`, and it reads `/1` and `/2`.
 - **Every new runtime module** the implementation adds under
@@ -1518,9 +2224,27 @@ needs any builder change, the implementer stops and asks.
 
 **Acceptance 11's "unchanged".** Following correction 1 of the approving issue
 rereview, acceptance 11 is read as: everything in `release.json` and the built
-manifest except exactly the changes listed above (the edits to the `outbox`
-and `delivery-records` entries, `package.files` and the interpreter note, and
-the new `outbox-db` and host-interface entries) is byte-for-byte unchanged.
+manifest except exactly the changes listed above is byte-for-byte unchanged.
+Those changes are:
+
+- the edits to the `outbox` and `delivery-records` entries, `package.files`
+  and the interpreter note;
+- the new `outbox-db`, `outbox-authority` and host-interface entries.
+
+The format-marker test also ties the shipped code's protocol version string
+to `outbox-authority`.
+
+**Cutover, separately authorized.** Moving the live system to this release is
+quiescent, and belongs to activation:
+
+- the running bridge and the old tools' flush are stopped first;
+- no client of this release opens the database;
+- any other writer is refused, by the exclusive lock and the `writer_model`
+  check (section 2.4.1, C-9), so a mixed old writer that uses SQL directly
+  cannot join;
+- old tools that only append `outbox.jsonl` stay an import boundary.
+
+No live migration is claimed.
 
 **Rollback is not claimed.** Releases before this one do not read
 `outbox-db/1`. Rolling back across it is a breaking state migration, which
@@ -1541,8 +2265,15 @@ rollback compatibility.
   in section 9 guard them.
 - **Activation.** Live import, quiescing the old writers and designation are
   separately approved.
+- **Bridge-down queueing.** While the authority is unavailable, posts wait
+  for the bridge instead of reaching the channel (section 2.4.4). The owner
+  accepted this on 2026-10-10.
+- **Latency.** Each transition of a direct post is one local request, and
+  one full flush of the disk. Every wait stays within its absolute deadline.
+- **Threads.** The bridge gains one thread. Only that thread touches SQLite,
+  and shared helpers are made thread-safe (section 2.4.3).
 
-## 11. Owner decisions (2026-10-09)
+## 11. Owner decisions (2026-10-09 and 2026-10-10)
 
 The owner approved these on 2026-10-09. They are recorded as D-73 in
 [plateia_design.md](plateia_design.md), and as an amendment to #19.
@@ -1584,8 +2315,31 @@ The owner approved these on 2026-10-09. They are recorded as D-73 in
    otherwise stay excluded, and no rollback compatibility is claimed. Requirement
    12 is satisfied by D-72 and D-73, with no new D-number.
 
-Implementation is **not** approved by these decisions. It needs a separate
-owner decision.
+7. **The bridge is the only outbox authority (2026-10-10).** The owner
+   approved the write-routing proposal made after design review round 4,
+   with its tradeoffs and review plan.
+   - **The writer.** The bridge is the only process that opens or writes the
+     database. Clients send complete, validated, bounded requests over a
+     local socket, and keep their own sends to the chat server (section
+     2.4).
+   - **R6 and C-8.** R6 is preserved as approved, and revision 5's C-8
+     exemption is rejected and removed.
+   - **Queued while unavailable.** While the authority is unavailable,
+     posts, acknowledgements and notices are queued durably instead of sent.
+     This is a material behaviour change, accepted with its preserved
+     delivery obligations (section 2.4.4).
+   - **A new interface.** The new read-write interface `outbox-authority/1`
+     extends the release scope beyond B1's read-only host interfaces
+     (section 10.1).
+   - **The review plan.** One refreshed canonical review of #19, as amended
+     a third time. Then, only if it approves, the remaining final design
+     review round 5. There is no further round.
+
+   This approves the design, its scope and its review only.
+
+Implementation is **not** approved by these decisions. Implementation, code,
+tests and the `release.json` edit need their own owner decision, and so does
+activation.
 
 ## 12. Revisions
 
@@ -1637,7 +2391,7 @@ owner decision.
   - **Tests:** 19–21 added.
 - **Design review round 3** requested changes on revision 4, with five
   findings.
-- **Revision 5** (this revision) addresses those five, and carries the
+- **Revision 5** (`abfd9e0`) addresses those five, and carries the
   approving issue rereview's two corrections:
   - **Directory durability on recovery (P1).** Every append, and every
     recovery that finds a record already present, makes a durable sync of
@@ -1652,8 +2406,8 @@ owner decision.
     writer's fallback append still waits as today, delaying only its own
     call. A paused holder delays only import and export; every eligible
     database entry, E7 and the alerts still flow (section 2.3, I-10, section
-    5.6 cases 9 and 10, test 23). C-8 states the database's single-writer
-    limit, bounded by `BUSY_WAIT`.
+    5.6 cases 9 and 10, test 23). C-8 stated the database's single-writer
+    limit, bounded by `BUSY_WAIT`. (Revision 6 removed both.)
   - **Alert identity (P2).** A new `alerts` table gives every alert, whether
     undecided, held or suspended, a key fixed by its event, inserted in the
     event's `TX`. X2 exports alert rows, and `entries.alert_exported` is
@@ -1668,3 +2422,37 @@ owner decision.
     fallback shape, and the revision 3 history above says what superseded
     it.
   - **Tests:** 22–24 added; 9, 14 and 17 updated.
+- **Design review round 4** requested changes on revision 5, with three
+  findings.
+- **Revision 6** (this revision) adopts the owner's 2026-10-10 decision
+  (section 11, decision 7), which answers all three:
+  - **A paused client stalls the database (P1).** The bridge is now the only
+    process that opens or writes the database. Clients send bounded,
+    validated requests over a local socket, and the authority thread runs
+    every transaction, never waiting for a client (section 2.4). R6 holds
+    with no exemption: C-8 is removed, and C-9 (who opens the database) and
+    C-10 (local storage) state exactly what remains. The other parts:
+    - replies only after a durable commit, replay-safe ops and epochs
+      (section 2.4.2);
+    - A12 and attested outcomes, applied only on the writer's own
+      nonce-bound statement (sections 3.3 and 6.4);
+    - exclusive locking, the authority lock, the socket path limit and the
+      peer check (section 2.4.1);
+    - the status snapshot (section 2.4.5);
+    - I-11, and section 5.6, cases 11 and 13.
+
+    While the authority is unavailable, clients queue instead of sending.
+    The owner accepted that as a material behaviour change (section 2.4.4,
+    and R9 in section 8).
+  - **The announce fallback blocks the bridge (P1).** No bridge flow appends
+    to `outbox.jsonl`. `announce` falls back to the bridge-private
+    `outbox.bridge.jsonl` with a derived *X*, imported by I0, and
+    `held_announced` is saved only after durability (sections 2.3 and 6.4,
+    and section 5.6, case 12).
+  - **Single-line accounting (P2).** R2 condition 5 applies to every part,
+    as #19's A3 requires (section 7.3).
+  - **Release.** Section 10.1 adds the `outbox-authority` read-write wire
+    format, the new state paths, the attestation in `outbox/2`, and a
+    quiescent cutover that refuses any other writer.
+  - **Tests.** 25–31 added; 11 and 17 and the setup updated.
+  - **Revision 5's history** above mentions C-8. Revision 6 removes it.

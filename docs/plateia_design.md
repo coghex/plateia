@@ -2161,6 +2161,41 @@ decisions.
   [chat_outbox_state.md](chat_outbox_state.md) section 10.1.
   - **Requirement 12.** It is satisfied by D-72 and this decision; no further
     D-number is created for it.
+- **The bridge is the only outbox authority (owner decision, 2026-10-10).**
+  Design review round 4 found that a client stopped inside its own database
+  transaction would block every bridge write. The owner rejected exempting
+  that from #19's independent-flow requirement (R6), and approved the
+  write-routing proposal instead, with its tradeoffs:
+  - **The writer.** The bridge is the only process that opens or writes the
+    outbox database. `pchat`, `pchat ack` and `agentcli` notices send
+    complete, validated, bounded requests to it over a local socket. They
+    keep their own sends to the chat server.
+  - **The authority's rules.** A transaction begins only for a complete
+    request, and commits durably before any reply. So a paused client holds
+    no database lock, and cannot stall unrelated deliveries. R6 holds as
+    approved, and revision 5's exemption (C-8) is removed.
+  - **Queued while unavailable.** While the bridge's authority is
+    unavailable, posts, acknowledgements and notices are queued durably
+    instead of sent, and delivered when it returns. That is a **material
+    behaviour change**, accepted with its preserved delivery obligations.
+    Nothing is lost, but such posts are delayed.
+  - **A new interface.** The new versioned read-write interface
+    `outbox-authority/1` extends the release scope beyond the read-only
+    host interfaces of the second amendment. Mixed writers are refused at a
+    separately authorized, quiescent cutover.
+  - **The other two round 4 findings.**
+    - The bridge's own `announce` falls back to a bridge-private file, never
+      waiting on the shared outbox lock.
+    - The absence rule's message accounting applies to every part.
+  - **Review plan.** One refreshed canonical review of #19, as amended a
+    third time, and, only if it approves, the final design review round 5.
+    There is no further round.
+
+  The design is revision 6 of
+  [chat_outbox_state.md](chat_outbox_state.md), sections 2.4, 6.4, 7.3 and
+  10.1. **This decision approves the design, its scope and its review only.**
+  Implementation, code, tests and the `release.json` edit still need their
+  own owner decision.
 
 Delivery stays at-least-once with the record check, and nothing claims
 exactly-once. These decisions approve the design only: implementing it needs
@@ -2173,6 +2208,12 @@ Rejected alternatives:
 - **Confirming delivery from text for every account.** An untracked identical
   message could retire a part that was never posted.
 - **A settling time as proof of absence.** It is not proved.
+- **Letting every caller open the database, with an availability exemption
+  (C-8).** A paused client could stall all delivery. Rejected 2026-10-10.
+- **A client-side journal while the bridge is down.** It would be a second,
+  concurrently written authority.
+- **A separate authority daemon.** It is a new service, and posts would still
+  queue while it is down.
 
 ## Open questions
 
