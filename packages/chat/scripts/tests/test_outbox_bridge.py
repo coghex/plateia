@@ -710,6 +710,23 @@ class DeliveredAnnouncementTests(BridgeCase):
         saved = self.bridge.Deliveries()  # what a restart reads back
         self.assertEqual([i["msgid"] for i in saved.items], ["m-int"])
 
+    def test_an_announcement_that_raises_after_delivery_is_owed_and_the_interrupt_rung_once(self):
+        deliveries = self.bridge.Deliveries()
+        deliveries.items = [self.item()]
+        real, raised = self.bridge.announce, []
+
+        def announce(cfg, item, text, reason):
+            if not raised:
+                raised.append(reason)
+                raise OSError(5, "the authority's reply could not be read (fake)")
+            return real(cfg, item, text, reason)
+        with mock.patch.object(self.bridge, "announce", announce):
+            rings = self.passes(deliveries, 3, durable=True)
+        self.assertEqual(raised, ["delivered"])
+        self.assertEqual(rings, ["m-int"], "the interrupt is rung exactly once")
+        self.assertEqual(deliveries.items[0]["phase"], "accept")
+        self.assertEqual(len(self.announcements()), 1, "the owed announcement is made durable at a later pass")
+
     def test_an_acknowledgement_before_recovery_keeps_the_announcement_owed(self):
         deliveries = self.bridge.Deliveries()
         deliveries.items = [self.item()]

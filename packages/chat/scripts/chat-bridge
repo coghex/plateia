@@ -495,7 +495,11 @@ class Deliveries:
             stop = (f"turn stopped {item['stopped_at'][11:19]}Z" if item.get("stopped_at")
                     else "it was not working")
             text = f"interrupt → {item['target']}: {stop}; instruction delivered; waiting for its acknowledgement"
-            announced = announce(cfg, item, text, "delivered")  # False: owed, and raised again each pass (C5)
+            try:
+                announced = announce(cfg, item, text, "delivered")  # False: owed, and raised again each pass (C5)
+            except Exception as err:  # owed too: the interrupt is delivered, and is never rung again for this
+                log(f"announce: {item['channel']}: not yet durable ({err!r:.80})")
+                announced = False
             item.update(phase="accept", next_at=time.time() + INTERRUPT_ACK_WAIT, delivered_announced=announced,
                         delivered_text=text)
             log(f"interrupt delivered ({item['channel']}) to {item['target']}: {detail}")

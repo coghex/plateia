@@ -295,7 +295,7 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
       "capture": "changed",
-      "sha256": "c95c6bed6b096232ae9a6d0cb426eb71d79265d6cd3158c0acd392224a3f8553",
+      "sha256": "09eab79057f262550c24b80e7aa1ccc623715aa374748c269dd4fbeb300d892a",
       "changes": [
         {
           "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
