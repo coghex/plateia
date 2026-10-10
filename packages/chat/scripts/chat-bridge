@@ -81,6 +81,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chatlib  # noqa: E402
+import delivery_store  # noqa: E402
 import identities  # noqa: E402
 import receipt_experiment  # noqa: E402
 
@@ -98,12 +99,6 @@ EVIDENCE_LOG = chatlib.STATE_DIR / "evidence.jsonl"
 EVIDENCE_MAX = 20_000_000  # bytes; a larger cited file is recorded but not copied
 TMP_PATH = re.compile(r"(?<![\w/])((?:/private)?/tmp/[^\s`'\"()<>\[\]{}|]+)")
 ACKS = chatlib.STATE_DIR / "acks.jsonl"
-COVERAGE = chatlib.STATE_DIR / "record-coverage.json"
-ATTRIBUTED = chatlib.STATE_DIR / "outbox-attributed.jsonl"  # msgids already counted as an outbox part's delivery
-RESERVED = chatlib.STATE_DIR / chatlib.RESERVED_NAME       # parts the server confirmed, msgid unknown, by key
-CLOCK_ALLOWANCE = 5      # seconds of clock difference allowed when matching a written part in the record
-SETTLE = 600             # a part is ruled absent only once the record is complete this long after it was written
-UNDECIDED_MAX = 86400    # a part neither found nor ruled absent for this long is dead-lettered
 BRIDGE_LOG = chatlib.STATE_DIR / "bridge.log"
 LOG_LIMIT = 5_000_000
 BACKOFF = (5, 30, 120, 600, 1800)  # seconds before attempts 2..6; then dead-letter
@@ -357,9 +352,19 @@ class Deliveries:
             self.items = []
 
     def _save(self):
-        tmp = PENDING.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.items))
-        os.replace(tmp, PENDING)
+        """A durable replace: an item leaves only after its ledger line is durable (section 3.6)."""
+        delivery_store.durable_replace(delivery_store.FS_DEFAULT, PENDING, json.dumps(self.items))
+
+    def ledger_has(self, key):
+        if not DELIVERIES.exists():
+            return False
+        for raw in DELIVERIES.read_text().splitlines():
+            try:
+                if json.loads(raw).get("alert_key") == key:
+                    return True
+            except ValueError:
+                continue
+        return False
 
     def add_all(self, new_items):
         if new_items:
@@ -367,15 +372,24 @@ class Deliveries:
             self._save()
 
     def _record(self, item, ok, detail):
-        _append_jsonl(DELIVERIES, {"at": now_iso(), "kind": item["kind"], "msgid": item["msgid"],
-                                   "channel": item["channel"], "project": item["project"],
-                                   "attempt": item["attempt"], "ok": ok, "detail": detail})
+        line = {"at": now_iso(), "kind": item["kind"], "msgid": item["msgid"], "channel": item["channel"],
+                "project": item["project"], "attempt": item["attempt"], "ok": ok, "detail": detail}
+        if item.get("alert_key"):
+            line["alert_key"] = item["alert_key"]
+        delivery_store.durable_append(delivery_store.FS_DEFAULT, DELIVERIES, json.dumps(line))
 
     def _dead(self, item, detail, cfg, reason=None):
         """Give up on a delivery. Every dead-lettered wake-up tells the owner,
         without the message text; a dead-lettered push only logs, so it can't loop."""
-        self.items.remove(item)
-        _append_jsonl(DEAD_LETTERS, {**item, "dead_at": now_iso(), "last_detail": detail})
+        key = f"delivery:{item['kind']}:{item['msgid']}:{item.get('target') or item.get('project') or ''}"
+        with delivery_store.flock(chatlib.STATE_DIR / "outbox.lock", wait=delivery_store.LOCK_WAIT) as held:
+            if not held:  # the item stays pending, unchanged; the dead letter is tried again later
+                log(f"{item['kind']} dead letter deferred: outbox.lock busy")
+                return
+            delivery_store.sink_append(delivery_store.FS_DEFAULT, DEAD_LETTERS,
+                                       {**item, "dl_key": key, "dead_at": now_iso(), "last_detail": detail},
+                                       "dl_key", key)
+        self.items.remove(item)  # only once its dead-letter line is durable
         self._record(item, False, f"dead-lettered: {detail}")
         log(f"{item['kind']} DEAD-LETTERED ({item['channel']}): {detail}")
         if item["kind"] == "ring":
@@ -424,8 +438,9 @@ class Deliveries:
             if ok is WAITING:  # cmux is holding it, or the recipient is busy: follow it, don't count it
                 self._record(item, None, detail)
                 if item.get("interrupt") and detail.startswith("held") and not item.get("held_announced"):
-                    item["held_announced"] = True
-                    announce(cfg, item, f"interrupt → {item['target']}: {detail}")
+                    # saved only once the announcement is a durable obligation (section 6.4)
+                    if announce(cfg, item, f"interrupt → {item['target']}: {detail}", "held"):
+                        item["held_announced"] = True
                 since = item.setdefault("waiting_since", time.time())
                 authority = {cfg.get("owner")} | set(cfg.get("assistants", []))
                 if time.time() - since > MAX_WAIT:
@@ -444,7 +459,7 @@ class Deliveries:
                 stop = (f"turn stopped {item['stopped_at'][11:19]}Z" if item.get("stopped_at")
                         else "it was not working")
                 announce(cfg, item, f"interrupt → {item['target']}: {stop}; instruction delivered;"
-                                    f" waiting for its acknowledgement")
+                                    f" waiting for its acknowledgement", "delivered")
                 item.update(phase="accept", next_at=time.time() + INTERRUPT_ACK_WAIT)
                 log(f"interrupt delivered ({item['channel']}) to {item['target']}: {detail}")
             elif ok and item.get("needs_ack"):
@@ -675,19 +690,36 @@ def _interrupt(item, surface, brand, label):
     return ok, f"{detail}: {label} {surface[:8]}"
 
 
-def announce(cfg, item, text):
-    """Post the bridge's own progress line, as a reply to the post it is about."""
-    entry = {"channel": item["channel"], "as": "chatbridge", "reply_to": item["msgid"],
-             "text": f"[status] chatbridge: {text}", "cont": "[status]", "at": now_iso()[:19]}
+def announce(cfg, item, text, reason):
+    """Post the bridge's own progress line, as a reply to the post it is about.
+    Its entry id is derived from the pending item and the reason, so a repeated
+    announcement is one obligation (section 6.4). An existing entry is never
+    taken as proof it was sent: an earlier bridge process's unfinished one is
+    adopted by the outbox (E9). Returns True once the announcement is a durable
+    obligation (sent, queued, handed off, or in a fallback file); False when
+    nothing durable could be written, so it is raised again at the next pass."""
+    key = f"{item['kind']}:{item['msgid']}:{item.get('target') or ''}"
+    entry_id = hashlib.sha256(f"{key}:{reason}".encode()).hexdigest()[:32]
+    client = bridge_client()
+    me = delivery_store.PROBES.identity()
+    found = client.call("query", me, id=entry_id)
+    if found and found.get("entry"):
+        e = found["entry"]
+        if e["state"] == "open" and e["owner_kind"] == "direct" \
+                and delivery_store.same_writer(e["owner_writer"], me):  # an earlier raise of this process stopped
+            reply = client.call("handoff", me, id=entry_id)
+            if reply is None or reply.get("result") not in ("ok", "replay"):
+                return False
+        return True  # outbox-owned, adopted (E9), done or terminal: one obligation, already durable
     try:
-        chatlib.post(item["channel"], f"[status] chatbridge: {text}", "chatbridge", cfg, reply_to=item["msgid"])
-    except chatlib.Refused as err:
-        if err.parts:  # the server refused it: retrying can't help, and its record keeps what went out
-            chatlib.dead_letter_post({**entry, "parts": err.parts}, str(err))
-        else:
-            chatlib.outbox_append([entry])
-    except (chatlib.ChatError, OSError) as err:  # only what the server has not confirmed is queued
-        chatlib.outbox_append([chatlib.queued_entry(entry, err)])
+        chatlib.post(item["channel"], f"[status] chatbridge: {text}", "chatbridge", cfg, reply_to=item["msgid"],
+                     origin="announce", entry_id=entry_id, client=client)
+    except (chatlib.Queued, chatlib.Refused):
+        return True  # queued durably, or terminal and exported as a dead letter
+    except (chatlib.ChatError, OSError) as err:
+        log(f"announce: not recorded ({err!r:.100}); raised again at the next pass")
+        return False
+    return True
 
 
 def agent_surface(name):
@@ -788,400 +820,301 @@ def _now():
     return time.time()
 
 
-class Coverage:
-    """Per channel, an interval over which the log is known to hold every
-    message the server published there: from `since` through `through`, as
-    seconds since the epoch. It begins when the channel's log becomes complete
-    on a connection (a finished catch-up, or a new channel joined), and is
-    carried over a reconnection only when that catch-up resumed from the very
-    checkpoint this record last saw, so nothing in between went unread. It
-    reaches a time only through a sync: a PING the server answered, after
-    which everything it published earlier has been read and logged. A seeded
-    checkpoint, a newest logged message, a dropped connection or a catch-up
-    cut short never extends it."""
+# --- the outbox (#19; docs/chat_outbox_state.md revision 8) -----------------------------
+# One SQLite authority, opened by this bridge alone (delivery_store.Authority), holds every
+# post and acknowledgement the transport owes. Its flush runs here, on the main thread, and
+# reaches the authority only through in-process requests.
 
-    def __init__(self):
-        try:
-            self.spans = json.loads(COVERAGE.read_text())
-        except (OSError, ValueError):
-            self.spans = {}
+OUTBOX_AUTHORITY = None  # this bridge's authority, once it runs (main())
+
+
+def bridge_client(authority=None):
+    """The bridge's own client of its authority: in-process requests, as B."""
+    authority = authority or OUTBOX_AUTHORITY
+    if authority is None or not authority.running:
+        return delivery_store.Client(None, clock=_now)
+    return delivery_store.Client(delivery_store.LocalTransport(authority, bridge=True), clock=_now)
+
+
+class Coverage:
+    """Per channel, an interval over which the record is known complete (V2-V4),
+    kept in the authority: from `since` through `through`. It begins when the
+    channel's log becomes complete on a connection (a finished catch-up, or a
+    new channel joined), and is carried over a reconnection only when that
+    catch-up resumed from the very checkpoint the record last saw. It reaches a
+    time only through a sync: a PING the server answered. Leaving the channel,
+    a dropped connection, a failed index or a catch-up cut short stops it."""
+
+    def __init__(self, authority=None):
+        self.authority = authority
         self.live = set()  # channels whose log is complete on the current connection, right now
 
+    def _tx(self, fn):
+        authority = self.authority or OUTBOX_AUTHORITY
+        if authority is None or not authority.running:
+            return delivery_store.CANCELLED
+        try:
+            return authority.run_tx(fn)
+        except Exception as err:  # a failed V-transition stops coverage; it never stops the record
+            log(f"coverage: {err!r:.100}")
+            return delivery_store.CANCELLED
+
     def connected(self):
-        """A new connection: nothing is complete on it until its catch-up finishes."""
         self.live = set()
 
     def lost(self, channel):
-        """The bridge left the channel (kicked, or parted): it hears nothing there
-        until it rejoins and catches up, so no sync may extend the interval."""
         self.live.discard(channel.lower())
 
-    def _save(self):
-        tmp = COVERAGE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.spans))
-        os.replace(tmp, COVERAGE)
-
     def begin(self, channel, start_mark, mark):
-        """The channel's log just became complete on this connection, after a
-        catch-up from `start_mark` (None for a new channel), through `mark`."""
-        ch = channel.lower()
-        span = self.spans.get(ch) or {}
-        if not (start_mark and span.get("mark") == start_mark and span.get("since") is not None):
-            span = {"since": _now(), "through": None}
-        span["mark"] = mark
-        self.spans[ch] = span
-        self.live.add(ch)
-        self._save()
+        if self._tx(lambda s: s.coverage_begin(channel, start_mark, mark)) is not delivery_store.CANCELLED:
+            self.live.add(channel.lower())
 
     def mark(self, channel, mark):
-        """A live message in a complete channel was fully handled: the log's checkpoint is now `mark`."""
-        span = self.spans.get(channel.lower())
-        if span is not None and mark and span.get("mark") != mark:
-            span["mark"] = mark
-            self._save()
+        if mark and self._tx(lambda s: s.coverage_mark(channel, mark)) is delivery_store.CANCELLED:
+            self.lost(channel)
 
     def sync(self, sent_at):
-        """The server answered a PING sent at `sent_at`: every channel still complete
-        on this connection has its log complete through then."""
-        changed = False
-        for ch in self.live:
-            span = self.spans.get(ch.lower())
-            if span is not None and (span.get("through") or 0) < sent_at:
-                span["through"] = sent_at
-                changed = True
-        if changed:
-            self._save()
-
-    def covers(self, channel, start, end):
-        span = self.spans.get(channel.lower()) or {}
-        return (span.get("since") is not None and span.get("through") is not None
-                and span["since"] <= start and span["through"] >= end)
+        live = sorted(self.live)
+        self._tx(lambda s: s.coverage_sync(live, sent_at))
 
 
-def _record_matches(channel, account, text, since):
-    """Logged messages in `channel` from the server-verified `account` with exactly
-    `text`, at or after `since` (seconds since the epoch), oldest first, as
-    (time, msgid) pairs."""
-    path = chatlib.channel_log(channel)
-    found = []
-    if path.exists():
-        for line in path.read_text().splitlines():
-            try:
-                e = json.loads(line)
-            except ValueError:
-                continue
-            if (e.get("verified") and e.get("from") == account and e.get("text") == text and e.get("msgid")
-                    and e.get("channel", "").lower() == channel.lower() and e.get("at")
-                    and parse_time(e["at"]).timestamp() >= since):
-                found.append((parse_time(e["at"]).timestamp(), e["msgid"]))
-    return sorted(found)
-
-
-def _window(part):
-    """When the message publishing `part` can carry its server time: from its
-    write (less the clock allowance); for a confirmed part, until its
-    confirmation (plus it), since the server published it before answering."""
-    lower = (part.get("written_at") or 0) - CLOCK_ALLOWANCE
-    upper = float("inf")
-    if part["state"] == "confirmed" and part.get("confirmed_at"):
-        upper = part["confirmed_at"] + CLOCK_ALLOWANCE
-    return lower, upper
-
-
-def reconcile(entry, coverage, attributed, others=()):
-    """Decide the entry's uncertain part from the record. Every part that has
-    a message of this text from this account in this channel is an obligation
-    needing a distinct logged message inside its own window: this entry's parts
-    with the same text, and `others` -- confirmed parts of other entries, pending
-    or retired, whose msgid is unknown. A msgid already counted for any outbox
-    part is never used again. The part is delivered when every obligation that
-    could compete with it is matched; it is absent when the record is complete
-    over the whole span and no matching leaves a message for it; otherwise it
-    is undecided. Returns 'delivered', 'absent' or 'undecided'."""
-    parts = entry["parts"]
-    target = next(p for p in parts if p["state"] == "uncertain")
-    text = target["text"]
-    lower = _window(target)[0]
-    own = [p for p in parts if p["text"] == text and not p.get("msgid") and p["state"] in ("confirmed", "uncertain")]
-    obligations = [(p, _window(p)) for p in own]
-    obligations += [(None, w) for w in others if w[1] >= lower]  # one ending before this part can't compete
-    start = min(w[0] for _, w in obligations)
-    found = [(at, mid) for at, mid in _record_matches(entry["channel"], entry["as"], text, start)
-             if mid not in attributed]
-    matched, used = {}, set()
-    # Earliest deadline first, each taking the earliest message in its window: a
-    # maximum matching of windows to messages.
-    for n, (part, (low, high)) in sorted(enumerate(obligations), key=lambda o: (o[1][1][1], o[1][1][0], o[0])):
-        pick = next((mid for at, mid in found if mid not in used and low <= at <= high), None)
-        if pick is not None:
-            used.add(pick)
-            matched[n] = pick
-    if len(matched) == len(obligations):
-        for n, (part, _) in enumerate(obligations):
-            if part is not None:
-                part["msgid"] = matched[n]
-                attributed.add(matched[n])
-                if part["state"] == "uncertain":
-                    part["state"] = "confirmed"
-        return "delivered"
-    uncertain = [p for p in own if p["state"] == "uncertain"]
-    end = (target.get("written_at") or 0) + SETTLE
-    for _, (low, high) in obligations:  # each confirmed one's message must be inside the complete span too
-        end = max(end, high if high != float("inf") else low + CLOCK_ALLOWANCE + SETTLE)
-    if len(uncertain) == 1 and coverage.covers(entry["channel"], start, end):
-        # The record is complete over every window: each confirmed obligation's own
-        # message is in it, so if they can't all be matched with this one too, it never arrived.
-        return "absent"
-    return "undecided"
-
-
-def _part_key(row, i, part):
-    return part.get("key") or f"{row.get('id')}:{i}"
-
-
-def _reserved():
-    """Every reservation still young enough to compete with a part that is owed,
-    one per key; older ones are dropped from the file (under the outbox lock,
-    so a concurrent pchat append is never lost)."""
-    found = {}
-    horizon = _now() - UNDECIDED_MAX - SETTLE - 3600
-    with chatlib._outbox_locked():
-        if not RESERVED.exists():
-            return found
-        lines = RESERVED.read_text().splitlines()
-        keep = []
-        for line in lines:
-            try:
-                r = json.loads(line)
-                window = _window(r)
-                r["key"], r["as"], r["channel"], r["text"]
-            except (ValueError, KeyError, TypeError, AttributeError):
-                continue
-            if window[1] < horizon:
-                continue
-            keep.append(line)
-            found[r["key"]] = r
-        if len(keep) != len(lines):
-            tmp = RESERVED.with_suffix(".tmp")
-            tmp.write_text("".join(line + "\n" for line in keep))
-            os.replace(tmp, RESERVED)
-    return found
-
-
-def _confirmed_elsewhere(files, entry, satisfied):
-    """The windows of every other confirmed part with this entry's channel,
-    account and uncertain text whose msgid is unknown, once per stable key:
-    reserved by whoever posted it (pchat, a notice, an announcement, a flush;
-    retired, dead-lettered or not) and still pending in the outbox. The
-    reservations are read afresh, so a part retired earlier in this very flush
-    counts too. Keys already matched to a msgid are satisfied."""
-    text = next(p for p in entry["parts"] if p["state"] == "uncertain")["text"]
-    key = (entry["as"], entry["channel"].lower(), text)
-    own = {_part_key(entry, i, p) for i, p in enumerate(entry["parts"])}
-    done = set(satisfied) | {_part_key(r, i, p) for f in files for r in f.rows if isinstance(r, dict)
-                             for i, p in enumerate(r.get("parts") or []) if p.get("msgid")}
-    windows = {}
-    for k, r in _reserved().items():
-        if (r["as"], r["channel"].lower(), r["text"]) == key:
-            windows[k] = _window(r)
-    for f in files:
-        for r in f.rows:
-            if isinstance(r, dict) and r is not entry and (r.get("as"), r.get("channel", "").lower()) == key[:2]:
-                for i, p in enumerate(r.get("parts") or []):
-                    if p.get("text") == text and p.get("state") == "confirmed" and not p.get("msgid"):
-                        windows[_part_key(r, i, p)] = _window(p)
-    return [w for k, w in windows.items() if k not in own and k not in done]
-
-
-def _attributed():
-    """Every msgid already counted as some outbox part's delivery, including
-    entries since retired, and the keys of the parts they were counted for."""
-    msgids, keys = set(), set()
-    if ATTRIBUTED.exists():
-        for line in ATTRIBUTED.read_text().splitlines():
-            try:
-                a = json.loads(line)
-                msgids.add(a["msgid"])
-            except (ValueError, KeyError, TypeError):
-                continue
-            if a.get("key"):
-                keys.add(a["key"])
-    return msgids, keys
-
-
-class _Claimed:
-    """One claimed outbox file, rewritten whole after every change, so what it
-    holds is always exactly what is still owed. An unreadable line is kept as it is."""
-
-    def __init__(self, path):
-        self.path, self.rows = path, []
-        for raw in path.read_text().splitlines():
-            if not raw.strip():
-                continue
-            try:
-                self.rows.append(json.loads(raw))
-            except ValueError:
-                self.rows.append(raw)
-        for row in self.rows:  # a part caught mid-write by a crash may have reached the server
-            for part in (row.get("parts") or []) if isinstance(row, dict) else []:
-                if part.get("state") == "writing":
-                    part["state"] = "uncertain"
-
-    def save(self):
-        if not self.rows:
-            self.path.unlink(missing_ok=True)
-            return
-        tmp = self.path.with_name("." + self.path.name + ".tmp")
-        tmp.write_text("".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in self.rows))
-        os.replace(tmp, self.path)
-
-    def done(self, row):
-        """Nothing more is owed for `row`. The msgids it was matched to are kept
-        first, and so is every part the server confirmed without our learning its
-        msgid, so no later check can count either message for another part."""
-        with ATTRIBUTED.open("a") as f:
-            for i, part in enumerate(row.get("parts") or []):
-                if part.get("msgid"):
-                    f.write(json.dumps({"msgid": part["msgid"], "key": _part_key(row, i, part)}) + "\n")
-        for i, part in enumerate(row.get("parts") or []):
-            if part.get("state") == "confirmed" and not part.get("msgid"):  # keyed: a repeat after a crash is one
-                chatlib.reserve(row["channel"], row["as"], {**part, "key": _part_key(row, i, part)})
-        self.rows.remove(row)
-        self.save()
-
-
-def _dead_lettered(entry_id):
-    if not DEAD_LETTERS.exists():
+def index_message(entry, authority=None):
+    """V1: a verified message into the authority, before the checkpoint passes it.
+    True when indexed (or nothing to index); False stops the channel's coverage."""
+    authority = authority or OUTBOX_AUTHORITY
+    if not entry.get("verified") or not entry.get("msgid") or entry.get("text") is None:
+        return True
+    if authority is None or not authority.running:
         return False
-    for line in DEAD_LETTERS.read_text().splitlines():
+    at = delivery_store.parse_iso(entry.get("at"))
+    try:
+        done = authority.run_tx(lambda s: s.index(entry["msgid"], entry["channel"], entry["from"], entry["text"], at))
+    except Exception as err:
+        log(f"index: {err!r:.100}")
+        return False
+    return done is not delivery_store.CANCELLED
+
+
+class Flusher:
+    """The bridge's outbox flush, pass after pass (sections 3.5 and 6.3). Its
+    memory holds only what it still owes the authority: its own attestations
+    whose in-process requests went unanswered, retried at each flush."""
+
+    def __init__(self, authority, probes=None):
+        self.authority = authority
+        self.probes = probes or authority.probes
+        self.importer = delivery_store.Importer(authority, log=log)
+        self.pending = []    # (entry row, attestation) of the bridge's own attempts, still to record
+        self.deferred = {}   # what waits for outbox.lock, and since when
+
+    def tx(self, fn, default=None):
         try:
-            d = json.loads(line)
-        except ValueError:
-            continue
-        if d.get("kind") == "post" and d.get("id") == entry_id:
-            return True
-    return False
+            result = self.authority.run_tx(fn)
+        except delivery_store.Conflict:
+            return default
+        return default if result is delivery_store.CANCELLED else result
+
+    def identity(self, conn_id=None):
+        return self.probes.identity(conn_id)
+
+    def run(self, cfg, deliveries=None):
+        self.retry_pending()
+        self.importer.clean_staging()
+        self.importer.import_fallback_files()          # IF: no outbox.lock
+        claims = self.importer.claim_legacy()          # I1: no outbox.lock
+        self.importer.import_legacy(claims)            # I2: no outbox.lock
+        self.end_gone_attempts()                       # A8, A8c
+        self.abandon_or_adopt()                        # E8, E9
+        self.reconcile()                               # R1, R2
+        expired = self.tx(lambda s: s.expire(), [])    # E7
+        for entry_id in expired:
+            log(f"outbox: DEAD-LETTERED entry {entry_id}: delivery undecided for {int(delivery_store.UNDECIDED_MAX // 3600)} h")
+        self.deliver(cfg)                              # every eligible entry's attempts
+        with delivery_store.flock(self.authority.paths.outbox_lock, wait=delivery_store.LOCK_WAIT,
+                                  clock=time.monotonic) as held:
+            if held:                                   # I3 and X1, only these need outbox.lock
+                self.deferred.clear()
+                self.importer.import_legacy(self.importer.claim_list(), barrier_at=self.authority.clock())
+                self.export_dead_letters()
+            else:
+                since = self.deferred.setdefault("retire_and_export", _now())
+                log(f"outbox: outbox.lock busy since {iso_of(since)}; claim retirement and dead-letter export deferred")
+        self.export_alerts(deliveries)                 # X2
+        self.tx(lambda s: s.collect())                 # G1
+        self.write_status()                            # X3
+
+    # --- the bridge's own attestations ---
+
+    def retry_pending(self):
+        still = []
+        for row, att in self.pending:
+            client = bridge_client(self.authority)
+            if att.get("kind") == "void":
+                reply = client.call("void", att["writer"], id=row["id"], attestation=att)
+            else:
+                reply = client.call("handoff", att["writer"], id=row["id"], attestation=att)
+            if reply is None:  # still unanswered: make the attestation durable another way
+                try:
+                    delivery_store.publish_fallback(self.authority.fs, self.authority.paths,
+                                                    dict(row, writer=att["writer"], attestation=att), clock=_now)
+                except OSError:
+                    still.append((row, att))
+        self.pending = still
+
+    # --- A8, A8c, E8, E9 ---
+
+    def end_gone_attempts(self):
+        writing = self.tx(lambda s: [(a["id"], a["writer"]) for a in s.con.execute(
+            "SELECT id, writer FROM attempts WHERE state = 'writing'")], [])
+        observed = []
+        for attempt_id, writer in writing:
+            w = json.loads(writer)
+            if self.probes.gone(w) is True:
+                observed.append((attempt_id, "writer_gone", _now()))
+            elif self.probes.conn_closed(w) is True:
+                observed.append((attempt_id, "connection_closed", _now()))
+        if observed:
+            self.tx(lambda s: s.end_attempts(observed))
+
+    def abandon_or_adopt(self):
+        direct = self.tx(lambda s: [(e["id"], e["owner_writer"]) for e in s.con.execute(
+            "SELECT id, owner_writer FROM entries WHERE state = 'open' AND owner_kind = 'direct'")], [])
+        gone = [entry_id for entry_id, w in direct if self.probes.gone(json.loads(w or "null")) is True]
+        for entry_id, what in self.tx(lambda s: s.abandon_or_adopt(gone), []):
+            log(f"outbox: entry {entry_id} of a gone writer {what}")
+
+    # --- R1, R2: one text key per transaction ---
+
+    def reconcile(self):
+        for key in self.tx(lambda s: s.reconcile_keys(), []):
+            for verdict, attempt_id in self.tx(lambda s, key=key: s.reconcile(*key, log=log), []):
+                log(f"outbox: attempt {attempt_id} of a post to {key[1]} as {key[0]}: {verdict}")
+
+    # --- B as the writer ---
+
+    def deliver(self, cfg):
+        rows = self.tx(lambda s: [s.entry_view(e["id"]) for e in s.con.execute(
+            "SELECT id FROM entries WHERE state = 'open' AND owner_kind = 'outbox' ORDER BY created_at, id")], [])
+        client = bridge_client(self.authority)
+        for e in rows:
+            try:
+                self._deliver_one(cfg, client, e)
+            except Exception as err:  # still failing: it stays owed, as recorded; the next entry gets its turn
+                log(f"outbox: still failing ({err!r:.100})")
+
+    def _deliver_one(self, cfg, client, e):
+        if e.get("ack"):  # an ack's ended attempt is retired first (A11), then retried
+            for part in e["parts"]:
+                if part["state"] == "uncertain":
+                    self.tx(lambda s: s.retire(e["id"], part["n"], bridge=True))
+            e = self.tx(lambda s: s.entry_view(e["id"]), e)
+        if any(p["state"] != "unsent" and p["state"] != "confirmed" for p in e["parts"]):
+            return  # a part awaits its delivery check, or is being written
+        if e["parts"] and all(p["state"] == "confirmed" for p in e["parts"]):
+            client.call("done", self.identity(), id=e["id"])
+            return
+        row = {"id": e["id"], "account": e["account"], "channel": e["channel"], "text": e["text"],
+               "cont": e["cont"], "reply_to": e["reply_to"], "ack": e["ack"], "delayed": e["delayed"],
+               "written": e["written"], "origin": e["origin"], "parts": e["parts"]}
+
+        def fix(parts):
+            return self.tx(lambda s: s.fix_parts(e["id"], parts), None) is not None
+        outcome, att = chatlib.deliver_entry(row, cfg, client, self.identity, fix)
+        if att:
+            fb_row = {"id": e["id"], "channel": e["channel"], "as": e["account"], "text": e["text"],
+                      "ack": e["ack"], "cont": e["cont"], "reply_to": e["reply_to"], "at": e["written"]}
+            self.pending.append((fb_row, dict(att, writer=att.get("writer") or self.identity())))
+        log(f"outbox: {e['channel']} as {e['account']}: {outcome}")
+
+    # --- X1, X2, X3 ---
+
+    def export_dead_letters(self):
+        """X1 under outbox.lock (held by the caller): the record by the sink
+        protocol, durable, then the mark. A later version supersedes."""
+        paths, fs = self.authority.paths, self.authority.fs
+        rows = self.tx(lambda s: [r["id"] for r in s.con.execute(
+            "SELECT id FROM entries WHERE state = 'terminal' AND dead_letter_exported_version < export_version")], [])
+        for entry_id in rows:
+            view = self.tx(lambda s: s.entry_view(entry_id))
+            if not view:
+                continue
+            v = view["export_version"]
+            record = {"kind": "post", "id": entry_id, "version": v, "supersedes": v - 1 if v > 1 else None,
+                      "dl_key": f"{entry_id}:{v}", "channel": view["channel"], "as": view["account"],
+                      "text": view["text"], "parts": [{"n": p["n"], "text": p["text"], "state": p["state"],
+                                                       "msgid": p["msgid"]} for p in view["parts"]],
+                      "attempts": view["attempts"], "dead_at": now_iso(), "last_detail": view["terminal_reason"]}
+            delivery_store.sink_append(fs, paths.dead_letters, record, "dl_key", record["dl_key"])
+            self.tx(lambda s: s.con.execute("UPDATE entries SET dead_letter_exported_version = MAX("
+                                            "dead_letter_exported_version, ?) WHERE id = ?", (v, entry_id)))
+
+    def export_alerts(self, deliveries):
+        """X2: each alert row onto the pending queue once, durably, then marked."""
+        if deliveries is None:
+            return
+        alerts = self.tx(lambda s: [dict(a) for a in s.con.execute(
+            "SELECT * FROM alerts WHERE exported_at IS NULL ORDER BY raised_at")], [])
+        for a in alerts:
+            key = a["alert_key"]
+            if any(i.get("alert_key") == key for i in deliveries.items):
+                deliveries._save()
+            elif deliveries.ledger_has(key):
+                self.authority.fs.durable(DELIVERIES)
+            else:
+                deliveries.items.append({"kind": "push", "msgid": key, "alert_key": key, "channel": "-",
+                                         "sender": "chatbridge", "project": None, "attempt": 0, "next_at": 0,
+                                         "text": a["text"]})
+                deliveries._save()
+            self.tx(lambda s: s.con.execute("UPDATE alerts SET exported_at = COALESCE(exported_at, ?)"
+                                            " WHERE alert_key = ?", (_now(), key)))
+
+    def write_status(self):
+        """X3: the dated snapshot pchat status reads while the authority is unavailable."""
+        summary = self.tx(lambda s: s.status(), {}) or {}
+        summary.update(written_at=_now(), epoch=self.authority.epoch,
+                       deferred={k: iso_of(v) for k, v in self.deferred.items()}, unavailable=None)
+        try:
+            delivery_store.durable_replace(self.authority.fs, self.authority.paths.status, json.dumps(summary))
+        except OSError as err:
+            log(f"outbox: status snapshot not written ({err!r:.80})")
 
 
-def _end(e, claimed, detail, deliveries, alert=None):
-    """Give up on an entry for good: marked terminal durably first, so a crash
-    anywhere after can only finish the job, never make it retryable again."""
-    e.setdefault("id", uuid.uuid4().hex)
-    e["terminal"] = {"detail": detail, "alert": alert}
-    claimed.save()
-    _finish(e, claimed, deliveries)
+def iso_of(t):
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat(timespec="seconds")
 
 
-def _finish(e, claimed, deliveries):
-    """Complete a terminal entry: dead-letter it once, with its parts, then
-    retire it. The owner's alert goes first: a crash may repeat it, never lose it."""
-    end = e["terminal"]
-    if not _dead_lettered(e["id"]):
-        if end.get("alert") and deliveries is not None:  # content-free: who and where, never the text
-            deliveries.add_all([{"kind": "push", "msgid": e["id"], "channel": e["channel"], "sender": "chatbridge",
-                                 "project": None, "attempt": 0, "next_at": 0,
-                                 "text": f"an outbox post from {e['as']} {end['alert']}; dead-lettered"}])
-        record = {k: v for k, v in e.items() if k != "terminal"}
-        _append_jsonl(DEAD_LETTERS, {**record, "kind": "post", "dead_at": now_iso(), "last_detail": end["detail"]})
-    claimed.done(e)
+_FLUSHERS = {}
 
 
-def flush_outbox(cfg, post=None, ack=None, coverage=None, deliveries=None):
-    """Post anything that failed to post earlier. Claims the outbox first, so
-    posts queued while this runs go to a fresh outbox and are never lost.
-    A claimed file is rewritten after every change and removed only when
-    empty, so a crash at any point leaves exactly what is still owed: a part
-    the server confirmed is never sent again, and a part caught mid-write is
-    treated as uncertain. Every entry gets its attempt each flush; one waiting
-    on a check or failing never holds up another."""
-    post = post or chatlib.post
-    coverage = coverage if coverage is not None else Coverage()
-    with chatlib.outbox_flushing() as mine:
+def flush_outbox(cfg, authority=None, deliveries=None, coverage=None, probes=None):
+    """One outbox flush: import, end gone writers' attempts, reconcile, give every
+    eligible entry its attempt, retire claims and export what is due. Only one
+    flusher at a time (outbox.flush.lock); nothing here waits for a client."""
+    authority = authority or OUTBOX_AUTHORITY
+    if authority is None or not authority.running:
+        log("outbox: the authority is not running; flush skipped")
+        return
+    flusher = _FLUSHERS.get(id(authority))
+    if flusher is None or flusher.authority is not authority:
+        flusher = _FLUSHERS[id(authority)] = Flusher(authority, probes)
+    with delivery_store.flock(authority.paths.flush_lock) as mine:
         if not mine:
             log("outbox: another flush is running; skipped")
             return
-        files = [_Claimed(path) for path in chatlib.outbox_claim()]
-        attributed, satisfied = _attributed()
-        attributed |= {p["msgid"] for f in files for r in f.rows if isinstance(r, dict)
-                       for p in r.get("parts") or [] if p.get("msgid")}
-        others = lambda entry: _confirmed_elsewhere(files, entry, satisfied)  # noqa: E731
-        for claimed in files:
-            for e in list(claimed.rows):
-                if isinstance(e, str):
-                    log(f"outbox: unreadable entry kept in {claimed.path.name}")
-                    continue
-                try:
-                    if e.get("terminal"):  # given up on before a crash: finish that, never retry
-                        _finish(e, claimed, deliveries)
-                    elif any(p.get("state") == "refused" for p in e.get("parts") or []):
-                        _end(e, claimed, "refused by the server", deliveries)
-                    elif _flush_entry(e, claimed, cfg, post, ack, coverage, deliveries, attributed, others):
-                        claimed.done(e)
-                except Exception as err:  # still failing: it stays owed, as recorded
-                    claimed.save()
-                    log(f"outbox: still failing ({err!r:.100})")
-            claimed.save()
+        flusher.run(cfg, deliveries)
 
 
-def _flush_entry(e, claimed, cfg, post, ack, coverage, deliveries, attributed, others=lambda entry: []):
-    """One outbox entry's attempt. True when nothing more is owed for it."""
-    if e.get("ack"):
-        (ack or chatlib.ack)(e["channel"], e["ack"], e["as"], cfg)
-        log(f"outbox: acknowledged in {e['channel']} as {e['as']}")
-        return True
-    parts = e.get("parts")
-    while parts and any(p["state"] == "uncertain" for p in parts):
-        index = next(i for i, p in enumerate(parts) if p["state"] == "uncertain")
-        verdict = reconcile(e, coverage, attributed, others(e))
-        claimed.save()
-        if verdict == "delivered":
-            log(f"outbox: part {index + 1} of a post to {e['channel']} as {e['as']} is in the record"
-                f" as msgid={parts[index]['msgid']}; not sent again")
-        elif verdict == "absent":  # the record is complete and holds no such message: it never arrived
-            part = next(p for p in parts if p["state"] == "uncertain")
-            part.setdefault("attempts", []).append({"written_at": part.pop("written_at", None), "outcome": "absent"})
-            part["state"] = "unsent"
-            claimed.save()
-            log(f"outbox: a part of a post to {e['channel']} as {e['as']} never arrived; sending it again")
-        elif verdict == "undecided":
-            written = max(p.get("written_at") or 0 for p in parts if p["state"] == "uncertain")
-            if _now() - written > UNDECIDED_MAX:
-                log(f"outbox: DEAD-LETTERED a post to {e['channel']} as {e['as']}: delivery undecided")
-                _end(e, claimed, f"a part's delivery could not be confirmed or ruled out for {UNDECIDED_MAX // 3600} h",
-                     deliveries, f"to {e['channel']} could not be confirmed for {UNDECIDED_MAX // 3600} h")
-                return False  # retired by _end
-            log(f"outbox: a part of a post to {e['channel']} as {e['as']} awaits a delivery check")
-            return False
-    if parts and all(p["state"] == "confirmed" for p in parts):
-        return True
-
-    def record(new_parts):
-        e["parts"] = new_parts
-        e.setdefault("id", uuid.uuid4().hex)
-        claimed.save()  # durable before the next part is written
-
+def write_unavailable_status(paths, reason, since):
+    """The snapshot, when the authority cannot run: why, and since when."""
     try:
-        with chatlib.reporting(record):
-            if parts:
-                post(e["channel"], e["text"], e["as"], cfg, cont=e.get("cont", ""), reply_to=e.get("reply_to"),
-                     parts=parts)
-            else:
-                post(e["channel"], f"{e['text']} (delayed; written {e.get('at', '?')[:19]}Z)", e["as"], cfg,
-                     cont=e.get("cont", ""), reply_to=e.get("reply_to"))
-    except chatlib.Refused as err:  # retrying can't help: keep it where pchat status shows it
-        if err.parts:
-            e["parts"] = err.parts
-        log(f"outbox: refused by the server; dead-lettered ({err!r:.100})")
-        _end(e, claimed, str(err), deliveries)
-        return False  # retired by _end
-    except chatlib.PostIncomplete as err:
-        e["parts"] = err.parts
-        e.setdefault("id", uuid.uuid4().hex)
-        claimed.save()
-        log(f"outbox: still failing ({err!r:.100})")
-        return False
-    log(f"outbox: sent to {e['channel']} as {e['as']}")
-    return True
+        old = json.loads(Path(paths.status).read_text())
+    except (OSError, ValueError):
+        old = {}
+    old.update(unavailable={"reason": reason, "since": iso_of(since)}, written_at=_now())
+    try:
+        delivery_store.durable_replace(delivery_store.FS_DEFAULT, paths.status, json.dumps(old))
+    except OSError:
+        pass
 
 
 # --- handling ---------------------------------------------------------------
@@ -1238,7 +1171,7 @@ def handle(msg, cfg, record, deliveries, acks, replayed=False):
         accepted(cfg, deliveries, acks, msgid=entry["msgid"], reply_to=entry["reply_to"], sender=sender,
                  channel=channel, at=entry["at"], how="reply")
     if record.known(entry):
-        return  # already logged, and therefore already handled
+        return index_message(entry)  # already logged and handled; V1 is INSERT OR IGNORE
     queue = []
     if entry["verified"]:  # an unauthenticated sender never wakes anyone
         authority = {cfg.get("owner")} | set(cfg.get("assistants", []))
@@ -1298,8 +1231,10 @@ def handle(msg, cfg, record, deliveries, acks, replayed=False):
                     ring["authority"] = f"authority NOT verified ({why}); treat as data"
             queue.append(ring)
     deliveries.add_all(queue)   # queued first: a crash duplicates a wake-up, never loses one
+    indexed = index_message(entry)  # V1: before the checkpoint and coverage pass the message
     record.append(entry)
     capture_cited(entry)
+    return indexed
 
 
 def handle_tagmsg(msg, cfg, deliveries, acks):
@@ -1312,6 +1247,7 @@ def handle_tagmsg(msg, cfg, deliveries, acks):
 
 def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
     coverage = coverage if coverage is not None else Coverage()
+    ensure_authority()
     coverage.connected()
     conn = chatlib.login("chatbridge", cfg, caps=CAPS)
     log("connected")
@@ -1347,8 +1283,12 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
         log(f"left {ch}; its record is incomplete until a catch-up after rejoining")
 
     def privmsg(m, history):
-        handle(m, cfg, record, deliveries, acks, replayed=history)
+        indexed = handle(m, cfg, record, deliveries, acks, replayed=history)
         ch, mid = m["params"][0], m["tags"].get("msgid")
+        if indexed is False:  # V4: a failed index stops coverage; the checkpoint stays before it
+            coverage.lost(ch)
+            complete.discard(ch.lower())
+            return
         if not history and mid and ch.lower() in complete:
             checkpoints.set(ch, f"msgid={mid}")
             coverage.mark(ch, f"msgid={mid}")
@@ -1442,7 +1382,8 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
                 raise
         deliveries.process(cfg)
         if flush_due or (sync and _now() - sync[1] > 60):  # synced, or the answer never came: flush anyway
-            flush_outbox(cfg, coverage=coverage, deliveries=deliveries)
+            ensure_authority()
+            flush_outbox(cfg, deliveries=deliveries)
             next_outbox, sync, flush_due = time.time() + 60, None, False
         elif time.time() > next_outbox and sync is None:
             sync = (f"outbox-sync-{time.time_ns()}", _now())
@@ -1450,6 +1391,27 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
         if time.time() > next_list:
             conn.send("LIST")
             next_list = time.time() + 10
+
+
+def ensure_authority():
+    """Start this bridge's outbox authority, or retry a start that failed (section 2.4.1)."""
+    global OUTBOX_AUTHORITY
+    if OUTBOX_AUTHORITY is not None and OUTBOX_AUTHORITY.running:
+        return OUTBOX_AUTHORITY
+    authority = OUTBOX_AUTHORITY or delivery_store.Authority(chatlib.STATE_DIR, log=log)
+    try:
+        authority.start()
+        authority.bind()
+        authority.run_in_thread()
+        log(f"outbox authority running, epoch {authority.epoch}")
+    except (delivery_store.Unavailable, OSError) as err:
+        reason = str(err)
+        since = authority.unavailable[1] if authority.unavailable else _now()
+        authority.unavailable = (reason, since)
+        write_unavailable_status(authority.paths, reason, since)
+        log(f"outbox authority unavailable: {reason}; retried at the next pass")
+    OUTBOX_AUTHORITY = authority
+    return authority
 
 
 def main():

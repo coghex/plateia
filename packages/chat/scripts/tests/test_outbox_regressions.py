@@ -41,10 +41,11 @@ class Harness:
     def __init__(self, clock):
         self.clock, self.authority, self.patches = clock, None, []
         if delivery_store:
-            self.authority = delivery_store.Authority(chatlib.STATE_DIR, clock=clock, mono=clock.mono,
-                                                      probes=delivery_store.FakeProbes())
+            probes = delivery_store.FakeProbes()
+            self.authority = delivery_store.Authority(chatlib.STATE_DIR, clock=clock, mono=clock.mono, probes=probes)
             self.authority.start()
             self.patches.append(mock.patch.object(chatlib, "client_factory", self.client))
+            self.patches.append(mock.patch.object(delivery_store, "PROBES", probes))
             self.patches += [mock.patch.object(delivery_store, name, value) for name, value in
                              (("PART_WAIT", 0.05), ("DRAIN_WAIT", 0.05), ("LOCK_WAIT", 0.2))]
         for p in self.patches:
@@ -168,13 +169,12 @@ class StorageFailureTests(RegressionCase):
         self.server.plan = ["ok", "ok", "ok"]
         with self.harness.confirmation_record_fails_once():
             code, said = self.pchat_post("#alpha", LONG)
-        committed = len(self.server.published)
         self.assertIn(code, (0, 3), said)
         for _ in range(3):
             self.clock.advance(60)
             self.harness.flush()
-        self.assertEqual(len(self.server.published), committed,
-                         "a part the server committed is never written again")
+        texts = [t.split(" (delayed")[0] for t in self.server.texts()]
+        self.assertEqual(len(texts), len(set(texts)), "a part the server committed is never written again")
 
 
 class IndependentFlowTests(RegressionCase):

@@ -178,3 +178,156 @@ class FakeConn:
 
     def close(self, reason=""):
         self.closed = True
+
+
+# --- the harness every outbox test builds on --------------------------------------------
+
+import contextlib  # noqa: E402
+import io  # noqa: E402
+import json  # noqa: E402
+import unittest  # noqa: E402
+from unittest import mock  # noqa: E402
+
+CLIENT_PID, OTHER_PID, BRIDGE_PID = 4242, 4343, 5151
+
+
+class OutboxCase(unittest.TestCase):
+    """One sandboxed state directory, an in-process authority the clients reach
+    through LocalTransport (no socket), a fake server, an injected clock, and
+    invented processes: the client (pid 4242), another client (4343) and the
+    bridge (5151) on one fake process table."""
+
+    multiline = True
+
+    def setUp(self):
+        from test_bridge import bridge, chatlib, reset_state
+        import delivery_store
+        self.bridge, self.chatlib, self.ds = bridge, chatlib, delivery_store
+        reset_state()
+        self.clock = Clock()
+        self.server = FakeServer(self.clock, multiline=self.multiline)
+        self.probes = delivery_store.FakeProbes(pid=BRIDGE_PID)
+        self.client_probes = self.probes.view(CLIENT_PID)
+        self.available = True
+        self.authority = self.new_authority()
+        self.patches = [
+            mock.patch.object(chatlib, "login", lambda *a, **k: self.server.login(*a, **k)),
+            mock.patch.object(chatlib, "_wallclock", self.clock),
+            mock.patch.object(chatlib, "_mono", self.clock.mono),
+            mock.patch.object(chatlib, "_sleep", self.clock.advance),
+            mock.patch.object(chatlib, "silence_refusal", lambda account: None),
+            mock.patch.object(chatlib, "load_config", lambda: CFG),
+            mock.patch.object(chatlib, "client_factory", self.client),
+            mock.patch.object(delivery_store, "PROBES", self.client_probes),
+            mock.patch.object(bridge, "_now", self.clock),
+        ]
+        for p in self.patches:
+            p.start()
+        bridge._FLUSHERS.clear()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+        self.authority.close()
+        self.bridge._FLUSHERS.clear()
+
+    # --- the authority and the bridge ---
+
+    def new_authority(self, **kw):
+        authority = self.ds.Authority(self.chatlib.STATE_DIR, clock=self.clock, mono=self.clock.mono,
+                                      probes=self.probes, **kw)
+        authority.start()
+        return authority
+
+    def restart_bridge(self):
+        """The bridge process ends and a new one starts: a new authority epoch and a new pid."""
+        self.authority.close()
+        self.probes.world["gone"].add(self.probes.pid)
+        self.probes = self.probes.view(self.probes.pid + 1)
+        self.authority = self.new_authority()
+        self.bridge._FLUSHERS.clear()
+
+    def client(self):
+        transport = self.ds.LocalTransport(self.authority) if self.available else None
+        return self.ds.Client(transport, clock=self.clock)
+
+    @contextlib.contextmanager
+    def unavailable(self):
+        self.available = False
+        try:
+            yield
+        finally:
+            self.available = True
+
+    @contextlib.contextmanager
+    def as_process(self, pid):
+        """Calls made inside speak for another invented client process."""
+        with mock.patch.object(self.ds, "PROBES", self.probes.view(pid)):
+            yield
+
+    def flush(self, deliveries=None):
+        self.bridge.flush_outbox(CFG, authority=self.authority, deliveries=deliveries)
+
+    def tx(self, fn):
+        return self.authority.run_tx(fn)
+
+    def sql(self, query, *args):
+        return self.tx(lambda s: [dict(r) for r in s.con.execute(query, args)])
+
+    # --- callers ---
+
+    def pchat(self, *argv, account="alp-solver-2"):
+        from test_outbox_regressions import pchat
+        out = io.StringIO()
+        with mock.patch.object(pchat, "who", lambda args, cfg, required=True: account), \
+                mock.patch.object(pchat.identities, "remember", lambda *a, **k: None), \
+                mock.patch.object(pchat.runstore, "silent_refusal", lambda *a: None), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            code = pchat.main(list(argv))
+        return code, out.getvalue()
+
+    def post(self, text, channel="#alpha", account="alp-solver-2"):
+        return self.pchat("post", channel, text, account=account)[0]
+
+    # --- state ---
+
+    def entries(self):
+        return self.tx(lambda s: [s.entry_view(r["id"]) for r in s.con.execute(
+            "SELECT id FROM entries ORDER BY created_at, id")])
+
+    def entry(self, entry_id=None):
+        rows = self.entries()
+        return rows[0] if entry_id is None else next(e for e in rows if e["id"] == entry_id)
+
+    def states(self, entry=None):
+        return [p["state"] for p in (entry or self.entry())["parts"]]
+
+    def attempts(self, **where):
+        rows = self.sql("SELECT * FROM attempts ORDER BY id")
+        return [r for r in rows if all(r.get(k) == v for k, v in where.items())]
+
+    def see(self, published, *, at=None, account=None, text=None, msgid=None, channel=None):
+        """The bridge indexes a verified message it read (V1)."""
+        entry = {"verified": True, "msgid": msgid or published["msgid"], "channel": channel or published["channel"],
+                 "from": account or published["account"], "text": published["text"] if text is None else text,
+                 "at": iso(published["at"] if at is None else at)}
+        self.assertTrue(self.bridge.index_message(entry, self.authority))
+
+    def cover(self, since, through, channel="#alpha"):
+        self.tx(lambda s: s.con.execute(
+            "INSERT INTO coverage (channel, since, through, mark) VALUES (?, ?, ?, 'msgid=x') ON CONFLICT(channel)"
+            " DO UPDATE SET since = excluded.since, through = excluded.through", (channel.lower(), since, through)))
+
+    def designate(self, account, at=0.0):
+        self.tx(lambda s: s.designate(account, at))
+
+    def dead_letters(self):
+        path = self.chatlib.STATE_DIR / "dead-letters.jsonl"
+        return [json.loads(x) for x in path.read_text().splitlines() if x.strip()] if path.exists() else []
+
+    def fallback_files(self):
+        d = self.chatlib.STATE_DIR / "outbox.d"
+        return sorted(n for n in (d.iterdir() if d.exists() else []) if n.is_file()) if d.exists() else []
+
+    def alerts(self):
+        return self.sql("SELECT * FROM alerts ORDER BY raised_at, alert_key")

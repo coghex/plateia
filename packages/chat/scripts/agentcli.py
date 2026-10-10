@@ -26,16 +26,14 @@ def notify(record, text, kind='status'):
         print(f'pchat agent: notice withheld: {refusal}', file=sys.stderr)
         return
     cfg = chatlib.load_config()
-    entry = dict(channel=channel, text=message, cont=tag, **{'as': record['name']}, at=ids.now())
     try:
-        chatlib.post(channel, message, record['name'], cfg, cont=tag)
-    except chatlib.Refused as err:
-        if err.parts:  # the server refused it: retrying can't help, and its record keeps what went out
-            chatlib.dead_letter_post({**entry, 'parts': err.parts}, str(err))
-        else:
-            chatlib.outbox_append([entry])
-    except (OSError, chatlib.ChatError) as err:  # only what the server has not confirmed is queued
-        chatlib.outbox_append([chatlib.queued_entry(entry, err)])
+        chatlib.post(channel, message, record['name'], cfg, cont=tag, origin='notify')
+    except chatlib.Refused as err:  # the server refused it: retrying can't help; the bridge dead-letters it
+        print(f'pchat agent: notice refused: {err}', file=sys.stderr)
+    except chatlib.Queued:  # durably queued, or its rest handed off: the bridge posts it
+        pass
+    except (OSError, chatlib.ChatError) as err:  # nothing could be queued: say so, as before
+        print(f'pchat agent: notice not posted: {err}', file=sys.stderr)
 
 
 def run_agent(a):

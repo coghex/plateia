@@ -1,966 +1,570 @@
-"""A long post whose completion times out after the server committed it must
-not be posted again on every outbox flush (#19). Each test drives chatlib.post,
-pchat post, agentcli, the bridge's announce and flush_outbox against a fake
-server that commits parts before answering, under _isolation: no IRC server,
-cmux, network or real home. The clock is injected and every confirmation wait
-is a fraction of a second. All names, channels, times and text are invented."""
+"""#19's acceptance 1-10, as amended, and design revision 8's posting
+scenarios (section 9: tests 1, 2, 4, 6, 10, 11, 13 and 18): a long post whose
+completion times out after the server committed it is never posted again
+whole. Each test drives pchat post, pchat ack, agent notices and the bridge's
+flush against a fake server and an in-process outbox authority, under
+_isolation, with an injected clock. All names, channels, times and text are
+invented."""
 import contextlib
-import datetime
-import importlib.machinery
-import inspect
-import importlib.util
 import io
-import json
 import sys
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import _isolation  # noqa: E402  (first: sandbox home and live-state guard)
-from test_bridge import bridge, chatlib, reset_state  # noqa: E402
+import _isolation  # noqa: E402,F401  (first: sandbox home and live-state guard)
+from outbox_fakes import CFG, LONG, T0, OTHER_PID, Crash, OutboxCase  # noqa: E402
+import test_bridge  # noqa: E402,F401  (puts the scripts on the path, under the sandbox)
 
-SCRIPTS = Path(__file__).resolve().parent.parent
 import agentcli  # noqa: E402
-
-_loader = importlib.machinery.SourceFileLoader("pchat_outbox", str(SCRIPTS / "pchat"))
-_spec = importlib.util.spec_from_loader("pchat_outbox", _loader)
-pchat = importlib.util.module_from_spec(_spec)
-_loader.exec_module(pchat)
-_isolation.check_bound(agentcli, pchat)
-
-CFG = {"owner": "pat", "assistants": ["sam"],
-       "accounts": {a: "x" for a in ("pat", "sam", "alp-solver-2", "alp-manager", "bet-solver-1", "chatbridge")},
-       "projects": {"alpha": {"channel": "#alpha", "prefix": "#alp-", "manager": "alp-manager"},
-                    "beta": {"channel": "#beta", "prefix": "#bet-", "manager": "bet-manager"}}}
-TAG = "[question alpha-20261009-1]"
-LONG = TAG + " " + "\n".join(f"point {i}: " + "lorem ipsum " * 25 for i in range(30))  # three 4 KB batches
-T0 = 1791500000.0  # an invented moment in October 2026
-
-
-class Crash(BaseException):
-    """Stands in for the bridge being killed: no except clause in the code catches it."""
-
-
-class Clock:
-    def __init__(self):
-        self.t = T0
-
-    def __call__(self):
-        return self.t
-
-
-class FakeServer:
-    """Commits each part as soon as it is written, then answers the PING that
-    follows it as `plan` says: ok, timeout, fail, fail-then-timeout, noise
-    (unrelated traffic until the deadline), slow (traffic, then the answer),
-    write-error (the write itself fails partway) or crash."""
-
-    def __init__(self, clock, plan=(), multiline=True):
-        self.clock, self.plan, self.multiline = clock, list(plan), multiline
-        self.published, self.writes, self.logins = [], [], []
-        self.close_error = False
-        self.stall_after = None  # once this many messages are committed, no PING is answered
-
-    def login(self, account, cfg=None, caps=()):
-        self.logins.append(account)
-        return FakeConn(self, account)
-
-    def texts(self):
-        return [m["text"] for m in self.published]
-
-
-class FakeConn:
-    def __init__(self, server, account):
-        self.server, self.account, self.answers, self.batch = server, account, [], None
-        self.caps = {"draft/multiline"} if server.multiline else set()
-        self.cap_values = {"draft/multiline": "max-bytes=4096,max-lines=100"} if server.multiline else {}
-
-    def _publish(self, channel, text):
-        s = self.server
-        s.published.append({"account": self.account, "channel": channel, "text": text,
-                            "msgid": f"srv{len(s.published) + 1}", "at": s.clock()})
-
-    def send(self, line):
-        s = self.server
-        if s.plan and s.plan[0] == "write-error" and line.startswith("BATCH -"):
-            s.plan.pop(0)
-            raise OSError("broken pipe")  # the batch's lines went out, its closing line did not
-        s.writes.append(line)
-        tags, rest = ("", line)
-        if line.startswith("@"):
-            tags, rest = line[1:].split(" ", 1)
-        if rest.startswith("BATCH +"):
-            self.batch = (rest.split()[3], [])
-        elif rest.startswith("BATCH -") and self.batch:
-            channel, lines = self.batch
-            self._publish(channel, "".join(p if i == 0 or c else "\n" + p for i, (p, c) in enumerate(lines)))
-            self.batch = None
-        elif rest.startswith("PRIVMSG "):
-            channel, text = rest[8:].split(" :", 1)
-            if "batch=" in tags and self.batch:
-                self.batch[1].append((text, "draft/multiline-concat" in tags))
-            else:
-                self._publish(channel, text)
-        elif rest == "PING :round":
-            if s.stall_after is not None and len(s.published) >= s.stall_after:
-                self.answers.append("timeout")
-            else:
-                self.answers.append(s.plan.pop(0) if s.plan else "ok")
-
-    def lines(self, timeout=None):
-        answer = self.answers.pop(0) if self.answers else "ok"
-        pong = {"command": "PONG", "params": ["irc", "round"], "tags": {}, "prefix": "irc"}
-        if answer == "ok":
-            yield pong
-        elif answer == "slow":
-            for _ in range(3):
-                yield {"command": "NOTICE", "params": ["*", "unrelated"], "tags": {}, "prefix": "irc"}
-            yield pong
-        elif answer == "noise":
-            while True:  # never the answer: only the absolute deadline ends this
-                yield {"command": "NOTICE", "params": ["*", "unrelated"], "tags": {}, "prefix": "irc"}
-        elif answer == "fail":
-            yield {"command": "FAIL", "params": ["BATCH", "MULTILINE_MAX_BYTES", "too long"], "tags": {}, "prefix": "irc"}
-            yield pong
-        elif answer == "fail-then-timeout":
-            yield {"command": "FAIL", "params": ["BATCH", "MULTILINE_MAX_BYTES", "too long"], "tags": {}, "prefix": "irc"}
-            raise TimeoutError("timed out")
-        elif answer == "error":  # an error reply, then the PING's answer: order, not acceptance
-            yield {"command": "479", "params": ["alp-solver-2", "#alpha", "Illegal channel name"], "tags": {},
-                   "prefix": "irc"}
-            yield pong
-        elif answer == "403-and-fail":
-            yield {"command": "403", "params": ["alp-solver-2", "#alpha", "No such channel"], "tags": {}, "prefix": "irc"}
-            yield {"command": "FAIL", "params": ["BATCH", "MULTILINE_INVALID", "refused"], "tags": {}, "prefix": "irc"}
-            yield pong
-        elif answer == "crash":
-            raise Crash()
-        else:  # timeout
-            raise TimeoutError("timed out")
-
-    def close(self, reason=""):
-        if self.server.close_error:
-            raise OSError("connection reset while leaving")
-
-
-def iso(t):
-    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat()
-
-
-class OutboxCase(unittest.TestCase):
-    def setUp(self):
-        reset_state()
-        self.clock = Clock()
-        self.server = FakeServer(self.clock)
-        # create=True and the getattr below only let this module run against the
-        # pre-#19 scripts, so their failing-first run reaches the assertions.
-        self.patches = [mock.patch.object(chatlib, "login", lambda *a, **k: self.server.login(*a, **k)),
-                        mock.patch.object(chatlib, "_wallclock", self.clock, create=True),
-                        mock.patch.object(chatlib, "PART_WAIT", 0.2, create=True),
-                        mock.patch.object(chatlib, "silence_refusal", lambda account: None),
-                        mock.patch.object(chatlib, "load_config", lambda: CFG),
-                        mock.patch.object(bridge, "_now", self.clock, create=True)]
-        for p in self.patches:
-            p.start()
-        self.coverage = getattr(bridge, "Coverage", dict)()
-
-    def tearDown(self):
-        for p in reversed(self.patches):
-            p.stop()
-
-    def serve(self, *plan, multiline=True):
-        self.server.plan, self.server.multiline = list(plan), multiline
-
-    def flush(self, module=None, deliveries=None, ack=None):
-        flush = (module or bridge).flush_outbox
-        if "coverage" in inspect.signature(flush).parameters:
-            flush(CFG, coverage=self.coverage, deliveries=deliveries, ack=ack)
-        else:  # the pre-#19 bridge
-            flush(CFG, ack=ack)
-
-    def entries(self):
-        files = [chatlib.OUTBOX] + sorted(chatlib.STATE_DIR.glob("outbox.claimed-*.jsonl"))
-        return [json.loads(line) for f in files if f.exists() for line in f.read_text().splitlines() if line.strip()]
-
-    def states(self, entry=None):
-        return [p["state"] for p in (entry or self.entries()[0])["parts"]]
-
-    def dead(self):
-        path = chatlib.STATE_DIR / "dead-letters.jsonl"
-        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-
-    def log_record(self, published, *, account=None, channel=None, verified=True, at=None, msgid=None):
-        """What the bridge would have logged on reading `published` from the server."""
-        bridge.Record().append({"at": iso(published["at"] if at is None else at),
-                                "msgid": msgid or published["msgid"], "channel": channel or published["channel"],
-                                "from": account or published["account"], "nick": account or published["account"],
-                                "verified": verified, "text": published["text"]})
-
-    def covered(self, since, through, channel="#alpha"):
-        self.coverage.spans[channel] = {"since": since, "through": through, "mark": "msgid=x"}
-
-    def pchat_post(self, channel, text, account="alp-solver-2", *extra):
-        out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(pchat, "who", lambda args, cfg, required=True: account), \
-                mock.patch.object(pchat.identities, "remember", lambda *a, **k: None), \
-                mock.patch.object(pchat.runstore, "silent_refusal", lambda *a: None), \
-                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = pchat.main(["post", channel, text, *extra])
-        return code, out.getvalue() + err.getvalue()
-
-    def queue_long(self, *plan, committed=3):
-        """pchat post of LONG: the server commits each part written, and confirms what `plan` says."""
-        self.serve(*plan)
-        code, said = self.pchat_post("#alpha", LONG)
-        self.assertEqual(code, 3, said)
-        self.assertEqual(len(self.server.published), committed)
-        return self.server.published[:]
 
 
 class CommittedThenTimeoutTests(OutboxCase):
-    def test_pchat_queues_only_the_unconfirmed_part(self):
-        published = self.queue_long("ok", "ok", "timeout")
-        [entry] = self.entries()
-        self.assertEqual(self.states(entry), ["confirmed", "confirmed", "uncertain"])
-        self.assertEqual([p["text"] for p in entry["parts"]], [m["text"] for m in published])
-        self.assertEqual(entry["text"], LONG)  # still shown in full where pchat status lists it
+    """Acceptance 1 and 4: confirmed, confirmed, then committed and never confirmed."""
+
+    def test_pchat_queues_only_the_unconfirmed_part_and_never_writes_it_again(self):
+        self.server.plan = ["ok", "ok", "timeout"]
+        code, said = self.pchat("post", "#alpha", LONG)
+        self.assertEqual(code, 3, said)
+        self.assertEqual(len(self.server.published), 3)
+        e = self.entry()
+        self.assertEqual(self.states(e), ["confirmed", "confirmed", "uncertain"])
+        self.assertEqual(e["owner_kind"], "outbox")  # the rest handed off (E3)
+        self.assertEqual(e["text"], LONG)
         for _ in range(3):
+            self.clock.advance(60)
             self.flush()
         self.assertEqual(len(self.server.published), 3, "no part is written again while its delivery is undecided")
+        status = self.tx(lambda s: s.status())
+        self.assertEqual(status["checking"], 1)  # visible as awaiting a delivery check
 
-    def test_delivered_part_is_found_in_the_record_and_retired_without_writing(self):
-        published = self.queue_long("ok", "ok", "timeout")
-        self.log_record(published[2])
-        self.clock.t += 30
-        with self.assertLogs_bridge() as said:
+    def test_the_line_transport_behaves_the_same(self):
+        self.server.multiline = False
+        self.server.stall_after = 3
+        code, said = self.pchat("post", "#alpha", "[status] one\ntwo\nthree\nfour")
+        self.assertEqual(code, 3, said)
+        self.assertEqual(self.states(), ["confirmed", "confirmed", "uncertain", "unsent"])
+        for _ in range(3):
             self.flush()
-        self.assertEqual(self.entries(), [])
         self.assertEqual(len(self.server.published), 3)
-        self.assertIn(published[2]["msgid"], said())
 
-    def test_absent_part_is_written_exactly_once_more(self):
-        part3 = self.queue_long("ok", "ok", "timeout")[2]
-        self.server.published.pop()  # the server never committed part 3 after all
-        self.clock.t += bridge.SETTLE + 60
-        self.covered(T0 - 3600, self.clock.t)
+    def test_an_uncertain_part_never_proves_absence_by_a_timeout(self):
+        self.server.plan = ["ok", "ok", "timeout"]
+        self.pchat("post", "#alpha", LONG)
+        self.cover(T0 - 3600, T0 + 10 * 86400)  # the record is complete, and holds no part 3
+        self.clock.advance(3600)
         self.flush()
-        self.assertEqual(self.entries(), [])
+        self.assertEqual(len(self.server.published), 3, "missing finality never proves absence (N7)")
+
+
+class ReconciledDeliveredTests(OutboxCase):
+    """Acceptance 2: the record holds part 3 from that verified, designated account."""
+
+    def test_a_designated_senders_logged_part_is_retired_without_writing(self):
+        self.designate("alp-solver-2", T0 - 60)
+        self.server.plan = ["ok", "ok", "timeout"]
+        self.pchat("post", "#alpha", LONG)
+        part3 = self.server.published[2]
+        self.see(part3)
+        self.clock.advance(30)
+        self.flush()
+        e = self.entry()
+        self.assertEqual(e["state"], "done")
+        self.assertEqual(e["parts"][2]["msgid"], part3["msgid"])
+        self.assertEqual(len(self.server.published), 3)
+
+    def test_an_undesignated_account_stays_unknown_whatever_the_record_shows(self):
+        self.server.plan = ["ok", "ok", "timeout"]
+        self.pchat("post", "#alpha", LONG)
+        self.see(self.server.published[2])
+        self.flush()
+        self.assertEqual(self.states(), ["confirmed", "confirmed", "uncertain"])
+
+
+class ReconciledAbsentTests(OutboxCase):
+    """Acceptance 3, as amended (AD-2): a non-refusal error reply with its PONG is
+    finality; complete coverage and no matching message: written exactly once more."""
+
+    def test_an_error_reply_with_finality_and_a_complete_record_resends_once(self):
+        self.server.plan = ["ok", "ok", "error"]
+        code, _ = self.pchat("post", "#alpha", LONG)
+        self.assertEqual(code, 3)
+        part3 = self.server.published.pop()  # the server published nothing of part 3 after all
+        self.assertEqual(self.states(), ["confirmed", "confirmed", "uncertain"])
+        self.cover(T0 - 3600, T0 + 120)
+        self.clock.advance(60)
+        self.flush()
+        self.assertEqual(self.entry()["state"], "done")
         self.assertEqual(len(self.server.published), 3)
         self.assertEqual(self.server.published[2]["text"], part3["text"], "the same part, unchanged")
         self.flush()
         self.assertEqual(len(self.server.published), 3, "parts 1 and 2 are never written again")
 
-    def test_undecided_part_waits_and_shows_in_status(self):
-        self.queue_long("ok", "ok", "timeout")
-        for _ in range(3):
-            self.clock.t += 60
-            self.flush()
+    def test_a_late_pong_without_an_error_is_confirmation(self):
+        self.server.plan = ["ok", "ok", "late"]
+        code, said = self.pchat("post", "#alpha", LONG)
+        self.assertEqual(code, 0, said)
+        self.assertEqual(self.states(), ["confirmed"] * 3)
+        self.flush()
         self.assertEqual(len(self.server.published), 3)
-        self.assertEqual(chatlib.outbox_summary(), {"pending": 1, "checking": 1, "unsent": 0})
-        self.assertIn("1 awaiting a delivery check", self.status())
 
-    def test_bridge_flush_of_a_text_only_entry_no_longer_reposts_the_whole_post(self):
-        """The defect as it was seen: a queued whole post committed, its completion timed out."""
-        chatlib.outbox_append([{"channel": "#alpha", "as": "alp-solver-2", "text": LONG, "cont": TAG,
-                                "at": "2026-10-09T09:00:00"}])
-        self.server.stall_after = 3  # every part is committed; the answer after the last never comes
-        for _ in range(3):
-            self.flush()
-            self.clock.t += 72
-        self.assertEqual(len(self.server.published), 3, "on master every flush posted all three again")
-        self.assertEqual(self.states(), ["confirmed", "confirmed", "uncertain"])
-
-    def test_restart_continues_from_recorded_progress(self):
-        self.queue_long("ok", "timeout", committed=2)
-        self.server.published.pop()  # part 2 never arrived; part 3 was never written
-        self.clock.t += bridge.SETTLE + 60
-        self.covered(T0 - 3600, self.clock.t)
-        loader = importlib.machinery.SourceFileLoader("chat_bridge_restarted", str(SCRIPTS / "chat-bridge"))
-        fresh = importlib.util.module_from_spec(importlib.util.spec_from_loader("chat_bridge_restarted", loader))
-        loader.exec_module(fresh)
-        self.coverage = fresh.Coverage()  # read back from disk, as a restarted bridge would
-        self.coverage.spans["#alpha"] = {"since": T0 - 3600, "through": self.clock.t, "mark": "msgid=x"}
-        with mock.patch.object(fresh, "_now", self.clock):
-            self.flush(module=fresh)
-        self.assertEqual(self.entries(), [])
-        self.assertEqual(len(self.server.published), 3)
-        part1 = [w for w in self.server.writes if "BATCH +p0" in w]
-        self.assertEqual(len(part1), 1, "part 1 was written once, by pchat, never by the restarted bridge")
-
-    def assertLogs_bridge(self):
-        log = chatlib.STATE_DIR / "bridge.log"
-        start = log.stat().st_size if log.exists() else 0
-
-        @contextlib.contextmanager
-        def watching():
-            yield lambda: log.read_text()[start:] if log.exists() else ""
-        return watching()
-
-    def status(self):
-        out = io.StringIO()
-        with mock.patch("subprocess.run", lambda *a, **k: types.SimpleNamespace(stdout="")), \
-                mock.patch.object(pchat, "unaccepted", lambda cfg, project=None: []), \
-                contextlib.redirect_stdout(out):
-            pchat.main(["status"])
-        return out.getvalue()
-
-
-class CrashTests(OutboxCase):
-    def test_crash_between_parts_never_resends_confirmed_or_mid_write_parts(self):
-        chatlib.outbox_append([{"channel": "#alpha", "as": "alp-solver-2", "text": LONG, "cont": TAG, "at": "t"}])
-        self.serve("ok", "crash")
-        with self.assertRaises(Crash):
-            self.flush()
-        [entry] = self.entries()
-        self.assertEqual(self.states(entry), ["confirmed", "writing", "unsent"])
-        self.serve()
-        for _ in range(2):
-            self.flush()
-        self.assertEqual(self.states(), ["confirmed", "uncertain", "unsent"])
-        self.assertEqual(len(self.server.published), 2, "part 2 may be in the channel: not resent blindly")
-        self.assertEqual(len(self.entries()), 1, "nothing lost, nothing doubled")
-
-    def test_completion_recorded_before_the_claimed_file_went_away(self):
-        parts = [{"kind": "line", "lines": [["done", False]], "text": "done", "state": "confirmed",
-                  "written_at": T0}]
-        (chatlib.STATE_DIR / "outbox.claimed-1.jsonl").write_text(
-            json.dumps({"channel": "#alpha", "as": "alp-solver-2", "text": "done", "id": "e1", "parts": parts}) + "\n")
+    def test_a_fail_is_a_refusal_dead_lettered_and_never_retried(self):
+        self.server.plan = ["ok", "fail"]
+        code, said = self.pchat("post", "#alpha", LONG)
+        self.assertEqual(code, 2, said)
+        self.assertIn("1 of 3 parts were already posted", said)
+        e = self.entry()
+        self.assertEqual((e["state"], self.states(e)), ("terminal", ["confirmed", "refused", "unsent"]))
         self.flush()
-        self.assertEqual((self.entries(), self.server.writes), ([], []))
+        [dead] = self.dead_letters()
+        self.assertEqual([p["state"] for p in dead["parts"]], ["confirmed", "refused", "unsent"])
+        self.assertEqual(len(self.server.published), 2)
 
-    def test_a_kept_entry_is_owed_once_across_flushes_and_crashes(self):
-        chatlib.outbox_append([{"channel": "#alpha", "as": "alp-solver-2", "text": "first", "at": "t"},
-                               {"channel": "#alpha", "as": "alp-solver-2", "text": "second", "at": "t"}])
-        self.serve("ok", "crash")  # the first entry completes, then the bridge dies on the second
-        with self.assertRaises(Crash):
-            self.flush()
-        self.assertEqual([e["text"] for e in self.entries()], ["second"])
-        self.serve("timeout")
-        self.flush()
-        self.flush()
-        self.assertEqual(len(self.entries()), 1, "a kept entry is never owed from two places")
-        self.assertEqual(self.server.texts().count(self.server.published[0]["text"]), 1, "the first is not resent")
-
-    def test_failure_to_record_progress_stops_writing(self):
-        chatlib.outbox_append([{"channel": "#alpha", "as": "alp-solver-2", "text": LONG, "cont": TAG, "at": "t"}])
-        self.serve("ok", "ok", "ok")
-        calls = []
-
-        def failing_save(self_):
-            calls.append(1)
-            if len(calls) == 2:  # recording part 1's confirmation fails
-                raise OSError("disk full")
-            return original(self_)
-        original = bridge._Claimed.save
-        with mock.patch.object(bridge._Claimed, "save", failing_save):
-            with contextlib.suppress(OSError):
+    def test_a_crash_or_broken_connection_never_proves_absence(self):
+        for plan in (["ok", "crash"], ["ok", "timeout"]):
+            with self.subTest(plan=plan):
+                self.setUp()
+                self.server.plan = list(plan)
+                try:
+                    self.pchat("post", "#alpha", LONG)
+                except Crash:
+                    pass
+                self.cover(T0 - 3600, T0 + 86400)
+                self.server.published[1:] = []
+                self.clock.advance(3600)
+                self.probes.world["gone"].add(4242)  # the crashed writer is gone: A8
                 self.flush()
-        self.assertEqual(len(self.server.published), 1, "no part is written after a record failed")
-        self.assertEqual(self.states()[1:], ["unsent", "unsent"])
-        self.assertIn(self.states()[0], ("writing", "confirmed"), "part 1 is never recorded as unsent")
+                self.assertEqual(len(self.server.published), 1)
+                self.tearDown()
 
 
 class IndependentDeliveryTests(OutboxCase):
-    def test_other_entries_go_out_while_one_awaits_its_check(self):
-        self.queue_long("ok", "ok", "timeout")
-        chatlib.outbox_append([
-            {"channel": "#beta", "as": "bet-solver-1", "text": "[status beta-20261009-2] unrelated", "at": "t"},
-            {"channel": "#alpha", "as": "alp-solver-2", "text": "[status alpha-20261009-1] same account", "at": "t"},
-            {"channel": "#alpha", "as": "sam", "text": "keeps failing", "at": "t"}])
-        failing = self.server.login
+    """Acceptance 8: another account's entry for #beta is delivered in the same flush."""
 
-        def login(account, cfg=None, caps=()):
-            if account == "sam":
-                raise OSError("connection refused")
-            return failing(account, cfg, caps)
-        self.server.login = login
+    def test_another_accounts_entry_flows_while_one_awaits_its_check(self):
+        self.server.plan = ["ok", "ok", "timeout"]
+        self.pchat("post", "#alpha", LONG)
+        self.server.refuse_login = {"bet-solver-1"}
+        code, _ = self.pchat("post", "#beta", "[status] beta green", account="bet-solver-1")
+        self.assertEqual(code, 3)
+        self.server.refuse_login = set()
         self.flush()
-        texts = [t.split(" (delayed")[0] for t in self.server.texts()]
-        self.assertIn("[status beta-20261009-2] unrelated", texts)
-        self.assertIn("[status alpha-20261009-1] same account", texts)
-        left = self.entries()
-        self.assertEqual(sorted(e["as"] for e in left), ["alp-solver-2", "sam"])
-        self.assertEqual(next(e for e in left if e["as"] == "sam").get("parts"), None,
-                         "nothing was written: the whole post stays queued, as before")
+        self.assertEqual([m["text"].split(" (delayed")[0] for m in self.server.by("bet-solver-1")],
+                         ["[status] beta green"])
+        [first] = [e for e in self.entries() if e["account"] == "alp-solver-2"]
+        self.assertEqual(self.states(first), ["confirmed", "confirmed", "uncertain"])
+
+    def test_a_refused_and_a_failing_entry_never_stop_the_others(self):
+        self.server.refuse_login = {"alp-solver-2", "bet-solver-1"}
+        self.post("[status] first", account="alp-solver-2")
+        self.post("[status] second", channel="#beta", account="bet-solver-1")
+        self.server.refuse_login = {"alp-solver-2"}  # still failing at the flush
+        self.flush()
+        self.assertEqual(len(self.server.by("bet-solver-1")), 1)
 
 
-class TransportTests(OutboxCase):
-    def post(self, text, **kw):
-        return chatlib.post("#alpha", text, "alp-solver-2", CFG, cont=TAG, **kw)
+class RestartTests(OutboxCase):
+    """Acceptance 6 and 7: a fresh bridge, or one killed between parts, continues
+    from the recorded progress; confirmed parts are never rewritten."""
 
-    def test_unrelated_traffic_does_not_extend_the_wait(self):
-        self.serve("noise")
-        with self.assertRaises(chatlib.PostIncomplete) as err:
-            self.post("[question alpha-20261009-1] short")
-        self.assertEqual([p["state"] for p in err.exception.parts], ["uncertain"])
-
-    def test_slow_but_confirmed_post_succeeds_without_queueing(self):
-        self.serve("slow", "slow", "slow")
-        code, said = self.pchat_post("#alpha", LONG)
-        self.assertEqual(code, 0, said)
-        self.assertFalse(chatlib.OUTBOX.exists())
-
-    def test_partial_write_failure_is_uncertain_not_unsent(self):
-        self.serve("ok", "write-error")
-        with self.assertRaises(chatlib.PostIncomplete) as err:
-            self.post(LONG)
-        self.assertEqual([p["state"] for p in err.exception.parts], ["confirmed", "uncertain", "unsent"])
-
-    def test_refusal_stands_through_a_later_timeout(self):
-        self.serve("ok", "fail-then-timeout")
-        with self.assertRaises(chatlib.Refused) as err:
-            self.post(LONG)
-        self.assertEqual([p["state"] for p in err.exception.parts], ["confirmed", "refused", "unsent"])
-
-    def test_cleanup_failure_after_confirmation_keeps_the_success(self):
-        self.server.close_error = True
-        self.serve("ok", "ok", "ok")
-        self.assertGreater(self.post(LONG), 0)
-
-    def test_line_transport_uncertain_middle_then_unsent(self):
-        self.serve("ok", "timeout", multiline=False)
-        with self.assertRaises(chatlib.PostIncomplete) as err:
-            self.post("[question alpha-20261009-1] one\ntwo\nthree\nfour")
-        self.assertEqual([p["state"] for p in err.exception.parts], ["confirmed", "uncertain", "unsent", "unsent"])
-        self.assertEqual([p["text"] for p in err.exception.parts][1], f"… {TAG} two")
-
-    def test_a_fixed_multiline_part_is_never_resplit_for_a_server_without_multiline(self):
-        self.queue_long("ok", "timeout", committed=2)
+    def test_a_restarted_bridge_continues_from_the_recorded_progress(self):
+        self.server.plan = ["ok", "ok", "error"]
+        self.pchat("post", "#alpha", LONG)
         self.server.published.pop()
-        self.clock.t += bridge.SETTLE + 60
-        self.covered(T0 - 3600, self.clock.t)
-        self.serve(multiline=False)
+        self.restart_bridge()
+        self.cover(T0 - 3600, T0 + 600)
+        self.clock.advance(60)
         self.flush()
-        self.assertEqual(len(self.server.published), 1, "kept unsent rather than split into lines")
-        self.assertEqual(self.states(), ["confirmed", "unsent", "unsent"])
-        self.serve()
-        self.flush()
-        self.assertEqual(self.entries(), [])
+        self.assertEqual(self.entry()["state"], "done")
         self.assertEqual(len(self.server.published), 3)
 
+    def test_a_flush_killed_after_writing_a_part_recovers_from_the_database(self):
+        self.server.refuse_login = {"alp-solver-2"}
+        self.post(LONG)
+        self.server.refuse_login = set()
+        self.server.plan = ["ok", "crash"]  # part 2 is written; the bridge dies before recording it
+        with self.assertRaises(Crash):
+            self.flush()
+        self.assertEqual(len(self.server.published), 2)
+        self.restart_bridge()  # the old bridge process is gone: its attempt ends without finality (A8)
+        for _ in range(2):
+            self.flush()
+        self.assertEqual(self.states(), ["confirmed", "uncertain", "unsent"])
+        self.assertEqual(len(self.server.published), 2, "part 1 is never rewritten, part 2 is never resent blindly")
 
-class EvidenceTests(OutboxCase):
-    """What counts as the record showing a part, and what shows it absent."""
 
-    def setUp(self):
-        super().setUp()
-        self.published = self.queue_long("ok", "ok", "timeout")
-        self.part3 = self.published[2]
-        self.clock.t += 30
+class UnknownForADayTests(OutboxCase):
+    """Acceptance 10: an uncertain part with no evidence either way, on an injected clock."""
 
-    def assertUndecided(self):
-        before = len(self.server.published)
+    def test_after_24_hours_it_is_dead_lettered_with_its_progress_and_one_alert(self):
+        self.server.plan = ["ok", "ok", "timeout"]
+        self.pchat("post", "#alpha", LONG)
+        deliveries = self.bridge.Deliveries()
+        self.clock.advance(self.ds.UNDECIDED_MAX - 60)
+        self.flush(deliveries)
+        self.assertEqual(self.entry()["state"], "open")
+        self.clock.advance(120)
+        self.flush(deliveries)
+        self.flush(deliveries)
+        e = self.entry()
+        self.assertEqual(e["state"], "terminal")
+        [dead] = self.dead_letters()
+        self.assertEqual([p["state"] for p in dead["parts"]], ["confirmed", "confirmed", "uncertain"])
+        self.assertEqual([p["text"] for p in dead["parts"]], [m["text"] for m in self.server.published])
+        pushes = [i for i in deliveries.items if i.get("alert_key") == f"outbox:{e['id']}"]
+        self.assertEqual(len(pushes), 1)
+        self.assertNotIn("lorem", pushes[0]["text"], "the alert is content-free")
+        self.assertEqual(len(self.server.published), 3, "never resent")
+
+
+class LegacyFlushTests(OutboxCase):
+    """Acceptance 5 and 9: the bridge's own flush of a legacy text-only row."""
+
+    def write_legacy(self, *rows):
+        import json
+        path = self.chatlib.STATE_DIR / "outbox.jsonl"
+        with path.open("a") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+
+    def test_a_legacy_post_whose_final_confirmation_times_out_is_not_reposted(self):
+        self.write_legacy({"channel": "#alpha", "as": "alp-solver-2", "text": LONG, "at": "2026-10-09T00:00:00"})
+        self.server.stall_after = 3
+        for _ in range(4):
+            self.clock.advance(60)
+            self.flush()
+        self.assertEqual(len(self.server.published), 3)
+        self.assertTrue(self.server.published[2]["text"].endswith("(delayed; written 2026-10-09T00:00:00Z)"))
+
+    def test_legacy_posts_and_acks_go_out_as_before(self):
+        self.write_legacy({"channel": "#alpha", "as": "alp-solver-2", "text": "[status] hi", "cont": "[status]",
+                           "reply_to": "m1", "at": "t"},
+                          {"channel": "#alpha", "as": "alp-manager", "ack": "m9", "at": "t"})
         self.flush()
-        self.assertEqual(self.states(), ["confirmed", "confirmed", "uncertain"])
-        self.assertEqual(len(self.server.published), before)
-
-    def test_wrong_account_unverified_wrong_channel_and_too_old_are_not_evidence(self):
-        self.log_record(self.part3, account="alp-manager", msgid="w1")
-        self.log_record(self.part3, verified=False, msgid="w2")
-        self.log_record(self.part3, channel="#beta", msgid="w3")
-        self.log_record(self.part3, at=self.part3["at"] - 3600, msgid="w4")
-        self.assertUndecided()
-
-    def test_absence_needs_the_whole_interval(self):
-        self.server.published.pop()
-        self.clock.t += bridge.SETTLE + 60
-        self.covered(T0 + 10, self.clock.t)  # began after the part was written
-        self.assertUndecided()
-        self.covered(T0 - 3600, T0 + 60)  # ends before the settle time
-        self.assertUndecided()
-        self.covered(T0 - 3600, self.clock.t)
-        self.flush()
-        self.assertEqual(self.entries(), [])
-
-    def test_a_msgid_is_never_evidence_for_two_parts(self):
-        self.log_record(self.part3)
-        other = {**self.entries()[0], "id": "e2", "as": "alp-solver-2"}
-        claimed = sorted(chatlib.STATE_DIR.glob("outbox.claimed-*.jsonl")) or [chatlib.OUTBOX]
-        with claimed[-1].open("a") as f:
-            f.write(json.dumps(other) + "\n")
-        self.flush()
-        left = self.entries()
-        self.assertEqual(len(left), 1, "one message confirms one of the two identical parts, not both")
-        self.assertEqual(self.states(left[0]), ["confirmed", "confirmed", "uncertain"])
-
-
-class RepeatedTextTests(OutboxCase):
-    def test_identical_parts_need_distinct_messages(self):
-        self.serve("ok", "ok", "timeout", multiline=False)
-        code, _ = self.pchat_post("#alpha", "[question alpha-20261009-1] first\nsame\nsame")
-        self.assertEqual(code, 3)
-        p = self.server.published
-        self.assertEqual(p[1]["text"], p[2]["text"])
-        self.log_record(p[1])  # only part 2's message is in the record
-        self.flush()
-        self.assertEqual(self.states(), ["confirmed", "confirmed", "uncertain"], "part 2's message is not part 3's")
-        self.log_record(p[2])
-        self.flush()
-        self.assertEqual(self.entries(), [])
-
-    def test_identical_parts_absent_when_complete(self):
-        self.serve("ok", "ok", "timeout", multiline=False)
-        self.pchat_post("#alpha", "[question alpha-20261009-1] first\nsame\nsame")
-        p = self.server.published
-        self.log_record(p[1])
-        self.server.published.pop()
-        self.clock.t += bridge.SETTLE + 60
-        self.covered(T0 - 3600, self.clock.t)
-        self.flush()
-        self.assertEqual(self.entries(), [])
-        self.assertEqual(len(self.server.published), 3, "part 3 written once more, part 2 not")
-
-
-class RefusalTests(OutboxCase):
-    def test_refusal_through_pchat_records_what_was_published(self):
-        self.serve("ok", "fail")
-        code, said = self.pchat_post("#alpha", LONG)
-        self.assertEqual(code, 2)
-        self.assertIn("1 of 3 parts were already posted", said)
-        self.assertEqual(self.entries(), [])
-        [dead] = self.dead()
-        self.assertEqual([p["state"] for p in dead["parts"]], ["confirmed", "refused", "unsent"])
-        self.assertTrue(all(p["text"] for p in dead["parts"]))
-        self.assertIn("1 of 3 parts posted, 2 not", self.status())
-
-    def test_refusal_in_the_bridge_dead_letters_with_parts_and_requeues_nothing(self):
-        chatlib.outbox_append([{"channel": "#alpha", "as": "alp-solver-2", "text": LONG, "cont": TAG, "at": "t"}])
-        self.serve("ok", "ok", "fail")
-        self.flush()
-        self.assertEqual(self.entries(), [])
-        [dead] = self.dead()
-        self.assertEqual([p["state"] for p in dead["parts"]], ["confirmed", "confirmed", "refused"])
-
-    def status(self):
-        return CommittedThenTimeoutTests.status(self)
+        [msg] = [m for m in self.server.published if m["text"]]
+        self.assertTrue(msg["text"].startswith("[status] hi (delayed; written t"))
+        self.assertIn("+draft/reply=m1", msg["tags"])
+        acks = [m for m in self.server.published if m.get("tagmsg")]
+        self.assertEqual(len(acks), 1)
+        self.assertIn("+draft/reply=m9", acks[0]["tagmsg"])
+        self.assertTrue(all(e["state"] == "done" for e in self.entries()))
 
 
 class UnchangedPathTests(OutboxCase):
-    def test_old_format_and_ack_entries_go_out_as_before(self):
-        chatlib.outbox_append([{"channel": "#alpha", "as": "alp-solver-2", "text": "[status alpha-1] x", "at": "t"},
-                               {"channel": "#alpha", "as": "alp-manager", "ack": "srv9", "at": "t"}])
-        acks = []
-        self.flush(ack=lambda *a: acks.append(a))
-        self.assertEqual(self.server.texts(), ["[status alpha-1] x (delayed; written tZ)"])
-        self.assertEqual(acks, [("#alpha", "srv9", "alp-manager", CFG)])
-        self.assertEqual(self.entries(), [])
+    """Test 18: a slow but confirmed post, exit codes and messages."""
 
-    def test_failure_before_any_write_keeps_the_whole_post(self):
-        def refused(*a, **k):
-            raise ConnectionRefusedError("chat is down")
-        self.server.login = refused
-        code, _ = self.pchat_post("#alpha", LONG)
+    def test_a_confirmed_post_exits_0_and_queues_nothing(self):
+        code, said = self.pchat("post", "#alpha", "[status] all good")
+        self.assertEqual((code, said.strip()), (0, "posted 1 line(s) to #alpha as alp-solver-2"))
+        self.assertEqual(self.entry()["state"], "done")
+        self.assertEqual(self.fallback_files(), [])
+
+    def test_a_server_that_cannot_be_reached_queues_the_whole_post_once(self):
+        self.server.refuse_login = {"alp-solver-2"}
+        code, said = self.pchat("post", "#alpha", "[status] later")
+        self.assertEqual(code, 3, said)
+        self.assertIn("queued", said)
+        self.server.refuse_login = set()
+        self.flush()
+        self.flush()
+        self.assertEqual([m["text"].split(" (delayed")[0] for m in self.server.published], ["[status] later"])
+
+    def test_ack_exits_0_and_is_one_tagmsg(self):
+        code, said = self.pchat("ack", "#alpha", "m1", account="alp-manager")
+        self.assertEqual(code, 0, said)
+        self.assertEqual(len([m for m in self.server.published if m.get("tagmsg")]), 1)
+
+
+class AcknowledgementTests(OutboxCase):
+    """Test 6 (F2): a failed ack, A11 and a retry that succeeds."""
+
+    def test_a_timed_out_ack_is_retired_and_retried_by_the_bridge(self):
+        self.server.plan = ["timeout"]
+        code, _ = self.pchat("ack", "#alpha", "m1", account="alp-manager")
         self.assertEqual(code, 3)
-        [entry] = self.entries()
-        self.assertEqual((entry["text"], "parts" in entry), (LONG, False))
-
-
-class OtherCallerTests(OutboxCase):
-    def test_agent_notices_queue_only_the_remainder(self):
-        self.serve("ok", "timeout")
-        with mock.patch.object(agentcli.runstore, "silent_refusal", lambda *a: None):
-            agentcli.notify({"channel": "#alpha", "name": "alp-solver-2", "request": "alpha-20261009-1"},
-                            LONG.split(" ", 2)[2])
-        self.assertEqual(self.states(), ["confirmed", "uncertain", "unsent"])
-
-    def test_bridge_announcements_queue_only_the_remainder(self):
-        self.serve("timeout")
-        bridge.announce(CFG, {"channel": "#alpha", "msgid": "srv1"}, "interrupt delivered")
-        [entry] = self.entries()
-        self.assertEqual((entry["as"], self.states(entry)), ("chatbridge", ["uncertain"]))
-
-    def test_a_silent_run_never_queues_a_remainder_either(self):
-        entry = {"channel": "#alpha", "as": "alp-solver-2", "text": "x", "id": "e1",
-                 "parts": [{"kind": "line", "lines": [["x", False]], "text": "x", "state": "uncertain"}]}
-        with mock.patch.object(chatlib, "silence_refusal", lambda account: "a silent run"), \
-                contextlib.redirect_stderr(io.StringIO()):
-            chatlib.outbox_append([entry])
-        self.assertEqual(self.entries(), [])
-
-
-class UndecidedForADayTests(OutboxCase):
-    def test_dead_lettered_after_a_day_with_a_content_free_alert(self):
-        self.queue_long("ok", "ok", "timeout")
-        deliveries = bridge.Deliveries()
-        self.clock.t += bridge.UNDECIDED_MAX - 60
-        self.flush(deliveries=deliveries)
-        self.assertEqual((len(self.entries()), self.dead()), (1, []))
-        self.clock.t += 120
-        self.flush(deliveries=deliveries)
-        self.assertEqual(self.entries(), [])
-        self.assertEqual(len(self.server.published), 3, "never written again without proof of absence")
-        [dead] = self.dead()
-        self.assertEqual([p["state"] for p in dead["parts"]], ["confirmed", "confirmed", "uncertain"])
-        self.assertTrue(dead["parts"][2]["text"] and dead["parts"][2]["written_at"])
-        [push] = [i for i in deliveries.items if i["kind"] == "push"]
-        self.assertNotIn("lorem", push["text"])
-        self.assertIn("alp-solver-2", push["text"])
-
-
-def uncertain_entry(entry_id, text, written_at, *, before=()):
-    """A queued entry whose last part (`text`) was written at `written_at` and never
-    confirmed, after confirmed parts `before`: (text, written_at) pairs."""
-    parts = [{"kind": "line", "lines": [[x, False]], "text": x, "state": "confirmed", "written_at": w}
-             for x, w in before]
-    parts.append({"kind": "line", "lines": [[text, False]], "text": text, "state": "uncertain",
-                  "written_at": written_at})
-    return {"channel": "#alpha", "as": "alp-solver-2", "text": text, "id": entry_id, "at": "t", "parts": parts}
-
-
-class RoundOneTests(OutboxCase):
-    """Review round 1 of #20: evidence is never reused, repeated parts are matched
-    by their own write times, and giving up on an entry survives a crash."""
-
-    def claimed(self, *entries):
-        path = chatlib.STATE_DIR / "outbox.claimed-1.jsonl"
-        path.write_text("".join(json.dumps(e) + "\n" for e in entries))
-
-    def recorded(self, text, at, msgid):
-        self.log_record({"account": "alp-solver-2", "channel": "#alpha", "text": text, "at": at, "msgid": msgid})
-
-    def test_a_msgid_counted_for_a_retired_entry_is_never_counted_again(self):
-        self.claimed(uncertain_entry("e1", "… [status alpha-1] same", T0),
-                     uncertain_entry("e2", "… [status alpha-1] same", T0))
-        self.recorded("… [status alpha-1] same", T0 + 1, "srv1")
-        self.clock.t += 60
+        a = self.attempts()[0]
+        self.assertEqual((a["state"], a["is_ack"]), ("ended", 1))
         self.flush()
-        self.assertEqual([e["id"] for e in self.entries()], ["e2"], "one message retires one entry")
+        self.assertEqual([x["state"] for x in self.attempts()], ["retired", "confirmed"])
+        self.assertEqual(self.entry()["state"], "done")
+        self.assertEqual(len([m for m in self.server.published if m.get("tagmsg")]), 2, "a repeated ack is harmless")
+
+    def test_a_restart_between_the_failure_and_the_retry_changes_nothing(self):
+        self.server.plan = ["timeout"]
+        self.pchat("ack", "#alpha", "m1", account="alp-manager")
+        self.restart_bridge()
+        self.flush()
+        self.assertEqual(self.entry()["state"], "done")
+
+
+class StorageFailureTests(OutboxCase):
+    """Test 1.2: A2 fails after part 1 of 3, through pchat, an agent notice and
+    the bridge's announcement. Nothing is requeued whole, and part 1 is never rewritten."""
+
+    def fail_outcomes(self, times, ops=("outcome",)):
+        real, left = self.authority.handle, [times]
+
+        def handle(request, **kw):
+            if request.get("op") in ops and left[0]:
+                left[0] -= 1
+                return {"v": self.ds.PROTOCOL, "request_id": request.get("request_id"), "result": "error",
+                        "authority_epoch": self.authority.epoch}
+            return real(request, **kw)
+        return mock.patch.object(self.authority, "handle", handle)
+
+    def test_pchat_retries_then_hands_off_the_rest(self):
+        with self.fail_outcomes(1):
+            code, said = self.pchat("post", "#alpha", LONG)
+        self.assertEqual(code, 3, said)
+        self.assertEqual(self.states(), ["confirmed", "unsent", "unsent"])
+        self.flush()
+        self.assertEqual(len(self.server.published), 3)
+        self.assertEqual(len({m["text"] for m in self.server.published}), 3)
+
+    def test_an_outcome_never_recorded_travels_as_an_attested_outcome(self):
+        with self.fail_outcomes(1000):
+            code, said = self.pchat("post", "#alpha", LONG)
+        self.assertEqual(code, 3, said)
+        self.assertEqual(self.fallback_files(), [], "the handoff was acknowledged: no file")
+        self.assertEqual(self.states(), ["confirmed", "unsent", "unsent"], "the attested A2 applied in E3's TX")
+        self.flush()
+        self.assertEqual(len(self.server.published), 3)
+
+    def test_with_the_handoff_unanswered_too_the_fallback_file_carries_the_outcome(self):
+        with self.fail_outcomes(1000, ops=("outcome", "handoff")):
+            code, said = self.pchat("post", "#alpha", LONG)
+        self.assertEqual(code, 3, said)
+        self.assertEqual(len(self.fallback_files()), 1)
+        self.flush()
+        self.assertEqual(self.states()[0], "confirmed", "the attested A2 applied before A8")
+        self.assertEqual(len(self.server.published), 3)
+
+    def test_an_agent_notice_does_the_same(self):
+        with self.fail_outcomes(1), contextlib.redirect_stderr(io.StringIO()):
+            agentcli.notify({"channel": "#alpha", "request": "r-1", "name": "alp-solver-2"}, LONG)
+        self.flush()
+        self.assertEqual(len({m["text"] for m in self.server.published}), len(self.server.published))
+        self.assertEqual(self.entry()["origin"], "notify")
+
+
+class FailureBeforeE1Tests(OutboxCase):
+    """Test 11 (F7) and the ambiguous creation commits: each queues the whole post once."""
+
+    def test_a_failed_login_queues_by_q0_with_no_fallback_file(self):
+        self.server.refuse_login = {"alp-solver-2"}
+        self.assertEqual(self.post("[status] x"), 3)
+        self.assertEqual(self.fallback_files(), [], "an acknowledged Q0 needs no file")
+        e = self.entry()
+        self.assertEqual((e["owner_kind"], e["parts"]), ("outbox", []))
+
+    def test_with_the_authority_unavailable_the_fallback_file_carries_it(self):
+        self.server.refuse_login = {"alp-solver-2"}
+        with self.unavailable():
+            self.assertEqual(self.post("[status] x"), 3)
+        self.assertEqual(len(self.fallback_files()), 1)
+        self.server.refuse_login = set()
+        self.flush()
+        self.assertEqual(len(self.server.published), 1)
+        self.assertEqual(self.fallback_files(), [])
+
+    def test_an_e1_commit_whose_reply_is_lost_is_handed_off_not_duplicated(self):
+        real = self.authority.handle
+
+        def handle(request, **kw):
+            reply = real(request, **kw)
+            if request.get("op") == "create":
+                return None  # landed, but the reply is lost
+            return reply
+        with mock.patch.object(self.authority, "handle", handle):
+            self.assertEqual(self.post("[status] once"), 3)
+        [e] = self.entries()
+        self.assertEqual(e["owner_kind"], "outbox")
+        self.flush()
+        self.assertEqual(len(self.server.published), 1)
+
+    def test_a_q0_commit_whose_reply_is_lost_plus_its_fallback_file_is_one_entry(self):
+        self.server.refuse_login = {"alp-solver-2"}
+        real = self.authority.handle
+
+        def handle(request, **kw):
+            reply = real(request, **kw)
+            return None if request.get("op") == "queue" else reply
+        with mock.patch.object(self.authority, "handle", handle):
+            self.assertEqual(self.post("[status] once"), 3)
+        self.assertEqual(len(self.fallback_files()), 1)
+        self.server.refuse_login = set()
         for _ in range(2):
             self.flush()
-        self.assertEqual([e["id"] for e in self.entries()], ["e2"], "not by the same msgid in a later flush")
-        loader = importlib.machinery.SourceFileLoader("chat_bridge_restarted_r1", str(SCRIPTS / "chat-bridge"))
-        fresh = importlib.util.module_from_spec(importlib.util.spec_from_loader("chat_bridge_restarted_r1", loader))
-        loader.exec_module(fresh)
-        with mock.patch.object(fresh, "_now", self.clock):
-            self.flush(module=fresh)
-        self.assertEqual([e["id"] for e in self.entries()], ["e2"], "nor after a restart")
-        self.assertEqual(self.server.writes, [])
+            self.restart_bridge()
+        self.assertEqual(len(self.entries()), 1)
+        self.assertEqual(len(self.server.published), 1)
 
-    def test_repeated_parts_are_matched_by_their_own_write_times(self):
-        text = "… [status alpha-1] same"
-        self.claimed(uncertain_entry("e1", text, T0 + 60, before=[("first", T0 - 1), (text, T0)]))
-        self.recorded(text, T0, "srv1")
-        self.recorded(text, T0 + 1, "srv2")  # both before the uncertain part was written
-        self.clock.t += 120
+    def test_two_calls_with_identical_text_are_two_entries(self):
+        self.server.refuse_login = {"alp-solver-2"}
+        self.post("[status] same")
+        self.post("[status] same")
+        self.server.refuse_login = set()
         self.flush()
-        self.assertEqual(self.states(), ["confirmed", "confirmed", "uncertain"])
-        self.recorded(text, T0 + 61, "srv3")
-        self.flush()
-        self.assertEqual(self.entries(), [])
+        self.assertEqual(len(self.server.published), 2)
 
-    def test_a_crash_after_dead_lettering_never_makes_the_entry_retryable(self):
-        chatlib.outbox_append([{"channel": "#alpha", "as": "alp-solver-2", "text": LONG, "cont": TAG, "at": "t"}])
-        self.serve("ok", "fail")
-        done = bridge._Claimed.done
-        with mock.patch.object(bridge._Claimed, "done", side_effect=Crash()):
-            with self.assertRaises(Crash):
+
+class PausedWriterTests(OutboxCase):
+    """Test 13: a paused writer is never ended or retried; gone-ness is proved
+    only by a missing pid, a changed start time or a changed boot id."""
+
+    def paused_attempt(self):
+        self.server.plan = ["ok", "crash"]  # stands in for the writer stopping after its A1, mid-part
+        with contextlib.suppress(Crash):
+            self.pchat("post", "#alpha", LONG)
+        self.assertEqual(self.attempts(state="writing")[0]["n"], 1)
+
+    def test_a_paused_writer_is_never_ended_or_retried(self):
+        self.paused_attempt()
+        for _ in range(3):
+            self.clock.advance(600)
+            self.flush()
+        self.assertEqual(len(self.attempts(state="writing")), 1)
+        self.assertEqual(len(self.server.published), 2)
+
+    def test_each_proof_of_a_gone_writer_ends_it_without_finality(self):
+        for how in ("pid", "start", "boot"):
+            with self.subTest(how=how):
+                self.setUp()
+                self.paused_attempt()
+                [a] = self.attempts(state="writing")
+                if how == "pid":
+                    self.probes.world["gone"].add(4242)
+                elif how == "start":
+                    self.probes.world["starts"][4242] = "start-2"
+                else:
+                    self.tx(lambda s: s.con.execute("UPDATE attempts SET writer = replace(writer, 'test-boot',"
+                                                    " 'old-boot')"))
                 self.flush()
-        self.assertEqual(len(self.dead()), 1)
-        writes = len(self.server.writes)
-        self.clock.t += bridge.SETTLE + 60
-        self.covered(T0 - 3600, self.clock.t)  # absence could now be shown: still never resent
-        with mock.patch.object(bridge._Claimed, "done", done):
-            self.flush()
-            self.flush()
-        self.assertEqual((self.entries(), len(self.dead()), len(self.server.writes)), ([], 1, writes))
+                [b] = self.attempts(id=a["id"])
+                self.assertEqual((b["state"], b["end_kind"], b["final_at"]), ("ended", "writer_gone", None))
+                self.tearDown()
 
-    def test_a_refused_part_left_by_a_crash_is_dead_lettered_once(self):
-        entry = uncertain_entry("e1", "second", T0, before=[("first", T0 - 1)])
-        entry["parts"][-1]["state"] = "refused"
-        self.claimed(entry)
+    def test_unreadable_probes_prove_nothing(self):
+        self.paused_attempt()
+        self.probes.world["unreadable"] = True
         self.flush()
+        self.assertEqual(len(self.attempts(state="writing")), 1)
+
+    def test_e7_makes_it_terminal_after_24_hours_but_leaves_it_writing(self):
+        self.paused_attempt()
+        self.clock.advance(self.ds.UNDECIDED_MAX + 60)
         self.flush()
-        self.assertEqual((self.entries(), len(self.dead()), self.server.writes), ([], 1, []))
-        self.assertEqual([p["state"] for p in self.dead()[0]["parts"]], ["confirmed", "refused"])
+        self.assertEqual(self.entry()["state"], "terminal")
+        self.assertEqual(len(self.attempts(state="writing")), 1)
 
-    def test_a_day_undecided_crash_before_retiring_alerts_once_and_dead_letters_once(self):
-        self.claimed(uncertain_entry("e1", "only", T0))
-        self.clock.t += bridge.UNDECIDED_MAX + 60
-        deliveries = bridge.Deliveries()
-        with mock.patch.object(bridge._Claimed, "done", side_effect=Crash()):
-            with self.assertRaises(Crash):
-                self.flush(deliveries=deliveries)
-        self.flush(deliveries=deliveries)
-        self.assertEqual((self.entries(), len(self.dead())), ([], 1))
-        self.assertEqual(len([i for i in deliveries.items if i["kind"] == "push"]), 1)
 
-    def test_first_part_refusals_are_terminal_for_agent_notices_and_announcements(self):
-        self.serve("fail")
-        with mock.patch.object(agentcli.runstore, "silent_refusal", lambda *a: None):
-            agentcli.notify({"channel": "#alpha", "name": "alp-solver-2", "request": "alpha-20261009-1"}, "short")
-        self.serve("fail")
-        bridge.announce(CFG, {"channel": "#alpha", "msgid": "srv1"}, "interrupt delivered")
-        self.assertEqual(self.entries(), [])
-        self.assertEqual([[p["state"] for p in d["parts"]] for d in self.dead()], [["refused"], ["refused"]])
-        writes = len(self.server.writes)
+class LateOutcomeTests(OutboxCase):
+    """Test 10 (F6): a paused writer resumes after E7's export: version 2 supersedes version 1."""
+
+    def test_a_late_outcome_exports_a_superseding_version(self):
+        self.server.plan = ["ok", "ok", "timeout"]
+        self.pchat("post", "#alpha", LONG)
+        e = self.entry()
+        [a] = self.attempts(n=2)
+        self.tx(lambda s: s.con.execute("UPDATE attempts SET state = 'writing', end_kind = NULL, ended_at = NULL"
+                                        " WHERE id = ?", (a["id"],)))  # as if its A5 had not landed: paused
+        self.tx(lambda s: s.con.execute("UPDATE parts SET state = 'inflight' WHERE entry_id = ? AND n = 2",
+                                        (e["id"],)))
+        self.clock.advance(self.ds.UNDECIDED_MAX + 60)
         self.flush()
-        self.assertEqual(len(self.server.writes), writes, "nothing is sent again")
-
-
-class RoundTwoTests(OutboxCase):
-    """Review round 2 of #20: no error reply confirms a part, and a refusal outranks channel recreation."""
-
-    def test_an_error_reply_outside_the_known_three_is_not_confirmation(self):
-        self.serve("ok", "error")
-        with self.assertRaises(chatlib.PostIncomplete) as err:
-            chatlib.post("#alpha", LONG, "alp-solver-2", CFG, cont=TAG)
-        self.assertEqual([p["state"] for p in err.exception.parts], ["confirmed", "uncertain", "unsent"])
-
-    def test_a_refusal_with_no_such_channel_is_never_retried(self):
-        self.serve("403-and-fail")
-        with self.assertRaises(chatlib.Refused) as err:
-            chatlib.post("#alpha", "[status alpha-1] short", "alp-solver-2", CFG)
-        self.assertEqual([p["state"] for p in err.exception.parts], ["refused"])
-        self.assertEqual(sum(1 for w in self.server.writes if " PRIVMSG " in w), 1, "written once, not again")
-
-
-class RoundThreeTests(OutboxCase):
-    """Review round 3 of #20: a part the server confirmed keeps its message
-    reserved, pending or retired, so it never confirms another entry's part."""
-
-    def two_identical(self):
-        chatlib.outbox_append([{"channel": "#alpha", "as": "alp-solver-2", "text": "[status alpha-1] same", "at": "t"},
-                               {"channel": "#alpha", "as": "alp-solver-2", "text": "[status alpha-1] same", "at": "t"}])
-        self.serve("ok", "write-error")  # the first is confirmed; the second is written but never committed
+        self.assertEqual([d["version"] for d in self.dead_letters()], [1])
+        writer = __import__("json").loads(a["writer"])
+        self.tx(lambda s: s.outcome(e["id"], 2, a["generation"], a["a1_nonce"], writer, "confirmed", T0 + 5))
         self.flush()
-        self.assertEqual(len(self.server.published), 1)
-        self.assertEqual(self.states(), ["uncertain"])
-        self.log_record(self.server.published[0])  # only the first entry's message is in the record
-        self.clock.t += 30
+        versions = [(d["version"], d["supersedes"]) for d in self.dead_letters()]
+        self.assertEqual(versions, [(1, None), (2, 1)])
+        self.assertEqual(self.entry()["state"], "terminal", "it never becomes retryable")
 
-    def test_one_message_never_satisfies_two_entries_across_flushes_and_a_restart(self):
-        self.two_identical()
-        for _ in range(2):
-            self.flush()
-        self.assertEqual(self.states(), ["uncertain"], "the first entry's message is not the second's")
-        loader = importlib.machinery.SourceFileLoader("chat_bridge_restarted_r3", str(SCRIPTS / "chat-bridge"))
-        fresh = importlib.util.module_from_spec(importlib.util.spec_from_loader("chat_bridge_restarted_r3", loader))
-        loader.exec_module(fresh)
-        with mock.patch.object(fresh, "_now", self.clock):
-            self.flush(module=fresh)
-        self.assertEqual(self.states(), ["uncertain"], "nor after a restart")
-        self.assertEqual(len(self.server.published), 1)
 
-    def test_the_second_is_sent_once_when_the_complete_record_shows_it_never_arrived(self):
-        self.two_identical()
-        self.clock.t += bridge.SETTLE + 60
-        self.covered(T0 - 3600, self.clock.t)
+class SameFlushTests(OutboxCase):
+    """Test 1.1 (round-5 finding 1): a confirmed part and an uncertain part of one
+    text, and another entry's delivered part of that text: one flush resolves them
+    all, from current state, with no resend."""
+
+    def test_one_flush_resolves_every_obligation_of_a_text(self):
+        self.designate("alp-solver-2", T0 - 60)
+        text = "[status] same words"
+        self.server.plan = ["ok"]
+        self.post(text)                                  # A: confirmed, msgid unknown
+        self.server.plan = ["timeout"]
+        with self.as_process(OTHER_PID):
+            self.post(text)                              # B: committed, then uncertain
+        for m in self.server.published:
+            self.see(m)
         self.flush()
+        self.assertEqual(len(self.server.published), 2)
+        self.assertTrue(all(e["state"] == "done" for e in self.entries()))
+        self.assertEqual(len(self.sql("SELECT * FROM attributions")), 2, "each message counted once")
+
+
+class DirectPostDuringFlushTests(OutboxCase):
+    """Test 1.3 (round-5 finding 3, section 5.6 case 1)."""
+
+    def test_a_direct_posts_message_never_satisfies_an_older_part_too(self):
+        text = "[status] build green"
+        self.server.plan = ["error"]  # U: ended with finality, never published
+        self.post(text)
+        self.server.published.clear()
+        self.cover(T0 - 3600, T0 + 3600)
+        self.clock.advance(1)
+        # D: the same text posted directly; its A1 commits and its message is indexed while it awaits the PONG
+        d_entry = "d" * 32
+        writer = self.probes.view(OTHER_PID).identity("127.0.0.1:1>127.0.0.1:6667")
+        self.tx(lambda s: s.create(d_entry, {"channel": "#alpha", "as": "alp-solver-2", "text": text},
+                                   [{"kind": "multiline", "lines": [[text, False]], "text": text}], writer, "post"))
+        status, att = self.tx(lambda s: s.attempt(d_entry, 0, 0, "nd", writer))
+        self.see({"msgid": "srv-d", "channel": "#alpha", "account": "alp-solver-2", "text": text,
+                  "at": self.clock() + 1})
         self.flush()
-        self.assertEqual(self.entries(), [])
-        self.assertEqual(len(self.server.published), 2, "one message per entry, no more")
-
-    def test_a_pending_confirmed_part_also_keeps_its_message(self):
-        """The first entry is still owed (a later part failed), its confirmed part has no msgid."""
-        same = "… [status alpha-1] same"
-        first = uncertain_entry("e1", "tail", T0 + 1, before=[(same, T0)])
-        first["parts"][0]["confirmed_at"] = T0 + 0.5
-        second = uncertain_entry("e2", same, T0 + 2)
-        (chatlib.STATE_DIR / "outbox.claimed-1.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
-        self.log_record({"account": "alp-solver-2", "channel": "#alpha", "text": same, "at": T0 + 0.2, "msgid": "srv1"})
-        self.clock.t += 30
+        u = [e for e in self.entries() if e["id"] != d_entry][0]
+        self.assertEqual(u["parts"][0]["state"], "uncertain", "R2 cannot rule U absent while D is writing")
+        self.tx(lambda s: s.outcome(d_entry, 0, att["generation"], "nd", writer, "confirmed", self.clock() + 2))
+        self.cover(T0 - 3600, T0 + 7200)
         self.flush()
-        self.assertEqual(self.states(self.entries()[1]), ["uncertain"])
+        u = [e for e in self.entries() if e["id"] != d_entry][0]
+        self.assertEqual(u["state"], "done")
+        self.assertEqual(len(self.server.published), 1, "U was resent once; D's message counted for D only")
 
 
-class RoundFourTests(OutboxCase):
-    """Review round 4 of #20: every confirmed part keeps its message whoever
-    posted it, once per part, and absence needs the record over every window."""
-    S = "[status alpha-1] same"
+class OutageTests(OutboxCase):
+    """Test 1.4: a 26-hour outage keeps the evidence an unresolved attempt needs."""
 
-    def confirmed_entry(self, entry_id, at, *, key=None, tail=None):
-        part = {"kind": "line", "lines": [[self.S, False]], "text": self.S, "state": "confirmed",
-                "written_at": at, "confirmed_at": at + 0.5}
-        if key:
-            part["key"] = key
-        entry = {"channel": "#alpha", "as": "alp-solver-2", "text": self.S, "id": entry_id, "at": "t", "parts": [part]}
-        if tail:
-            entry["parts"].append({"kind": "line", "lines": [[tail, False]], "text": tail, "state": "uncertain",
-                                   "written_at": at + 1})
-        return entry
+    def test_evidence_survives_a_26_hour_outage(self):
+        self.server.plan = ["ok", "ok", "timeout"]
+        self.pchat("post", "#alpha", LONG)
+        for m in self.server.published:
+            self.see(m)
+        self.clock.advance(26 * 3600)
+        self.tx(lambda s: s.collect())
+        self.assertEqual(len(self.sql("SELECT * FROM messages")), 3)
 
-    def claimed(self, *entries):
-        (chatlib.STATE_DIR / "outbox.claimed-1.jsonl").write_text("".join(json.dumps(e) + "\n" for e in entries))
 
-    def recorded(self, at, msgid, text=None):
-        self.log_record({"account": "alp-solver-2", "channel": "#alpha", "text": text or self.S, "at": at,
-                         "msgid": msgid})
+class UntrackedSubstitutionTests(OutboxCase):
+    """Test 2: an identical untracked message."""
 
-    def test_an_entry_retired_earlier_in_the_same_flush_keeps_its_message(self):
-        self.claimed(self.confirmed_entry("a", T0), uncertain_entry("b", self.S, T0 + 2))
-        self.recorded(T0 + 0.2, "srv1")
-        self.clock.t += 30
+    def test_undesignated_it_leaves_the_part_unknown_until_its_dead_letter(self):
+        self.server.plan = ["timeout"]
+        self.post("[status] ping")
+        self.server.published.clear()
+        self.see({"msgid": "untracked", "channel": "#alpha", "account": "alp-solver-2", "text": "[status] ping",
+                  "at": T0 + 1})
         self.flush()
-        self.assertEqual([e["id"] for e in self.entries()], ["b"])
         self.assertEqual(self.states(), ["uncertain"])
 
-    def test_a_part_both_reserved_and_pending_after_a_crash_counts_once(self):
-        a = self.confirmed_entry("a", T0, key="k-a", tail="… other")
-        chatlib.reserve("#alpha", "alp-solver-2", a["parts"][0])  # appended before the crash removed nothing
-        self.claimed(a, uncertain_entry("b", self.S, T0 + 2))
-        self.recorded(T0 + 0.2, "srv1")
-        self.recorded(T0 + 2.2, "srv2")  # b's message is there too
-        self.clock.t += bridge.SETTLE + 60
-        self.covered(T0 - 3600, self.clock.t)
-        self.flush()
-        self.assertNotIn("b", [e["id"] for e in self.entries()], "b is delivered")
-        self.assertNotIn(self.S, self.server.texts(), "and never judged absent and resent")
-
-    def test_absence_needs_the_record_over_a_later_obligation_too(self):
-        self.claimed(uncertain_entry("b", self.S, T0))
-        later = {"key": "k-later", "kind": "line", "lines": [[self.S, False]], "text": self.S,
-                 "state": "confirmed", "written_at": T0 + 1000, "confirmed_at": T0 + 1000.5}
-        chatlib.reserve("#alpha", "alp-solver-2", later)  # its message isn't logged
-        self.recorded(T0 + 0.2, "srv1")  # b's own message
-        self.clock.t += 1200
-        self.covered(T0 - 3600, T0 + 900)  # complete, but not through the later obligation's window
-        self.flush()
-        self.assertEqual(self.server.writes, [], "never judged absent and resent")
-        self.assertEqual(self.states(), ["uncertain"])
-
-    def test_a_direct_post_keeps_its_message_from_an_identical_queued_one(self):
-        self.serve("ok")
-        self.assertEqual(self.pchat_post("#alpha", self.S)[0], 0)
-        first = self.server.published[0]
-        self.clock.t += 1
-        self.serve("write-error")  # the identical second post is written but never committed
-        self.assertEqual(self.pchat_post("#alpha", self.S)[0], 3)
-        self.log_record(first)
-        self.clock.t += 30
-        self.flush()
-        self.assertEqual(self.states(), ["uncertain"], "the first post's message is not the second's")
-        self.clock.t += bridge.SETTLE
-        self.covered(T0 - 3600, self.clock.t)
-        self.flush()
-        self.assertEqual((self.entries(), len(self.server.published)), ([], 2))
-
-    def test_a_dead_lettered_confirmed_part_keeps_its_message(self):
-        self.serve("ok", "fail")
-        self.assertEqual(self.pchat_post("#alpha", LONG)[0], 2)
-        [dead] = self.dead()
-        reserved = [json.loads(line) for line in (chatlib.STATE_DIR / chatlib.RESERVED_NAME).read_text().splitlines()]
-        self.assertEqual([r["key"] for r in reserved], [dead["parts"][0]["key"]])
-
-
-class CoverageTests(unittest.TestCase):
-    """The record is complete over an interval only through a finished catch-up and a sync."""
-
-    def setUp(self):
-        reset_state()
-        cfgfile = Path(_isolation.CHAT_STATE) / "config.json"
-        cfgfile.write_text("{}")
-        orig = bridge.HistoryPager
-        self.patches = [mock.patch.object(chatlib, "CONFIG_PATH", cfgfile),
-                        mock.patch.object(bridge, "HISTORY_PAGE", 2),
-                        mock.patch.object(bridge, "HistoryPager", lambda: orig(page=2))]
-        for p in self.patches:
-            p.start()
-        self.state = (bridge.Record(), bridge.Deliveries(), bridge.Acks(), bridge.Checkpoints())
-        self.coverage = bridge.Coverage()
-        from test_bridge import privmsg
-        self.privmsg = privmsg
-        bridge.handle(privmsg("pat", "before", "m0", channel="#alpha", t="2026-10-09T09:00:00Z"),
-                      CFG, *self.state[:3])
-
-    def tearDown(self):
-        for p in self.patches:
-            p.stop()
-
-    def connect(self, script):
-        from test_bridge import FakeServer as ScriptedServer
-        server = ScriptedServer(script)
-        with mock.patch.object(chatlib, "login", lambda *a, **k: server):
-            with self.assertRaises(chatlib.ChatError):
-                bridge.run(CFG, *self.state, self.coverage)
-
-    def test_interrupted_page_establishes_nothing_and_a_finished_one_does(self):
-        from test_bridge import batch, in_batch, join
-        self.connect([join("#alpha"), batch("b1", "#alpha"),
-                      in_batch("b1", self.privmsg("pat", "gap 1", "m1", channel="#alpha", t="2026-10-09T10:00:00Z")),
-                      in_batch("b1", self.privmsg("pat", "gap 2", "m2", channel="#alpha", t="2026-10-09T10:01:00Z")),
-                      batch("b1", None)])  # a full page, then the connection drops
-        self.coverage.sync(T0)
-        self.assertFalse(self.coverage.covers("#alpha", 0, 0))
-        self.connect([join("#alpha"), batch("b2", "#alpha"), batch("b2", None)])  # finished
-        since = self.coverage.spans["#alpha"]["since"]
-        self.assertIsNone(self.coverage.spans["#alpha"]["through"], "complete, but not through any time yet")
-        self.coverage.sync(since + 100)
-        self.assertTrue(self.coverage.covers("#alpha", since, since + 100))
-        self.assertFalse(self.coverage.covers("#alpha", since - 1, since + 100))
-
-    def test_losing_the_channel_stops_the_interval_until_a_catch_up_after_rejoining(self):
-        from test_bridge import batch, join
-        kick = {"tags": {}, "prefix": "op!u@h", "command": "KICK", "params": ["#alpha", "chatbridge", "out"]}
-        live = self.privmsg("pat", "live", "m5", channel="#alpha", t="2026-10-09T11:00:00Z")
-        sent = []
-        from test_bridge import FakeServer as ScriptedServer
-        server = ScriptedServer([join("#alpha"), batch("b1", "#alpha"), batch("b1", None), live, kick, join("#alpha")])
-        with mock.patch.object(chatlib, "login", lambda *a, **k: server):
-            with self.assertRaises(chatlib.ChatError):
-                bridge.run(CFG, *self.state, self.coverage)
-        sent = [line for line in server.sent if line.startswith("CHATHISTORY")]
-        self.assertEqual(sent[-1], "CHATHISTORY AFTER #alpha msgid=m5 2", "the gap is caught up after rejoining")
-        since = self.coverage.spans["#alpha"]["since"]
-        self.coverage.sync(since + 700)  # a sync while out of the channel, or before the catch-up ends
-        self.assertIsNone(self.coverage.spans["#alpha"]["through"])
-        self.assertFalse(self.coverage.covers("#alpha", since, since + 700))
-
-    def test_a_catch_up_open_when_the_channel_is_lost_completes_nothing(self):
-        from test_bridge import batch, join
-        kick = {"tags": {}, "prefix": "op!u@h", "command": "KICK", "params": ["#alpha", "chatbridge", "out"]}
-        self.connect([join("#alpha"), batch("b1", "#alpha"), batch("b1", None)])  # complete, from a real checkpoint
-        since = self.coverage.spans["#alpha"]["since"]
-        self.coverage.sync(since + 10)
-        self.connect([join("#alpha"), batch("b2", "#alpha"), kick, batch("b2", None)])  # lost mid catch-up
-        self.assertNotIn("#alpha", self.coverage.live)
-        self.coverage.sync(since + 2000)
-        self.assertFalse(self.coverage.covers("#alpha", since, since + 2000))
-        # A part committed after the kick, so missing from the record, is not judged absent and resent.
-        entry = uncertain_entry("e1", "committed while out", since + 100)
-        (chatlib.STATE_DIR / "outbox.claimed-1.jsonl").write_text(json.dumps(entry) + "\n")
-        writes = []
-        with mock.patch.object(chatlib, "login", lambda *a, **k: writes.append(a) or None):
-            bridge.flush_outbox(CFG, coverage=self.coverage)
-        self.assertEqual(writes, [])
-        [left] = [json.loads(line) for line in (chatlib.STATE_DIR / "outbox.claimed-1.jsonl").read_text().splitlines()]
-        self.assertEqual([p["state"] for p in left["parts"]], ["uncertain"])
-
-    def test_a_history_reply_that_opens_after_the_channel_is_lost_completes_nothing(self):
-        from test_bridge import batch, join
-        kick = {"tags": {}, "prefix": "op!u@h", "command": "KICK", "params": ["#alpha", "chatbridge", "out"]}
-        self.connect([join("#alpha"), batch("b1", "#alpha"), batch("b1", None)])
-        since = self.coverage.spans["#alpha"]["since"]
-        self.coverage.sync(since + 10)
-        self.connect([join("#alpha"), kick, batch("b2", "#alpha"), batch("b2", None)])  # asked before, answered after
-        self.assertNotIn("#alpha", self.coverage.live)
-        self.coverage.sync(since + 2000)
-        self.assertFalse(self.coverage.covers("#alpha", since, since + 2000))
-        entry = uncertain_entry("e1", "committed while out", since + 100)
-        (chatlib.STATE_DIR / "outbox.claimed-1.jsonl").write_text(json.dumps(entry) + "\n")
-        writes = []
-        with mock.patch.object(chatlib, "login", lambda *a, **k: writes.append(a) or None):
-            bridge.flush_outbox(CFG, coverage=self.coverage)
-        self.assertEqual(writes, [])
-        # Rejoining asks again; only that newer reply completes the channel.
-        self.connect([join("#alpha"), kick, batch("b3", "#alpha"), batch("b3", None),
-                      join("#alpha"), batch("b4", "#alpha"), batch("b4", None)])
-        self.assertIn("#alpha", self.coverage.live)
-
-    def test_a_resumed_catch_up_keeps_the_interval_and_a_seeded_one_does_not(self):
-        from test_bridge import batch, join
-        self.connect([join("#alpha"), batch("b1", "#alpha"), batch("b1", None)])
-        since = self.coverage.spans["#alpha"]["since"]
-        self.coverage.sync(since + 10)
-        self.connect([join("#alpha"), batch("b2", "#alpha"), batch("b2", None)])  # from the same checkpoint
-        self.assertEqual(self.coverage.spans["#alpha"]["since"], since)
-        bridge.CHECKPOINTS.unlink()  # lost: the next catch-up starts from a seeded checkpoint
-        self.coverage.spans["#alpha"]["mark"] = "msgid=elsewhere"
-        self.state = (*self.state[:3], bridge.Checkpoints())
-        self.connect([join("#alpha"), batch("b3", "#alpha"), batch("b3", None)])
-        self.assertGreaterEqual(self.coverage.spans["#alpha"]["since"], since)
-        self.assertIsNone(self.coverage.spans["#alpha"]["through"])
+    def test_designated_an_unexplained_message_suspends_once_with_one_alert(self):
+        self.designate("alp-solver-2", T0 - 60)
+        for i in range(2):
+            self.see({"msgid": f"x{i}", "channel": "#alpha", "account": "alp-solver-2", "text": f"stray {i}",
+                      "at": T0 + i})
+        [acct] = self.sql("SELECT * FROM accounts")
+        self.assertIsNotNone(acct["suspended_at"])
+        self.assertEqual([a["alert_key"] for a in self.alerts()], ["suspended:alp-solver-2:1"])
 
 
 if __name__ == "__main__":
