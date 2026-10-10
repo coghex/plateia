@@ -1972,7 +1972,9 @@ class Authority:
                 self._flush(peer)
 
     def _accept(self):
-        while True:
+        """At most CONN_MAX connections per turn, rejected ones included: a flood
+        of them never keeps the turn from its job, its request and its expiries."""
+        for _ in range(CONN_MAX):
             try:
                 sock, _ = self.listener.accept()
             except (BlockingIOError, InterruptedError):
@@ -2156,6 +2158,7 @@ class Importer:
         self.log = log
         self.pass_names = None  # the names the current import pass listed when it began
         self.kept = []  # fallback files kept after a failure, least recently tried first
+        self.staging_after = None  # the last tmp/ name the previous cleanup examined
 
     def _sha(self, data):
         return hashlib.sha256(data).hexdigest()
@@ -2252,8 +2255,14 @@ class Importer:
 
     def clean_staging(self):
         """A tmp/ file is removed only once its writer is gone, or once published.
-        A writer identity its name does not fully carry is unknown, never gone."""
-        for name in self._listdir(self.paths.staging) or []:
+        A writer identity its name does not fully carry is unknown, never gone.
+        At most IMPORT_MAX files per flush, in rotation, so every one is reached."""
+        names = sorted(self._listdir(self.paths.staging) or [])
+        if self.staging_after is not None:
+            names = [n for n in names if n > self.staging_after] + [n for n in names if n <= self.staging_after]
+        batch = names[:IMPORT_MAX]
+        self.staging_after = batch[-1] if len(names) > IMPORT_MAX else None
+        for name in batch:
             try:
                 self._clean_one(name)
             except Exception as err:  # cleanup only: tried again at the next flush
@@ -2309,10 +2318,11 @@ class Importer:
         return dict(row) if row is not None else {}
 
     def import_legacy(self, claims, barrier_at=None):
-        """I2 for each open claim, at most LINES_MAX lines per request; with
-        `barrier_at` (an outbox.lock acquisition after the claim was first
-        recorded), the final read and I3. A claim that fails is kept, with an
-        alert, and the next one proceeds."""
+        """I2 for each open claim: one request of at most LINES_MAX lines per
+        claim per call, so a large claim never holds the flush (the rest is read
+        at the next one); with `barrier_at` (an outbox.lock acquisition after the
+        claim was first recorded), the final read and I3. A claim that fails is
+        kept, with an alert, and the next one proceeds."""
         for name in claims:
             try:
                 if self._import_claim(name, barrier_at) is CANCELLED:
@@ -2322,54 +2332,51 @@ class Importer:
 
     def _import_claim(self, name, barrier_at):
         path = self.paths.state / name
-        while True:
+        try:
+            data = self.fs.read(path)
+        except FileNotFoundError:
+            return None
+        row = self._import_row(name)
+        if row is None:
+            return CANCELLED
+        if row.get("state") == "closed":
             try:
-                data = self.fs.read(path)
-            except FileNotFoundError:
-                return None
-            row = self._import_row(name)
-            if row is None:
-                return CANCELLED
-            if row.get("state") == "closed":
-                try:
-                    self.fs.unlink(path)  # I3's unlink, replayed
-                    self.fs.sync_dir(self.paths.state)
-                except OSError as err:
-                    self.log(f"outbox: {name} retired but not removed ({err!r:.80})")
-                return None
-            offset, ordinal = row.get("offset", 0), row.get("lines", 0)
-            if row and self._sha(data[:offset]) != row.get("sha256"):
-                self.authority.run_tx(lambda s: s.hold_changed(name, self._sha(data)))
-                return None  # rewritten by something outside this design: held, never unlinked
-            tail = data[offset:]
-            cut = tail.rfind(b"\n") + 1
-            complete = tail[:cut].split(b"\n")[:-1] if cut else []
-            take = complete[:LINES_MAX]
-            new_offset = offset + sum(len(x) + 1 for x in take)
-            final = (barrier_at is not None and row.get("first_seen") is not None
-                     and row["first_seen"] < barrier_at and len(take) == len(complete))
-            lines = [x.decode(errors="replace") for x in take]
-            if final and tail[cut:]:
-                lines.append(tail[cut:].decode(errors="replace"))  # an unterminated last line: held
-                new_offset = len(data)
-            if not lines and not final:
-                if not row:
-                    self.authority.run_tx(lambda s: s.import_legacy(name, 0, [], 0, self._sha(b"")))
-                return None
+                self.fs.unlink(path)  # I3's unlink, replayed
+                self.fs.sync_dir(self.paths.state)
+            except OSError as err:
+                self.log(f"outbox: {name} retired but not removed ({err!r:.80})")
+            return None
+        offset, ordinal = row.get("offset", 0), row.get("lines", 0)
+        if row and self._sha(data[:offset]) != row.get("sha256"):
+            self.authority.run_tx(lambda s: s.hold_changed(name, self._sha(data)))
+            return None  # rewritten by something outside this design: held, never unlinked
+        tail = data[offset:]
+        cut = tail.rfind(b"\n") + 1
+        complete = tail[:cut].split(b"\n")[:-1] if cut else []
+        take = complete[:LINES_MAX]
+        new_offset = offset + sum(len(x) + 1 for x in take)
+        final = (barrier_at is not None and row.get("first_seen") is not None
+                 and row["first_seen"] < barrier_at and len(take) == len(complete))
+        lines = [x.decode(errors="replace") for x in take]
+        if final and tail[cut:]:
+            lines.append(tail[cut:].decode(errors="replace"))  # an unterminated last line: held
+            new_offset = len(data)
+        if not lines and not final:
+            if not row:
+                self.authority.run_tx(lambda s: s.import_legacy(name, 0, [], 0, self._sha(b"")))
+            return None
+        try:
+            n = self.authority.run_tx(lambda s, lines=lines, new_offset=new_offset, final=final:
+                                      s.import_legacy(name, ordinal, lines, new_offset,
+                                                      self._sha(data[:new_offset]), close=final))
+        except Conflict:
+            return None
+        if n is CANCELLED:
+            return CANCELLED
+        if final:
             try:
-                n = self.authority.run_tx(lambda s, lines=lines, new_offset=new_offset, final=final:
-                                          s.import_legacy(name, ordinal, lines, new_offset,
-                                                          self._sha(data[:new_offset]), close=final))
-            except Conflict:
-                return None
-            if n is CANCELLED:
-                return CANCELLED
-            if final:
-                try:
-                    self.fs.unlink(path)
-                    self.fs.sync_dir(self.paths.state)
-                except OSError as err:  # closed: the next flush removes it
-                    self.log(f"outbox: {name} retired but not removed ({err!r:.80})")
-                return None
-            if len(take) == len(complete):
-                return None
+                self.fs.unlink(path)
+                self.fs.sync_dir(self.paths.state)
+            except OSError as err:  # closed: the next flush removes it
+                self.log(f"outbox: {name} retired but not removed ({err!r:.80})")
+        return None  # one batch per claim per call: the rest at the next

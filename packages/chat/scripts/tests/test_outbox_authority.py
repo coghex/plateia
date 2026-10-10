@@ -5,6 +5,7 @@ socketpair connects nothing. Peer credentials, processes and clocks are faked.
 Invented data only."""
 import json
 import os
+import selectors
 import socket
 import sqlite3
 import struct
@@ -295,6 +296,54 @@ class TransactionFailureTests(AuthorityCase):
             self.authority.store.con = real
         self.assertEqual((first["result"], second["result"]), ("error", "ok"))
         self.assertEqual([e["id"] for e in self.entries()], ["f" * 32])
+
+
+class AcceptFloodTests(AuthorityCase):
+    """Code review slot 5, finding 2 (re-check: unbounded drains): one turn
+    accepts at most CONN_MAX connections, rejected ones included, through the
+    listening socket, so a flood never stops the turn's in-process job, its
+    client request or its expiry checks."""
+
+    def test_a_connection_flood_never_stops_a_turn(self):
+        ready_r, ready_w = socket.socketpair()
+        ready_w.send(b"x")  # the listener always looks readable
+        self.addCleanup(ready_r.close)
+        self.addCleanup(ready_w.close)
+        accepted = []
+
+        class Flood:
+            def fileno(self):
+                return ready_r.fileno()
+
+            def accept(self):
+                if len(accepted) >= 10000:
+                    raise AssertionError("the accept loop never returned to its turn")
+                mine, theirs = socket.socketpair()
+                theirs.close()  # a client that connects and goes: nothing to read but EOF
+                accepted.append(1)
+                return mine, None
+
+            def close(self):
+                pass
+        a = self.authority
+        a.sel = a.sel or selectors.DefaultSelector()
+        c = self.conn()
+        c.send(self.create("a" * 32))
+        a.listener = Flood()
+        a.sel.register(a.listener, selectors.EVENT_READ, "listen")
+        self.addCleanup(lambda: setattr(a, "listener", None))
+        job = self.ds._Job(lambda s: s.status())
+        a.jobs.append(job)
+        a.serve_once(0)
+        self.assertLessEqual(len(accepted), self.ds.CONN_MAX, "at most CONN_MAX accepts in one turn")
+        self.assertEqual(job.state, "done", "the in-process job still ran this turn")
+        reply = c.reply()
+        self.assertEqual(reply["result"], "ok", "the client request is still answered")
+        stale = list(a.peers.values())
+        self.clock.advance(self.ds.REQ_WAIT + 1)
+        a.serve_once(0)
+        self.assertFalse(any(p in a.peers.values() for p in stale), "expiry checks still run")
+        a.sel.unregister(a.listener)
 
 
 class LockFailureTests(AuthorityCase):

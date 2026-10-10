@@ -606,6 +606,8 @@ class _Call:
                     err.parts = _part_states(self.parts)
                     raise err
                 if outcome == "rejected" and "403" in (detail or "") and round_ == 0 and not self.joined:
+                    if self.conn is None:  # a record retry closed it: never reused; the rest is handed off
+                        self.handoff(f"part {n + 1}: no such channel, and the connection is closed")
                     try:  # no such channel: nothing was accepted, and A4 is committed; create it, then resend
                         ensure_channel(self.conn, channel, wait=delivery_store.CHANNEL_WAIT)
                     except (OSError, ChatError) as err:

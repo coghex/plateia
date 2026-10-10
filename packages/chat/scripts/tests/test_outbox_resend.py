@@ -584,6 +584,34 @@ class HostProbeTests(unittest.TestCase):
             self.assertEqual(ds._process_start(4194305), "Sat Oct 10 10:00:00 2026")
 
 
+class ClosedConnectionTests(OutboxCase):
+    """Code review slot 5, finding 1 (re-check: closed connections): a 403 whose
+    outcome was recorded only on a retry, after the first reply was lost and
+    the connection closed, hands the remainder off durably; it never uses the
+    closed connection to recreate the channel. The bridge delivers it once."""
+
+    def test_a_403_recorded_only_on_a_retry_is_handed_off_and_delivered_once(self):
+        real, lost = self.ds.Client.call, []
+
+        def call(client, op, writer, **args):
+            reply = real(client, op, writer, **args)
+            if op == "outcome" and not lost:
+                lost.append(reply)  # committed, but its reply never arrives
+                return None
+            return reply
+        self.server.plan = ["403"]
+        with mock.patch.object(self.ds.Client, "call", call):
+            code, out = self.pchat("post", "#alpha", "[status] once")
+        self.assertEqual(code, 3, out)
+        self.assertEqual(self.states(), ["unsent"])
+        self.assertEqual(self.entry()["owner_kind"], "outbox", "handed off durably")
+        self.assertEqual(self.server.texts(), [], "nothing was accepted on the 403")
+        self.flush()
+        self.flush()
+        self.assertEqual([t.split(" (delayed")[0] for t in self.server.texts()], ["[status] once"], "delivered once")
+        self.assertEqual(self.states(), ["confirmed"])
+
+
 class LateOutcomeTests(OutboxCase):
     """Test 10 (F6): a paused writer resumes after E7's export: version 2 supersedes version 1."""
 

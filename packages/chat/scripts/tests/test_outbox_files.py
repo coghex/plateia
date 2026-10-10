@@ -594,6 +594,33 @@ class ListingFailureTests(FilesCase):
         self.assertEqual(self.epoch(), before + 1, "the pass completes once the directory can be listed")
 
 
+class BoundedDrainTests(FilesCase):
+    """Code review slot 5's re-check (unbounded drains): staging cleanup and the
+    legacy import are bounded per flush and rotate, so neither can keep a flush
+    from the rest of its work however much is waiting; all of it is done in time."""
+
+    def test_staging_cleanup_is_bounded_per_flush_and_reaches_every_file(self):
+        staging = self.state / "outbox.d" / "tmp"
+        for i in range(5):
+            (staging / f"test-boot.{CLIENT_PID}.start-1.{i:04x}.tmp").write_bytes(b"{}")
+        self.probes.world["gone"].add(CLIENT_PID)
+        left = []
+        with mock.patch.object(self.ds, "IMPORT_MAX", 2):
+            for _ in range(3):
+                self.importer.clean_staging()
+                left.append(len(list(staging.iterdir())))
+        self.assertEqual(left, [3, 1, 0])
+
+    def test_a_large_claim_is_imported_one_bounded_batch_per_flush(self):
+        self.legacy(*[self.row(f"[status] row {i}") for i in range(5)], name="outbox.claimed-1-a.jsonl")
+        counts = []
+        with mock.patch.object(self.ds, "LINES_MAX", 2):
+            for _ in range(3):
+                self.importer.import_legacy(self.importer.claim_list())
+                counts.append(len(self.entries()))
+        self.assertEqual(counts, [2, 4, 5])
+
+
 class StagingIdentityTests(FilesCase):
     """Self-audit, classes A and C: a staging file whose writer identity in its
     name is incomplete or odd is kept while its pid lives, and never stops the flush."""
@@ -745,7 +772,8 @@ class ImportBoundaryTests(FilesCase):
         rows = [self.row(f"[status] {i}") for i in range(5)]
         self.legacy(*rows, name="outbox.claimed-7-x.jsonl")
         with mock.patch.object(self.ds, "LINES_MAX", 2):
-            self.importer.import_legacy(["outbox.claimed-7-x.jsonl"])
+            for _ in range(3):  # one bounded request per call (slot 5's re-check): 2, 2, then 1 line
+                self.importer.import_legacy(["outbox.claimed-7-x.jsonl"])
         once = sorted(e["id"] for e in self.entries())
         self.assertEqual(len(once), 5)
         self.importer.import_legacy(["outbox.claimed-7-x.jsonl"])

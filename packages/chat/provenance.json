@@ -99,14 +99,14 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "d5fd3bca06e139c3f61dfb6d34ef56947255c0b723fb9778c6da3afea874e8d0",
       "capture": "changed",
-      "sha256": "04537ec9ffccee9f01ece8156607a015c627dcc6736be9b89f189e6be4dd2982",
+      "sha256": "8892a202b58faba3ecfee02ae869ca1974665979c0d9144c9a07a9a6081afec9",
       "changes": [
         {
           "change": "The config example in the module docstring shows placeholder owner and assistant names.",
           "reason": "Remove real account names (requirement 3); docstring only, no behaviour change."
         },
         {
-          "change": "post() and ack() commit each part's attempt with the bridge's outbox authority (delivery_store) before any of its bytes, record each part's outcome (confirmed, refused, rejected, or ended without or with finality after an absolute wait and a bounded drain), and on a failure hand off the unconfirmed remainder or queue the whole call; with no committed answer they publish one immutable fallback file per call instead, and raise Queued only once it is durable. Login and channel creation have absolute deadlines. A silent run's post is refused and never queued in any form. outbox_append(), outbox_claim(), outbox_summary(), reserve() and queued_entry() are removed: this release writes no outbox.jsonl row.",
+          "change": "post() and ack() commit each part's attempt with the bridge's outbox authority (delivery_store) before any of its bytes, record each part's outcome (confirmed, refused, rejected, or ended without or with finality after an absolute wait and a bounded drain), and on a failure hand off the unconfirmed remainder or queue the whole call (a connection a failed record closed is never used again); with no committed answer they publish one immutable fallback file per call instead, and raise Queued only once it is durable. Login and channel creation have absolute deadlines. A silent run's post is refused and never queued in any form. outbox_append(), outbox_claim(), outbox_summary(), reserve() and queued_entry() are removed: this release writes no outbox.jsonl row.",
           "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
