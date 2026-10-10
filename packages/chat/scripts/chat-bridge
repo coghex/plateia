@@ -1247,7 +1247,6 @@ def handle_tagmsg(msg, cfg, deliveries, acks):
 
 def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
     coverage = coverage if coverage is not None else Coverage()
-    ensure_authority()
     coverage.connected()
     conn = chatlib.login("chatbridge", cfg, caps=CAPS)
     log("connected")
@@ -1420,6 +1419,7 @@ def main():
     coverage = Coverage()
     while True:
         try:
+            ensure_authority()  # before the first index, coverage change or flush of this connection
             run(chatlib.load_config(), record, deliveries, acks, checkpoints, coverage)
         except Exception as e:  # reconnect on anything; the service must stay up
             log(f"disconnected: {e!r}; reconnecting in 5s")

@@ -660,9 +660,11 @@ class CatchUpRecoveryTests(unittest.TestCase):
         cfgfile = Path(STATE) / "config.json"
         cfgfile.write_text("{}")
         orig = bridge.HistoryPager
+        self.authority = in_process_authority()  # #19: a live message is indexed before its checkpoint moves
         self.patches = [mock.patch.object(chatlib, "CONFIG_PATH", cfgfile),
                         mock.patch.object(bridge, "HISTORY_PAGE", 2),
-                        mock.patch.object(bridge, "HistoryPager", lambda: orig(page=2))]
+                        mock.patch.object(bridge, "HistoryPager", lambda: orig(page=2)),
+                        mock.patch.object(bridge, "OUTBOX_AUTHORITY", self.authority.__enter__())]
         for p in self.patches:
             p.start()
         self.state = (bridge.Record(), bridge.Deliveries(), bridge.Acks(), bridge.Checkpoints())
@@ -671,6 +673,7 @@ class CatchUpRecoveryTests(unittest.TestCase):
     def tearDown(self):
         for p in self.patches:
             p.stop()
+        self.authority.__exit__(None, None, None)
 
     def connect(self, script):
         server = FakeServer(script)
