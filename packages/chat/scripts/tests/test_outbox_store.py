@@ -265,6 +265,21 @@ class CollectionTests(StoreCase):
         self.assertEqual(self.attempts(entry_id=a), [])
         self.assertEqual(len(self.sql("SELECT * FROM entries WHERE id = ?", a)), 1, "entry rows are tombstones")
 
+    def test_messages_kept_for_an_unresolved_attempt_never_stop_newer_ones_being_collected(self):
+        """Self-audit, class D: each collection examines a bounded window that
+        rotates past what it must keep, so retention never starves."""
+        a, w = self.entry_with(["kept"])
+        self.attempt(a, 0, w, at=T0 - 10 * 86400, outcome="closed")  # an open window from ten days ago
+        for i in range(3):
+            self.message(f"kept {i}", T0 - 9 * 86400 + i)
+        other = self.message("other", T0 - 8 * 86400, account="bet-solver-1", channel="#beta")
+        self.clock.t = T0
+        for _ in range(3):
+            self.tx(lambda s: s.collect(limit=2))
+        msgids = {r["msgid"] for r in self.sql("SELECT msgid FROM messages")}
+        self.assertNotIn(other, msgids)
+        self.assertEqual(len(msgids), 3, "the protected ones are kept")
+
     def test_open_window_dead_attempts_are_kept(self):
         a, w = self.entry_with(["stuck"])
         self.attempt(a, 0, w, at=T0, outcome="closed")

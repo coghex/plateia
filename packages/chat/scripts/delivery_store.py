@@ -277,12 +277,40 @@ def flock(path, *, wait=None, clock=time.monotonic, sleep=time.sleep):
 
 # --- writer identity and the host probes (section 5.4) ---------------------------
 
+# Where the process table is /proc, it is the only source read, so two readings
+# of one process (its own, when it records its identity, and the bridge's
+# probe) always come from the same source and compare. Elsewhere, ps and lsof.
+HAS_PROC = os.path.isdir("/proc/self")
+UNKNOWN = ("", "x", "None", "unknown")  # how a value that could not be read is written
+
+
+def known(value):
+    """A boot id or start time that was read, or None for one that was not."""
+    return value if isinstance(value, str) and value not in UNKNOWN else None
+
+
+def valid_pid(pid):
+    return isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid < 2 ** 31
+
+
+def conn_port(conn):
+    """The local port of a recorded connection identity ("host:port>peer"), or None."""
+    if not isinstance(conn, str) or ">" not in conn:
+        return None
+    try:
+        port = int(conn.split(">", 1)[0].rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+    return port if 0 < port < 65536 else None
+
+
 def _boot_id():
     """The boot id (a read-only host interface), or None when it cannot be read."""
-    try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-    except OSError:
-        pass
+    if HAS_PROC:
+        try:
+            return Path("/proc/sys/kernel/random/boot_id").read_text().strip() or None
+        except OSError:
+            return None
     try:
         r = subprocess.run(["sysctl", "-n", "kern.bootsessionuuid"], capture_output=True, text=True, timeout=5)
         return r.stdout.strip() or None
@@ -292,11 +320,12 @@ def _boot_id():
 
 def _process_start(pid):
     """A process's start time (the process table), or None when it cannot be read."""
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-        return stat.rsplit(")", 1)[1].split()[19]  # field 22: start time in clock ticks since boot
-    except (OSError, IndexError):
-        pass
+    if HAS_PROC:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            return stat.rsplit(")", 1)[1].split()[19]  # field 22: start time in clock ticks since boot
+        except (OSError, IndexError):
+            return None
     try:
         r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
         return r.stdout.strip() or None
@@ -306,8 +335,8 @@ def _process_start(pid):
 
 def _tcp_ports(pid):
     """The local ports of `pid`'s TCP sockets, or None when that can't be read."""
-    proc = Path(f"/proc/{pid}")
-    if proc.exists():
+    if HAS_PROC:
+        proc = Path(f"/proc/{pid}")
         try:
             inodes = set()
             for fd in (proc / "fd").iterdir():
@@ -328,8 +357,8 @@ def _tcp_ports(pid):
                            capture_output=True, text=True, timeout=10)
     except Exception:  # an unreadable probe proves nothing
         return None
-    if r.returncode not in (0, 1):
-        return None
+    if r.returncode not in (0, 1) or (r.returncode == 1 and r.stderr.strip()):
+        return None  # lsof exits 1 for "nothing found" and for its own errors alike; only a quiet 1 is "none"
     ports = set()
     for line in r.stdout.splitlines():
         if line.startswith("n"):
@@ -362,35 +391,36 @@ class HostProbes:
         return {"boot": self.boot(), "pid": pid, "start": self._own[1], "conn": conn_id}
 
     def gone(self, writer):
-        if not writer:
+        """True only on proof: a boot id, both known, that differs; no such
+        process; or a start time, both known, that differs. A value either
+        side could not read, or a malformed identity, proves nothing (None)."""
+        if not isinstance(writer, dict) or not valid_pid(writer.get("pid")):
             return None
-        if writer.get("boot") and writer["boot"] != self.boot() and self.boot() != "unknown":
+        boot, mine = known(writer.get("boot")), known(self.boot())
+        if boot and mine and boot != mine:
             return True
-        pid = writer.get("pid")
-        if not isinstance(pid, int):
-            return None
+        pid = writer["pid"]
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
             return True
         except PermissionError:
-            pass
-        start = _process_start(pid)
-        if start is None:
+            pass  # it exists, as another user's
+        except OSError:
             return None
-        return start != writer.get("start")
+        start, now = known(writer.get("start")), known(_process_start(pid))
+        if start is None or now is None:
+            return None
+        return start != now
 
     def conn_closed(self, writer):
-        if not writer or not writer.get("conn"):
+        if not isinstance(writer, dict) or self.gone(writer) is not False:
             return None
-        if self.gone(writer) is not False:
+        port = conn_port(writer.get("conn"))
+        if port is None:
             return None
         ports = _tcp_ports(writer["pid"])
         if ports is None:
-            return None
-        try:
-            port = int(writer["conn"].split(">")[0].rsplit(":", 1)[1])
-        except (IndexError, ValueError):
             return None
         return port not in ports  # a reused port can only make a closed connection look open
 
@@ -426,16 +456,21 @@ class FakeProbes:
                 "conn": conn_id}
 
     def gone(self, writer):
-        if self.world["unreadable"] or not writer:
+        """As HostProbes.gone: only values known on both sides are compared."""
+        if self.world["unreadable"] or not isinstance(writer, dict) or not valid_pid(writer.get("pid")):
             return None
-        if writer.get("boot") != self._boot or writer.get("pid") in self.world["gone"]:
+        boot = known(writer.get("boot"))
+        if (boot and boot != self._boot) or writer["pid"] in self.world["gone"]:
             return True
-        return writer.get("start") != self.world["starts"].get(writer.get("pid"), "start-1")
+        start = known(writer.get("start"))
+        if start is None:
+            return None
+        return start != self.world["starts"].get(writer["pid"], "start-1")
 
     def conn_closed(self, writer):
-        if self.world["unreadable"] or not writer or not writer.get("conn"):
+        if self.world["unreadable"] or not isinstance(writer, dict) or not writer.get("conn"):
             return None
-        if self.gone(writer):
+        if self.gone(writer) is not False:
             return None
         return writer["conn"] in self.world["closed"]
 
@@ -449,6 +484,118 @@ def same_writer(a, b):
     if not a or not b:
         return False
     return (a.get("boot"), a.get("pid"), a.get("start")) == (b.get("boot"), b.get("pid"), b.get("start"))
+
+
+# --- what every untrusted row and request must be, before any of it is used ------------
+
+ENTRY_STRINGS = ("text", "cont", "reply_to", "ack", "at")
+LEGACY_FIELDS = ("channel", "as") + ENTRY_STRINGS
+PART_KINDS = ("line", "multiline", "ack")
+
+
+def valid_name(value):
+    """A channel or account as it goes on an IRC command line: a non-empty string
+    without spaces, commas or control characters."""
+    return (isinstance(value, str) and 0 < len(value) <= 200
+            and not any(c.isspace() or c == "," or ord(c) < 32 or ord(c) == 127 for c in value))
+
+
+def valid_id(value):
+    return isinstance(value, str) and 0 < len(value) <= 128 and all(c.isalnum() or c in "_-" for c in value)
+
+
+def _count(value, low):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= low
+
+
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value \
+        and value not in (float("inf"), float("-inf"))
+
+
+def _optional_str(value):
+    return value is None or isinstance(value, str)
+
+
+def valid_writer(writer, *, optional=True):
+    """A writer identity: a valid pid; boot, start and connection strings or None."""
+    if writer is None:
+        return optional
+    return (isinstance(writer, dict) and valid_pid(writer.get("pid"))
+            and all(_optional_str(writer.get(k)) for k in ("boot", "start", "conn")))
+
+
+def valid_attestation(att):
+    """None, or one attestation (section 6.4) with every field of the type it is used as."""
+    if att is None:
+        return True
+    if not isinstance(att, dict) or att.get("kind") not in ("void", "outcome"):
+        return False
+    if not (_count(att.get("n"), 0) and _count(att.get("generation"), 1)
+            and isinstance(att.get("a1_nonce"), str) and att["a1_nonce"] and valid_writer(att.get("writer"))):
+        return False
+    if att["kind"] == "outcome":
+        return (isinstance(att.get("outcome"), str) and att["outcome"] in OUTCOMES
+                and (att.get("final_at") is None or _number(att.get("final_at"))) and _optional_str(att.get("detail")))
+    return True
+
+
+def valid_entry_row(row):
+    """The fields an entry is made from: channel and account names, the text
+    fields strings or None, a post's text or an ack's message id."""
+    return (isinstance(row, dict) and valid_name(row.get("channel")) and valid_name(row.get("as"))
+            and all(_optional_str(row.get(k)) for k in ENTRY_STRINGS) and row.get("kind") in (None, "post", "ack")
+            and (row.get("text") is not None or bool(row.get("ack"))))
+
+
+def valid_fallback(row):
+    """A whole outbox/2 fallback file (section 6.4), before any part of it is used."""
+    return (isinstance(row, dict) and row.get("v") == FALLBACK_FORMAT and valid_id(row.get("id"))
+            and valid_entry_row(row) and valid_writer(row.get("writer")) and valid_attestation(row.get("attestation"))
+            and _optional_str(row.get("origin")) and (row.get("epoch_seen") is None or _count(row.get("epoch_seen"), 0)))
+
+
+def valid_parts(parts):
+    """An entry's fixed parts: each a kind, its text, and its lines as [piece, concat] pairs."""
+    if not isinstance(parts, list) or not parts:
+        return False
+    for p in parts:
+        if not isinstance(p, dict) or p.get("kind") not in PART_KINDS or not isinstance(p.get("text"), str):
+            return False
+        lines = p.get("lines")
+        if not isinstance(lines, list) or not lines or not all(
+                isinstance(x, list) and len(x) == 2 and isinstance(x[0], str) and isinstance(x[1], bool) for x in lines):
+            return False
+    return True
+
+
+def request_error(r):
+    """Why a request is malformed, or None: every field an op uses, checked before
+    any of it is (section 2.4.2). The writer and op are checked by the caller."""
+    op = r["op"]
+    if op == "status":
+        return None
+    if not valid_id(r.get("id")):
+        return "invalid entry id"
+    if op in ("create", "queue") and not valid_entry_row(r.get("entry")):
+        return "invalid entry"
+    if op == "create" and not valid_parts(r.get("parts")):
+        return "invalid parts"
+    if op in ("attempt", "outcome") and not (_count(r.get("n"), 0) and _count(r.get("generation"), 0)
+                                            and isinstance(r.get("a1_nonce"), str) and r["a1_nonce"]):
+        return "invalid attempt"
+    if op == "outcome" and not (isinstance(r.get("outcome"), str) and (r.get("final_at") is None
+                                                                       or _number(r.get("final_at")))
+                                and _optional_str(r.get("detail"))):
+        return "invalid outcome"
+    if op == "retire" and not _count(r.get("n"), 0):
+        return "invalid part"
+    if op == "void" and not (isinstance(r.get("attestation"), dict)
+                             and valid_attestation(dict(r["attestation"], kind="void"))):
+        return "invalid attestation"
+    if op == "handoff" and not valid_attestation(r.get("attestation")):
+        return "invalid attestation"
+    return None
 
 
 # --- fallback files (sections 2.1 and 6.4) ----------------------------------------
@@ -574,10 +721,13 @@ class Store:
         self.paths, self.clock, self.fs = paths, clock, fs or FS()
         self.con = None
         self.epoch = 0
+        self.collect_after = None  # (at, msgid) where the next collection resumes; None from the oldest
 
     # --- opening (section 2.4.1) ---
 
     def open(self):
+        """All or nothing: on any failure, the database files' durable sync
+        included, the connection is closed and the error raised."""
         try:
             con = sqlite3.connect(str(self.paths.db), timeout=OPEN_WAIT, isolation_level=None,
                                   check_same_thread=False)
@@ -610,6 +760,9 @@ class Store:
                     raise Unavailable("database without writer_model bridge-exclusive/1: refused")
                 self.epoch = int(self.meta("authority_epoch") or 0) + 1
                 self.set_meta("authority_epoch", self.epoch)
+            for name in ("outbox.db", "outbox.db-wal"):  # the database's own files are durable too
+                if self.fs.exists(self.paths.state / name):
+                    self.fs.durable(self.paths.state / name)
         except sqlite3.Error as err:  # busy, locked by another opener, not a database, unreadable
             con.close()
             self.con = None
@@ -618,9 +771,6 @@ class Store:
             con.close()
             self.con = None
             raise
-        for name in ("outbox.db", "outbox.db-wal"):  # the database's own files are durable too
-            if self.fs.exists(self.paths.state / name):
-                self.fs.durable(self.paths.state / name)
 
     def close(self):
         if self.con is not None:
@@ -632,10 +782,19 @@ class Store:
         self.con.execute("BEGIN IMMEDIATE")
         try:
             yield self.con
+            self.con.execute("COMMIT")
         except BaseException:
-            self.con.execute("ROLLBACK")
+            self._rollback()
             raise
-        self.con.execute("COMMIT")
+
+    def _rollback(self):
+        """Never leave the connection inside a transaction: a failed statement or
+        COMMIT may or may not have rolled it back already (SQLite's "may or may not")."""
+        try:
+            if self.con.in_transaction:
+                self.con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
 
     def meta(self, name):
         row = self.con.execute("SELECT value FROM meta WHERE name = ?", (name,)).fetchone()
@@ -1003,8 +1162,7 @@ class Store:
         return outcome
 
     def _apply_fallback(self, name, row, epoch):
-        if not isinstance(row, dict) or row.get("v") != FALLBACK_FORMAT or not row.get("id") \
-                or not row.get("channel") or not row.get("as") or (row.get("text") is None and not row.get("ack")):
+        if not valid_fallback(row):  # the whole file, before any part of it is used
             self.hold(name, None, json.dumps(row) if not isinstance(row, (bytes, str)) else row, "invalid fallback file")
             return "held"
         e = self.entry(row["id"])
@@ -1032,15 +1190,22 @@ class Store:
             self.apply_attestation(att)
         return "handed off"
 
-    def hold(self, name, ordinal, raw, why):
+    def _hold_row(self, name, ordinal, raw, why):
+        """One held row per (file, ordinal), or per (file, content, why) for a
+        whole file: UNIQUE never matches a NULL ordinal, so that is checked here."""
+        if ordinal is None and self.con.execute("SELECT 1 FROM held WHERE file = ? AND ordinal IS NULL AND raw = ?"
+                                                " AND why = ?", (name, raw, why)).fetchone():
+            return
         self.con.execute("INSERT OR IGNORE INTO held (file, ordinal, raw, why) VALUES (?, ?, ?, ?)",
-                         (name, ordinal, raw if isinstance(raw, str) else str(raw), why))
+                         (name, ordinal, raw, why))
+
+    def hold(self, name, ordinal, raw, why):
+        self._hold_row(name, ordinal, raw if isinstance(raw, str) else str(raw), why)
         self.raise_alert(f"held:{name}", "held", name,
                          "queued outbox rows could not be imported and are held; see pchat status")
 
     def hold_changed(self, name, sha):
-        self.con.execute("INSERT OR IGNORE INTO held (file, ordinal, raw, why) VALUES (?, NULL, ?, ?)",
-                         (name, sha, "changed after import began"))
+        self._hold_row(name, None, sha, "changed after import began")
         self.raise_alert(f"held:{name}:{sha}", "held", name,
                          "queued outbox rows could not be imported and are held; see pchat status")
 
@@ -1064,18 +1229,19 @@ class Store:
             occurrence = hashlib.sha256(f"{name}:{i}".encode()).hexdigest()[:32]
             try:
                 row = json.loads(raw)
-            except ValueError:
+            except (ValueError, RecursionError):
                 row = None
-            ok = (isinstance(row, dict) and row.get("channel") and row.get("as")
-                  and not any(k in row for k in ("parts", "terminal", "id", "fallback", "v"))
-                  and (isinstance(row.get("text"), str) or isinstance(row.get("ack"), str)))
+            clean = {k: row[k] for k in LEGACY_FIELDS if k in row} if isinstance(row, dict) else None
+            ok = (clean is not None and not any(k in row for k in ("parts", "terminal", "id", "fallback", "v"))
+                  and valid_entry_row(clean)
+                  and (isinstance(clean.get("text"), str) or isinstance(clean.get("ack"), str)))
             if not ok:
                 self.hold(name, i, raw if isinstance(raw, str) else raw.decode(errors="replace"),
                           "unsupported or unreadable legacy row")
                 continue
             if self.entry(occurrence) is None:
-                self._insert_entry(occurrence, row, owner_kind="outbox", writer=None,
-                                   origin="ack" if row.get("ack") else "legacy",
+                self._insert_entry(occurrence, clean, owner_kind="outbox", writer=None,
+                                   origin="ack" if clean.get("ack") else "legacy",
                                    occ=(name, i, hashlib.sha256(raw.encode() if isinstance(raw, str) else raw)
                                         .hexdigest()))
         self.con.execute("UPDATE imports SET lines = ?, offset = ?, sha256 = ?, epoch = ?, last_import = ?,"
@@ -1319,12 +1485,21 @@ class Store:
     # --- collection (I-7) ---
 
     def collect(self, limit=COLLECT_MAX):
-        """G1: delete only what nothing depends on, at most `limit` rows."""
+        """G1: delete only what nothing depends on, at most `limit` rows. Each
+        call examines at most `limit` messages, resuming after the last one the
+        previous call examined, so messages that must be kept never stop newer
+        ones from being examined (fairness under the bound)."""
         now = self.clock()
         horizon = now - A - GC_MARGIN
         hulls = self._dependency_hulls()
         deleted = 0
-        for m in self.con.execute("SELECT * FROM messages WHERE at < ? ORDER BY at LIMIT ?", (horizon, limit)):
+        q, args = "SELECT * FROM messages WHERE at < ?", [horizon]
+        if self.collect_after is not None:
+            q += " AND (at > ? OR (at = ? AND msgid > ?))"
+            args += [self.collect_after[0], self.collect_after[0], self.collect_after[1]]
+        window_rows = self.con.execute(q + " ORDER BY at, msgid LIMIT ?", args + [limit]).fetchall()
+        self.collect_after = (window_rows[-1]["at"], window_rows[-1]["msgid"]) if len(window_rows) == limit else None
+        for m in window_rows:
             if any(lo <= m["at"] and (hi is None or m["at"] <= hi)
                    for (acct, ch), spans in hulls.items() if (acct, ch) == (m["account"], m["channel"])
                    for lo, hi in spans):
@@ -1455,9 +1630,10 @@ class _Peer:
 
 class Authority:
     """The bridge's authority: the only holder of the only connection to
-    outbox.db (section 2.4). `start` takes the authority lock and opens the
-    database; `bind` serves clients on outbox.sock; `run` is the authority
-    thread. Without a running thread (the tests), requests run at once."""
+    outbox.db (section 2.4). `launch` is the bridge's whole start: the
+    authority lock, the database, outbox.sock and the authority thread, all or
+    nothing. `start` is its first part alone: without a running thread (the
+    tests), requests run at once."""
 
     def __init__(self, state, *, clock=time.time, mono=time.monotonic, probes=None, fs=None, log=lambda m: None):
         self.paths = Paths(state)
@@ -1477,6 +1653,8 @@ class Authority:
         self.wake_r = self.wake_w = None
         self.turn = 0
         self.unavailable = None  # (reason, since) while the authority cannot run
+        self.ready = False  # set only once a start has completed; cleared by close()
+        self.bridge_only = False  # no socket: its path is over the platform's limit
 
     @property
     def epoch(self):
@@ -1484,10 +1662,33 @@ class Authority:
 
     @property
     def running(self):
-        return self.store.con is not None
+        """True only after a complete start, and while its thread (if any) lives."""
+        return (self.ready and self.store.con is not None
+                and (self.thread is None or self.thread.is_alive()))
 
     def start(self):
-        """Steps 1-4 of section 2.4.1. Raises Unavailable, having opened and bound nothing."""
+        """Steps 1-4 of section 2.4.1, all or nothing; requests then run at once,
+        in this thread (the tests). Raises, having opened and bound nothing."""
+        self._open()
+        self.ready = True
+        return self.epoch
+
+    def launch(self):
+        """The bridge's whole start: steps 1-4, the socket (step 5) and the
+        authority thread. All or nothing: any failure closes what was opened,
+        releases the lock and raises; running only once every step is done."""
+        try:
+            self._open()
+            self.bridge_only = not self.bind()
+            self.run_in_thread()
+        except BaseException:
+            self.close()
+            raise
+        return self.epoch
+
+    def _open(self):
+        """Steps 1-4: the authority lock, then the database. Raises, having
+        opened nothing and released the lock."""
         self.paths.state.mkdir(parents=True, exist_ok=True)
         f = open(self.paths.auth_lock, "a")
         try:
@@ -1496,6 +1697,9 @@ class Authority:
             f.close()
             self.unavailable = ("another bridge holds the authority lock", self.clock())
             raise Unavailable(self.unavailable[0]) from None
+        except BaseException:
+            f.close()
+            raise
         try:
             self.store.open()
         except BaseException as err:  # opened and bound nothing: the lock is released for the next try
@@ -1511,38 +1715,44 @@ class Authority:
             self.fs.mkdir(self.paths.staging)
         except OSError as err:
             self.log(f"authority: cannot create outbox.d: {err}")
-        return self.epoch
 
     def bind(self):
-        """Step 5: the socket, mode 0600, unless its path is over the platform's limit."""
+        """Step 5: the socket, mode 0600, unless its path is over the platform's
+        limit. Raises, having left nothing bound, on any failure."""
         path = str(self.paths.sock)
         if len(os.fsencode(path)) > SOCKET_LIMIT:
             self.log(f"authority: socket path over {SOCKET_LIMIT} bytes; serving the bridge only")
             return False
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
-        old = os.umask(0o177)  # the socket is created 0600: only this user may connect
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            listener.bind(path)
-        except BaseException:  # nothing half-bound is left behind: the next pass binds again
+            old = os.umask(0o177)  # the socket is created 0600: only this user may connect
+            try:
+                listener.bind(path)
+            finally:
+                os.umask(old)
+            if os.stat(path).st_mode & 0o777 != 0o600:
+                raise Unavailable("socket mode is not 0600")
+            listener.listen(CONN_MAX)
+            listener.setblocking(False)
+        except BaseException:  # nothing half-bound is left behind: the next start binds again
             listener.close()
+            with contextlib.suppress(OSError):
+                os.unlink(path)
             raise
-        finally:
-            os.umask(old)
-        if os.stat(path).st_mode & 0o777 != 0o600:
-            listener.close()
-            raise Unavailable("socket mode is not 0600")
-        listener.listen(CONN_MAX)
-        listener.setblocking(False)
         self.listener = listener
         return True
 
     def close(self):
+        """Stop serving and release everything a start opened, whatever step it
+        reached: the thread, the connections, the socket, the database, the lock."""
+        self.ready = False
         self.stopping = True
-        if self.thread is not None:
+        thread, self.thread = self.thread, None
+        if thread is not None and thread.is_alive():
             self._wake()
-            self.thread.join(10)
+            thread.join(10)
         for peer in list(self.peers.values()):
             peer.sock.close()
         self.peers.clear()
@@ -1551,6 +1761,15 @@ class Authority:
             self.listener = None
             with contextlib.suppress(OSError):
                 os.unlink(self.paths.sock)
+        if self.sel is not None:
+            with contextlib.suppress(Exception):
+                self.sel.close()
+            self.sel = None
+        for fd in (self.wake_r, self.wake_w):
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        self.wake_r = self.wake_w = None
         self.store.close()
         if self.lock_file is not None:
             fcntl.flock(self.lock_file, fcntl.LOCK_UN)
@@ -1568,8 +1787,11 @@ class Authority:
         if not isinstance(request, dict) or request.get("v") != PROTOCOL or request.get("op") not in CLIENT_OPS:
             return reply("refused", detail="invalid request or unknown version")
         writer = request.get("writer")
-        if request["op"] != "status" and not isinstance(writer, dict):
-            return reply("refused", detail="no writer")
+        if not valid_writer(writer, optional=request["op"] == "status"):
+            return reply("refused", detail="no valid writer")
+        problem = request_error(request)
+        if problem:  # validated whole before any part of it is used
+            return reply("refused", detail=problem)
         if peer_pid is not None and isinstance(writer, dict) and writer.get("pid") != peer_pid:
             return reply("refused", detail="the request does not speak for its sender")
         if not self.running:
@@ -1579,7 +1801,7 @@ class Authority:
                 result, data = self._dispatch(request, bridge)
         except Conflict as err:
             return reply("conflict", detail=str(err))
-        except (sqlite3.Error, OSError, KeyError, TypeError, ValueError) as err:
+        except Exception as err:  # rolled back; this request fails alone
             self.log(f"authority: request {request.get('op')} failed: {err!r:.120}")
             return reply("error")
         return reply(result, **data)
@@ -1671,14 +1893,21 @@ class Authority:
                 os.write(self.wake_w, b"x")
 
     def run_in_thread(self):
+        """The last step of a start. A failure leaves the selector and pipe for
+        close(), which launch() calls, and no thread recorded."""
         self.sel = selectors.DefaultSelector()
         self.wake_r, self.wake_w = os.pipe()
         os.set_blocking(self.wake_r, False)
         self.sel.register(self.wake_r, selectors.EVENT_READ, "wake")
         if self.listener is not None:
             self.sel.register(self.listener, selectors.EVENT_READ, "listen")
-        self.thread = threading.Thread(target=self._loop, name="outbox-authority", daemon=True)
-        self.thread.start()
+        thread = threading.Thread(target=self._loop, name="outbox-authority", daemon=True)
+        self.thread, self.ready = thread, True
+        try:
+            thread.start()
+        except BaseException:
+            self.thread, self.ready = None, False
+            raise
 
     def adopt(self, sock, creds=None):
         """Serve one already connected socket (a socketpair end, in the tests)."""
@@ -1771,7 +2000,7 @@ class Authority:
         peer.buf += data
         try:
             request, rest = decode_frame(peer.buf, FRAME_MAX)
-        except ValueError:
+        except Exception:  # too large, or not JSON this decoder can read: this connection alone ends
             self._drop(peer)
             return
         if request is None:
@@ -1856,11 +2085,15 @@ class LocalTransport:
         request, _ = decode_frame(encode_frame(request, FRAME_MAX), FRAME_MAX)
         if self.bridge:
             base = {"v": PROTOCOL, "request_id": request.get("request_id")}
+            if (request.get("op") not in CLIENT_OPS
+                    or not valid_writer(request.get("writer"), optional=request.get("op") == "status")
+                    or request_error(request)):
+                return dict(base, result="refused", authority_epoch=self.authority.epoch)
             try:
                 done = self.authority.run_tx(lambda store: self.authority._dispatch(request, True))
             except Conflict as err:
                 done = ("conflict", {"detail": str(err)})
-            except (sqlite3.Error, OSError, KeyError, TypeError, ValueError):
+            except Exception:  # rolled back: this request fails alone
                 return dict(base, result="error", authority_epoch=self.authority.epoch)
             if done is CANCELLED:
                 return None  # never began: nothing committed
@@ -1911,25 +2144,28 @@ class Client:
 class Importer:
     """IF (fallback files) and I1-I3 (the legacy outbox), run on the bridge's
     flush. Holds only L_flush; never takes outbox.lock to import. File work is
-    done here; each file or batch of lines is one in-process request."""
+    done here; each file or batch of lines is one in-process request. A file
+    or claim that fails is kept, with an alert, and every other one proceeds."""
 
     def __init__(self, authority, *, log=lambda m: None):
         self.authority, self.fs, self.paths = authority, authority.fs, authority.paths
         self.log = log
         self.pass_names = None  # the names the current import pass listed when it began
+        self.kept = []  # fallback files kept after a failure, least recently tried first
 
     def _sha(self, data):
         return hashlib.sha256(data).hexdigest()
 
     def unreadable(self, name, err):
-        """A file the import cannot list, sync or read: it is kept, retried at
-        every flush, and raises one content-free alert; nothing else waits for it."""
-        self.log(f"outbox: {name} cannot be read ({err!r:.100}); kept, and retried at the next flush")
+        """A file the import cannot list, sync, read, import or remove: it is kept,
+        retried at later flushes, and raises one content-free alert; nothing else
+        waits for it."""
+        self.log(f"outbox: {name} could not be imported ({err!r:.100}); kept, and retried at a later flush")
         try:
             self.authority.run_tx(lambda s: s.raise_alert(
                 f"held:{name}:unreadable", "held", name,
-                "a queued outbox file could not be read; it is kept and retried; see pchat status"))
-        except (Conflict, sqlite3.Error):
+                "a queued outbox file could not be read or imported; it is kept and retried; see pchat status"))
+        except Exception:  # the alert is raised again with the next failure
             pass
 
     def _listdir(self, path):
@@ -1939,67 +2175,93 @@ class Importer:
             self.unreadable(Path(path).name, err)
             return []
 
+    def _budget(self, names):
+        """This flush's files, at most IMPORT_MAX: the oldest names not kept after
+        a failure, then kept ones in rotation, at least one when any is kept. So a
+        kept file never stops a later one, and each is tried again in turn."""
+        present = set(names)
+        self.kept = [n for n in self.kept if n in present]
+        kept = set(self.kept)
+        reserve = min(len(self.kept), max(1, IMPORT_MAX // 8))
+        take = [n for n in names if n not in kept][:IMPORT_MAX - reserve]
+        return take + self.kept[:IMPORT_MAX - len(take)]
+
     def import_fallback_files(self):
-        """At most IMPORT_MAX published files, oldest name first. Returns how many.
-        A file that cannot be synced or read is kept, with an alert, and every
-        other file and entry proceeds."""
+        """At most IMPORT_MAX published files, oldest name first. Returns how many
+        were imported."""
         names = sorted(n for n in self._listdir(self.paths.fallback) if is_published_name(n))
         if self.pass_names is None:
             self.pass_names = set(names)
         count = 0
-        for name in names[:IMPORT_MAX]:
-            path = self.paths.fallback / name
+        for name in self._budget(names):
             try:
-                self.fs.durable(path)
-                data = self.fs.read(path)
-            except FileNotFoundError:
-                continue
-            except OSError as err:  # kept: its obligation is not lost, and it blocks nothing else
+                outcome = self._import_file(name)
+            except Exception as err:  # kept: its obligation is not lost, and it blocks nothing else
                 self.unreadable(name, err)
+                if name in self.kept:
+                    self.kept.remove(name)
+                self.kept.append(name)
                 continue
-            sha = self._sha(data)
-            try:
-                row = json.loads(data.decode())
-            except (ValueError, UnicodeDecodeError):
-                row = data.decode(errors="replace")
-            outcome = self.authority.run_tx(lambda s, name=name, sha=sha, row=row: s.import_fallback(name, sha, row))
             if outcome is CANCELLED:
                 break  # not run: try again at the next flush
-            if outcome == "changed":
-                self.authority.run_tx(lambda s, name=name, sha=sha: s.hold_changed(name, sha))
-            try:
-                self.fs.unlink(path)
-                self.fs.sync_dir(self.paths.fallback)
-            except OSError as err:  # imported: the next flush finds its imports row and removes it
-                self.log(f"outbox: {name} imported but not removed ({err!r:.80})")
-                continue
-            self.pass_names.discard(name)
-            count += 1
-            if outcome not in ("imported", "noop"):
-                self.log(f"outbox: fallback file {name}: {outcome}")
+            if name in self.kept:
+                self.kept.remove(name)
+            if outcome is not None:
+                count += 1
         if not (self.pass_names & set(self._listdir(self.paths.fallback))):
             self.authority.run_tx(lambda s: s.complete_pass())
             self.pass_names = None
         return count
 
+    def _import_file(self, name):
+        """IF for one file: its durable sync, one TX, then its removal. Returns
+        the outcome; None if it is gone; CANCELLED if the TX never began."""
+        path = self.paths.fallback / name
+        try:
+            self.fs.durable(path)
+            data = self.fs.read(path)
+        except FileNotFoundError:
+            return None
+        sha = self._sha(data)
+        try:
+            row = json.loads(data.decode())
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            row = data.decode(errors="replace")
+        outcome = self.authority.run_tx(lambda s: s.import_fallback(name, sha, row))
+        if outcome is CANCELLED:
+            return CANCELLED
+        if outcome == "changed":
+            self.authority.run_tx(lambda s: s.hold_changed(name, sha))
+        self.fs.unlink(path)  # a failure keeps it: the next try finds its imports row and removes it
+        self.fs.sync_dir(self.paths.fallback)
+        self.pass_names.discard(name)
+        if outcome not in ("imported", "noop"):
+            self.log(f"outbox: fallback file {name}: {outcome}")
+        return outcome
+
     def clean_staging(self):
-        """A tmp/ file is removed only once its writer is gone, or once published."""
+        """A tmp/ file is removed only once its writer is gone, or once published.
+        A writer identity its name does not fully carry is unknown, never gone."""
         for name in self._listdir(self.paths.staging):
-            path = self.paths.staging / name
             try:
-                if self.fs.nlink(path) > 1:
+                self._clean_one(name)
+            except Exception as err:  # cleanup only: tried again at the next flush
+                self.log(f"outbox: staging file {name}: {err!r:.80}")
+
+    def _clean_one(self, name):
+        path = self.paths.staging / name
+        try:
+            if self.fs.nlink(path) > 1:
+                self.fs.unlink(path)
+                return
+        except OSError:
+            return
+        tag = name.split(".")
+        if len(tag) >= 3 and tag[1].isascii() and tag[1].isdigit():
+            writer = {"boot": known(tag[0]), "pid": int(tag[1]), "start": known(tag[2]) and tag[2].replace("_", " ")}
+            if self.authority.probes.gone(writer) is True:
+                with contextlib.suppress(OSError):
                     self.fs.unlink(path)
-                    continue
-            except OSError:
-                continue  # cleanup only: tried again at the next flush
-            tag = name.split(".")
-            if len(tag) >= 3 and tag[1].isdigit():
-                writer = {"boot": tag[0], "pid": int(tag[1]), "start": tag[2].replace("_", " ")}
-                if self.authority.probes.gone(writer) is True:
-                    try:
-                        self.fs.unlink(path)
-                    except OSError:
-                        pass
 
     def claim_legacy(self):
         """I1: rename a non-empty outbox.jsonl to a never-used claim name, WITHOUT
@@ -2038,60 +2300,65 @@ class Importer:
     def import_legacy(self, claims, barrier_at=None):
         """I2 for each open claim, at most LINES_MAX lines per request; with
         `barrier_at` (an outbox.lock acquisition after the claim was first
-        recorded), the final read and I3."""
+        recorded), the final read and I3. A claim that fails is kept, with an
+        alert, and the next one proceeds."""
         for name in claims:
-            path = self.paths.state / name
-            while True:
-                try:
-                    data = self.fs.read(path)
-                except FileNotFoundError:
-                    break
-                except OSError as err:  # kept, with an alert; the other claims and entries go on
-                    self.unreadable(name, err)
-                    break
-                row = self._import_row(name)
-                if row is None:
+            try:
+                if self._import_claim(name, barrier_at) is CANCELLED:
                     return
-                if row.get("state") == "closed":
-                    try:
-                        self.fs.unlink(path)  # I3's unlink, replayed
-                        self.fs.sync_dir(self.paths.state)
-                    except OSError as err:
-                        self.log(f"outbox: {name} retired but not removed ({err!r:.80})")
-                    break
-                offset, ordinal = row.get("offset", 0), row.get("lines", 0)
-                if row and self._sha(data[:offset]) != row.get("sha256"):
-                    self.authority.run_tx(lambda s: s.hold_changed(name, self._sha(data)))
-                    break  # rewritten by something outside this design: held, never unlinked
-                tail = data[offset:]
-                cut = tail.rfind(b"\n") + 1
-                complete = tail[:cut].split(b"\n")[:-1] if cut else []
-                take = complete[:LINES_MAX]
-                new_offset = offset + sum(len(x) + 1 for x in take)
-                final = (barrier_at is not None and row.get("first_seen") is not None
-                         and row["first_seen"] < barrier_at and len(take) == len(complete))
-                lines = [x.decode(errors="replace") for x in take]
-                if final and tail[cut:]:
-                    lines.append(tail[cut:].decode(errors="replace"))  # an unterminated last line: held
-                    new_offset = len(data)
-                if not lines and not final:
-                    if not row:
-                        self.authority.run_tx(lambda s: s.import_legacy(name, 0, [], 0, self._sha(b"")))
-                    break
+            except Exception as err:
+                self.unreadable(name, err)
+
+    def _import_claim(self, name, barrier_at):
+        path = self.paths.state / name
+        while True:
+            try:
+                data = self.fs.read(path)
+            except FileNotFoundError:
+                return None
+            row = self._import_row(name)
+            if row is None:
+                return CANCELLED
+            if row.get("state") == "closed":
                 try:
-                    n = self.authority.run_tx(lambda s, lines=lines, new_offset=new_offset, final=final:
-                                              s.import_legacy(name, ordinal, lines, new_offset,
-                                                              self._sha(data[:new_offset]), close=final))
-                except Conflict:
-                    break
-                if n is CANCELLED:
-                    return
-                if final:
-                    try:
-                        self.fs.unlink(path)
-                        self.fs.sync_dir(self.paths.state)
-                    except OSError as err:  # closed: the next flush removes it
-                        self.log(f"outbox: {name} retired but not removed ({err!r:.80})")
-                    break
-                if len(take) == len(complete):
-                    break
+                    self.fs.unlink(path)  # I3's unlink, replayed
+                    self.fs.sync_dir(self.paths.state)
+                except OSError as err:
+                    self.log(f"outbox: {name} retired but not removed ({err!r:.80})")
+                return None
+            offset, ordinal = row.get("offset", 0), row.get("lines", 0)
+            if row and self._sha(data[:offset]) != row.get("sha256"):
+                self.authority.run_tx(lambda s: s.hold_changed(name, self._sha(data)))
+                return None  # rewritten by something outside this design: held, never unlinked
+            tail = data[offset:]
+            cut = tail.rfind(b"\n") + 1
+            complete = tail[:cut].split(b"\n")[:-1] if cut else []
+            take = complete[:LINES_MAX]
+            new_offset = offset + sum(len(x) + 1 for x in take)
+            final = (barrier_at is not None and row.get("first_seen") is not None
+                     and row["first_seen"] < barrier_at and len(take) == len(complete))
+            lines = [x.decode(errors="replace") for x in take]
+            if final and tail[cut:]:
+                lines.append(tail[cut:].decode(errors="replace"))  # an unterminated last line: held
+                new_offset = len(data)
+            if not lines and not final:
+                if not row:
+                    self.authority.run_tx(lambda s: s.import_legacy(name, 0, [], 0, self._sha(b"")))
+                return None
+            try:
+                n = self.authority.run_tx(lambda s, lines=lines, new_offset=new_offset, final=final:
+                                          s.import_legacy(name, ordinal, lines, new_offset,
+                                                          self._sha(data[:new_offset]), close=final))
+            except Conflict:
+                return None
+            if n is CANCELLED:
+                return CANCELLED
+            if final:
+                try:
+                    self.fs.unlink(path)
+                    self.fs.sync_dir(self.paths.state)
+                except OSError as err:  # closed: the next flush removes it
+                    self.log(f"outbox: {name} retired but not removed ({err!r:.80})")
+                return None
+            if len(take) == len(complete):
+                return None

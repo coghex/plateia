@@ -138,10 +138,10 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "edf4615c95b572c9b677994bfb65da9d2158513dca4d2ec943ed11d86a558227",
       "capture": "changed",
-      "sha256": "62b23d14ec24010bcef943395f6b95391e94c135f1f4c7b9b1b8e10a2a220d63",
+      "sha256": "2982647418923e5b5e1416334fecd3e682c0d713472188fcf8c2e1eff25180a0",
       "changes": [
         {
-          "change": "pchat post and pchat ack exit 3 only once the call is durably queued or handed off (by an acknowledged request, or a fallback file); a refusal after some parts were published is reported, and the bridge dead-letters it with its parts; pchat status reads the outbox authority's status, or its dated snapshot while the authority is unavailable, and counts fallback files and legacy rows waiting for it.",
+          "change": "pchat post and pchat ack exit 3 only once the call is durably queued or handed off (by an acknowledged request, or a fallback file); a refusal after some parts were published is reported, and the bridge dead-letters it with its parts; pchat status reads the outbox authority's status, or its dated snapshot while the authority is unavailable, and counts fallback files and legacy rows waiting for it, reporting any it cannot read.",
           "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
         }
       ]
@@ -295,14 +295,14 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
       "capture": "changed",
-      "sha256": "1e8ec31e312057e5ff599bbdc15e4822e440f9562314ad155c0583696519c6f0",
+      "sha256": "80bb9d2e0cc6e1da953ba9757ec840c0ad62ff253f4adc670fbd1bfbc92007d0",
       "changes": [
         {
           "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
           "reason": "Deliberate deviation from c572bad, by owner decision on PR #16's first review: a catch-up cut short leaves the checkpoint behind, so after a restart more than 5,000 replayed messages would be logged again and an accepted request queued again (PLT-15 requirement 8). The running bridge keeps the baseline behavior until activation."
         },
         {
-          "change": "The bridge runs the outbox authority (delivery_store.Authority: the only opener of outbox.db, on its own thread, serving outbox.sock; a start that failed part-way is finished at the next pass) and its flush: it imports fallback files and the legacy outbox without outbox.lock, ends gone writers' attempts, abandons (E8) or, for its own announcements, adopts (E9) their entries, reconciles from current state (R1, R2), dead-letters after 24 hours with a content-free alert row, gives every eligible entry its attempt, and retires claims and writes dead letters under a bounded outbox.lock. It indexes every verified message (V1) before its checkpoint moves; a failed index invalidates any catch-up of that channel, which completes nothing until a replay from the preserved checkpoint indexes it; keeps record coverage in the authority, writes the pending queue, ledger and dead letters durably, and announces with a derived entry id, saving held_announced only once the announcement is durable. The file-based claimed-outbox, reservation and attribution state is removed.",
+          "change": "The bridge runs the outbox authority (delivery_store.Authority: the only opener of outbox.db, on its own thread, serving outbox.sock; started all or nothing, and started again whole at the next pass after any failure or a dead thread) and its flush, in which one step's or one item's failure never stops another: it imports fallback files and the legacy outbox without outbox.lock, ends gone writers' attempts, abandons (E8) or, for its own announcements, adopts (E9) their entries, reconciles from current state (R1, R2), dead-letters after 24 hours with a content-free alert row, gives every eligible entry its attempt, and retires claims and writes dead letters under a bounded outbox.lock. It indexes every verified message (V1) before its checkpoint moves, and one whose server time cannot be read is a failed index; a failed index invalidates any catch-up of that channel, which completes nothing until a replay from the preserved checkpoint indexes it; keeps record coverage in the authority, writes the pending queue, ledger and dead letters durably (a delivery leaves only once its ledger line is durable, and one that cannot be written blocks no other), and announces with a derived entry id, saving held_announced only once the announcement is durable. The file-based claimed-outbox, reservation and attribution state is removed.",
           "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
         }
       ]

@@ -271,6 +271,128 @@ class RequestCrashTests(AuthorityCase):
         self.assertEqual(order[:2], ["commit", "reply"])
 
 
+class TransactionFailureTests(AuthorityCase):
+    """Self-audit, classes A and B: a commit that fails is rolled back, so one
+    failed request never leaves the connection inside a transaction."""
+
+    def test_a_failed_commit_is_rolled_back_and_the_next_request_runs(self):
+        real, failed = self.authority.store.con, []
+
+        class Con:
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def execute(self, sql, *args):
+                if sql == "COMMIT" and not failed:
+                    failed.append(sql)
+                    raise sqlite3.OperationalError("disk I/O error (fake)")
+                return real.execute(sql, *args)
+        self.authority.store.con = Con()
+        try:
+            first = self.authority.handle(self.create("e" * 32))
+            second = self.authority.handle(self.create("f" * 32))
+        finally:
+            self.authority.store.con = real
+        self.assertEqual((first["result"], second["result"]), ("error", "ok"))
+        self.assertEqual([e["id"] for e in self.entries()], ["f" * 32])
+
+
+class LockFailureTests(AuthorityCase):
+    """Self-audit, class B: a lock that cannot be taken, for any reason, leaves no file open."""
+
+    def test_a_lock_error_leaves_no_file_open(self):
+        import errno
+        self.authority.close()
+        fresh = self.ds.Authority(self.chatlib.STATE_DIR, clock=self.clock, mono=self.clock.mono, probes=self.probes)
+        before = len(os.listdir("/dev/fd"))
+        with mock.patch.object(self.ds.fcntl, "flock", side_effect=OSError(errno.ENOLCK, "no locks available (fake)")):
+            with self.assertRaises(OSError):
+                fresh.start()
+        self.assertEqual(len(os.listdir("/dev/fd")), before)
+        self.assertFalse(fresh.running)
+        self.authority = self.new_authority()
+
+
+class BindFailureTests(AuthorityCase):
+    """Self-audit, class B: a bind that fails after the socket file exists (its
+    mode check) leaves no socket file and no listener behind. The socket is a
+    fake that only creates its file."""
+
+    def test_a_socket_with_the_wrong_mode_is_removed(self):
+        path = self.authority.paths.sock
+        closed = []
+
+        class FakeListener:
+            def __init__(self, *a):
+                pass
+
+            def bind(self, p):
+                Path(p).write_bytes(b"")
+                os.chmod(p, 0o644)  # not 0600
+
+            def close(self):
+                closed.append(1)
+        with mock.patch.object(self.ds, "SOCKET_LIMIT", 4096), \
+                mock.patch.object(self.ds.socket, "socket", FakeListener):
+            with self.assertRaises(self.ds.Unavailable):
+                self.authority.bind()
+        self.assertIsNone(self.authority.listener)
+        self.assertEqual(closed, [1])
+        self.assertFalse(path.exists(), "no socket file is left behind")
+
+
+class MalformedRequestTests(AuthorityCase):
+    """Self-audit, class A: a request is validated whole before any part of it
+    is used; a malformed one is refused and stores nothing."""
+
+    def test_a_malformed_create_or_queue_is_refused_and_stores_nothing(self):
+        good = self.create("a" * 32)
+        entries = [{"channel": ["#alpha"], "as": "alp-solver-2", "text": "x"}, {"channel": "#alpha", "text": "x"},
+                   {"channel": "#alpha", "as": {"x": 1}, "text": "x"}, {"channel": "#alpha", "as": "alp-solver-2",
+                                                                        "text": 5},
+                   ["not", "a", "dict"], {"channel": "#al pha", "as": "alp-solver-2", "text": "x"},
+                   {"channel": "#alpha", "as": "alp-solver-2", "text": "x", "cont": 5},
+                   {"channel": "#alpha", "as": "alp-solver-2", "text": "x", "kind": ["post"]}]
+        parts = [[], "abc", [{"kind": "line", "lines": [], "text": "x"}],
+                 [{"kind": "line", "lines": "ab", "text": "x"}], [{"kind": "line", "lines": [[1, False]], "text": "x"}],
+                 [{"kind": "zzz", "lines": [["x", False]], "text": "x"}],
+                 [{"kind": "line", "lines": [["x", False]], "text": 7}], ["part"]]
+        n = 0
+        for entry in entries:
+            for op in ("create", "queue"):
+                n += 1
+                with self.subTest(op=op, entry=entry):
+                    reply = self.authority.handle(dict(good, op=op, id=f"{n:032d}", entry=entry))
+                    self.assertEqual(reply["result"], "refused")
+        for p in parts:
+            n += 1
+            with self.subTest(parts=p):
+                self.assertEqual(self.authority.handle(dict(good, id=f"{n:032d}", parts=p))["result"], "refused")
+        for bad_id in (7, "", "x" * 300, None):
+            with self.subTest(id=bad_id):
+                self.assertEqual(self.authority.handle(dict(good, id=bad_id))["result"], "refused")
+        for writer in ({"pid": "x"}, {"pid": 4242, "start": 5}, "w", None):
+            with self.subTest(writer=writer):
+                self.assertEqual(self.authority.handle(dict(good, writer=writer))["result"], "refused")
+        self.assertEqual(self.entries(), [])
+        self.assertEqual(self.authority.handle(good)["result"], "ok")
+
+    def test_a_frame_that_cannot_be_decoded_closes_only_its_own_connection(self):
+        bad, good = self.conn(), self.conn()
+        real = self.ds.decode_frame
+
+        def decode(buf, limit):
+            if buf[4:5] == b"[":
+                raise RecursionError("maximum recursion depth exceeded while decoding a JSON array (fake)")
+            return real(buf, limit)
+        with mock.patch.object(self.ds, "decode_frame", decode):
+            bad.mine.sendall(struct.pack(">I", 2) + b"[]")
+            good.send(self.create("a" * 32))
+            self.authority.serve_once(0)
+        self.assertTrue(bad.closed_by_authority())
+        self.assertEqual(good.reply()["result"], "ok")
+
+
 class UnavailableTests(AuthorityCase):
     """Test 28: the material change. With the authority unavailable in any way, a
     call sends no byte without a committed attempt reply, and exits 3 only once

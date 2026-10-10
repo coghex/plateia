@@ -7,6 +7,9 @@ _isolation, with an injected clock. All names, channels, times and text are
 invented."""
 import contextlib
 import io
+import json
+import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -476,6 +479,32 @@ class PausedWriterTests(OutboxCase):
                 [b] = self.attempts(id=a["id"])
                 self.assertEqual((b["state"], b["end_kind"], b["final_at"]), ("ended", "writer_gone", None))
 
+    def test_missing_recorded_identity_proves_nothing(self):
+        """Code review slot 2, finding 1: a boot id or start time the writer could
+        not record is unknown, never different; its live attempt is not ended, its
+        entry is not abandoned, and its own outcome still applies."""
+        for how in ("start missing", "boot unknown", "both"):
+            with self.subTest(how=how):
+                self.fresh()
+                self.paused_attempt()
+                [a] = self.attempts(state="writing")
+                w = json.loads(a["writer"])
+                if how != "boot unknown":
+                    w["start"] = None
+                if how != "start missing":
+                    w["boot"] = "unknown"
+                self.tx(lambda s: s.con.execute("UPDATE attempts SET writer = ?", (self.ds.jdump(w),)))
+                self.tx(lambda s: s.con.execute("UPDATE entries SET owner_writer = ?", (self.ds.jdump(w),)))
+                for _ in range(2):
+                    self.clock.advance(600)
+                    self.flush()
+                [b] = self.attempts(id=a["id"])
+                self.assertEqual(b["state"], "writing", "a live writer is never ended on missing evidence")
+                e = self.entry()
+                self.assertEqual((e["state"], e["owner_kind"]), ("open", "direct"), "nor its entry abandoned")
+                self.assertEqual(self.tx(lambda s: s.outcome(e["id"], b["n"], b["generation"], b["a1_nonce"], w,
+                                                             "confirmed", T0 + 5)), "ok")
+
     def test_unreadable_probes_prove_nothing(self):
         self.paused_attempt()
         self.probes.world["unreadable"] = True
@@ -488,6 +517,71 @@ class PausedWriterTests(OutboxCase):
         self.flush()
         self.assertEqual(self.entry()["state"], "terminal")
         self.assertEqual(len(self.attempts(state="writing")), 1)
+
+
+class HostProbeTests(unittest.TestCase):
+    """Code review slot 2, finding 1, on the host probes (self-audit, classes A
+    and C): only a boot id or start time known on both sides is compared, each
+    read from one source per platform; nothing unreadable or malformed proves a
+    writer gone or its connection closed, and nothing raises. The host
+    interfaces are faked: no process table, kernel or socket table is read."""
+
+    BOOT, START = "boot-a", "start-a"
+
+    def probes(self, boot=BOOT, start=START):
+        import delivery_store as ds
+        for p in (mock.patch.object(ds, "_boot_id", lambda: boot),
+                  mock.patch.object(ds, "_process_start", lambda pid: start),
+                  mock.patch.object(ds, "_tcp_ports", lambda pid: {1})):
+            p.start()
+            self.addCleanup(p.stop)
+        return ds.HostProbes()
+
+    def test_only_values_known_on_both_sides_are_compared(self):
+        me = os.getpid()
+        for host_boot, writer, want in (
+                (self.BOOT, {"boot": "unknown", "pid": me, "start": self.START}, False),
+                (self.BOOT, {"boot": None, "pid": me, "start": self.START}, False),
+                (self.BOOT, {"pid": me, "start": self.START}, False),
+                (self.BOOT, {"boot": self.BOOT, "pid": me, "start": None}, None),
+                (self.BOOT, {"boot": self.BOOT, "pid": me}, None),
+                (self.BOOT, {"boot": "unknown", "pid": me, "start": None}, None),
+                (None, {"boot": "boot-b", "pid": me, "start": self.START}, False),
+                (self.BOOT, {"boot": "boot-b", "pid": me, "start": self.START}, True),
+                (self.BOOT, {"boot": self.BOOT, "pid": me, "start": "start-b"}, True)):
+            with self.subTest(host_boot=host_boot, writer=writer):
+                self.assertIs(self.probes(boot=host_boot).gone(writer), want)
+
+    def test_malformed_identities_prove_nothing_and_raise_nothing(self):
+        p = self.probes()
+        for pid in (2 ** 40, 0, -1, True, "12", None, 1.5):
+            with self.subTest(pid=pid):
+                self.assertIsNone(p.gone({"boot": self.BOOT, "pid": pid, "start": self.START}))
+        me = {"boot": self.BOOT, "pid": os.getpid(), "start": self.START}
+        for conn in (5, None, "", "garbage", ["x"], "127.0.0.1:99999999999999999999>s"):
+            with self.subTest(conn=conn):
+                self.assertIsNone(p.conn_closed(dict(me, conn=conn)))
+        self.assertIs(p.conn_closed(dict(me, conn="127.0.0.1:2>s")), True)
+        self.assertIs(p.conn_closed(dict(me, conn="127.0.0.1:1>s")), False)
+
+    def test_a_socket_table_that_cannot_be_read_proves_nothing(self):
+        import delivery_store as ds
+        for rc, err in ((1, "lsof: WARNING: can't stat() a file system\n"), (2, "")):
+            ran = lambda *a, rc=rc, err=err, **k: subprocess.CompletedProcess(a, rc, "", err)  # noqa: E731
+            with self.subTest(rc=rc), mock.patch.object(ds, "HAS_PROC", False, create=True), \
+                    mock.patch.object(ds.subprocess, "run", ran):
+                self.assertIsNone(ds._tcp_ports(4194305))
+        none = lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "")  # noqa: E731
+        with mock.patch.object(ds, "HAS_PROC", False, create=True), mock.patch.object(ds.subprocess, "run", none):
+            self.assertEqual(ds._tcp_ports(4194305), set(), "no TCP socket at all: each of its connections closed")
+
+    def test_a_start_time_is_read_from_one_source_per_platform(self):
+        import delivery_store as ds
+        ps = lambda *a, **k: subprocess.CompletedProcess(a, 0, "Sat Oct 10 10:00:00 2026\n", "")  # noqa: E731
+        with mock.patch.object(ds, "HAS_PROC", True, create=True), mock.patch.object(ds.subprocess, "run", ps):
+            self.assertIsNone(ds._process_start(4194305), "where /proc is the source, an unreadable entry is unknown")
+        with mock.patch.object(ds, "HAS_PROC", False, create=True), mock.patch.object(ds.subprocess, "run", ps):
+            self.assertEqual(ds._process_start(4194305), "Sat Oct 10 10:00:00 2026")
 
 
 class LateOutcomeTests(OutboxCase):

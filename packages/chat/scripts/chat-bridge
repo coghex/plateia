@@ -389,8 +389,8 @@ class Deliveries:
             delivery_store.sink_append(delivery_store.FS_DEFAULT, DEAD_LETTERS,
                                        {**item, "dl_key": key, "dead_at": now_iso(), "last_detail": detail},
                                        "dl_key", key)
-        self.items.remove(item)  # only once its dead-letter line is durable
         self._record(item, False, f"dead-lettered: {detail}")
+        self.items.remove(item)  # only once its dead-letter line and its ledger line are durable
         log(f"{item['kind']} DEAD-LETTERED ({item['channel']}): {detail}")
         if item["kind"] == "ring":
             self._alert(item, f"delivery to {_recipient(item)} {reason or 'failed: ' + detail[:80]}")
@@ -406,8 +406,8 @@ class Deliveries:
             owner = item.get("target") or cfg.get("projects", {}).get(item["project"], {}).get("manager")
             if owner != by:
                 continue
-            self.items.remove(item)
             self._record(item, True, f"accepted by {by} ({how})")
+            self.items.remove(item)  # only once its ledger line is durable
             if item.get("agent_msg_id"):  # the queued cmux copy is now redundant
                 _cmux("rpc", "agent.message.mark_read", json.dumps({"ids": [item["agent_msg_id"]]}))
             log(f"ring accepted ({item['channel']}) by {by} ({how})")
@@ -416,65 +416,74 @@ class Deliveries:
     def process(self, cfg):
         due = [i for i in self.items if i["next_at"] <= time.time()]
         for item in due:
-            if item.get("phase") == "accept":  # delivered, but never accepted in time
-                if item.get("interrupt"):  # re-sending would interrupt it again
-                    self._dead(item, "interrupted, but never acknowledged", cfg,
-                               reason=f"was interrupted but has not acknowledged it after {INTERRUPT_ACK_WAIT // 60} min")
-                    continue
-                if item.get("reminders", 0) < MAX_REMINDERS:
-                    item.update(phase="deliver", reminders=item.get("reminders", 0) + 1,
-                                attempt=0, next_at=0)
-                    for k in ("agent_msg_id", "waiting_since", "stuck_alerted"):
-                        item.pop(k, None)
-                    self._record(item, False, f"not accepted after {ACCEPT_WAIT // 60} min; reminder {item['reminders']}")
-                    continue
-                self._dead(item, "delivered but never accepted by the manager", cfg,
-                           reason=f"was never accepted (from {item['sender']})")
-                continue
-            if item["kind"] == "push":
-                ok, detail = push_owner(cfg, item)
-            else:
-                ok, detail = (ring_agent if item.get("target") else ring_manager)(cfg, item)
-            if ok is WAITING:  # cmux is holding it, or the recipient is busy: follow it, don't count it
-                self._record(item, None, detail)
-                if item.get("interrupt") and detail.startswith("held") and not item.get("held_announced"):
-                    # saved only once the announcement is a durable obligation (section 6.4)
-                    if announce(cfg, item, f"interrupt → {item['target']}: {detail}", "held"):
-                        item["held_announced"] = True
-                since = item.setdefault("waiting_since", time.time())
-                authority = {cfg.get("owner")} | set(cfg.get("assistants", []))
-                if time.time() - since > MAX_WAIT:
-                    self._dead(item, detail, cfg, reason=f"still waiting after {MAX_WAIT // 3600} h")
-                    continue
-                if (time.time() - since > STUCK_ALERT and not item.get("stuck_alerted")
-                        and item["sender"] in authority):
-                    item["stuck_alerted"] = True
-                    self._alert(item, f"{_recipient(item)} has not taken a post from {item['sender']}"
-                                      f" after {STUCK_ALERT // 60} min (still queued)")
-                item["next_at"] = time.time() + WAIT_CHECK
-                continue
-            item["attempt"] += 1
-            self._record(item, ok, detail)
-            if ok and item.get("interrupt"):
-                stop = (f"turn stopped {item['stopped_at'][11:19]}Z" if item.get("stopped_at")
-                        else "it was not working")
-                announce(cfg, item, f"interrupt → {item['target']}: {stop}; instruction delivered;"
-                                    f" waiting for its acknowledgement", "delivered")
-                item.update(phase="accept", next_at=time.time() + INTERRUPT_ACK_WAIT)
-                log(f"interrupt delivered ({item['channel']}) to {item['target']}: {detail}")
-            elif ok and item.get("needs_ack"):
-                item.update(phase="accept", next_at=time.time() + ACCEPT_WAIT)
-                log(f"ring delivered ({item['channel']}); awaiting acceptance: {detail}")
-            elif ok:
-                self.items.remove(item)
-                log(f"{item['kind']} done ({item['channel']}, attempt {item['attempt']}): {detail}")
-            elif item["attempt"] > len(BACKOFF):
-                self._dead(item, detail, cfg)
-            else:
-                item["next_at"] = time.time() + BACKOFF[item["attempt"] - 1]
-                log(f"{item['kind']} pending ({item['channel']}, attempt {item['attempt']}): {detail}")
+            try:
+                self._process_one(item, cfg)
+            except Exception as err:  # it stays, as it is, and is tried again; the other items go on
+                log(f"{item['kind']} ({item['channel']}) not processed: {err!r:.100}; tried again next pass")
         if due:
-            self._save()
+            try:
+                self._save()
+            except OSError as err:
+                log(f"pending deliveries not saved: {err!r:.100}; saved again next pass")
+
+    def _process_one(self, item, cfg):
+        if item.get("phase") == "accept":  # delivered, but never accepted in time
+            if item.get("interrupt"):  # re-sending would interrupt it again
+                self._dead(item, "interrupted, but never acknowledged", cfg,
+                           reason=f"was interrupted but has not acknowledged it after {INTERRUPT_ACK_WAIT // 60} min")
+                return
+            if item.get("reminders", 0) < MAX_REMINDERS:
+                item.update(phase="deliver", reminders=item.get("reminders", 0) + 1,
+                            attempt=0, next_at=0)
+                for k in ("agent_msg_id", "waiting_since", "stuck_alerted"):
+                    item.pop(k, None)
+                self._record(item, False, f"not accepted after {ACCEPT_WAIT // 60} min; reminder {item['reminders']}")
+                return
+            self._dead(item, "delivered but never accepted by the manager", cfg,
+                       reason=f"was never accepted (from {item['sender']})")
+            return
+        if item["kind"] == "push":
+            ok, detail = push_owner(cfg, item)
+        else:
+            ok, detail = (ring_agent if item.get("target") else ring_manager)(cfg, item)
+        if ok is WAITING:  # cmux is holding it, or the recipient is busy: follow it, don't count it
+            self._record(item, None, detail)
+            if item.get("interrupt") and detail.startswith("held") and not item.get("held_announced"):
+                # saved only once the announcement is a durable obligation (section 6.4)
+                if announce(cfg, item, f"interrupt → {item['target']}: {detail}", "held"):
+                    item["held_announced"] = True
+            since = item.setdefault("waiting_since", time.time())
+            authority = {cfg.get("owner")} | set(cfg.get("assistants", []))
+            if time.time() - since > MAX_WAIT:
+                self._dead(item, detail, cfg, reason=f"still waiting after {MAX_WAIT // 3600} h")
+                return
+            if (time.time() - since > STUCK_ALERT and not item.get("stuck_alerted")
+                    and item["sender"] in authority):
+                item["stuck_alerted"] = True
+                self._alert(item, f"{_recipient(item)} has not taken a post from {item['sender']}"
+                                  f" after {STUCK_ALERT // 60} min (still queued)")
+            item["next_at"] = time.time() + WAIT_CHECK
+            return
+        item["attempt"] += 1
+        self._record(item, ok, detail)
+        if ok and item.get("interrupt"):
+            stop = (f"turn stopped {item['stopped_at'][11:19]}Z" if item.get("stopped_at")
+                    else "it was not working")
+            announce(cfg, item, f"interrupt → {item['target']}: {stop}; instruction delivered;"
+                                f" waiting for its acknowledgement", "delivered")
+            item.update(phase="accept", next_at=time.time() + INTERRUPT_ACK_WAIT)
+            log(f"interrupt delivered ({item['channel']}) to {item['target']}: {detail}")
+        elif ok and item.get("needs_ack"):
+            item.update(phase="accept", next_at=time.time() + ACCEPT_WAIT)
+            log(f"ring delivered ({item['channel']}); awaiting acceptance: {detail}")
+        elif ok:
+            self.items.remove(item)
+            log(f"{item['kind']} done ({item['channel']}, attempt {item['attempt']}): {detail}")
+        elif item["attempt"] > len(BACKOFF):
+            self._dead(item, detail, cfg)
+        else:
+            item["next_at"] = time.time() + BACKOFF[item["attempt"] - 1]
+            log(f"{item['kind']} pending ({item['channel']}, attempt {item['attempt']}): {detail}")
 
 
 def _cmux(*args):
@@ -887,6 +896,9 @@ def index_message(entry, authority=None):
     if authority is None or not authority.running:
         return False
     at = delivery_store.parse_iso(entry.get("at"))
+    if at is None:  # a server time that cannot be read: not indexed, so it proves nothing (V4)
+        log(f"index: {entry['channel']}: a message's time cannot be read; its record is incomplete")
+        return False
     try:
         done = authority.run_tx(lambda s: s.index(entry["msgid"], entry["channel"], entry["from"], entry["text"], at))
     except Exception as err:
@@ -917,48 +929,64 @@ class Flusher:
     def identity(self, conn_id=None):
         return self.probes.identity(conn_id)
 
+    @staticmethod
+    def step(name, fn, *args, default=None):
+        """One step of the flush. Its failure is logged, and never stops the steps
+        after it: each serves obligations of its own (R6)."""
+        try:
+            return fn(*args)
+        except Exception as err:
+            log(f"outbox: {name} failed ({err!r:.120}); the rest of the flush goes on")
+            return default
+
     def run(self, cfg, deliveries=None):
-        self.retry_pending()
-        self.importer.clean_staging()
-        self.importer.import_fallback_files()          # IF: no outbox.lock
-        claims = self.importer.claim_legacy()          # I1: no outbox.lock
-        self.importer.import_legacy(claims)            # I2: no outbox.lock
-        self.end_gone_attempts()                       # A8, A8c
-        self.abandon_or_adopt()                        # E8, E9
-        self.reconcile()                               # R1, R2
-        expired = self.tx(lambda s: s.expire(), [])    # E7
+        step = self.step
+        step("attestation retry", self.retry_pending)
+        step("staging cleanup", self.importer.clean_staging)
+        step("fallback import", self.importer.import_fallback_files)                # IF: no outbox.lock
+        claims = step("legacy claim", self.importer.claim_legacy, default=[])        # I1: no outbox.lock
+        step("legacy import", self.importer.import_legacy, claims)                   # I2: no outbox.lock
+        step("gone writers", self.end_gone_attempts)                                 # A8, A8c
+        step("gone entries", self.abandon_or_adopt)                                  # E8, E9
+        step("reconciliation", self.reconcile)                                       # R1, R2
+        expired = step("expiry", self.tx, lambda s: s.expire(), default=[]) or []    # E7
         for entry_id in expired:
             log(f"outbox: DEAD-LETTERED entry {entry_id}: delivery undecided for {int(delivery_store.UNDECIDED_MAX // 3600)} h")
-        self.deliver(cfg)                              # every eligible entry's attempts
+        step("delivery", self.deliver, cfg)                                          # every eligible entry's attempts
+        step("retirement and export", self.retire_and_export)                        # I3, X1
+        step("alert export", self.export_alerts, deliveries)                         # X2
+        step("collection", self.tx, lambda s: s.collect())                           # G1
+        step("status", self.write_status)                                            # X3
+
+    def retire_and_export(self):
         with delivery_store.flock(self.authority.paths.outbox_lock, wait=delivery_store.LOCK_WAIT,
                                   clock=time.monotonic) as held:
             if held:                                   # I3 and X1, only these need outbox.lock
                 self.deferred.clear()
-                self.importer.import_legacy(self.importer.claim_list(), barrier_at=self.authority.clock())
-                self.export_dead_letters()
+                self.step("claim retirement", self.importer.import_legacy, self.importer.claim_list(),
+                          self.authority.clock())
+                self.step("dead-letter export", self.export_dead_letters)
             else:
                 since = self.deferred.setdefault("retire_and_export", _now())
                 log(f"outbox: outbox.lock busy since {iso_of(since)}; claim retirement and dead-letter export deferred")
-        self.export_alerts(deliveries)                 # X2
-        self.tx(lambda s: s.collect())                 # G1
-        self.write_status()                            # X3
 
     # --- the bridge's own attestations ---
 
     def retry_pending(self):
         still = []
         for row, att in self.pending:
-            client = bridge_client(self.authority)
-            if att.get("kind") == "void":
-                reply = client.call("void", att["writer"], id=row["id"], attestation=att)
-            else:
-                reply = client.call("handoff", att["writer"], id=row["id"], attestation=att)
-            if reply is None:  # still unanswered: make the attestation durable another way
-                try:
+            try:
+                client = bridge_client(self.authority)
+                if att.get("kind") == "void":
+                    reply = client.call("void", att["writer"], id=row["id"], attestation=att)
+                else:
+                    reply = client.call("handoff", att["writer"], id=row["id"], attestation=att)
+                if reply is None:  # still unanswered: make the attestation durable another way
                     delivery_store.publish_fallback(self.authority.fs, self.authority.paths,
                                                     dict(row, writer=att["writer"], attestation=att), clock=_now)
-                except OSError:
-                    still.append((row, att))
+            except Exception as err:  # kept, and tried again at the next flush; the others go on
+                log(f"outbox: attestation for {row.get('id')} not yet durable ({err!r:.80})")
+                still.append((row, att))
         self.pending = still
 
     # --- A8, A8c, E8, E9 ---
@@ -968,18 +996,27 @@ class Flusher:
             "SELECT id, writer FROM attempts WHERE state = 'writing'")], [])
         observed = []
         for attempt_id, writer in writing:
-            w = json.loads(writer)
-            if self.probes.gone(w) is True:
-                observed.append((attempt_id, "writer_gone", _now()))
-            elif self.probes.conn_closed(w) is True:
-                observed.append((attempt_id, "connection_closed", _now()))
+            try:
+                w = json.loads(writer)
+                if self.probes.gone(w) is True:
+                    observed.append((attempt_id, "writer_gone", _now()))
+                elif self.probes.conn_closed(w) is True:
+                    observed.append((attempt_id, "connection_closed", _now()))
+            except Exception as err:  # a probe that fails proves nothing; the next attempt is checked
+                log(f"outbox: attempt {attempt_id}: writer not checked ({err!r:.80})")
         if observed:
             self.tx(lambda s: s.end_attempts(observed))
 
     def abandon_or_adopt(self):
         direct = self.tx(lambda s: [(e["id"], e["owner_writer"]) for e in s.con.execute(
             "SELECT id, owner_writer FROM entries WHERE state = 'open' AND owner_kind = 'direct'")], [])
-        gone = [entry_id for entry_id, w in direct if self.probes.gone(json.loads(w or "null")) is True]
+        gone = []
+        for entry_id, w in direct:
+            try:
+                if self.probes.gone(json.loads(w or "null")) is True:
+                    gone.append(entry_id)
+            except Exception as err:  # a probe that fails proves nothing
+                log(f"outbox: entry {entry_id}: writer not checked ({err!r:.80})")
         for entry_id, what in self.tx(lambda s: s.abandon_or_adopt(gone), []):
             log(f"outbox: entry {entry_id} of a gone writer {what}")
 
@@ -987,18 +1024,25 @@ class Flusher:
 
     def reconcile(self):
         for key in self.tx(lambda s: s.reconcile_keys(), []):
-            for verdict, attempt_id in self.tx(lambda s, key=key: s.reconcile(*key, log=log), []):
+            try:
+                verdicts = self.tx(lambda s, key=key: s.reconcile(*key, log=log), [])
+            except Exception as err:  # rolled back: this key stays undecided; the next is decided
+                log(f"outbox: reconciliation of a post to {key[1]} as {key[0]} failed ({err!r:.80}); undecided")
+                continue
+            for verdict, attempt_id in verdicts:
                 log(f"outbox: attempt {attempt_id} of a post to {key[1]} as {key[0]}: {verdict}")
 
     # --- B as the writer ---
 
     def deliver(self, cfg):
-        rows = self.tx(lambda s: [s.entry_view(e["id"]) for e in s.con.execute(
+        ids = self.tx(lambda s: [e["id"] for e in s.con.execute(
             "SELECT id FROM entries WHERE state = 'open' AND owner_kind = 'outbox' ORDER BY created_at, id")], [])
         client = bridge_client(self.authority)
-        for e in rows:
+        for entry_id in ids:
             try:
-                self._deliver_one(cfg, client, e)
+                e = self.tx(lambda s, i=entry_id: s.entry_view(i))
+                if e:
+                    self._deliver_one(cfg, client, e)
             except Exception as err:  # still failing: it stays owed, as recorded; the next entry gets its turn
                 log(f"outbox: still failing ({err!r:.100})")
 
@@ -1035,18 +1079,24 @@ class Flusher:
         rows = self.tx(lambda s: [r["id"] for r in s.con.execute(
             "SELECT id FROM entries WHERE state = 'terminal' AND dead_letter_exported_version < export_version")], [])
         for entry_id in rows:
-            view = self.tx(lambda s: s.entry_view(entry_id))
-            if not view:
-                continue
-            v = view["export_version"]
-            record = {"kind": "post", "id": entry_id, "version": v, "supersedes": v - 1 if v > 1 else None,
-                      "dl_key": f"{entry_id}:{v}", "channel": view["channel"], "as": view["account"],
-                      "text": view["text"], "parts": [{"n": p["n"], "text": p["text"], "state": p["state"],
-                                                       "msgid": p["msgid"]} for p in view["parts"]],
-                      "attempts": view["attempts"], "dead_at": now_iso(), "last_detail": view["terminal_reason"]}
-            delivery_store.sink_append(fs, paths.dead_letters, record, "dl_key", record["dl_key"])
-            self.tx(lambda s: s.con.execute("UPDATE entries SET dead_letter_exported_version = MAX("
-                                            "dead_letter_exported_version, ?) WHERE id = ?", (v, entry_id)))
+            try:
+                self._export_one(paths, fs, entry_id)
+            except Exception as err:  # still due: exported again at the next flush; the next one goes on
+                log(f"outbox: dead letter for {entry_id} not exported ({err!r:.80})")
+
+    def _export_one(self, paths, fs, entry_id):
+        view = self.tx(lambda s: s.entry_view(entry_id))
+        if not view:
+            return
+        v = view["export_version"]
+        record = {"kind": "post", "id": entry_id, "version": v, "supersedes": v - 1 if v > 1 else None,
+                  "dl_key": f"{entry_id}:{v}", "channel": view["channel"], "as": view["account"],
+                  "text": view["text"], "parts": [{"n": p["n"], "text": p["text"], "state": p["state"],
+                                                   "msgid": p["msgid"]} for p in view["parts"]],
+                  "attempts": view["attempts"], "dead_at": now_iso(), "last_detail": view["terminal_reason"]}
+        delivery_store.sink_append(fs, paths.dead_letters, record, "dl_key", record["dl_key"])
+        self.tx(lambda s: s.con.execute("UPDATE entries SET dead_letter_exported_version = MAX("
+                                        "dead_letter_exported_version, ?) WHERE id = ?", (v, entry_id)))
 
     def export_alerts(self, deliveries):
         """X2: each alert row onto the pending queue once, durably, then marked."""
@@ -1055,18 +1105,28 @@ class Flusher:
         alerts = self.tx(lambda s: [dict(a) for a in s.con.execute(
             "SELECT * FROM alerts WHERE exported_at IS NULL ORDER BY raised_at")], [])
         for a in alerts:
-            key = a["alert_key"]
-            if any(i.get("alert_key") == key for i in deliveries.items):
+            try:
+                self._export_alert(deliveries, a)
+            except Exception as err:  # unmarked: exported again at the next flush; the next one goes on
+                log(f"outbox: alert {a.get('alert_key')} not exported ({err!r:.80})")
+
+    def _export_alert(self, deliveries, a):
+        key = a["alert_key"]
+        if any(i.get("alert_key") == key for i in deliveries.items):
+            deliveries._save()
+        elif deliveries.ledger_has(key):
+            self.authority.fs.durable(DELIVERIES)
+        else:
+            item = {"kind": "push", "msgid": key, "alert_key": key, "channel": "-", "sender": "chatbridge",
+                    "project": None, "attempt": 0, "next_at": 0, "text": a["text"]}
+            deliveries.items.append(item)
+            try:
                 deliveries._save()
-            elif deliveries.ledger_has(key):
-                self.authority.fs.durable(DELIVERIES)
-            else:
-                deliveries.items.append({"kind": "push", "msgid": key, "alert_key": key, "channel": "-",
-                                         "sender": "chatbridge", "project": None, "attempt": 0, "next_at": 0,
-                                         "text": a["text"]})
-                deliveries._save()
-            self.tx(lambda s: s.con.execute("UPDATE alerts SET exported_at = COALESCE(exported_at, ?)"
-                                            " WHERE alert_key = ?", (_now(), key)))
+            except BaseException:
+                deliveries.items.remove(item)  # not durable: not queued
+                raise
+        self.tx(lambda s: s.con.execute("UPDATE alerts SET exported_at = COALESCE(exported_at, ?)"
+                                        " WHERE alert_key = ?", (_now(), key)))
 
     def write_status(self):
         """X3: the dated snapshot pchat status reads while the authority is unavailable."""
@@ -1413,28 +1473,27 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
 
 
 def ensure_authority():
-    """Start this bridge's outbox authority, or finish a start that failed part-way
-    (section 2.4.1): each step not yet done (open, bind, the thread) is retried
-    at the next pass, so a failed bind never leaves clients unserved for good."""
+    """Start this bridge's outbox authority (section 2.4.1), all or nothing: the
+    lock, the database, the socket and the thread. A start that fails at any
+    step leaves nothing open and the lock free, and the next pass starts again
+    from the lock; so does an authority whose thread has died."""
     global OUTBOX_AUTHORITY
-    authority = OUTBOX_AUTHORITY or delivery_store.Authority(chatlib.STATE_DIR, log=log)
-    if authority.running and authority.thread is not None:
-        OUTBOX_AUTHORITY = authority
-        return authority
+    old = OUTBOX_AUTHORITY
+    if old is not None and old.running:
+        return old
+    since = old.unavailable[1] if old is not None and old.unavailable else None
+    if old is not None:
+        old.close()  # whatever it still holds is released before the next start takes the lock
+    authority = delivery_store.Authority(chatlib.STATE_DIR, log=log)
     try:
-        if not authority.running:
-            authority.start()
-        if authority.listener is None and not getattr(authority, "bridge_only", False):
-            authority.bridge_only = not authority.bind()  # a socket path over the limit: the bridge alone
-        authority.run_in_thread()
-        authority.unavailable = None
+        authority.launch()
         log(f"outbox authority running, epoch {authority.epoch}")
-    except (delivery_store.Unavailable, OSError) as err:
-        reason = str(err)
-        since = authority.unavailable[1] if authority.unavailable else _now()
+    except Exception as err:
+        reason = str(err) or type(err).__name__
+        since = since or _now()
         authority.unavailable = (reason, since)
         write_unavailable_status(authority.paths, reason, since)
-        log(f"outbox authority unavailable: {reason}; retried at the next pass")
+        log(f"outbox authority unavailable: {reason}; started again at the next pass")
     OUTBOX_AUTHORITY = authority
     return authority
 

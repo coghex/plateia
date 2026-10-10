@@ -6,6 +6,8 @@ stand in for a power loss; a held flock stands in for a stopped old tool.
 Invented data only, under _isolation."""
 import fcntl
 import json
+import os
+import sqlite3
 import sys
 import threading
 import time
@@ -426,6 +428,167 @@ class UnreadableFileTests(FilesCase):
             os.chmod(claim, 0o600)
         self.flush()
         self.assertEqual(sorted(self.published_texts()), ["[status] old", "[status] other"])
+
+
+class MalformedFallbackTests(FilesCase):
+    """Code review slot 2, finding 3 (and self-audit class A): a fallback file is
+    validated whole before any part of it is used. An invalid one is held once,
+    with one alert, and removed like an imported file (section 6.2); a request
+    that fails keeps its file, with an alert; nothing else waits for either."""
+
+    def write(self, i, row):
+        name = f"{int((T0 + i) * 1e9):020d}-{row.get('id') if isinstance(row, dict) else 'x'}-{i:08x}.json"
+        path = self.state / "outbox.d" / name
+        path.write_bytes((json.dumps(row) + "\n").encode())
+        self.fs.durable(path)
+        return path
+
+    def queued(self, text="[status] other"):
+        self.server.refuse_login = {"sam"}
+        self.post(text, channel="#beta", account="sam")
+        self.server.refuse_login = set()
+
+    def test_malformed_fields_anywhere_are_held_once_and_block_nothing(self):
+        base = dict(self.row("[status] odd"), v="outbox/2")
+        att = {"kind": "void", "n": 0, "generation": 1, "a1_nonce": "x"}
+        bad = [dict(base, id="a" * 32, attestation="bad"),
+               dict(base, id="b" * 32, attestation=dict(att, n="0")),
+               dict(base, id="c" * 32, attestation=dict(att, kind="outcome", outcome="confirmed", final_at="soon")),
+               dict(base, id="d" * 32, attestation=dict(att, writer=5)),
+               dict(base, id="e" * 32, attestation=dict(att, kind="other")),
+               dict(base, id="f" * 32, writer="x"),
+               dict(base, id="g" * 32, writer={"boot": "test-boot", "pid": "x", "start": "start-1"}),
+               dict(base, id=7),
+               dict(base, id="h" * 32, **{"as": {"x": 1}}),
+               dict(base, id="i" * 32, cont=5),
+               dict(base, id="j" * 32, reply_to=["m"]),
+               dict(base, id="k" * 32, text=None, ack=5),
+               dict(base, id="l" * 32, origin=["post"]),
+               dict(base, id="m" * 32, channel="#al pha"),
+               dict(base, id="n" * 32, at={"t": 1}),
+               ["a", "list"]]
+        paths = [self.write(i, row) for i, row in enumerate(bad)]
+        self.write(len(bad), dict(base, id="z" * 32, text="[status] fine"))
+        self.queued()
+        self.flush()
+        self.assertEqual(sorted(self.published_texts()), ["[status] fine", "[status] other"])
+        self.assertEqual(self.fallback_files(), [], "each invalid file is held, then removed like an imported one")
+        held = self.sql("SELECT file FROM held")
+        self.assertEqual(sorted(h["file"] for h in held), sorted(p.name for p in paths))
+        self.assertEqual(sorted(a["ref"] for a in self.alerts()), sorted(p.name for p in paths))
+        self.flush()
+        self.assertEqual(len(self.sql("SELECT * FROM held")), len(bad))
+
+    def test_an_import_request_that_fails_keeps_its_file_with_an_alert_and_blocks_nothing(self):
+        failing = self.write(0, dict(self.row("[status] later"), v="outbox/2", id="a" * 32))
+        self.write(1, dict(self.row("[status] fine"), v="outbox/2", id="b" * 32))
+        self.queued()
+        real = self.ds.Store.import_fallback
+
+        def flaky(store, name, sha, row):
+            if name == failing.name:
+                raise sqlite3.OperationalError("database disk image is malformed (fake)")
+            return real(store, name, sha, row)
+        with mock.patch.object(self.ds.Store, "import_fallback", flaky):
+            self.flush()
+        self.assertEqual(sorted(self.published_texts()), ["[status] fine", "[status] other"])
+        self.assertEqual(self.fallback_files(), [failing], "kept: its obligation is not lost")
+        self.assertEqual([a["ref"] for a in self.alerts()], [failing.name])
+        self.flush()
+        self.assertEqual(sorted(self.published_texts()), ["[status] fine", "[status] later", "[status] other"])
+
+    def test_a_malformed_legacy_row_is_held_and_blocks_nothing(self):
+        bad = [dict(self.row("x"), **{"as": {"x": 1}}), dict(self.row("x"), cont=5),
+               dict(self.row("x"), reply_to={"m": 1}), dict(self.row("x"), at=7),
+               dict(self.row("x"), channel="#a b"), dict(self.row("x"), channel=["#alpha"]),
+               {"channel": "#alpha", "as": "alp-solver-2", "ack": "m1", "text": 5}]
+        self.legacy(*bad, self.row("[status] good"))
+        self.flush()
+        self.assertEqual(self.published_texts(), ["[status] good"])
+        self.assertEqual(len(self.sql("SELECT * FROM held")), len(bad))
+
+
+class ImportRotationTests(FilesCase):
+    """Code review slot 2, finding 4 (class D): retained failures rotate within
+    the bounded budget, so a later file is never starved by them."""
+
+    def test_retained_failures_never_starve_a_later_file(self):
+        for i in range(3):
+            self.ds.publish_fallback(self.fs, self.authority.paths, dict(self.row(f"[status] stuck {i}"), id=f"{i}" * 32),
+                                     clock=lambda i=i: T0 + i)
+        stuck = self.fallback_files()
+        self.ds.publish_fallback(self.fs, self.authority.paths, dict(self.row("[status] later"), id="9" * 32),
+                                 clock=lambda: T0 + 10)
+        for p in stuck:
+            os.chmod(p, 0)
+        try:
+            with mock.patch.object(self.ds, "IMPORT_MAX", 2):
+                for _ in range(3):
+                    self.flush()
+            self.assertEqual(self.published_texts(), ["[status] later"])
+            self.assertEqual({a["ref"] for a in self.alerts()}, {p.name for p in stuck}, "each one tried")
+        finally:
+            for p in stuck:
+                os.chmod(p, 0o600)
+        self.flush()
+        self.assertEqual(sorted(self.published_texts()), ["[status] later"] + [f"[status] stuck {i}" for i in range(3)])
+
+
+class StagingIdentityTests(FilesCase):
+    """Self-audit, classes A and C: a staging file whose writer identity in its
+    name is incomplete or odd is kept while its pid lives, and never stops the flush."""
+
+    def test_an_incomplete_writer_identity_never_proves_its_writer_gone(self):
+        staging = self.state / "outbox.d" / "tmp"
+        names = [f"test-boot.{CLIENT_PID}.x.0a1b.tmp", f"test-boot.{CLIENT_PID}.None.0a1c.tmp",
+                 f"unknown.{CLIENT_PID}.start-1.0a1d.tmp", f"x.{CLIENT_PID}.x.0a1e.tmp"]
+        odd = "test-boot.\u00b2\u00b3.x.0a1f.tmp"  # digits to str.isdigit, but not a number
+        for n in names + [odd]:
+            (staging / n).write_bytes(b"{}")
+        self.importer.clean_staging()
+        self.assertEqual(sorted(p.name for p in staging.iterdir()), sorted(names + [odd]))
+        self.probes.world["gone"].add(CLIENT_PID)
+        self.importer.clean_staging()
+        self.assertEqual([p.name for p in staging.iterdir()], [odd])
+
+
+class ChangedClaimTests(FilesCase):
+    """Self-audit, classes A and D: a claim changed outside this design is held
+    once (one held row, one alert) however many flushes see it, and never unlinked."""
+
+    def test_a_changed_claim_is_held_once(self):
+        claim = self.legacy(self.row("[status] one"), name="outbox.claimed-1-a.jsonl")
+        self.flush()  # its line imported; not yet quiet, so not retired
+        data = claim.read_bytes()
+        claim.write_bytes(b" " + data[1:])  # its imported prefix rewritten
+        self.fs.durable(claim)
+        for _ in range(3):
+            self.flush()
+        self.assertEqual(len(self.sql("SELECT * FROM held WHERE file = ?", claim.name)), 1)
+        self.assertEqual(len([a for a in self.alerts() if a["ref"] == claim.name]), 1)
+        self.assertTrue(claim.exists())
+
+
+class StatusReadTests(FilesCase):
+    """Self-audit, class A: pchat status, which every outbox alert points to,
+    reports what it cannot read instead of failing on it."""
+
+    def test_status_reports_unreadable_files_and_an_odd_snapshot(self):
+        from test_outbox_regressions import pchat
+        claim = self.legacy(self.row("[status] old"), name="outbox.claimed-5-z.jsonl")
+        (self.state / "outbox-status.json").write_text("[1, 2]")
+        fallback = self.state / "outbox.d"
+        os.chmod(claim, 0)
+        os.chmod(fallback, 0)
+        try:
+            with self.unavailable():
+                lines = pchat.outbox_status()
+        finally:
+            os.chmod(claim, 0o600)
+            os.chmod(fallback, 0o700)
+        text = "\n".join(lines)
+        self.assertIn("UNAVAILABLE", text)
+        self.assertIn("could not be read", text)
 
 
 class ImportBoundaryTests(FilesCase):

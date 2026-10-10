@@ -139,30 +139,40 @@ def outbox_status():
     paths = chatlib.delivery_store.Paths(chatlib.STATE_DIR)
     reply = chatlib.client_factory().call("status", None)
     lines = []
-    if reply and reply.get("status"):
+    if reply and isinstance(reply.get("status"), dict):
         st, source = reply["status"], f"authority epoch {reply.get('authority_epoch')}"
     else:
         try:
             st = json.loads(paths.status.read_text())
         except (OSError, ValueError):
             st = {}
-        age = time.time() - st.get("written_at", time.time())
-        why = (st.get("unavailable") or {})
+        st = st if isinstance(st, dict) else {}  # what cannot be read is reported as unknown
+        written = st.get("written_at")
+        age = f"{int(time.time() - written)}s old" if isinstance(written, (int, float)) else "of unknown age"
+        why = st.get("unavailable") if isinstance(st.get("unavailable"), dict) else {}
         source = (f"authority UNAVAILABLE since {why.get('since', '?')} ({why.get('reason', 'no answer')});"
-                  f" snapshot {int(age)}s old")
+                  f" snapshot {age}")
     lines.append(f"outbox ({source}): {st.get('waiting', '?')} waiting to post,"
                  f" {st.get('checking', '?')} awaiting a delivery check, {st.get('held', 0)} held rows")
-    if st.get("suspended"):
-        lines.append(f"   suspended sender designations: {', '.join(st['suspended'])}")
-    for what, since in (st.get("deferred") or {}).items():
-        lines.append(f"   deferred ({what.replace('_', ' ')}): outbox.lock busy since {since}")
-    files = [n for n in (os.listdir(paths.fallback) if paths.fallback.exists() else [])
-             if chatlib.delivery_store.is_published_name(n)]
+    if isinstance(st.get("suspended"), list) and st["suspended"]:
+        lines.append(f"   suspended sender designations: {', '.join(map(str, st['suspended']))}")
+    for what, since in (st.get("deferred") if isinstance(st.get("deferred"), dict) else {}).items():
+        lines.append(f"   deferred ({str(what).replace('_', ' ')}): outbox.lock busy since {since}")
+    unreadable = 0
+    try:
+        files = [n for n in (os.listdir(paths.fallback) if paths.fallback.exists() else [])
+                 if chatlib.delivery_store.is_published_name(n)]
+    except OSError:
+        files, unreadable = [], unreadable + 1
     legacy = 0
     for f in [paths.legacy] + sorted(chatlib.STATE_DIR.glob("outbox.claimed-*.jsonl")):
-        if f.exists():
-            legacy += sum(1 for line in f.read_text(errors="replace").splitlines() if line.strip())
-    lines.append(f"   waiting for the bridge to import: {len(files)} fallback files, {legacy} legacy rows")
+        try:
+            if f.exists():
+                legacy += sum(1 for line in f.read_text(errors="replace").splitlines() if line.strip())
+        except OSError:
+            unreadable += 1
+    lines.append(f"   waiting for the bridge to import: {len(files)} fallback files, {legacy} legacy rows"
+                 + (f"; {unreadable} file(s) or folder(s) could not be read" if unreadable else ""))
     return lines
 
 
