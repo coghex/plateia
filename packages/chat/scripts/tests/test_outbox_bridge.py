@@ -666,6 +666,62 @@ class BoundedSetupTests(BridgeCase):
         self.assertEqual([m["account"] for m in self.server.published], ["sam"])
 
 
+class DeliveredAnnouncementTests(BridgeCase):
+    """Code review slot 6, finding 2 (C5): an interrupt's "delivered"
+    announcement that nothing durable recorded stays pending and is raised
+    again at later passes until it is durable; the interrupt is never repeated,
+    and acceptance and dead-lettering keep working."""
+
+    def item(self):
+        return {"kind": "ring", "msgid": "m-int", "channel": "#alpha", "sender": "pat", "project": "alpha",
+                "target": "alp-solver-2", "phase": "deliver", "interrupt": True, "needs_ack": True, "attempt": 0,
+                "next_at": 0, "text": "!! stop and read #alpha"}
+
+    def passes(self, deliveries, n, *, durable):
+        rings = []
+
+        def ring(cfg, item):
+            rings.append(item["msgid"])
+            return True, "delivered (fake)"
+        with mock.patch.object(self.bridge, "ring_agent", ring), mock.patch.object(self.bridge, "log", lambda m: None):
+            for _ in range(n):
+                if durable:
+                    deliveries.process(CFG)
+                else:
+                    with mock.patch.object(self.bridge, "OUTBOX_AUTHORITY", None), \
+                            mock.patch.object(self.ds, "publish_fallback", side_effect=OSError(28, "no space (fake)")):
+                        deliveries.process(CFG)
+        return rings
+
+    def announcements(self):
+        return [m for m in self.server.published if m["text"] and "instruction delivered" in m["text"]]
+
+    def test_an_unrecorded_announcement_is_raised_again_until_durable_without_a_second_interrupt(self):
+        deliveries = self.bridge.Deliveries()
+        deliveries.items = [self.item()]
+        rings = self.passes(deliveries, 3, durable=False)
+        self.assertEqual(rings, ["m-int"], "the interrupt is delivered once")
+        self.assertEqual(self.announcements(), [], "nothing could be recorded yet")
+        self.assertEqual(deliveries.items[0]["phase"], "accept", "it still waits for its acknowledgement")
+        rings += self.passes(deliveries, 2, durable=True)
+        self.assertEqual(rings, ["m-int"], "never interrupted again")
+        self.assertEqual(len(self.announcements()), 1, "announced once, at recovery")
+        self.assertEqual([i["phase"] for i in deliveries.items], ["accept"])
+        saved = self.bridge.Deliveries()  # what a restart reads back
+        self.assertEqual([i["msgid"] for i in saved.items], ["m-int"])
+
+    def test_an_acknowledgement_before_recovery_keeps_the_announcement_owed(self):
+        deliveries = self.bridge.Deliveries()
+        deliveries.items = [self.item()]
+        self.passes(deliveries, 1, durable=False)
+        deliveries.accept("m-int", "alp-solver-2", "reply", CFG)
+        self.assertEqual(self.announcements(), [])
+        rings = self.passes(deliveries, 2, durable=True)
+        self.assertEqual(rings, [], "an accepted interrupt is never rung again")
+        self.assertEqual(len(self.announcements()), 1)
+        self.assertEqual(deliveries.items, [], "it leaves once its announcement is durable")
+
+
 class AnnounceTests(BridgeCase):
     """Tests 29 and 36: the bridge's own announcement, its fallback file, and E9."""
 

@@ -401,26 +401,51 @@ class Deliveries:
 
     def accept(self, msgid, by, how, cfg):
         """The wake-up's recipient accepted message `msgid`: its manager, or for
-        a direct delivery (an interrupt) the agent it was for."""
-        for item in [i for i in self.items if i["kind"] == "ring" and i["msgid"] == msgid]:
+        a direct delivery (an interrupt) the agent it was for. An interrupt whose
+        delivered announcement is still owed stays, accepted, until it is durable."""
+        for item in [i for i in self.items if i["kind"] == "ring" and i["msgid"] == msgid
+                     and i.get("phase") != "accepted"]:
             owner = item.get("target") or cfg.get("projects", {}).get(item["project"], {}).get("manager")
             if owner != by:
                 continue
             self._record(item, True, f"accepted by {by} ({how})")
-            self.items.remove(item)  # only once its ledger line is durable
+            if item.get("delivered_announced") is False:  # C5: its announcement is raised again until durable
+                item["phase"] = "accepted"
+            else:
+                self.items.remove(item)  # only once its ledger line is durable
             if item.get("agent_msg_id"):  # the queued cmux copy is now redundant
                 _cmux("rpc", "agent.message.mark_read", json.dumps({"ids": [item["agent_msg_id"]]}))
             log(f"ring accepted ({item['channel']}) by {by} ({how})")
             self._save()
 
+    def retry_announcements(self, cfg):
+        """An interrupt's delivered announcement that nothing durable recorded is
+        raised again at every pass, by its same entry id, until it is durable
+        (C5); the interrupt itself is never rung again for it. Returns whether
+        anything changed."""
+        changed = False
+        for item in [i for i in self.items if i.get("delivered_announced") is False]:
+            try:
+                if not announce(cfg, item, item.get("delivered_text") or "interrupt delivered", "delivered"):
+                    continue
+            except Exception as err:  # still owed: raised again at the next pass
+                log(f"announce: {item['channel']}: not yet durable ({err!r:.80})")
+                continue
+            item["delivered_announced"] = True
+            changed = True
+            if item.get("phase") == "accepted":
+                self.items.remove(item)  # acknowledged already: nothing more is owed for it
+        return changed
+
     def process(self, cfg):
-        due = [i for i in self.items if i["next_at"] <= time.time()]
+        changed = self.retry_announcements(cfg)
+        due = [i for i in self.items if i["next_at"] <= time.time() and i.get("phase") != "accepted"]
         for item in due:
             try:
                 self._process_one(item, cfg)
             except Exception as err:  # it stays, as it is, and is tried again; the other items go on
                 log(f"{item['kind']} ({item['channel']}) not processed: {err!r:.100}; tried again next pass")
-        if due:
+        if due or changed:
             try:
                 self._save()
             except OSError as err:
@@ -469,9 +494,10 @@ class Deliveries:
         if ok and item.get("interrupt"):
             stop = (f"turn stopped {item['stopped_at'][11:19]}Z" if item.get("stopped_at")
                     else "it was not working")
-            announce(cfg, item, f"interrupt → {item['target']}: {stop}; instruction delivered;"
-                                f" waiting for its acknowledgement", "delivered")
-            item.update(phase="accept", next_at=time.time() + INTERRUPT_ACK_WAIT)
+            text = f"interrupt → {item['target']}: {stop}; instruction delivered; waiting for its acknowledgement"
+            announced = announce(cfg, item, text, "delivered")  # False: owed, and raised again each pass (C5)
+            item.update(phase="accept", next_at=time.time() + INTERRUPT_ACK_WAIT, delivered_announced=announced,
+                        delivered_text=text)
             log(f"interrupt delivered ({item['channel']}) to {item['target']}: {detail}")
         elif ok and item.get("needs_ack"):
             item.update(phase="accept", next_at=time.time() + ACCEPT_WAIT)

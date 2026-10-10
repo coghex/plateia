@@ -325,6 +325,38 @@ class PausedLockHolderTests(FilesCase):
         self.assertEqual(len(self.dead_letters()), 1)
 
 
+class CleanupAfterPublicationTests(FilesCase):
+    """Code review slot 6, finding 1: once the fallback file and its
+    directories are durably synced, a failed removal of its tmp/ copy is
+    cleanup only. The call is queued (exit 3), never "not queued", and the
+    bridge delivers it once. A failure before publication stays a failure."""
+
+    def test_a_cleanup_failure_after_publication_is_still_queued_and_delivered_once(self):
+        real, failed = self.fs.unlink, []
+
+        def unlink(path):
+            if Path(path).parent == self.state / "outbox.d" / "tmp":
+                failed.append(path)
+                raise PermissionError(13, "permission denied (fake)")
+            return real(path)
+        with self.unavailable(), mock.patch.object(self.fs, "unlink", unlink):
+            code, out = self.pchat("post", "#alpha", "[status] queued once")
+        self.assertEqual(code, 3, out)
+        self.assertEqual(len(failed), 1, "the cleanup was tried")
+        self.assertEqual(len(self.fallback_files()), 1, "published")
+        self.assertEqual(len(list((self.state / "outbox.d" / "tmp").iterdir())), 1, "its staging copy is kept")
+        self.flush()
+        self.flush()
+        self.assertEqual(self.published_texts(), ["[status] queued once"], "delivered once")
+        self.assertEqual(list((self.state / "outbox.d" / "tmp").iterdir()), [], "cleaned up later, once linked")
+
+    def test_a_failure_before_publication_is_still_a_failure(self):
+        with self.unavailable(), mock.patch.object(self.fs, "link", side_effect=OSError(28, "no space (fake)")):
+            code, out = self.pchat("post", "#alpha", "[status] not queued")
+        self.assertNotEqual(code, 3, out)
+        self.assertEqual(self.fallback_files(), [])
+
+
 class PublicationTests(FilesCase):
     """Test 33: unfinished, duplicate and failing publications."""
 

@@ -616,7 +616,9 @@ def publish_fallback(fs, paths, row, *, clock=time.time):
     """Publish one complete, immutable fallback file for row["id"]: exclusive
     creation under tmp/, the whole content synced, a link() that never replaces
     a file, then outbox.d/ and the state directory synced. Returns its name.
-    Any OSError means nothing was reported queued (the caller fails as today)."""
+    An OSError up to those syncs means nothing was reported queued (the caller
+    fails as today); after them the call is queued, and removing the tmp/
+    copy is cleanup only (clean_staging removes it later, once linked)."""
     fs.mkdir(paths.fallback)
     fs.mkdir(paths.staging)
     writer = row.get("writer") or {}
@@ -635,7 +637,10 @@ def publish_fallback(fs, paths, row, *, clock=time.time):
         raise OSError(errno.EEXIST, "no free fallback name")
     fs.sync_dir(paths.fallback)
     fs.sync_dir(paths.state)
-    fs.unlink(tmp)  # cleanup only
+    try:
+        fs.unlink(tmp)  # cleanup only: published and durable already
+    except OSError:
+        pass
     return name
 
 
