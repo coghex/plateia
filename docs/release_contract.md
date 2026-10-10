@@ -126,8 +126,12 @@ they don't refresh the source's index.
   reads or writes, with the versions it reads and the version it writes
   (none for a format it only reads). Three formats carry an embedded version:
   the identity registry (`version: 1`), child runs (`schema: childrun/2`) and
-  the receipt marker (`review-start-receipts-v1` in its file name). The rest
-  get documented baseline identifiers such as `channel-log/1`. The chat
+  the receipt marker (`review-start-receipts-v1` in its file name). #19's
+  future implementation, which is not yet approved or live, would add three
+  more: the outbox store `outbox-db` (its `meta` schema-version row), the
+  outbox authority protocol `outbox-authority` (each frame's `v`), and the
+  `outbox/2` fallback file (its `v`). The rest get documented baseline
+  identifiers such as `channel-log/1`. The chat
   config is written as well as read: `identities.register()` adds accounts,
   identity roles and assistants to it. The inventory also lists
   `role_colors.py`'s WeeChat state (`weechat.look.nick_color_force` and the

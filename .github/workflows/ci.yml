@@ -39,7 +39,8 @@ jobs:
       # (skill/OPERATING.md), the captured chat suite, the chat capture's own
       # tooling tests (docs/chat_capture.md) and the release builder's tests
       # (docs/release_contract.md), which build, verify and install a release
-      # into a fresh venv with the venv's own pip and no index. For each,
+      # into a fresh venv with the venv's own pip and no index, then stage it
+      # on invented homes (docs/release_staging.md; test_stage). For each,
       # unittest's own exit status decides first. Then the step refuses a run
       # that tested nothing: Python 3.10 and 3.11 exit 0 on an empty
       # discovery, which would let a moved test directory pass, and a missing
@@ -89,7 +90,7 @@ jobs:
             test_bridge test_receipt_experiment test_rotate_logs
           run_suite chat-tools packages/chat/tests
           run_suite release packages/release/tests \
-            test_build test_verify test_install test_privacy
+            test_build test_verify test_install test_privacy test_stage
 
   # The single required CI context. A failed dependency *skips* a dependent
   # job, and a skipped check is not a failed one to the drainer, so this job

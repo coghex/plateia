@@ -1307,6 +1307,9 @@ selected because it would reopen D-15.
 recorded fix to the bridge's deduplication window; otherwise the captured code
 behaves as today's live tools.
 
+**Amended by D-72 (2026-10-09):** the first activation also brings #19's
+recorded repair of partial-post delivery through the outbox.
+
 ### D-24. PLT-15 also captures the chat skill's operating guidance
 
 Owner decision in this conversation, 2026-10-08: amend the approved PLT-15
@@ -2057,6 +2060,232 @@ Two alternatives were not selected:
   into place.** It doesn't close the race, because the temporary directory's
   own parents can be swapped instead. A built environment also can't be
   moved: its console scripts name their build path.
+
+### D-72. #19 repairs partial-post delivery through the outbox as a recorded deviation
+
+Owner decision, 2026-10-09: the owner authorized the repair, and the plateia
+manager confirmed at the issue's signoff that it is recorded here. It amends
+D-23's "behaves as today's live tools" for this one transport repair only, as
+D-70 did for the deduplication window.
+
+**The defect.** A long post goes to the chat server in parts. The captured
+`chatlib.post` wrote every part, then waited once for the server's answer, so
+a timeout after the server had committed the parts looked like nothing was
+sent:
+
+- `pchat post` queued the whole text;
+- every outbox flush posted it all again, each copy under new message IDs that
+  msgid deduplication cannot catch;
+- each copy woke the recipient again.
+
+**The repair.**
+
+- Each part is confirmed before the next is written, and a failure says which
+  parts are confirmed, uncertain or unsent.
+- Every caller that feeds the outbox queues only the unconfirmed remainder.
+- The bridge records each part's state durably around every write.
+- It checks an uncertain part against the channel record, and resends it only
+  once the record is known complete well past the attempt and holds no such
+  message.
+- A part still undecided after a day is dead-lettered, with a content-free
+  owner alert.
+
+Delivery stays at-least-once with that check; nothing claims exactly-once.
+`packages/chat/provenance.json` records the change for each file. The drift
+check still compares the live tree with the baseline, and the live tools are
+unchanged, so it reports no new drift for these files.
+
+The running tools keep the defect until the release and activation slices
+(PLT-11, PLT-12, PLT-14) replace them with the captured code. #19 changes
+neither the running bridge nor the live skills tree.
+
+Fixing only the live tools was not selected: it would split the shared code
+D-23 makes plateia the single source of. Capturing the defect verbatim and
+fixing it in a later slice was not selected either: the reposting wakes
+managers on every flush.
+
+### D-73. #19's outbox state: one SQLite authority, designated senders, conservative finality
+
+Owner decision, 2026-10-09, relayed by the plateia manager. It refines D-72's
+repair after PR #20's review found four defects. All four came from outbox
+state split across several files and processes. The design is in
+[chat_outbox_state.md](chat_outbox_state.md); its section 11 gives the same
+decisions.
+
+- **One SQLite authority.** All outbox delivery state of plateia's copy lives
+  in one SQLite database, used through Python's standard `sqlite3`. That
+  covers entries, parts, attempts, attributions, evidence and coverage.
+  - The JSONL outbox files are only an import boundary.
+  - The dead letters and the owner alert are only exports.
+  - Every transport caller records its intent before sending anything.
+- **Designated senders (D2).** Delivery is confirmed from a matching message
+  in the record only for designated sender accounts. Which accounts are
+  designated is configured only at a separately approved activation, and
+  nothing is configured now. For any other account, such a part stays
+  unknown.
+- **Conservative finality (N6, N7).**
+  - Absence is proved only by finality specific to the attempt: the server's
+    in-order reply on the attempt's own connection.
+  - A crash, a broken connection, or no response by the end of a bounded
+    drain can never prove absence, and neither can a timeout. Such a part is
+    confirmed only by the designated-sender rule. Otherwise it stays unknown.
+  - A refusal whose durable record failed stays unknown.
+  - An unknown part is kept, never resent, and after 24 hours it is
+    dead-lettered, keeping its progress, with a content-free owner alert.
+  - Confirmed parts are never resent, and independent posts keep flowing.
+- **Not adopted (D1).** A dead direct writer's unsent remainder is not taken
+  over.
+- **#19's acceptance.**
+  - Acceptance 7 recovers the SQLite crash state rather than a claimed file,
+    with the same behavioral assertions (AD-1).
+  - Acceptance 3's absence fixture needs finality specific to the attempt,
+    not a bare timeout (AD-2). The second amendment makes that a non-refusal
+    error reply with the attempt's matching completion PONG: a late PONG
+    without an error confirms the part, and a FAIL dead-letters it.
+
+  #19 carries the owner's amendments saying so.
+- **Release packaging (second amendment, 2026-10-09).** #19's implementation
+  includes, in the same pull request, the minimal release metadata and
+  validation that package the SQLite authority correctly:
+  - the `outbox.db` state format, with its read and write versions;
+  - the new fallback-row and versioned dead-letter versions;
+  - every new runtime module in the payload;
+  - the new host interfaces;
+  - a test tying them to the shipped code.
+
+  That resolves #19's conflict between "`packages/chat` only" and its
+  release exclusion. Other release behavior, staging, live migration and
+  activation stay excluded. No rollback compatibility across `outbox-db/1`
+  is claimed: that is a breaking state migration, reserved for activation's
+  owner checkpoint and recovery plan. The details are in
+  [chat_outbox_state.md](chat_outbox_state.md) section 10.1.
+  - **Requirement 12.** It is satisfied by D-72 and this decision; no further
+    D-number is created for it.
+- **The bridge is the only outbox authority (owner decision, 2026-10-10).**
+  Design review round 4 found that a client stopped inside its own database
+  transaction would block every bridge write. The owner rejected exempting
+  that from #19's independent-flow requirement (R6), and approved the
+  write-routing proposal instead, with its tradeoffs:
+  - **The writer.** The bridge is the only process that opens or writes the
+    outbox database. `pchat`, `pchat ack` and `agentcli` notices send
+    complete, validated, bounded requests to it over a local socket. They
+    keep their own sends to the chat server.
+  - **The authority's rules.** A transaction begins only for a complete
+    request, and commits durably before any reply. So a paused client holds
+    no database lock, and cannot stall unrelated deliveries. R6 holds as
+    approved, and revision 5's exemption (C-8) is removed.
+  - **Queued while unavailable.** While the bridge's authority is
+    unavailable, posts, acknowledgements and notices are queued durably
+    instead of sent, and delivered when it returns. That is a **material
+    behaviour change**, accepted with its preserved delivery obligations.
+    Nothing is lost, but such posts are delayed.
+  - **A new interface.** The new versioned read-write interface
+    `outbox-authority/1` extends the release scope beyond the read-only
+    host interfaces of the second amendment. Mixed writers are refused at a
+    separately authorized, quiescent cutover.
+  - **The other two round 4 findings.**
+    - The bridge's own `announce` falls back to a bridge-private file, never
+      waiting on the shared outbox lock.
+    - The absence rule's message accounting applies to every part.
+  - **Review plan.** One refreshed canonical review of #19, as amended a
+    third time, and, only if it approves, the final design review round 5.
+    There is no further round.
+
+  The design is revision 6 of
+  [chat_outbox_state.md](chat_outbox_state.md), sections 2.4, 6.4, 7.3 and
+  10.1. **This decision approves the design, its scope and its review only.**
+  Implementation, code, tests and the `release.json` edit still need their
+  own owner decision.
+- **Per-entry fallback files and the review's corrections (owner decision,
+  2026-10-10, 11:31 UTC).** The canonical issue review of #19's third
+  amendment found that a fallback row already durable in the shared outbox
+  file still waited for a client stopped while holding the outbox lock. The
+  owner approved the manager's repair instead of narrowing R6:
+  - **One fallback file per entry.** A queueing caller, the bridge's own
+    `announce` included, publishes one complete, immutable fallback file per
+    entry. That is exclusive creation, a durable write, a link that never
+    replaces, and directory syncs.
+  - **No lock on import.** The bridge imports published files, and the
+    legacy outbox's rows, without the outbox lock. A stopped writer can delay
+    only its own unfinished publication.
+  - **The files are boundaries,** not a second authority. The bridge-private
+    fallback file is replaced by these files.
+  - **R6 preserved** over the database and over every already durable
+    obligation, with no exemption, lock stealing, lease or killing of
+    holders. The bridge-only authority, the queueing while it is unavailable,
+    and the `outbox-authority/1` interface all stand.
+  - **The review's five corrections:**
+    - acceptance 11 ignores generated manifest fields;
+    - the future guidance explains queueing while the authority cannot
+      answer;
+    - the future release suite may build and install isolated invented
+      fixtures;
+    - a writer's no-byte statement survives the bridge ending its attempt
+      first;
+    - a bridge announcement whose entry exists but whose content was never
+      sent is still delivered after a restart. Ordinary dead direct callers
+      keep D1.
+  - **Review budget.** At most five further review launches, shared by #19's
+    canonical issue review and the design review. The unused design round 5
+    is one of them.
+
+  The design is revision 7 of
+  [chat_outbox_state.md](chat_outbox_state.md), sections 3.3, 6.3, 6.4, I-12
+  and 10.1. **This decision approves the specification, the design and their
+  review only.** Implementation, code, tests and the `release.json` edit
+  still need their own owner decision.
+- **Staging test support and the rereview's corrections (owner decision,
+  2026-10-10, 12:29 UTC).** The canonical issue rereview of #19's fourth
+  amendment found that the required release declarations make the release
+  suite's required staging tests fail, while every file that could fix them
+  was excluded. The owner approved option A:
+  - **Test support.** The future implementation may minimally change exactly
+    two staging test-support files, `packages/release/tests/test_stage.py`
+    and `packages/release/tests/_staging.py`, so their invented, isolated
+    fixture releases use the live baseline formats. A fixture never presents
+    #19's changed manifest as already live.
+  - **The refusal test.** A future test shows that #19's real release is
+    refused at staging preflight against the live versions. That is the
+    correct outcome until a separately approved activation.
+  - **Unchanged:** `staging.json`, `stage_release.py`, operational staging,
+    the builder and its privacy scan, activation, and the sequencing of
+    PLT-12 and PLT-14. This is not a staging or activation project.
+  - **The rereview's corrections and additions,** three of each:
+    - when a fallback file is published;
+    - what the outbox lock still orders;
+    - that no post line, though a login, may precede a recorded attempt;
+    - module names that avoid the build's privacy scan;
+    - the fallback file's embedded version;
+    - captured tests updated with provenance.
+  - **The review budget is unchanged:** one of the five further launches
+    used, four remaining.
+
+  The design is revision 8 of
+  [chat_outbox_state.md](chat_outbox_state.md), section 10.1 and section 11,
+  decision 9. **This decision approves the specification, the design and
+  that test-support scope only.** Implementation, code, tests and the
+  `release.json` edit still need their own owner decision.
+
+Delivery stays at-least-once with the record check, and nothing claims
+exactly-once. These decisions approve the design only: implementing it needs
+a separate owner decision, and so does activation.
+
+Rejected alternatives:
+
+- **More local patches to the file-based state.** Each review round found a
+  new interleaving.
+- **Confirming delivery from text for every account.** An untracked identical
+  message could retire a part that was never posted.
+- **A settling time as proof of absence.** It is not proved.
+- **Letting every caller open the database, with an availability exemption
+  (C-8).** A paused client could stall all delivery. Rejected 2026-10-10.
+- **A client-side journal while the bridge is down.** It would be a second,
+  concurrently written authority.
+- **A separate authority daemon.** It is a new service, and posts would still
+  queue while it is down.
+- **Exempting already durable fallback rows that wait behind a stopped
+  holder of the outbox lock** (narrowing R6). Rejected 2026-10-10: per-entry
+  fallback files remove the wait instead.
 
 ## Open questions
 

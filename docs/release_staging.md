@@ -150,8 +150,10 @@ The plan reads no configuration, credentials, messages or chat state, and
 prints none. Paths under the home directory are printed as `~/...`.
 
 A managed or captured file is read only when it is a regular file with a
-single link, and, for a file in the skills tree, only when it is reached
-from the tree's root with no alias on the way. A hard link or an alias may
+single link, and only when it is reached with no alias on the way: a file
+in the skills tree from the tree's root, and a LaunchAgent from the home
+folder (so `~/Library/LaunchAgents` linked into private data is never
+read through). A hard link or an alias may
 be private data under another name, and a path can't show which, so such a
 file is never opened. Its target blocks, naming the file and why it wasn't
 read. The file opened must still be the one checked, with one link, before
@@ -445,18 +447,25 @@ its inode. Every temporary file gets a `creating` record before it exists.
   - each command is executable and calls the wheel's entry point. It runs
     the environment's `bin/python`, whose links lead to the chosen
     interpreter, read from its shebang or from the `/bin/sh` launcher pip
-    writes for long paths. Any other interpreter is refused, even another
-    name in `bin/`;
+    writes for long paths. The shebang must be that interpreter alone, with
+    no argument, and the line ends only at a newline, as the kernel reads
+    it. The `/bin/sh` preamble must be pip's, complete. Any other
+    interpreter is refused, even another name in `bin/`;
   - each command is the launcher pip writes, judged by its structure, never
-    by its `RECORD` hash. It's parsed (nothing runs): after the shebang, or
-    the `/bin/sh` preamble, only `import re` and `import sys`, the one
-    import of the wheel's entry point, and an `if __name__ == "__main__":`
-    block. That block normalises `sys.argv[0]` with exactly one of the forms
-    pip's versions write, statement for statement, and then exits with the
-    entry point's result. The forms are distlib's `re.sub`, the `.exe`
-    slice (with or without the `-script.pyw` branch), and
-    `removesuffix('.exe')`. This is checked at install, and again whenever
-    the environment is verified;
+    by its `RECORD` hash. It's parsed from its bytes, as Python reads the
+    file, coding declaration included, so nothing can hide in a comment
+    (nothing runs). After the shebang, or the `/bin/sh` preamble, it must
+    be exactly one of the templates pip's versions write:
+    - that template's imports: `import re` and `import sys` for distlib's
+      `re.sub`, and `import sys` alone for the `.exe` slice (with or
+      without the `-script.pyw` branch) and for `removesuffix('.exe')`;
+    - the one import of the wheel's entry point;
+    - an `if __name__ == "__main__":` block that normalises `sys.argv[0]`
+      as that template does, statement for statement, and then exits with
+      the entry point's result.
+
+    This is checked at install, and again whenever the environment is
+    verified;
   - what the environment's own startup would establish, from the same
     snapshot: `bin/python` leads, through links inside the environment, to
     the operation's chosen interpreter; `pyvenv.cfg` names that
@@ -554,6 +563,11 @@ The tests cover:
     With `open` and `os.open` set to fail on that inode, the full plan never
     opens it. Every target blocks, naming the skills root, and staging is
     refused;
+  - round 10's fixture: `~/Library/LaunchAgents` is a link to the invented
+    `~/.config/chat`, which holds private content at both expected plist
+    names. With `open` and `os.open` set to fail on those inodes, the full
+    plan never opens them. Both LaunchAgent targets block, naming why, and
+    staging is refused;
   - a changed file;
   - a retargeted link or program;
   - a missing target;
@@ -672,6 +686,13 @@ The tests cover:
     normalisation becomes `sys.argv[0] = sys.argv[0].endswith()`. Each has
     its `RECORD` row updated. Each is refused at install, naming the
     command, and nothing is recorded installed.
+  - **A launcher's imports or shebang (round 10):** right after pip
+    returns, `pchat` carries the `re.sub` normalisation without
+    `import re`, or its shebang passes the interpreter `-S`. Each has its
+    `RECORD` row updated. Each is refused at install, naming the command,
+    and nothing is recorded installed. A unit test also refuses a launcher
+    whose utf-7 coding declaration turns a comment into an extra import,
+    and a shebang with a carriage return after the interpreter.
   - **A change after verification (round 8):** right after
     `verify-environment` records `ok`, the environment is swapped for a
     link into the invented private state, or a `.pth` hook is added. The
@@ -705,7 +726,7 @@ The tests cover:
   record no call. Every recorded command is the chosen interpreter or the
   staged environment's.
 
-### Crash recovery (invented fixtures, stager at `787f780`)
+### Crash recovery (invented fixtures, stager at `4f39714`)
 
 Each row is a fresh invented home. The run was stopped right after the
 journal record in the first column, then run again with the same inputs.
@@ -727,13 +748,13 @@ macOS arm64, CPython 3.14.8:
 | intent copy-artifacts | unfinished | (empty) | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.manifest.json.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
-| created <release>/artifacts/.manifest.json.b8bb49ac54e4.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.manifest.json.2f595f676708.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/manifest.json | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
-| created <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.a5e44bdfa3bc.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.plateia-skill-chat-0.1.0+g04cab9561a11.zip.c5b5045af9cb.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/plateia-skill-chat-0.1.0+g04cab9561a11.zip | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.<random>.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
-| created <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.b07cdb58dab4.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
+| created <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.3132b68f3dee.tmp | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | created <release>/artifacts/plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | outcome copy-artifacts | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
 | intent create-environment | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
@@ -741,14 +762,14 @@ macOS arm64, CPython 3.14.8:
 | outcome create-environment | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
 | intent install-package | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
 | creating <release>/.env-inventory.json.<random>.tmp | unfinished | artifacts, env | resumed and staged | 1 | 1 | yes |
-| created <release>/.env-inventory.json.995cc3885f9a.tmp | unfinished | .env-inventory.json.995cc3885f9a.tmp, artifacts, env | resumed and staged | 1 | 1 | yes |
+| created <release>/.env-inventory.json.a19d07070025.tmp | unfinished | .env-inventory.json.a19d07070025.tmp, artifacts, env | resumed and staged | 1 | 1 | yes |
 | created <release>/env-inventory.json | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | outcome install-package | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | intent verify-environment | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | outcome verify-environment | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | intent complete | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | creating <release>/.staged.json.<random>.tmp | unfinished | artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
-| created <release>/.staged.json.71f49c730064.tmp | unfinished | .staged.json.71f49c730064.tmp, artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
+| created <release>/.staged.json.50dae8d434b9.tmp | unfinished | .staged.json.50dae8d434b9.tmp, artifacts, env, env-inventory.json | resumed and staged | 1 | 1 | yes |
 | created <release>/staged.json | unfinished | artifacts, env, env-inventory.json, staged.json | resumed and staged | 1 | 1 | yes |
 | outcome complete | complete | artifacts, env, env-inventory.json, staged.json | already staged, verified | 1 | 1 | yes |
 | creating <release>/artifacts/.plateia_chat-0.1.0+g04cab9561a11-py3-none-any.whl.<random>.tmp (and the manifest copy cut short) | unfinished | artifacts | resumed and staged | 1 | 1 | yes |
