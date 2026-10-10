@@ -350,6 +350,7 @@ class Deliveries:
             self.items = json.loads(PENDING.read_text())
         except (OSError, ValueError):
             self.items = []
+        self.unsaved = False  # a change whose save failed: saved again at every pass until it is
 
     def _save(self):
         """A durable replace: an item leaves only after its ledger line is durable (section 3.6)."""
@@ -409,7 +410,7 @@ class Deliveries:
             if owner != by:
                 continue
             self._record(item, True, f"accepted by {by} ({how})")
-            if item.get("delivered_announced") is False:  # C5: its announcement is raised again until durable
+            if self._owes(item):  # C5: what its delivery still owes is done first
                 item["phase"] = "accepted"
             else:
                 self.items.remove(item)  # only once its ledger line is durable
@@ -418,37 +419,59 @@ class Deliveries:
             log(f"ring accepted ({item['channel']}) by {by} ({how})")
             self._save()
 
-    def retry_announcements(self, cfg):
-        """An interrupt's delivered announcement that nothing durable recorded is
-        raised again at every pass, by its same entry id, until it is durable
-        (C5); the interrupt itself is never rung again for it. Returns whether
-        anything changed."""
+    @staticmethod
+    def _owes(item):
+        """What a delivered interrupt still owes: its ledger line, or its announcement."""
+        return "delivered_detail" in item or item.get("delivered_announced") is False
+
+    def retry_owed(self, cfg):
+        """What a delivered interrupt still owes, done again at every pass until
+        it is durable: its ledger line, then its announcement (C5, by its same
+        entry id). The interrupt itself is never rung again for either. Returns
+        whether anything changed."""
         changed = False
-        for item in [i for i in self.items if i.get("delivered_announced") is False]:
+        for item in [i for i in self.items if self._owes(i)]:
+            changed |= self._do_owed(item, cfg)
+        return changed
+
+    def _do_owed(self, item, cfg):
+        changed = False
+        if "delivered_detail" in item:
             try:
-                if not announce(cfg, item, item.get("delivered_text") or "interrupt delivered", "delivered"):
-                    continue
+                self._record(item, True, item["delivered_detail"])
+            except Exception as err:  # still owed: written at the next pass
+                log(f"{item['kind']} ({item['channel']}) ledger line not yet durable ({err!r:.80})")
+                return changed
+            item.pop("delivered_detail")
+            changed = True
+        if item.get("delivered_announced") is False:
+            try:
+                announced = announce(cfg, item, item.get("delivered_text") or "interrupt delivered", "delivered")
             except Exception as err:  # still owed: raised again at the next pass
                 log(f"announce: {item['channel']}: not yet durable ({err!r:.80})")
-                continue
+                announced = False
+            if not announced:
+                return changed
             item["delivered_announced"] = True
             changed = True
-            if item.get("phase") == "accepted":
-                self.items.remove(item)  # acknowledged already: nothing more is owed for it
+        if item.get("phase") == "accepted":
+            self.items.remove(item)  # acknowledged already: nothing more is owed for it
         return changed
 
     def process(self, cfg):
-        changed = self.retry_announcements(cfg)
+        changed = self.retry_owed(cfg)
         due = [i for i in self.items if i["next_at"] <= time.time() and i.get("phase") != "accepted"]
         for item in due:
             try:
                 self._process_one(item, cfg)
             except Exception as err:  # it stays, as it is, and is tried again; the other items go on
                 log(f"{item['kind']} ({item['channel']}) not processed: {err!r:.100}; tried again next pass")
-        if due or changed:
+        if due or changed or self.unsaved:
             try:
                 self._save()
-            except OSError as err:
+                self.unsaved = False
+            except Exception as err:  # what changed in memory is saved again at every pass until it is
+                self.unsaved = True
                 log(f"pending deliveries not saved: {err!r:.100}; saved again next pass")
 
     def _process_one(self, item, cfg):
@@ -490,20 +513,21 @@ class Deliveries:
             item["next_at"] = time.time() + WAIT_CHECK
             return
         item["attempt"] += 1
-        self._record(item, ok, detail)
         if ok and item.get("interrupt"):
+            # Delivered: the item is marked so first, and nothing after this can make it
+            # ringable again. Its ledger line, its announcement (C5) and the save of this
+            # state are owed: each that fails is done again at later passes (retry_owed,
+            # process), and the interrupt is never rung again for any of them.
             stop = (f"turn stopped {item['stopped_at'][11:19]}Z" if item.get("stopped_at")
                     else "it was not working")
             text = f"interrupt → {item['target']}: {stop}; instruction delivered; waiting for its acknowledgement"
-            try:
-                announced = announce(cfg, item, text, "delivered")  # False: owed, and raised again each pass (C5)
-            except Exception as err:  # owed too: the interrupt is delivered, and is never rung again for this
-                log(f"announce: {item['channel']}: not yet durable ({err!r:.80})")
-                announced = False
-            item.update(phase="accept", next_at=time.time() + INTERRUPT_ACK_WAIT, delivered_announced=announced,
-                        delivered_text=text)
+            item.update(phase="accept", next_at=time.time() + INTERRUPT_ACK_WAIT, delivered_announced=False,
+                        delivered_text=text, delivered_detail=detail)
             log(f"interrupt delivered ({item['channel']}) to {item['target']}: {detail}")
-        elif ok and item.get("needs_ack"):
+            self._do_owed(item, cfg)
+            return
+        self._record(item, ok, detail)
+        if ok and item.get("needs_ack"):
             item.update(phase="accept", next_at=time.time() + ACCEPT_WAIT)
             log(f"ring delivered ({item['channel']}); awaiting acceptance: {detail}")
         elif ok:

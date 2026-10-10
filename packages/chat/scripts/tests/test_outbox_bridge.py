@@ -727,6 +727,71 @@ class DeliveredAnnouncementTests(BridgeCase):
         self.assertEqual(deliveries.items[0]["phase"], "accept")
         self.assertEqual(len(self.announcements()), 1, "the owed announcement is made durable at a later pass")
 
+    def ledger(self):
+        path = self.bridge.DELIVERIES
+        rows = [json.loads(x) for x in path.read_text().splitlines() if x.strip()] if path.exists() else []
+        return [r for r in rows if r.get("msgid") == "m-int" and r.get("ok") is True]
+
+    def test_no_failure_after_delivery_ever_rings_the_interrupt_again(self):
+        """Code review slot 7: once ring_agent has delivered the interrupt, a
+        failing ledger line, announcement or state save leaves it delivered;
+        only that owed work is retried, across passes and a restart."""
+        real_record, real_announce, real_save = (self.bridge.Deliveries._record, self.bridge.announce,
+                                                 self.bridge.Deliveries._save)
+        for failure in ("ledger raises", "announcement raises", "announcement fails", "save raises"):
+            with self.subTest(failure=failure):
+                self.fresh()
+                failed = []
+
+                def record(d, item, ok, detail):
+                    if failure == "ledger raises" and ok is True and not failed:
+                        failed.append(detail)
+                        raise OSError(28, "no space left on device (fake)")
+                    return real_record(d, item, ok, detail)
+
+                def announce(cfg, item, text, reason):
+                    if failure.startswith("announcement") and not failed:
+                        failed.append(reason)
+                        if failure == "announcement raises":
+                            raise OSError(5, "the authority's reply could not be read (fake)")
+                        return False
+                    return real_announce(cfg, item, text, reason)
+
+                def save(d):
+                    if failure == "save raises" and any(i.get("phase") == "accept" for i in d.items) and not failed:
+                        failed.append("save")
+                        raise OSError(28, "no space left on device (fake)")
+                    return real_save(d)
+                deliveries = self.bridge.Deliveries()
+                deliveries.items = [self.item()]
+                deliveries._save()  # as queued: "deliver", durably
+                with mock.patch.object(self.bridge.Deliveries, "_record", record), \
+                        mock.patch.object(self.bridge, "announce", announce), \
+                        mock.patch.object(self.bridge.Deliveries, "_save", save):
+                    rings = self.passes(deliveries, 3, durable=True)
+                    rings += self.passes(self.bridge.Deliveries(), 2, durable=True)  # after a restart
+                self.assertEqual(len(failed), 1, "the failure was injected once")
+                self.assertEqual(rings, ["m-int"], "the interrupt is rung exactly once")
+                self.assertEqual(len(self.ledger()), 1, "its ledger line is written once")
+                self.assertEqual(len(self.announcements()), 1, "its announcement is made once")
+                self.assertEqual([i["phase"] for i in self.bridge.Deliveries().items], ["accept"], "saved as delivered")
+
+    def test_a_failure_before_delivery_is_retried_as_before(self):
+        deliveries = self.bridge.Deliveries()
+        deliveries.items = [self.item()]
+        calls = []
+
+        def ring(cfg, item):
+            calls.append(item["msgid"])
+            if len(calls) == 1:
+                raise OSError(61, "cmux did not answer (fake)")  # nothing delivered: it is rung again
+            return True, "delivered (fake)"
+        with mock.patch.object(self.bridge, "ring_agent", ring), mock.patch.object(self.bridge, "log", lambda m: None):
+            for _ in range(3):
+                deliveries.process(CFG)
+        self.assertEqual(calls, ["m-int", "m-int"], "rung again only because the first was never delivered")
+        self.assertEqual(len(self.announcements()), 1)
+
     def test_an_acknowledgement_before_recovery_keeps_the_announcement_owed(self):
         deliveries = self.bridge.Deliveries()
         deliveries.items = [self.item()]
