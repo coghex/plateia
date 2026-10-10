@@ -4,7 +4,7 @@ This is the design note for #19 and pull request #20. It is design only:
 nothing here is implemented, and implementing it needs a separate owner
 decision.
 
-This is revision 7. Revision 3 answered design review round 2. Revision 4
+This is revision 8. Revision 3 answered design review round 2. Revision 4
 aligned the note with the owner's second amendment to #19:
 
 - the release-packaging scope;
@@ -46,6 +46,21 @@ stopped while holding `outbox.lock`.
     still delivered after a restart (E9, section 6.4);
   - acceptance 11's comparison, the guidance, and the release suite's
     fixture builds are corrected (sections 8 and 10.1).
+
+Revision 8 adopts the owner's third decision of 2026-10-10, made after the
+canonical issue rereview of #19's fourth amendment. It adds three things:
+
+- **Staging test support (option A).** The future implementation may
+  minimally change the two staging test-support files, so their fixtures
+  stay on the live formats. A new future test shows that #19's real release
+  is refused at staging preflight against the live versions (section 10.1).
+  Operational staging is unchanged.
+- **That review's three wording corrections:**
+  - when a fallback file is published;
+  - what `L_outbox` still orders;
+  - what "send nothing" means while the authority is unavailable.
+- **Its three release and test additions** (sections 2.4.4, 6.4, 8 and
+  10.1).
 
 Section 12 lists what changed and why. The owner's decisions of 2026-10-09 and
 2026-10-10 are recorded in section 11, and in D-73 of
@@ -328,7 +343,7 @@ The columns listed are the minimum the proofs rely on.
 | `TX` | A `BEGIN IMMEDIATE` transaction, run only by the authority thread. Every row condition is checked inside the transaction that changes the row. |
 | `L_auth` | The non-blocking flock `outbox.authority.lock`, taken by the bridge before it opens the database and held for the authority's lifetime (section 2.4.1). A second bridge cannot take it, and so never opens the database or binds the socket. |
 | `L_flush` | The non-blocking flock `outbox.flush.lock`. One flusher at a time, held for the whole flush, including import and export. This lock exists at PR #20's head `e658bb8`, but **not** on master `a12d99c`, whose `flush_outbox` takes no flush lock. The implementation adds it, and declares it in the new `outbox-db` format's path (section 10.1). |
-| `L_outbox` | The flock `outbox.lock`, which exists on master (`chatlib.py`'s `_outbox_locked`) and at `e658bb8`. In this design it orders only two things: every write to `dead-letters.jsonl` (section 3.6), and the **retirement** of a legacy claim file (section 6.3). No client of this release takes it, and **no import waits for it**. The old tools take it to append to `outbox.jsonl` (`chatlib.py:391` on master). The bridge acquires it only with a bounded wait, and never on the authority thread. |
+| `L_outbox` | The flock `outbox.lock`, which exists on master (`chatlib.py`'s `_outbox_locked`) and at `e658bb8`. In this design it orders only two things: every write to `dead-letters.jsonl` (section 3.6), and the **retirement** of a legacy claim file (section 6.3). No client of this release takes it, and **no import waits for it**. The old tools take it to append to `outbox.jsonl` (`chatlib.py:391` on master). The bridge acquires it only with a bounded wait, and never on the authority thread. Within the legacy outbox its one role is that retirement barrier. It still serializes dead-letter writes within `LOCK_WAIT`, and a busy lock defers them (the canonical issue rereview of #19's fourth amendment, correction 2). |
 | **owner** | The acting flow's writer identity equals the row's. |
 | **gone**, **conn-closed** | Section 5.4. |
 
@@ -601,8 +616,19 @@ A client treats the authority as **unavailable** when:
 
 Then:
 
-- **It never sends a byte without a committed `attempt` reply.** Lines go out
-  only while it holds the committed reply for that part.
+- **It sends no line of a part or acknowledgement without a committed
+  `attempt` reply.** That covers `BATCH`, `PRIVMSG` and `TAGMSG` lines, and
+  the channel recreation that follows a 403. Lines go out only while it holds
+  the committed reply for that part. A channel recreation goes out only after
+  the rejected attempt's A4 outcome is committed too. If that `outcome`
+  request is not answered, the call recreates nothing, and hands off with the
+  attested outcome.
+- **Connecting and logging in are not part of any post.** A call may check
+  the authority, connect and log in before E1, as E1's "after logging in"
+  and Q0's "a failed login or setup" already say. That publishes nothing to
+  any channel. "Sends nothing to the chat server" in #19's third amendment
+  means no such line (the canonical issue rereview of #19's fourth
+  amendment).
 - **Before any byte of the call,** it publishes the fallback file (section
   6.4) for *X*, durably, and only then reports the post as queued (exit 3).
   If an `attempt` request went unanswered, the file carries an A12
@@ -936,8 +962,9 @@ message's content.
 ### I-1. Intent before bytes
 
 Every transport caller commits a `writing` attempt (A1) before any byte of a
-part or an ack is sent. A failure before that point writes nothing: Q0 only
-queues the call.
+part or an ack is sent, and before any channel recreation for it. A failure
+before that point writes nothing: Q0 only queues the call. Connecting and
+logging in come before E1, and publish nothing (section 2.4.4).
 
 **Why it holds.** Posting and acknowledging both go through the attempt
 protocol, including today's separate `chatlib.ack` send. A1 is the only way
@@ -1867,11 +1894,17 @@ P exits 3, reporting the post as queued, only after step 4. No lock is taken,
 so a writer stopped at any point delays only its own call (I-12). If
 publication fails, P fails as described at the end of this section.
 
-**When a writer publishes one.** When its `queue` or `handoff` request is not
-answered as committed: the authority is unavailable, or the reply is missing,
-`busy` or `error` (section 2.4.4). Also, when it must make an attestation
-durable and no request is answered (section 3.3). A call publishes at most one
-fallback file, because publishing one ends the call.
+**When a writer publishes one, and only then** (the canonical issue
+rereview of #19's fourth amendment, correction 1):
+
+- its `queue` or `handoff` request is not answered as committed: the
+  authority is unavailable, or the reply is missing, `busy` or `error`
+  (section 2.4.4); or
+- it must make an attestation durable, and no request is answered (section
+  3.3).
+
+A Q0 or E3 that commits needs no file. A call publishes at most one fallback
+file, because publishing one ends the call.
 
 **Its name** is `<t>-<X>-<r>.json` (section 6.3): the publication time, the
 entry id *X*, and a random suffix. If `link()` finds the name taken, the writer
@@ -2235,7 +2268,8 @@ posted on the issue. The mapping is to the amended issue.
 | R7, refusals | A3 and E6; N6 for a refusal that could not be recorded. |
 | R8, visibility | `pchat status` from the authority: waiting to post, awaiting a check, held rows, suspended designations, fallback files and legacy rows not yet imported, and claim retirement or export deferred by a busy lock. While the authority is unavailable, the dated snapshot and the waiting fallback files and legacy rows (section 2.4.5). |
 | R9, no exactly-once; delivery preservation | Stated here. A transport failure before any part is written still queues the whole post once. **Changed by the owner's 2026-10-10 decision:** while the authority is unavailable, a post, ack or notice is queued in full instead of sent, and delivered when the bridge returns (section 2.4.4). Nothing is lost, and it is not claimed equivalent to today. |
-| R10, R13 | Unchanged. |
+| R10, capture record | Unchanged, plus: captured tests whose assertions encode replaced behaviour are updated in the implementation's pull request, with requirement 10 provenance entries, keeping their protective intent. That covers ack rows queued to `outbox.jsonl`, which no client of this release writes, and direct sending while no authority runs. For `test_silence.py` (`:152-171`, `:175-185`): a silent run's post is never queued in any form, including fallback files and `queue` or `handoff` requests; its acknowledgements are still kept; and a pre-run entry keeps its delivery (addition 3). |
+| R13 | Unchanged. |
 | R11, guidance | In the implementation's pull request, `packages/chat/SKILL.md` also explains, in plain words with invented examples, that posts, acknowledgements and notices are queued while the bridge's authority cannot answer, **even when the chat server is reachable**, and are delivered when it returns (correction (b) of the canonical issue review of #19's third amendment). That file is read by agents and by `test_skill_guidance.py`, so it changes only in that pull request, never by `docs-push`, and it is not changed now. |
 | R12, contract documentation | Satisfied by D-72 and D-73, which are updated as needed. No new D-number. |
 | R14, the SQLite authority | Sections 2–7. The bridge is its only opener and writer (section 2.4; the 2026-10-10 decision). |
@@ -2244,7 +2278,7 @@ posted on the issue. The mapping is to the amended issue.
 | Acceptance 3 | As amended (AD-2, corrected by the second amendment). The fixture gives part 3 a **non-refusal** error reply together with its matching completion PONG, complete coverage, and no unexplained message. Companion checks: a late PONG without an error is A2, confirmed and not resent; a FAIL is A3, dead-lettered and not retried; a bare timeout, crash or broken connection never proves absence. |
 | Acceptance 7 | As amended (AD-1): the test recovers the SQLite crash state, with the same assertions. |
 | Acceptance 11 | As corrected (section 10.1): the comparison excludes normally generated fields, and the release suite's isolated fixture builds and installs are allowed. |
-| Acceptance 12 (third amendment), with the fourth amendment's additions | Tests 25–37 (section 9). |
+| Acceptance 12 (third amendment), with the fourth and fifth amendments' additions | Tests 25–40 (section 9). |
 
 **Narrowings inside UNKNOWN.** Each of these ends as UNKNOWN, never as a
 resend:
@@ -2649,6 +2683,37 @@ written or run now.
       releases in isolated temporary directories, under
       `_support.py`/`test_install.py`'s existing isolation.
 
+Tests 38–40 are the fifth amendment's future regressions. They too are
+specifications, not runs.
+
+38. **Staging, with #19's formats (option A).**
+    - `test_stage`'s happy-path fixtures, built by the changed
+      `test_stage.py` and `_staging.py`, use the live baseline formats, and
+      still reach `staged`. Every existing protective staging test keeps its
+      assertion.
+    - **The refusal test.** The release built from #19's own
+      `release.json` is refused at preflight against the real
+      `staging.json` baseline. Preflight names `outbox` (`outbox/2` against
+      `outbox/1`), `delivery-records` (`/2` against `/1`), and each new
+      format the live tools don't use. Nothing is staged.
+    - `staging.json` and `stage_release.py` are unchanged. The test reads
+      them as they are.
+39. **Release metadata.**
+    - Every new runtime module's wheel path passes `STATE_NAMES` unchanged.
+      A negative control named `outbox_*.py` is refused by the build.
+    - The `outbox` entry declares `embedded_version: true` with `field: "v"`.
+      The format-marker test ties `"outbox/2"` in the shipped code to it.
+40. **Captured tests, updated with provenance.** `test_silence.py`, and every
+    other captured test whose assertion encodes replaced behaviour, is
+    updated in the pull request with a requirement 10 provenance entry. Each
+    keeps its protection:
+    - a silent run's post is never queued in any form: no fallback file, no
+      `queue` or `handoff` request, and no legacy row;
+    - its acknowledgements are kept;
+    - an entry from before the run keeps its delivery.
+
+    No case is weakened to pass.
+
 ## 10. Feasibility and risks
 
 **Feasibility.** Everything uses the standard library's `sqlite3`, `os.fsync`,
@@ -2711,6 +2776,14 @@ in the same PR #20, makes these minimal declarations in
   - It reads `outbox/1` (the legacy rows in `outbox.jsonl` and claim files)
     and `outbox/2`.
   - This release never writes `outbox/1`.
+  - **Its embedded version.** An `outbox/2` file carries `v: "outbox/2"`, so
+    the entry's `embedded_version` becomes `true`, with `field: "v"`.
+    `outbox/1` rows carry no version, and the entry says so in its `covers`
+    text. This is part of the same minimal `outbox` edit under acceptance 11,
+    not an unlisted change. `docs/release_contract.md`'s list of formats that
+    carry an embedded version names `outbox-db`, `outbox-authority` and
+    `outbox/2` as #19's future formats (the canonical issue rereview of #19's
+    fourth amendment, addition 2).
 - **A new `wire` format, `outbox-authority`: the read-write interface the
   owner approved on 2026-10-10.** It covers the request protocol on
   `$CHAT_STATE/outbox.sock` between the clients (`pchat`, `agentcli`) and the
@@ -2727,6 +2800,12 @@ in the same PR #20, makes these minimal declarations in
 - **Every new runtime module** the implementation adds under
   `packages/chat/scripts` is listed in `package.files`. It is also recorded in
   `provenance.json` as a plateia-only file.
+  - **Its name** must not match the builder's unchanged privacy scan,
+    `build_release.STATE_NAMES` (`build_release.py:81-82`). That scan flags
+    any wheel member whose base name starts with `outbox` or ends in
+    `.jsonl`, among other state names, and the build refuses such an
+    artifact (`:316-319`). So a module is named, say, `delivery_store.py`,
+    never `outbox_store.py`. The scan is not changed (addition 1).
 - **The interpreter note** says that the standard library's `sqlite3` module
   is required.
 - **New host interfaces the probes read:**
@@ -2738,7 +2817,49 @@ in the same PR #20, makes these minimal declarations in
 
 Nothing else in the release changes: the builder, verification, staging, other
 format entries, the skill, and the package version policy. If declaring these
-needs any builder change, the implementer stops and asks.
+needs any builder change, the implementer stops and asks. The one exception is
+the staging test support below.
+
+**Staging test support (option A; the owner's decision of 2026-10-10, 12:29
+UTC).** The canonical issue rereview of #19's fourth amendment found that
+these declarations make the required `test_stage` suite fail.
+
+- **Why it fails.**
+  - `test_stage` builds its fixture release from the checkout's own
+    `release.json` (`test_stage.py:40-43`).
+  - It then stages that fixture against `staging.json`'s `live_versions`
+    (`_staging.py:116-120`).
+  - Preflight refuses a release that writes `outbox/2` or
+    `delivery-records/2` where the live tools use `/1`, and refuses any
+    declared format the live tools don't use (`stage_release.py:838-885`;
+    [release_staging.md](release_staging.md)).
+- **The exception.** The future implementation may minimally change exactly
+  two test-support files: `packages/release/tests/test_stage.py`, and the
+  helper `packages/release/tests/_staging.py` under `tests/` (not
+  `stage_release.py`).
+  - **What the change does.** Their invented, isolated fixture releases are
+    built with the **baseline** formats that the staging happy-path tests
+    need: the live versions.
+  - **What it must never do.** A fixture never presents #19's changed
+    production manifest as if its new formats were already live.
+- **A new future test: #19's real release is refused.** The release built
+  from #19's own `release.json` is **refused** at preflight:
+  - against the live `outbox/1` and `delivery-records/1` versions;
+  - against the existing declared live-format set, for `outbox-db`,
+    `outbox-authority` and the new host interfaces.
+
+  That refusal is the correct safety outcome until a separately approved
+  activation and cutover. Nothing makes a refusal look like a successful
+  stage.
+- **What stays.** The existing protective staging tests keep their intent,
+  and compatibility is not weakened to pass the suite.
+- **Unchanged:** `staging.json`, `stage_release.py`, operational staging,
+  the builder and its privacy scan, activation, and the sequencing of
+  PLT-12 and PLT-14.
+- **Not a project.** This is not a staging or activation prerequisite
+  project. Until activation provides a migration path, no plateia release
+  that includes #19 passes staging preflight against the live baseline. That
+  is consistent with "Rollback is not claimed".
 
 **Fixture builds and installs** (correction (c) of the canonical issue review
 of #19's third amendment):
@@ -2825,7 +2946,7 @@ rollback compatibility.
 
 ## 11. Owner decisions (2026-10-09 and 2026-10-10)
 
-The owner approved decisions 1–6 on 2026-10-09, and decisions 7 and 8 on
+The owner approved decisions 1–6 on 2026-10-09, and decisions 7 to 9 on
 2026-10-10. They are recorded as D-73 in
 [plateia_design.md](plateia_design.md), and as an amendment to #19.
 
@@ -2915,6 +3036,27 @@ The owner approved decisions 1–6 on 2026-10-09, and decisions 7 and 8 on
      round 5 is one of them, not a sixth.
 
    This approves the specification, the design and their review only.
+
+9. **Staging test support and the rereview's corrections (2026-10-10, 12:29
+   UTC).** The canonical issue rereview of #19's fourth amendment found that
+   the required release declarations make the required `test_stage` suite
+   fail, while every file that could fix it was excluded. The owner approved
+   option A:
+   - **Staging test support.** The future implementation may minimally change
+     exactly `packages/release/tests/test_stage.py` and
+     `packages/release/tests/_staging.py`. Their invented fixture releases
+     then use the live baseline formats.
+   - **The refusal test.** A future test shows that #19's real release is
+     refused at preflight against the live versions.
+   - **Unchanged:** `staging.json`, `stage_release.py`, operational staging,
+     the builder, activation, and PLT-12 and PLT-14 sequencing (section
+     10.1).
+   - **The rereview's three corrections and three additions** are carried
+     (sections 2.4.4, 6.4, 8 and 10.1, and tests 38–40).
+   - **The review budget is unchanged:** one of five used, four remaining.
+
+   This approves the specification, the design and that test-support scope
+   only.
 
 Implementation is **not** approved by these decisions. Implementation, code,
 tests and the `release.json` edit need their own owner decision, and so does
@@ -3039,7 +3181,7 @@ activation.
   on revision 6. Its open decision: a fallback row already durable in
   `outbox.jsonl` waited for a client stopped while holding `outbox.lock`. It
   also made five corrections and additions.
-- **Revision 7** (this revision) adopts the owner's decision of 2026-10-10,
+- **Revision 7** (`bb3cd76`) adopts the owner's decision of 2026-10-10,
   11:31 UTC (section 11, decision 8):
   - **Per-entry fallback files (the open decision).** Every queueing caller,
     the bridge's `announce` included, publishes one complete, immutable file
@@ -3082,3 +3224,32 @@ activation.
     | C-9, C-10 | Unchanged. C-11 states the fallback directory's storage. |
     | Third amendment's acceptance 12, items 1–6 | Tests 25, 26, 28, 29, 30 and 31, with 29 now using fallback files. |
     | The canonical approval's clarifications | Unchanged: the implementation gate, no designation interface, SQLite and sockets inside the test sandbox only, the release suite among the local gates, and failing-first evidence that shows the defect. |
+- **The canonical issue rereview of #19's fourth amendment** requested
+  changes on revision 7. It resolved every point of the previous review, and
+  found one open decision: the required release declarations break the
+  required `test_stage` suite, and every file that could fix it was excluded.
+  It also made three corrections and three additions.
+- **Revision 8** (this revision) adopts the owner's decision of 2026-10-10,
+  12:29 UTC (section 11, decision 9):
+  - **Option A (the open decision).** Section 10.1 allows minimal future
+    changes to `test_stage.py` and `_staging.py` under
+    `packages/release/tests/`, so their fixtures use the live baseline
+    formats. It adds a future test that #19's real release is refused at
+    preflight, and keeps operational staging unchanged.
+  - **Correction 1:** a fallback file is published only when no `queue` or
+    `handoff` request is answered as committed, or to make an attestation
+    durable (section 6.4).
+  - **Correction 2:** `L_outbox` still serializes dead-letter writes; its
+    legacy role is only the retirement barrier (section 2.3).
+  - **Correction 3:** while the authority is unavailable, no line of a part,
+    acknowledgement or channel recreation goes out without a committed
+    attempt, and logging in before E1 is allowed (sections 2.4.4 and I-1).
+  - **Additions:**
+    - module names that avoid `STATE_NAMES`;
+    - `outbox/2`'s embedded version in the `outbox` entry and in
+      [release_contract.md](release_contract.md);
+    - captured tests such as `test_silence.py` updated with provenance
+      (sections 8 and 10.1).
+  - **Tests:** 38–40 added.
+  - **Unchanged:** everything revision 7 adopted. No resolved finding is
+    reopened.

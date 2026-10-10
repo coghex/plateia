@@ -2234,6 +2234,37 @@ decisions.
   and 10.1. **This decision approves the specification, the design and their
   review only.** Implementation, code, tests and the `release.json` edit
   still need their own owner decision.
+- **Staging test support and the rereview's corrections (owner decision,
+  2026-10-10, 12:29 UTC).** The canonical issue rereview of #19's fourth
+  amendment found that the required release declarations make the release
+  suite's required staging tests fail, while every file that could fix them
+  was excluded. The owner approved option A:
+  - **Test support.** The future implementation may minimally change exactly
+    two staging test-support files, `packages/release/tests/test_stage.py`
+    and `packages/release/tests/_staging.py`, so their invented, isolated
+    fixture releases use the live baseline formats. A fixture never presents
+    #19's changed manifest as already live.
+  - **The refusal test.** A future test shows that #19's real release is
+    refused at staging preflight against the live versions. That is the
+    correct outcome until a separately approved activation.
+  - **Unchanged:** `staging.json`, `stage_release.py`, operational staging,
+    the builder and its privacy scan, activation, and the sequencing of
+    PLT-12 and PLT-14. This is not a staging or activation project.
+  - **The rereview's corrections and additions,** three of each:
+    - when a fallback file is published;
+    - what the outbox lock still orders;
+    - that no post line, though a login, may precede a recorded attempt;
+    - module names that avoid the build's privacy scan;
+    - the fallback file's embedded version;
+    - captured tests updated with provenance.
+  - **The review budget is unchanged:** one of the five further launches
+    used, four remaining.
+
+  The design is revision 8 of
+  [chat_outbox_state.md](chat_outbox_state.md), section 10.1 and section 11,
+  decision 9. **This decision approves the specification, the design and
+  that test-support scope only.** Implementation, code, tests and the
+  `release.json` edit still need their own owner decision.
 
 Delivery stays at-least-once with the record check, and nothing claims
 exactly-once. These decisions approve the design only: implementing it needs
