@@ -2169,11 +2169,13 @@ class Importer:
             pass
 
     def _listdir(self, path):
+        """The names in `path`, or None when it cannot be listed: a failed
+        listing is never read as an empty directory."""
         try:
             return self.fs.listdir(path)
         except OSError as err:
             self.unreadable(Path(path).name, err)
-            return []
+            return None
 
     def _budget(self, names):
         """This flush's files, at most IMPORT_MAX: the oldest names not kept after
@@ -2188,8 +2190,12 @@ class Importer:
 
     def import_fallback_files(self):
         """At most IMPORT_MAX published files, oldest name first. Returns how many
-        were imported."""
-        names = sorted(n for n in self._listdir(self.paths.fallback) if is_published_name(n))
+        were imported. A listing that fails completes no pass: the pass in
+        progress stays unfinished and import_epoch where it is (section 6.3)."""
+        listed = self._listdir(self.paths.fallback)
+        if listed is None:
+            return 0
+        names = sorted(n for n in listed if is_published_name(n))
         if self.pass_names is None:
             self.pass_names = set(names)
         count = 0
@@ -2208,7 +2214,8 @@ class Importer:
                 self.kept.remove(name)
             if outcome is not None:
                 count += 1
-        if not (self.pass_names & set(self._listdir(self.paths.fallback))):
+        remaining = self._listdir(self.paths.fallback)
+        if remaining is not None and not (self.pass_names & set(remaining)):
             self.authority.run_tx(lambda s: s.complete_pass())
             self.pass_names = None
         return count
@@ -2242,7 +2249,7 @@ class Importer:
     def clean_staging(self):
         """A tmp/ file is removed only once its writer is gone, or once published.
         A writer identity its name does not fully carry is unknown, never gone."""
-        for name in self._listdir(self.paths.staging):
+        for name in self._listdir(self.paths.staging) or []:
             try:
                 self._clean_one(name)
             except Exception as err:  # cleanup only: tried again at the next flush
@@ -2287,7 +2294,7 @@ class Importer:
         return claims
 
     def claim_list(self):
-        return sorted(n for n in self._listdir(self.paths.state)
+        return sorted(n for n in self._listdir(self.paths.state) or []
                       if n.startswith("outbox.claimed-") and n.endswith(".jsonl"))
 
     def _import_row(self, name):

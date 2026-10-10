@@ -3,11 +3,14 @@ section 9: tests 3, 4, 5, 15, 19, 24, 27, 30 and 35): attribution, finality,
 fragments, message accounting on every part, collection, alert identity,
 A12 and attested outcomes. Each builds attempts and messages straight in a
 sandboxed database, on an injected clock, with invented data only."""
+import contextlib
 import json
+import socket
 import sqlite3
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _isolation  # noqa: E402,F401  (first: sandbox home and live-state guard)
@@ -156,6 +159,156 @@ class FinalityTests(StoreCase):
                 [att] = self.attempts(entry_id=a)
                 self.assertEqual((att["state"], att["final_at"]), ("ended", None))
                 self.assertEqual(self.part_state(a), "uncertain")
+
+
+class ScriptedSock:
+    """A connected socket to an invented server, on the test's clock, for the
+    real chatlib.Connection. Each `PING :round` is answered as `plan` says:
+    ok (the PONG); chatter (unrelated lines, one a second, never the PONG);
+    fail-silent (a FAIL, then nothing); silent (nothing). Waiting for nothing
+    advances the clock to the reader's timeout. `break_on` makes the write
+    that carries those bytes fail after sending part of them."""
+
+    def __init__(self, clock, plan=(), break_on=None, fail_close=False):
+        self.clock, self.plan, self.break_on, self.fail_close = clock, list(plan), break_on, fail_close
+        self.sent, self.pending, self.mode, self.timeout, self.reads = b"", b"", "silent", None, 0
+
+    def settimeout(self, t):
+        self.timeout = t
+
+    def sendall(self, data):
+        if self.break_on and self.break_on in data:
+            self.sent += data[:len(data) // 2]  # how much reached the server is unknown to the writer
+            raise BrokenPipeError(32, "broken pipe (fake)")
+        self.sent += data
+        if data.startswith(b"PING :round"):
+            self.mode = self.plan.pop(0) if self.plan else "ok"
+            if self.mode == "ok":
+                self.pending += b":irc PONG irc :round\r\n"
+            elif self.mode == "fail-silent":
+                self.pending += b":irc FAIL PRIVMSG CANNOT_SEND #alpha :refused (fake)\r\n"
+
+    def recv(self, n):
+        self.reads += 1
+        if self.reads > 10000:
+            raise AssertionError("the reader never stopped")
+        if self.pending:
+            data, self.pending = self.pending, b""
+            return data
+        if self.mode == "chatter":
+            self.clock.advance(1.0)
+            return b":sam!sam@x PRIVMSG #beta :unrelated traffic\r\n"
+        if self.timeout is None:
+            raise AssertionError("a read with no deadline")
+        self.clock.advance(self.timeout)
+        raise socket.timeout("timed out")
+
+    def shutdown(self, how):
+        if self.fail_close:
+            raise OSError(57, "socket is not connected (fake)")
+
+    def close(self):
+        if self.fail_close:
+            raise OSError(9, "bad file descriptor (fake)")
+
+    def getsockname(self):
+        return ("127.0.0.1", 40999)
+
+    def getpeername(self):
+        return ("127.0.0.1", 6667)
+
+    def parts_sent(self, text):
+        return self.sent.count(f"PRIVMSG #alpha :{text}\r\n".encode())
+
+
+class TransportOutcomeTests(StoreCase):
+    """Code review slot 3, finding 2: the posting path itself (pchat post, the
+    real chatlib.Connection, its absolute deadlines) under injected transport
+    failures. Each keeps every part's durable state, a refusal or a
+    confirmation as recorded, and never sends a confirmed or uncertain part again."""
+
+    TEXT = "[status] one\n[status] two\n[status] three"
+    LINES = ["[status] one", "… [status] two", "… [status] three"]
+
+    def connect(self, sock):
+        conn = self.chatlib.Connection.__new__(self.chatlib.Connection)
+        conn.sock, conn.buf, conn.deadline, conn.account = sock, b"", None, "alp-solver-2"
+        conn.caps, conn.cap_values = set(), {}  # line mode: one part per line
+        return conn
+
+    def post(self, sock, text=TEXT):
+        with mock.patch.object(self.chatlib, "login", lambda *a, **k: self.connect(sock)), \
+                mock.patch.object(self.chatlib.time, "monotonic", self.clock.mono):
+            return self.pchat("post", "#alpha", text)
+
+    def bridge_flushes(self):
+        """The bridge's flushes after the writer is gone, on the fake server: nothing may be sent again."""
+        self.probes.world["gone"].add(CLIENT_PID)
+        for _ in range(2):
+            self.clock.advance(120)
+            self.flush()
+        self.assertEqual(self.server.published, [], "no part is sent again")
+
+    def test_unrelated_traffic_never_extends_a_parts_absolute_deadline(self):
+        sock = ScriptedSock(self.clock, ["chatter"])
+        start = self.clock.mono()
+        code, out = self.post(sock, "[status] one")
+        waited = self.clock.mono() - start
+        self.assertEqual(code, 3, out)
+        self.assertLessEqual(waited, self.ds.PART_WAIT + self.ds.DRAIN_WAIT + 2, "absolute, whatever arrives")
+        self.assertGreaterEqual(waited, self.ds.PART_WAIT + self.ds.DRAIN_WAIT)
+        [a] = self.attempts()
+        self.assertEqual((a["state"], a["final_at"]), ("ended", None), "no answer: no finality")
+        self.assertEqual(self.states(), ["uncertain"])
+        self.assertEqual(sock.parts_sent("[status] one"), 1)
+        self.bridge_flushes()
+        self.assertEqual(self.states(), ["uncertain"])
+
+    def test_a_write_that_fails_part_way_leaves_that_part_uncertain(self):
+        sock = ScriptedSock(self.clock, ["ok"], break_on="[status] two".encode())
+        code, out = self.post(sock)
+        self.assertEqual(code, 3, out)
+        self.assertIn("1 of 3 parts posted", out)
+        self.assertEqual(self.states(), ["confirmed", "uncertain", "unsent"])
+        a = {x["n"]: x for x in self.attempts()}
+        self.assertEqual((a[1]["state"], a[1]["final_at"]), ("ended", None), "unknown progress: no finality")
+        self.assertNotIn(2, a, "nothing of a later part is written")
+        self.assertEqual(sock.parts_sent("[status] one"), 1)
+        self.bridge_flushes()
+        self.assertEqual(self.states(), ["confirmed", "uncertain", "unsent"])
+
+    def test_a_fail_then_silence_is_a_refusal_kept_as_recorded(self):
+        sock = ScriptedSock(self.clock, ["ok", "fail-silent"])
+        code, out = self.post(sock)
+        self.assertEqual(code, 2, out)
+        self.assertIn("1 of 3 parts were already posted", out)
+        e = self.entry()
+        self.assertEqual(e["state"], "terminal")
+        self.assertEqual(self.states(e), ["confirmed", "refused", "unsent"])
+        a = {x["n"]: x for x in self.attempts()}
+        self.assertEqual((a[0]["state"], a[1]["state"]), ("confirmed", "refused"))
+        self.assertNotIn(2, a)
+        self.bridge_flushes()
+        self.assertEqual(self.states(), ["confirmed", "refused", "unsent"])
+        [dl] = self.dead_letters()
+        self.assertEqual([p["state"] for p in dl["parts"]], ["confirmed", "refused", "unsent"])
+
+    def test_a_cleanup_failure_after_confirmation_changes_nothing(self):
+        real_call = self.ds.Client.call
+
+        def call(client, op, writer, **args):
+            return None if op == "done" else real_call(client, op, writer, **args)
+        sock = ScriptedSock(self.clock, ["ok", "ok", "ok"], fail_close=True)
+        with mock.patch.object(self.ds.Client, "call", call):
+            code, out = self.post(sock)
+        self.assertEqual(code, 0, out)
+        self.assertIn("posted 3 line(s)", out)
+        self.assertEqual(self.states(), ["confirmed"] * 3)
+        self.assertEqual([x["state"] for x in self.attempts()], ["confirmed"] * 3)
+        for line in self.LINES:
+            self.assertEqual(sock.parts_sent(line), 1)
+        self.bridge_flushes()
+        self.assertEqual(self.states(), ["confirmed"] * 3)
 
 
 class FragmentTests(StoreCase):

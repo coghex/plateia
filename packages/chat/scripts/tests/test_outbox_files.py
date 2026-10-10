@@ -534,6 +534,66 @@ class ImportRotationTests(FilesCase):
         self.assertEqual(sorted(self.published_texts()), ["[status] later"] + [f"[status] stuck {i}" for i in range(3)])
 
 
+class ListingFailureTests(FilesCase):
+    """Code review slot 3, finding 1: a listing of outbox.d that fails is never
+    read as an empty directory. It completes no import pass and leaves
+    import_epoch where it was, so a durable handoff keeps its H1 window; other
+    entries are delivered meanwhile."""
+
+    def epoch(self):
+        return int(self.sql("SELECT value FROM meta WHERE name = 'import_epoch'")[0]["value"])
+
+    def queued(self, text="[status] other"):
+        self.server.refuse_login = {"sam"}
+        self.post(text, channel="#beta", account="sam")
+        self.server.refuse_login = set()
+
+    def test_the_same_handoff_imports_once_the_directory_can_be_read_again(self):
+        w = self.probes.view(CLIENT_PID).identity("127.0.0.1:1>127.0.0.1:6667")
+        text = "[status] handed"
+        self.tx(lambda s: s.create("h" * 32, {"channel": "#alpha", "as": "alp-solver-2", "text": text},
+                                   [{"kind": "line", "lines": [[text, False]], "text": text}], w, "post"))
+        self.ds.publish_fallback(self.fs, self.authority.paths, dict(self.row(text), id="h" * 32, writer=w),
+                                 clock=self.clock)  # the writer's durable handoff (H1), then it is gone
+        self.probes.world["gone"].add(CLIENT_PID)
+        self.queued()
+        before = self.epoch()
+        fallback = self.state / "outbox.d"
+        os.chmod(fallback, 0)
+        try:
+            for _ in range(3):
+                self.flush()
+            self.assertEqual(self.epoch(), before, "no pass completed on a listing that failed")
+            self.assertEqual(self.entry("h" * 32)["state"], "abandoned", "E8, before its handoff could be read")
+            self.assertEqual(self.published_texts(), ["[status] other"], "other entries are delivered meanwhile")
+        finally:
+            os.chmod(fallback, 0o700)
+        self.flush()
+        self.assertEqual(self.sql("SELECT * FROM held"), [], "H1's window is intact")
+        self.assertEqual(sorted(self.published_texts()), ["[status] handed", "[status] other"])
+        self.assertEqual(self.entry("h" * 32)["state"], "done")
+        self.assertEqual(self.fallback_files(), [])
+
+    def test_a_listing_that_fails_after_the_import_completes_no_pass(self):
+        real, calls = self.fs.listdir, []
+
+        def listdir(path):
+            if Path(path) == self.authority.paths.fallback:
+                calls.append(path)
+                if len(calls) % 2 == 0:  # the second listing of each flush: the one that ends a pass
+                    raise PermissionError(13, "permission denied (fake)")
+            return real(path)
+        self.queued()
+        before = self.epoch()
+        with mock.patch.object(self.fs, "listdir", listdir):
+            for _ in range(3):
+                self.flush()
+        self.assertEqual(self.epoch(), before)
+        self.assertEqual(self.published_texts(), ["[status] other"])
+        self.flush()
+        self.assertEqual(self.epoch(), before + 1, "the pass completes once the directory can be listed")
+
+
 class StagingIdentityTests(FilesCase):
     """Self-audit, classes A and C: a staging file whose writer identity in its
     name is incomplete or odd is kept while its pid lives, and never stops the flush."""
