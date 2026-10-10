@@ -438,6 +438,22 @@ class OneOpenerTests(AuthorityCase):
             active[0] = False
         self.assertEqual(opened, [])
 
+    def test_the_socket_is_bound_0600_and_a_path_over_the_limit_binds_nothing(self):
+        import tempfile
+        short = Path(tempfile.mkdtemp(prefix="ob-", dir="/tmp"))
+        try:
+            with mock.patch.object(self.authority.paths, "sock", short / "outbox.sock"):
+                self.assertTrue(self.authority.bind())
+                self.assertEqual(os.stat(short / "outbox.sock").st_mode & 0o777, 0o600)
+                self.authority.listener.close()
+                self.authority.listener = None
+            with mock.patch.object(self.authority.paths, "sock", short / ("x" * 120) / "outbox.sock"):
+                self.assertFalse(self.authority.bind(), "serving the bridge alone; every client call queues")
+        finally:
+            for f in short.iterdir():
+                f.unlink()
+            short.rmdir()
+
     def test_a_peer_of_another_uid_is_closed_unread(self):
         c = Conn(self, creds=(os.getuid() + 1, CLIENT_PID))
         self.conns.append(c)

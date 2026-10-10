@@ -347,6 +347,39 @@ class StorageFailureTests(OutboxCase):
         self.assertEqual(self.entry()["origin"], "notify")
 
 
+class AnnounceStorageFailureTests(StorageFailureTests):
+    def test_the_bridges_announcement_does_the_same(self):
+        item = {"kind": "ring", "msgid": "m-x", "channel": "#alpha", "target": "alp-solver-2"}
+        with self.fail_outcomes(1), \
+                mock.patch.object(self.bridge, "OUTBOX_AUTHORITY", self.authority), \
+                mock.patch.object(self.ds, "PROBES", self.probes):
+            self.assertTrue(self.bridge.announce(CFG, item, "x\n" + "y " * 3000, "held"))
+        self.flush()
+        texts = [m["text"] for m in self.server.published]
+        self.assertEqual(len(texts), len(set(texts)))
+        self.assertEqual(self.entry()["state"], "done")
+
+
+class StatusTests(OutboxCase):
+    """Test 18 and R8: pchat status, from the authority or, while it is unavailable, its snapshot."""
+
+    def test_status_counts_waiting_checking_and_files_awaiting_import(self):
+        self.server.plan = ["ok", "ok", "timeout"]
+        self.pchat("post", "#alpha", LONG)
+        self.server.refuse_login = {"sam"}
+        with self.unavailable():
+            self.post("[status] later", account="sam")
+        from test_outbox_regressions import pchat
+        text = "\n".join(pchat.outbox_status())
+        self.assertIn("1 awaiting a delivery check", text)
+        self.assertIn("1 fallback files", text)
+        self.flush()
+        with self.unavailable():
+            text = "\n".join(pchat.outbox_status())
+        self.assertIn("UNAVAILABLE", text)
+        self.assertIn("snapshot", text)
+
+
 class FailureBeforeE1Tests(OutboxCase):
     """Test 11 (F7) and the ambiguous creation commits: each queues the whole post once."""
 

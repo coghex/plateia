@@ -1521,7 +1521,7 @@ class Authority:
             return False
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
-        old = os.umask(0o077)
+        old = os.umask(0o177)  # the socket is created 0600: only this user may connect
         try:
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             listener.bind(path)
