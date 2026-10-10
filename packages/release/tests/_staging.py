@@ -113,6 +113,32 @@ def provenance_for(skills, path):
     return path
 
 
+def baseline_release_spec(path):
+    """The checkout's release.json with every format at the live tools' versions
+    (staging.json's live_versions), and without the formats the live tools
+    don't use, written to `path` (#19, the fifth amendment's option A). The
+    staging happy-path tests build their invented, isolated fixture releases
+    from it, so a release that writes newer versions (#19's outbox/2,
+    delivery-records/2, outbox-db, outbox-authority) never stands in for one
+    the live baseline accepts. #19's real release is refused by preflight, as
+    test_stage's ReleaseOf19Tests shows; staging.json and stage_release.py
+    are unchanged."""
+    spec = json.loads((_support.RELEASE / "release.json").read_text(encoding="utf-8"))
+    live = json.loads((_support.RELEASE / "staging.json").read_text(encoding="utf-8"))["live_versions"]
+    formats = []
+    for fmt in spec["formats"]:
+        if fmt["name"] not in live:
+            continue
+        fmt = dict(fmt)
+        if fmt["read"]:
+            fmt["read"] = [live[fmt["name"]]]
+        if fmt["write"] is not None:
+            fmt["write"] = live[fmt["name"]]
+        formats.append(fmt)
+    spec["formats"] = formats
+    return write(path, json.dumps(spec, indent=2))
+
+
 def spec_for(provenance, path):
     spec = json.loads((_support.RELEASE / "staging.json").read_text())
     spec["provenance"] = str(provenance)
