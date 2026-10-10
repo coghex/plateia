@@ -633,6 +633,30 @@ class StatusReadTests(FilesCase):
     """Self-audit, class A: pchat status, which every outbox alert points to,
     reports what it cannot read instead of failing on it."""
 
+    def test_status_reads_the_highest_dead_letter_version_of_each_post(self):
+        """Code review slot 4, finding 3: a late confirmation's version 2
+        supersedes version 1; legacy records stay; the file is never rewritten."""
+        import subprocess
+        dead = self.state / "dead-letters.jsonl"
+        rows = [{"kind": "ring", "msgid": "r1", "channel": "#alpha", "dl_key": "delivery:ring:r1:"},
+                {"kind": "post", "id": "e" * 32, "version": 1, "supersedes": None, "channel": "#alpha",
+                 "as": "alp-solver-2", "parts": [{"n": 0, "state": "confirmed"}, {"n": 1, "state": "uncertain"}],
+                 "last_detail": "undecided for 24 h"},
+                {"kind": "post", "id": "e" * 32, "version": 2, "supersedes": 1, "channel": "#alpha",
+                 "as": "alp-solver-2", "parts": [{"n": 0, "state": "confirmed"}, {"n": 1, "state": "confirmed"}],
+                 "last_detail": "undecided for 24 h"}]
+        dead.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        before = dead.read_bytes()
+        idle = lambda *a, **k: subprocess.CompletedProcess(a, 0, "", "")  # noqa: E731  (no service is asked)
+        with mock.patch.object(subprocess, "run", idle):
+            code, out = self.pchat("status")
+        self.assertEqual(code, 0, out)
+        self.assertIn("dead letters: 2", out)
+        posts = [line for line in out.splitlines() if "post to #alpha" in line]
+        self.assertEqual(len(posts), 1, out)
+        self.assertIn("2 of 2 parts posted", posts[0])
+        self.assertEqual(dead.read_bytes(), before, "the stored history is never rewritten")
+
     def test_status_reports_unreadable_files_and_an_odd_snapshot(self):
         from test_outbox_regressions import pchat
         claim = self.legacy(self.row("[status] old"), name="outbox.claimed-5-z.jsonl")

@@ -79,7 +79,9 @@ class CoverageTests(BridgeCase):
                 self.assertRaises(self.chatlib.ChatError):
             self.bridge.run(CFG, *state, coverage=cov)
         self.assertNotIn("#alpha", cov.live)
-        self.assertIsNone(state[3].marks.get("#alpha"), "the checkpoint stays before the failed message")
+        mark = state[3].marks.get("#alpha")  # a new channel's checkpoint is its join boundary (slot 4, finding 2)
+        self.assertTrue(mark.startswith("timestamp="), "the checkpoint stays before the failed message")
+        self.assertNotEqual(mark, "msgid=m1")
 
     def test_the_bridges_loop_indexes_verified_messages(self):
         from test_bridge import FakeServer as ScriptServer, join, privmsg
@@ -180,6 +182,56 @@ class CatchUpIndexFailureTests(BridgeCase):
                          batch("b2", None)], state, cov)
         self.assertIn("#alpha", cov.live)
         self.assertEqual(state[3].marks.get("#alpha"), "msgid=m1")
+
+
+class ServerEvidenceTests(CatchUpIndexFailureTests):
+    """Code review slot 4, findings 1 and 2 (self-audit: server fields, and
+    first-time paths). Only the server's own time, msgid and account are
+    evidence: a message without them is a failed index, which stops coverage.
+    A brand-new channel gets a durable replay boundary when it is joined, so a
+    failed first index is replayed, on this connection and after a reconnect,
+    and never skipped."""
+
+    def test_a_late_message_without_server_time_never_proves_absence(self):
+        from test_bridge import batch, join, privmsg
+        state, cov = self.setup_channel()  # a logged channel, with its checkpoint
+        self.run_script([join("#alpha"), batch("b0", "#alpha"), batch("b0", None)], state, cov)  # covered from now
+        self.clock.advance(10)
+        self.server.plan = ["error"]  # published, then an error reply: uncertain, with finality
+        self.post("[status] late")
+        self.assertEqual(self.states(), ["uncertain"])
+        late = privmsg("alp-solver-2", "[status] late", "m1", channel="#alpha")
+        del late["tags"]["time"]  # received late, and without its server time
+        self.run_script([join("#alpha"), batch("b1", "#alpha"), batch("b1", None), late], state, cov)
+        self.assertEqual(self.sql("SELECT since FROM coverage")[0]["since"], T0, "carried over the reconnect")
+        cov.sync(self.clock() + 1000)  # a sync after it: only channels still complete are carried
+        self.server.published.clear()
+        self.clock.advance(60)
+        self.flush()
+        self.assertEqual(self.states(), ["uncertain"], "absence is never proved from a local receipt time")
+        self.assertEqual(self.server.published, [], "nothing is sent again")
+        self.assertEqual(self.sql("SELECT * FROM messages"), [], "local receipt time is not evidence")
+
+    def test_a_failed_first_index_without_a_checkpoint_is_replayed_and_never_skipped(self):
+        from test_bridge import batch, in_batch, join, privmsg
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks(), self.bridge.Checkpoints())
+        cov = self.bridge.Coverage(self.authority)
+        ticks = iter(range(10 ** 6))
+        clock = lambda: 1_000_000.0 + 20 * next(ticks)  # noqa: E731  (each check is 20 s later: LIST is due)
+        first = privmsg("sam", "first", "m1", channel="#new", t="2026-10-02T10:00:00.000Z")
+        server = self.run_script([join("#new"), dict(first, tags=dict(first["tags"]))], state, cov,
+                                 failing={"m1"}, clock=clock)
+        asked = [x for x in server.sent if x.startswith("CHATHISTORY")]
+        self.assertEqual(len(asked), 1, "replayed on the same connection")
+        self.assertTrue(asked[0].startswith("CHATHISTORY AFTER #new timestamp="), asked)
+        self.assertNotIn("#new", cov.live, "coverage stops at the failure")
+        self.assertEqual(self.sql("SELECT through FROM coverage WHERE channel = '#new'")[0]["through"], None)
+        state = state[:3] + (self.bridge.Checkpoints(),)  # a reconnect, after a restart: from the durable file
+        server = self.run_script([join("#new"), batch("b2", "#new"), in_batch("b2", dict(first, tags=dict(first["tags"]))),
+                                  batch("b2", None)], state, cov)
+        [again] = [x for x in server.sent if x.startswith("CHATHISTORY")]
+        self.assertEqual(again, asked[0], "the reconnect asks from the same boundary, not after the failed message")
+        self.assertEqual([m["msgid"] for m in self.sql("SELECT msgid FROM messages")], ["m1"], "indexed at last")
 
 
 class NoThread:
@@ -461,6 +513,24 @@ class DeliveryContainmentTests(BridgeCase):
 class IndexTimeTests(BridgeCase):
     """Self-audit, class C: a verified message whose server time cannot be read
     is not indexed, so it stops the channel's coverage instead of passing as seen."""
+
+    def test_server_fields_missing_or_malformed_are_never_replaced_by_local_ones(self):
+        """Code review slot 4's re-check, through handle(): no server time, a
+        time without its zone, no msgid, or an empty account is never evidence."""
+        from test_bridge import privmsg
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks())
+        cases = {"no time": lambda m: m["tags"].pop("time"),
+                 "no zone": lambda m: m["tags"].update(time="2026-10-02T10:00:00"),
+                 "no msgid": lambda m: m["tags"].pop("msgid")}
+        for name, spoil in cases.items():
+            with self.subTest(name=name):
+                m = privmsg("sam", f"hi {name}", f"m-{name}", channel="#alpha", t="2026-10-02T10:00:00.000Z")
+                spoil(m)
+                self.assertIs(self.bridge.handle(m, CFG, *state), False, "a failed index: coverage stops")
+        m = privmsg("sam", "hi", "m-empty", channel="#alpha", t="2026-10-02T10:00:00.000Z")
+        m["tags"]["account"] = ""
+        self.bridge.handle(m, CFG, *state)
+        self.assertEqual(self.sql("SELECT * FROM messages"), [], "no message is indexed under a local substitute")
 
     def test_an_unreadable_time_is_a_failed_index(self):
         for at in ("not a time", None, ""):

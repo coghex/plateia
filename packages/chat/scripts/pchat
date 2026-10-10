@@ -132,6 +132,25 @@ def unaccepted(cfg, project=None):
     return sorted(out, key=lambda u: u["at"])
 
 
+def current_dead_letters(rows):
+    """Dead letters as they stand now: each record without a version as it is,
+    and for each post entry id only its highest version, which supersedes the
+    rest (revision 8, section 3.6). The stored history is not changed."""
+    others, posts = [], {}
+    for raw in rows:
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            d = None
+        if (isinstance(d, dict) and d.get("kind") == "post" and d.get("id")
+                and isinstance(d.get("version"), int) and not isinstance(d.get("version"), bool)):
+            if d["id"] not in posts or d["version"] > posts[d["id"]]["version"]:
+                posts[d["id"]] = d
+        else:
+            others.append(d)
+    return others + list(posts.values())
+
+
 def outbox_status():
     """The outbox, from the bridge's authority (a status request), or, while it
     is unavailable, from its dated snapshot; with the fallback files and legacy
@@ -424,18 +443,14 @@ def main(argv=None):
                     else:
                         failed += 1
             dead = chatlib.STATE_DIR / "dead-letters.jsonl"
-            dead_rows = dead.read_text().splitlines() if dead.exists() else []
+            dead_rows = current_dead_letters(dead.read_text().splitlines() if dead.exists() else [])
             ndead = len(dead_rows)
             print(f"deliveries (24h): {done} done, {waiting} checks while queued at cmux, {failed} failed attempts")
             print(f"dead letters: {ndead}")
             for line in outbox_status():
                 print(line)
-            for raw in dead_rows:  # a post dead-lettered partway: what went out, what didn't
-                try:
-                    d = json.loads(raw)
-                except ValueError:
-                    continue
-                if d.get("kind") == "post" and d.get("parts"):
+            for d in dead_rows:  # a post dead-lettered partway: what went out, what didn't (its latest version)
+                if isinstance(d, dict) and d.get("kind") == "post" and d.get("parts"):
                     c = chatlib.part_counts(d["parts"])
                     print(f"   post to {d.get('channel')} as {d.get('as')}: {c['confirmed']} of {len(d['parts'])}"
                           f" parts posted, {len(d['parts']) - c['confirmed']} not ({d.get('last_detail', '')[:60]})")

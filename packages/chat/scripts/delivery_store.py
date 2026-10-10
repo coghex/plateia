@@ -83,12 +83,16 @@ def now_iso(t):
 
 
 def parse_iso(s):
-    """Seconds since the epoch of an ISO-8601 server time, or None."""
+    """Seconds since the epoch of an ISO-8601 server time with its zone, or None:
+    missing, unreadable, or without a zone (whose meaning would be a guess)."""
     import datetime
+    if not isinstance(s, str) or not s:
+        return None
     try:
-        return datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+        t = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
+    return t.timestamp() if t.tzinfo is not None else None
 
 
 def jdump(obj):
