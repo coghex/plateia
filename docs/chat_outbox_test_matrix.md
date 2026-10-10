@@ -5,7 +5,7 @@ item 20) requires. It maps every requirement, acceptance item, binding
 correction and spec addition of #19, design revision 9's tests 1–48
 ([`chat_outbox_state.md`](chat_outbox_state.md), section 9), owner
 amendment 6, and the code reviews' findings, to the named tests that assert
-them, with a status for each. It describes PR #20 at `5aec2b8`.
+them, with a status for each. It describes PR #20 at `e4dc48a`.
 
 How to read it:
 - Each row's **Requirement** or **Item** column (for design tests, the
@@ -216,7 +216,7 @@ Module abbreviations, all under `packages/chat/scripts/tests/` unless stated:
 | ID | Item | Tests | Status | Note |
 |---|---|---|---|---|
 | F1.intent | Intent durable before the first physical step; none if it cannot be recorded (test 41) | bridge.InterruptIntentTests.test_the_intent_is_durable_before_the_first_command; bridge.InterruptIntentTests.test_without_a_durable_intent_nothing_is_done | COVERED | Failing first at 97db1bf. |
-| F1.held | Unknown or partial outcome held, never repeated; recovery from `intent` is held (test 42) | bridge.InterruptIntentTests.test_a_crash_at_any_boundary_after_the_intent_never_interrupts_again; bridge.InterruptOutcomeTests.test_a_proved_no_action_is_retried_and_a_partial_step_is_held | COVERED | Failing first at 97db1bf. |
+| F1.held | Unknown or partial outcome held, never repeated; recovery from `intent` is held (test 42) | bridge.InterruptIntentTests.test_a_crash_at_any_boundary_after_the_intent_never_interrupts_again; bridge.InterruptOutcomeTests.test_a_proved_no_action_is_retried_and_a_partial_step_is_held; bridge.ReplayedInterruptTests.test_a_replayed_interrupt_keeps_one_obligation_whatever_its_outcome | COVERED | Failing first at 97db1bf; the replay case at 5aec2b8. |
 | F1.crash1 | One failed delivered-state save, then a crash at once (test 43) | bridge.InterruptOutcomeTests.test_save_failures_after_delivery_never_interrupt_again (persistent=False) | COVERED | Failing first at 97db1bf. |
 | F1.crashN | Saves failing persistently through the crash (test 43) | bridge.InterruptOutcomeTests.test_save_failures_after_delivery_never_interrupt_again (persistent=True) | COVERED | Failing first at 97db1bf. |
 | F1.ledger | A surviving exact-identity ledger record reconciles with no ring (test 43) | bridge.InterruptOutcomeTests.test_save_failures_after_delivery_never_interrupt_again; bridge.InterruptOutcomeTests.test_proof_that_is_not_proof_leaves_it_held (exact) | COVERED | Failing first at 97db1bf. |
@@ -236,7 +236,7 @@ Module abbreviations, all under `packages/chat/scripts/tests/` unless stated:
 |---|---|---|---|---|
 | SA.corr | Recovery holds an interrupt still in intent without surviving success proof; durable accept or settled states kept; exact submission proof reconciles; no repeated interrupt | bridge.InterruptIntentTests.test_a_crash_at_any_boundary_after_the_intent_never_interrupts_again; bridge.InterruptOutcomeTests.test_proof_that_is_not_proof_leaves_it_held; bridge.InterruptOutcomeTests.test_save_failures_after_delivery_never_interrupt_again | COVERED | Failing first at 97db1bf. |
 | SA.add1 | The intent gate covers every agent-affecting command, the preparatory Escape and draft cleanup included; a failed or unclear command never proves no action (a failure after the Escape; an Enter that acts but reports failure) | bridge.InterruptIntentTests.test_the_intent_is_durable_before_the_first_command; bridge.InterruptOutcomeTests.test_a_proved_no_action_is_retried_and_a_partial_step_is_held | COVERED | Failing first at 97db1bf. |
-| SA.add2 | Ledger, announcement and pending-save failures apart; the acknowledgement while work is owed, then a restart at once; each obligation kept with its identity; the settled item kept until durable; no further interrupt | bridge.InterruptOutcomeTests.test_an_acknowledgement_while_work_is_owed_then_a_restart (the acknowledgement's save working and failing); bridge.InterruptOutcomeTests.test_save_failures_after_delivery_never_interrupt_again; bridge.InterruptOutcomeTests.test_with_no_surviving_proof_it_is_held_alerted_once_and_settled_by_the_acknowledgement; bridge.OwedAnnouncementExpiryTests; bridge.AcknowledgementRecoveryTests | COVERED | Failing first at 97db1bf; the acknowledgement recovery cases failed first at 10c6df5. |
+| SA.add2 | Ledger, announcement and pending-save failures apart; the acknowledgement while work is owed, then a restart at once; each obligation kept with its identity; the settled item kept until durable; no further interrupt | bridge.InterruptOutcomeTests.test_an_acknowledgement_while_work_is_owed_then_a_restart (the acknowledgement's save working and failing); bridge.InterruptOutcomeTests.test_save_failures_after_delivery_never_interrupt_again; bridge.InterruptOutcomeTests.test_with_no_surviving_proof_it_is_held_alerted_once_and_settled_by_the_acknowledgement; bridge.OwedAnnouncementExpiryTests; bridge.AcknowledgementRecoveryTests; bridge.LiveAcknowledgementRetryTests | COVERED | Failing first at 97db1bf; the acknowledgement recovery cases at 10c6df5, and the live retry at 5aec2b8. |
 
 ## 14. Code review 6102471519 (slot 9) and the final re-check
 
@@ -252,6 +252,18 @@ All failed first at `10c6df5` except where the note says control.
 | RC1 | Re-check, a lookup by message alone where one message has several recipients: an owner alert's dead-letter identity carries its recipient and the alert, so alerts for two recipients of one message, or two alerts for one, are never collapsed into one record | bridge.AlertIdentityTests.test_two_recipients_alerts_are_each_dead_lettered | COVERED | |
 | RC2 | Re-check, a removal that does not re-validate the bytes: a legacy claim rewritten between its final import and its removal is kept, then held with its exact bytes | files.LegacyClaimIntegrityTests.test_a_claim_rewritten_between_its_final_import_and_its_removal_is_held | COVERED | |
 | RC3 | Re-check, a removal that does not re-validate the bytes: a fallback file rewritten between its import and its removal is kept, then held with its exact bytes (as F2(b)) before removal | files.LegacyClaimIntegrityTests.test_a_fallback_file_rewritten_between_its_import_and_its_removal_is_held | COVERED | |
+
+## 15. Code review 6102730761 (slot 10)
+
+All failed first at `5aec2b8` except where the note says control.
+
+| ID | Item | Tests | Status | Note |
+|---|---|---|---|---|
+| L1 | A server message handled again on replay (its log failed, or a crash came between queueing and logging) keeps ONE interrupt obligation per message and recipient: the existing one keeps its identity, intent, phase and owed work, in each outcome (not yet rung, possibly acted, held, delivered, settled), and the recipient is never interrupted twice | bridge.ReplayedInterruptTests.test_a_replayed_interrupt_keeps_one_obligation_whatever_its_outcome | COVERED | |
+| L2 | Another recipient of the same message stays independent | bridge.ReplayedInterruptTests.test_another_recipient_of_the_same_message_stays_independent | COVERED | |
+| L3 | With no pending item and an unreadable ledger, a replayed interrupt is a possible repeat: held, never rung | bridge.ReplayedInterruptTests.test_a_replay_with_an_unreadable_ledger_is_never_rung | COVERED | |
+| L4 | An ordinary wake-up keeps its documented baseline: a replay may duplicate it, never lose it | bridge.ReplayedInterruptTests.test_an_ordinary_wake_up_keeps_its_baseline | COVERED | A control. |
+| L5 | A live acknowledgement whose settling fails in the ledger is settled by a later pass of the same bridge once the ledger works, with its owed work kept: no replay, no second interrupt or acknowledgement, no false dead letter | bridge.LiveAcknowledgementRetryTests.test_a_live_acknowledgement_is_settled_after_a_transient_ledger_failure (with and without an owed announcement) | COVERED | |
 
 ## Counts
 
@@ -271,16 +283,17 @@ All failed first at `10c6df5` except where the note says control.
 | 12. Owner amendment 6 | 14 | 0 | 0 |
 | 13. Scope approval 6102156233: the binding correction and two additions | 3 | 0 | 0 |
 | 14. Code review 6102471519 (slot 9) and the final re-check | 8 | 0 | 0 |
-| **Total (149 rows)** | **149** | **0** | **0** |
+| 15. Code review 6102730761 (slot 10) | 5 | 0 | 0 |
+| **Total (154 rows)** | **154** | **0** | **0** |
 
 History: at `97db1bf`, before amendment 6's round, 104 of the then 130 rows
 were COVERED, 15 PARTIAL and 11 MISSING. That round closed them and added
 section 13. The final round added design tests 41–48 as their own rows in
-section 11, and section 14.
+section 11, and section 14. The recovery round added section 15.
 
 ## Appendix A. The test methods of every class named above
 
-Generated from the test tree at `5aec2b8`. A module named on its own (such as `rb` or `sil`) stands
+Generated from the test tree at `e4dc48a`. A module named on its own (such as `rb` or `sil`) stands
 for all of its classes, listed here.
 
 ### `resend`: `packages/chat/scripts/tests/test_outbox_resend.py`
@@ -348,7 +361,9 @@ for all of its classes, listed here.
 - **InterruptIntentTests**: `test_the_intent_is_durable_before_the_first_command`, `test_without_a_durable_intent_nothing_is_done`, `test_a_crash_at_any_boundary_after_the_intent_never_interrupts_again`, `test_a_crash_after_the_evidence_never_interrupts_again`, `test_a_crash_before_the_intent_is_retried_as_today`
 - **InterruptOutcomeTests**: `test_save_failures_after_delivery_never_interrupt_again`, `test_with_no_surviving_proof_it_is_held_alerted_once_and_settled_by_the_acknowledgement`, `test_an_acknowledgement_while_work_is_owed_then_a_restart`, `test_a_proved_no_action_is_retried_and_a_partial_step_is_held`, `test_proof_that_is_not_proof_leaves_it_held`
 - **JoinWithoutServerTimeTests**: `test_a_failed_first_index_after_an_untimed_join_is_never_skipped_and_proves_nothing`, `test_a_timed_join_takes_its_boundary_from_the_server_alone`, `test_a_failed_index_mid_catch_up_never_restores_completeness_or_moves_the_checkpoint`, `test_a_successful_replay_restores_completeness_from_the_preserved_checkpoint`
+- **LiveAcknowledgementRetryTests**: `test_a_live_acknowledgement_is_settled_after_a_transient_ledger_failure`
 - **OwedAnnouncementExpiryTests**: `test_an_owed_announcement_survives_the_expiry_and_a_restart`
+- **ReplayedInterruptTests**: `test_a_replayed_interrupt_keeps_one_obligation_whatever_its_outcome`, `test_another_recipient_of_the_same_message_stays_independent`, `test_an_ordinary_wake_up_keeps_its_baseline`, `test_a_replay_with_an_unreadable_ledger_is_never_rung`
 - **ServerEvidenceTests**: `test_a_late_message_without_server_time_never_proves_absence`, `test_a_failed_first_index_without_a_checkpoint_is_replayed_and_never_skipped`, `test_a_failed_index_mid_catch_up_never_restores_completeness_or_moves_the_checkpoint`, `test_a_successful_replay_restores_completeness_from_the_preserved_checkpoint`
 - **StartupCleanupTests**: `test_a_failed_sync_of_the_database_files_releases_everything`, `test_a_failed_bind_or_thread_start_releases_everything`, `test_a_dead_authority_thread_is_not_running_and_is_replaced`
 
