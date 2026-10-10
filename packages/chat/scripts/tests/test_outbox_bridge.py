@@ -1166,6 +1166,153 @@ class AcknowledgementRecoveryTests(InterruptCase):
         self.assertEqual(self.unacknowledged_dead_letters(), [])
 
 
+class ReplayedInterruptTests(InterruptCase):
+    """Code review slot 10, finding 1: the bridge queues a message's deliveries
+    durably before it logs the message, so a failed log (or a crash between the
+    two) means the same server message is handled again on replay. An interrupt
+    keeps ONE obligation per message and recipient: the replay adds nothing, and
+    the existing item keeps its identity, intent, phase and owed work, whatever
+    its outcome so far. Another recipient of the same message stays independent."""
+
+    def message(self, text="!! @alp-solver-2 stop and read #alpha"):
+        from test_bridge import privmsg
+        return privmsg("pat", text, "m-int", channel="#alpha", t="2026-10-09T10:00:00.000Z")
+
+    def ingest_unlogged(self, msg):
+        """handle() with the message's log append failing: queued, never logged."""
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks())
+        with mock.patch.object(self.bridge.Record, "append", side_effect=OSError(28, "no space left (fake)")):
+            with self.assertRaises(OSError):
+                self.bridge.handle(msg, CFG, *state)
+        return state[1]
+
+    def replay(self, msg):
+        """A restart, then the same server message replayed."""
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks())
+        self.bridge.handle(msg, CFG, *state, replayed=True)
+        return state[1]
+
+    def rings(self, d, target="alp-solver-2"):
+        return [i for i in d.items if i["kind"] == "ring" and i.get("target") == target]
+
+    def test_a_replayed_interrupt_keeps_one_obligation_whatever_its_outcome(self):
+        for outcome in ("deliver", "possibly acted", "held", "accept", "settled"):
+            with self.subTest(outcome=outcome):
+                self.fresh()
+                d = self.ingest_unlogged(self.message())
+                [item] = self.rings(d)
+                first = self.FakeAgent()
+                if outcome == "possibly acted":  # killed at the Enter: still in intent on disk
+                    with self.assertRaises(Crash):
+                        self.passes(CrashingAgent(first, 4), deliveries=d)
+                elif outcome == "held":
+                    with self.assertRaises(Crash):
+                        self.passes(CrashingAgent(first, 4), deliveries=d)
+                    self.passes(self.FakeAgent(), deliveries=self.bridge.Deliveries())
+                elif outcome in ("accept", "settled"):
+                    self.passes(first, deliveries=d)
+                    if outcome == "settled":
+                        self.bridge.accepted(CFG, d, self.bridge.Acks(), msgid="m-ack", reply_to="m-int",
+                                             sender="alp-solver-2", channel="#alpha",
+                                             at="2026-10-09T10:01:00Z", how="reply")
+                before = [{k: i.get(k) for k in ("intent_id", "phase")} for i in self.rings(self.bridge.Deliveries())]
+                after = self.replay(self.message())
+                self.assertEqual([{k: i.get(k) for k in ("intent_id", "phase")} for i in self.rings(after)], before,
+                                 "the replay adds nothing and changes nothing")
+                second = self.FakeAgent()
+                self.passes(second, 3, deliveries=after)
+                if outcome == "deliver":  # never rung before: rung once now
+                    self.assertEqual(self.interrupts(second), 1)
+                else:
+                    self.assertEqual(second.keys, [], "no second interrupt, and no partial step either")
+                self.assertLessEqual(self.interrupts(first, second), 1, "never submitted twice")
+
+    def test_another_recipient_of_the_same_message_stays_independent(self):
+        d = self.ingest_unlogged(self.message("!! @alp-solver-2 stop and read #alpha"))
+        self.passes(self.FakeAgent(), deliveries=d)
+        after = self.replay(self.message("!! @alp-solver-2 @alp-manager stop and read #alpha"))
+        self.assertEqual(len(self.rings(after)), 1, "the existing obligation is kept")
+        self.assertEqual(len(self.rings(after, "alp-manager")), 1, "another recipient gets its own")
+
+    def test_an_ordinary_wake_up_keeps_its_baseline(self):
+        """Not an interrupt: a replay may duplicate a wake-up, never lose one (as documented)."""
+        d = self.ingest_unlogged(self.message("@alp-manager status of #alpha?"))
+        self.assertEqual(len(self.rings(d, None)), 1)
+        after = self.replay(self.message("@alp-manager status of #alpha?"))
+        self.assertEqual(len(self.rings(after, None)), 2, "queued again, as before")
+
+    def test_a_replay_with_an_unreadable_ledger_is_never_rung(self):
+        """No pending item, and the ledger that would show an earlier obligation
+        cannot be read: possibly a repeat, so it is held, never rung (a pause over
+        a duplicate), with one owner alert."""
+        d = self.ingest_unlogged(self.message())
+        agent = self.FakeAgent()
+        self.passes(agent, deliveries=d)
+        self.bridge.accepted(CFG, d, self.bridge.Acks(), msgid="m-ack", reply_to="m-int", sender="alp-solver-2",
+                             channel="#alpha", at="2026-10-09T10:01:00Z", how="reply")
+        ledger = self.bridge.DELIVERIES.read_text()
+        self.bridge.DELIVERIES.unlink()
+        self.bridge.DELIVERIES.mkdir()
+        try:
+            after = self.replay(self.message())
+            self.passes(agent, 2, deliveries=after)
+        finally:
+            self.bridge.DELIVERIES.rmdir()
+            self.bridge.DELIVERIES.write_text(ledger)
+        self.assertEqual(self.interrupts(agent), 1, "never rung again")
+        self.assertEqual([i["phase"] for i in self.rings(after)], ["held"])
+
+
+class LiveAcknowledgementRetryTests(InterruptCase):
+    """Code review slot 10, finding 2: a live acknowledgement is durable in
+    acks.jsonl, but settling it fails in the ledger. The SAME Deliveries instance
+    settles it at a later pass once the ledger works, with its owed work kept:
+    no replay, no second interrupt, no second acknowledgement, no false dead
+    letter."""
+
+    def delivered(self, **extra):
+        item = dict(self.item(), phase="accept", attempt=1, next_at=self.bridge.time.time() + 600,
+                    intent_id="i" * 32, intent_surface="S", intent_session=None, delivered_announced=True)
+        item.update(extra)
+        return item
+
+    def test_a_live_acknowledgement_is_settled_after_a_transient_ledger_failure(self):
+        for owed in (False, True):
+            with self.subTest(announcement_owed=owed):
+                self.fresh()
+                d = self.bridge.Deliveries()
+                text = "interrupt → alp-solver-2: it was not working; instruction delivered; waiting for its acknowledgement"
+                d.items = [self.delivered(**({"delivered_announced": False, "delivered_text": text} if owed else {}))]
+                d._save()
+                agent = self.FakeAgent()
+                with mock.patch.object(self.bridge, "announce", lambda *a: False):
+                    self.passes(agent, deliveries=d)  # the first scan is complete
+                real = self.bridge.Deliveries._record
+
+                def record(dd, item, ok, detail):
+                    if str(detail).startswith("accepted by"):
+                        raise OSError(5, "input/output error (fake)")
+                    return real(dd, item, ok, detail)
+                acks = self.bridge.Acks()
+                with mock.patch.object(self.bridge.Deliveries, "_record", record):
+                    with self.assertRaises(OSError):
+                        self.bridge.accepted(CFG, d, acks, msgid="m-ack", reply_to="m-int", sender="alp-solver-2",
+                                             channel="#alpha", at="2026-10-09T10:01:00Z", how="reply")
+                    with mock.patch.object(self.bridge, "announce", lambda *a: False):
+                        self.passes(agent, deliveries=d)  # the ledger still fails
+                self.passes(agent, deliveries=d)  # the ledger works again: same instance, no replay
+                for i in d.items:
+                    i["next_at"] = 0
+                self.passes(agent, 2, deliveries=d)
+                self.assertEqual([i for i in d.items if i["kind"] == "ring"], [], "settled")
+                self.assertEqual([r for r in self.dead_letters() if r.get("msgid") == "m-int"], [],
+                                 "no false unacknowledged dead letter")
+                self.assertEqual(agent.keys, [], "never rung")
+                self.assertEqual(len([r for r in self.ledger() if str(r.get("detail")).startswith("accepted by")]), 1)
+                self.assertEqual(len(self.bridge.ACKS.read_text().splitlines()), 1, "one acknowledgement")
+                self.assertEqual(len(self.announcements()), 1 if owed else 0, "owed work kept and done")
+
+
 class AlertIdentityTests(InterruptCase):
     """The final round's re-check: an owner alert's dead-letter identity carries
     its recipient and the alert itself, so the alerts for two recipients of one

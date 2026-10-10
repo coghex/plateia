@@ -368,15 +368,46 @@ class Deliveries:
         return False
 
     def add_all(self, new_items):
+        """Queue a message's deliveries durably. The message is logged only after
+        this, so after a failed log or a crash it is handled again on replay: an
+        interrupt then keeps ONE obligation per server message and recipient
+        (owner amendment 6; code review slot 10). One already pending, in any
+        phase, or recorded in the ledger, is kept as it is and nothing is added.
+        If the ledger cannot be read, a possible repeat is held, never rung."""
+        new_items = [i for i in new_items if not self._earlier_interrupt(i)]
         if new_items:
             self.items.extend(new_items)
             self._save()
+
+    def _earlier_interrupt(self, item):
+        if not (item["kind"] == "ring" and item.get("interrupt") and item.get("msgid") and item.get("target")):
+            return False
+        key = (item["msgid"], item["target"])
+        if any((i["msgid"], i.get("target")) == key for i in self.items if i["kind"] == "ring"):
+            return True
+        try:
+            lines = DELIVERIES.read_text().splitlines() if DELIVERIES.exists() else []
+        except (OSError, ValueError) as err:
+            item.update(phase="intent", intent_at=time.time())  # unknown: possibly acted before; never rung
+            self._hold(item, f"cannot check for an earlier interrupt ({err!r:.60})")
+            return False
+        for raw in lines:
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("kind") == "ring" and (row.get("msgid"), row.get("target")) == key:
+                log(f"interrupt ({item['channel']}) to {item['target']}: already handled; the replay adds nothing")
+                return True
+        return False
 
     def _record(self, item, ok, detail):
         line = {"at": now_iso(), "kind": item["kind"], "msgid": item["msgid"], "channel": item["channel"],
                 "project": item["project"], "attempt": item["attempt"], "ok": ok, "detail": detail}
         if item.get("alert_key"):
             line["alert_key"] = item["alert_key"]
+        if item["kind"] == "ring" and item.get("target"):
+            line["target"] = item["target"]  # one obligation per message and recipient (add_all)
         if item.get("intent_id"):  # an interrupt's exact identity: what recovery reconciles by (section 3.7)
             line.update(intent=item["intent_id"], target=item.get("target"), surface=item.get("intent_surface"),
                         session=item.get("intent_session"))
@@ -490,7 +521,11 @@ class Deliveries:
             owner = item.get("target") or cfg.get("projects", {}).get(item["project"], {}).get("manager")
             if owner != by:
                 continue
-            self._record(item, True, f"accepted by {by} ({how})")
+            try:
+                self._record(item, True, f"accepted by {by} ({how})")
+            except Exception:  # the acknowledgement is durable in acks.jsonl: the next pass settles it
+                self._acks_checked = False
+                raise
             if self._owes(item):  # C5: what its delivery still owes is done first
                 item["phase"] = "settled"
             else:
@@ -553,7 +588,7 @@ class Deliveries:
         if getattr(self, "_acks_checked", False):
             return False
         pending = {(i["msgid"], i.get("target")): i for i in self.items if i["kind"] == "ring"
-                   and i.get("interrupt") and i.get("phase") in ("accept", "held")}
+                   and i.get("interrupt") and i.get("phase") in ("deliver", "accept", "held")}
         if not pending:
             self._acks_checked = True
             return False
@@ -562,6 +597,7 @@ class Deliveries:
         except (OSError, ValueError) as err:
             log(f"acknowledgements not read ({err!r:.80}); read again next pass")
             return False
+        self._acks_checked = True  # a settling below that fails sets it back, for the next pass
         changed = False
         for raw in lines:
             try:
@@ -570,9 +606,12 @@ class Deliveries:
                 continue
             item = pending.get((row.get("reply_to"), row.get("by"))) if isinstance(row, dict) else None
             if item is not None and item in self.items:
-                self.accept(item["msgid"], row["by"], row.get("how") or "recovered", cfg)
+                try:
+                    self.accept(item["msgid"], row["by"], row.get("how") or "recovered", cfg)
+                except Exception as err:
+                    log(f"acknowledgement of {item['channel']} not yet settled ({err!r:.80}); next pass")
+                    continue
                 changed = True
-        self._acks_checked = True
         return changed
 
     def process(self, cfg):
