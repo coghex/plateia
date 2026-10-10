@@ -124,7 +124,7 @@ class ReconciledAbsentTests(OutboxCase):
     def test_a_crash_or_broken_connection_never_proves_absence(self):
         for plan in (["ok", "crash"], ["ok", "timeout"]):
             with self.subTest(plan=plan):
-                self.setUp()
+                self.fresh()
                 self.server.plan = list(plan)
                 try:
                     self.pchat("post", "#alpha", LONG)
@@ -136,7 +136,6 @@ class ReconciledAbsentTests(OutboxCase):
                 self.probes.world["gone"].add(4242)  # the crashed writer is gone: A8
                 self.flush()
                 self.assertEqual(len(self.server.published), 1)
-                self.tearDown()
 
 
 class IndependentDeliveryTests(OutboxCase):
@@ -430,7 +429,7 @@ class PausedWriterTests(OutboxCase):
     def test_each_proof_of_a_gone_writer_ends_it_without_finality(self):
         for how in ("pid", "start", "boot"):
             with self.subTest(how=how):
-                self.setUp()
+                self.fresh()
                 self.paused_attempt()
                 [a] = self.attempts(state="writing")
                 if how == "pid":
@@ -443,7 +442,6 @@ class PausedWriterTests(OutboxCase):
                 self.flush()
                 [b] = self.attempts(id=a["id"])
                 self.assertEqual((b["state"], b["end_kind"], b["final_at"]), ("ended", "writer_gone", None))
-                self.tearDown()
 
     def test_unreadable_probes_prove_nothing(self):
         self.paused_attempt()

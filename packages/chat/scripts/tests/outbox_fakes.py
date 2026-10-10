@@ -231,6 +231,11 @@ class OutboxCase(unittest.TestCase):
         self.authority.close()
         self.bridge._FLUSHERS.clear()
 
+    def fresh(self):
+        """A clean case inside one test (for subTest loops): tear down, then set up again."""
+        self.tearDown()
+        self.setUp()
+
     # --- the authority and the bridge ---
 
     def new_authority(self, **kw):
@@ -331,3 +336,21 @@ class OutboxCase(unittest.TestCase):
 
     def alerts(self):
         return self.sql("SELECT * FROM alerts ORDER BY raised_at, alert_key")
+
+
+@contextlib.contextmanager
+def in_process_authority():
+    """An outbox authority on the sandboxed state, reached in-process by every
+    client in the block, with invented processes: for tests that need only that."""
+    import chatlib
+    import delivery_store
+    probes = delivery_store.FakeProbes(pid=BRIDGE_PID)
+    authority = delivery_store.Authority(chatlib.STATE_DIR, probes=probes)
+    authority.start()
+    client = lambda: delivery_store.Client(delivery_store.LocalTransport(authority))  # noqa: E731
+    try:
+        with mock.patch.object(chatlib, "client_factory", client), \
+                mock.patch.object(delivery_store, "PROBES", probes.view(CLIENT_PID)):
+            yield authority
+    finally:
+        authority.close()

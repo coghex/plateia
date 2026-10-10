@@ -25,6 +25,7 @@ _spec = importlib.util.spec_from_loader("chat_bridge", _loader)
 bridge = importlib.util.module_from_spec(_spec)
 _loader.exec_module(bridge)
 _isolation.check_bound(chatlib, bridge)
+from outbox_fakes import OutboxCase, in_process_authority  # noqa: E402  (#19: the in-process outbox authority)
 
 CFG = {"owner": "pat", "assistants": ["claude", "codex", "sam"],
        "accounts": {a: "x" for a in ("pat", "claude", "codex", "sam", "nov-manager", "nov-solver-1",
@@ -117,45 +118,51 @@ class TypingTests(unittest.TestCase):
         self.assertIn("no evidence", detail)
 
 
-class OutboxTests(unittest.TestCase):
-    def setUp(self):
-        reset_state()
+class OutboxTests(OutboxCase):
+    """The outbox keeps every post it owes until it is sent (#19 revision 8: one
+    SQLite authority; queued posts arrive as fallback files or legacy rows)."""
+
+    def write_legacy(self, path, *rows):
+        with path.open("a") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
 
     def test_post_queued_during_flush_survives(self):
-        chatlib.outbox_append([{"channel": "#nov", "as": "claude", "text": "A", "at": "t"}])
-        sent = []
+        self.write_legacy(Path(STATE) / "outbox.jsonl", {"channel": "#nov", "as": "claude", "text": "A", "at": "t"})
+        real_login = self.server.login
 
-        def post(channel, text, account, cfg, cont="", reply_to=None):
-            sent.append(text)
-            if text.startswith("A"):  # a concurrent pchat queues B mid-flush
-                chatlib.outbox_append([{"channel": "#nov", "as": "codex", "text": "B", "at": "t"}])
-        bridge.flush_outbox(CFG, post=post)
-        self.assertEqual([t[0] for t in sent], ["A"])
-        self.assertEqual(chatlib.outbox_pending(), 1)
-        bridge.flush_outbox(CFG, post=post)
-        self.assertEqual([t[0] for t in sent], ["A", "B"])
-        self.assertEqual(chatlib.outbox_pending(), 0)
+        def login(account, *a, **k):  # a concurrent pchat queues B mid-flush, the authority not answering it
+            if account == "claude" and not self.fallback_files():
+                self.server.refuse_login.add("codex")
+                with self.unavailable():
+                    self.pchat("post", "#nov", "B", account="codex")
+                self.server.refuse_login.discard("codex")
+            return real_login(account, *a, **k)
+        with mock.patch.object(chatlib, "login", login):
+            self.flush()
+        self.assertEqual([m["text"][0] for m in self.server.published], ["A"])
+        self.assertEqual(len(self.fallback_files()), 1)
+        self.flush()
+        self.assertEqual([m["text"][0] for m in self.server.published], ["A", "B"])
+        self.assertEqual(self.fallback_files(), [])
 
     def test_failures_are_requeued_and_crashed_claims_resumed(self):
-        (Path(STATE) / "outbox.claimed-1.jsonl").write_text(
-            json.dumps({"channel": "#nov", "as": "claude", "text": "left by a crash", "at": "t"}) + "\n")
-        chatlib.outbox_append([{"channel": "#nov", "as": "claude", "text": "fails", "at": "t"}])
-        sent = []
-
-        def post(channel, text, account, cfg, cont="", reply_to=None):
-            if text.startswith("fails"):
-                raise OSError("down")
-            sent.append(text)
-        bridge.flush_outbox(CFG, post=post)
-        self.assertTrue(sent and sent[0].startswith("left by a crash"))
-        self.assertEqual(chatlib.outbox_pending(), 1)
+        self.write_legacy(Path(STATE) / "outbox.claimed-1.jsonl",
+                          {"channel": "#nov", "as": "claude", "text": "left by a crash", "at": "t"})
+        self.write_legacy(Path(STATE) / "outbox.jsonl", {"channel": "#nov", "as": "codex", "text": "fails", "at": "t"})
+        self.server.refuse_login = {"codex"}
+        self.flush()
+        self.assertTrue(self.server.published and self.server.published[0]["text"].startswith("left by a crash"))
+        self.assertEqual([e["state"] for e in self.entries() if e["account"] == "codex"], ["open"])
 
     def test_tag_and_reply_survive_the_outbox(self):
-        chatlib.outbox_append([{"channel": "#nov", "as": "claude", "text": "[status r-20261002-1] x",
-                                "cont": "[status r-20261002-1]", "reply_to": "m1", "at": "t"}])
-        calls = []
-        bridge.flush_outbox(CFG, post=lambda *a, **k: calls.append(k))
-        self.assertEqual(calls, [{"cont": "[status r-20261002-1]", "reply_to": "m1"}])
+        self.write_legacy(Path(STATE) / "outbox.jsonl",
+                          {"channel": "#nov", "as": "claude", "text": "[status r-20261002-1] x",
+                           "cont": "[status r-20261002-1]", "reply_to": "m1", "at": "t"})
+        self.flush()
+        [m] = self.server.published
+        self.assertIn("+draft/reply=m1", m["tags"])
+        self.assertTrue(m["text"].startswith("[status r-20261002-1] x"))
 
 
 class AcceptanceTests(unittest.TestCase):
@@ -974,7 +981,7 @@ class SendMultilineTests(unittest.TestCase):
 
             def close(self, reason=""):
                 pass
-        with mock.patch.object(chatlib, "login", lambda *a, **k: Conn()):
+        with mock.patch.object(chatlib, "login", lambda *a, **k: Conn()), in_process_authority():
             chatlib.post("#nov-41", "[answer r-20261002-1] yes\nsee #44", "sam", reply_to="m1")
         return sent
 
