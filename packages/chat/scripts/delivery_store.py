@@ -1213,8 +1213,13 @@ class Store:
         self.raise_alert(f"held:{name}", "held", name,
                          "queued outbox rows could not be imported and are held; see pchat status")
 
-    def hold_changed(self, name, sha):
-        self._hold_row(name, None, sha, "changed after import began")
+    def hold_changed(self, name, sha, data=None):
+        """A file changed after its import began: held, with its exact bytes when
+        they are given (a fallback file, removed only after this commits; owner
+        amendment 6, F2(b)), or by its sha256 (a legacy claim, which is never
+        removed). Never merged or replayed."""
+        self._hold_row(name, None, data if data is not None else sha,
+                       "changed after import began" + (f" ({sha})" if data is not None else ""))
         self.raise_alert(f"held:{name}:{sha}", "held", name,
                          "queued outbox rows could not be imported and are held; see pchat status")
 
@@ -2249,8 +2254,9 @@ class Importer:
         outcome = self.authority.run_tx(lambda s: s.import_fallback(name, sha, row))
         if outcome is CANCELLED:
             return CANCELLED
-        if outcome == "changed":
-            self.authority.run_tx(lambda s: s.hold_changed(name, sha))
+        if outcome == "changed":  # its exact bytes are held first; a hold that fails or never runs keeps the file
+            if self.authority.run_tx(lambda s: s.hold_changed(name, sha, data)) is CANCELLED:
+                return CANCELLED
         self.fs.unlink(path)  # a failure keeps it: the next try finds its imports row and removes it
         self.fs.sync_dir(self.paths.fallback)
         self.pass_names.discard(name)

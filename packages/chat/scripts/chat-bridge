@@ -377,7 +377,81 @@ class Deliveries:
                 "project": item["project"], "attempt": item["attempt"], "ok": ok, "detail": detail}
         if item.get("alert_key"):
             line["alert_key"] = item["alert_key"]
+        if item.get("intent_id"):  # an interrupt's exact identity: what recovery reconciles by (section 3.7)
+            line.update(intent=item["intent_id"], target=item.get("target"), surface=item.get("intent_surface"),
+                        session=item.get("intent_session"))
         delivery_store.durable_append(delivery_store.FS_DEFAULT, DELIVERIES, json.dumps(line))
+
+    def _proof(self, item):
+        """Surviving, exact-identity proof that this interrupt's submission was
+        proved: a durable ledger line with its intent id, target, surface and
+        session. Anything missing, mismatched or unreadable is no proof."""
+        want = {"intent": item.get("intent_id"), "target": item.get("target"),
+                "surface": item.get("intent_surface"), "session": item.get("intent_session")}
+        if not want["intent"]:
+            return False
+        try:
+            lines = DELIVERIES.read_text().splitlines() if DELIVERIES.exists() else []
+        except (OSError, ValueError):
+            return False
+        for raw in lines:
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("ok") is True and all(row.get(k) == v for k, v in want.items()):
+                return True
+        return False
+
+    def _commit_intent(self, item, surface):
+        """The interrupt's durable intent, before its first agent-affecting command.
+        True once saved; False (and the item as it was) if it cannot be."""
+        before = dict(item)
+        try:
+            session = identities.read_registry().get("agents", {}).get(item.get("target"), {}).get("session_id")
+        except Exception:  # the session is part of the identity when it can be read
+            session = None
+        item.update(phase="intent", intent_id=uuid.uuid4().hex, intent_surface=surface, intent_session=session,
+                    intent_at=time.time())
+        try:
+            self._save()
+            self.unsaved = False
+            return True
+        except Exception as err:
+            item.clear()
+            item.update(before)
+            log(f"interrupt ({item['channel']}) to {item.get('target')}: intent not saved ({err!r:.80}); nothing done")
+            return False
+
+    def _hold(self, item, why):
+        """An interrupt that may have acted, with no proof it was submitted: held
+        for reconciliation and never rung again (section 3.7). One owner alert."""
+        item.update(phase="held", held_detail=why[:200],
+                    next_at=(item.get("intent_at") or time.time()) + INTERRUPT_ACK_WAIT)
+        if not item.get("held_alerted"):
+            item["held_alerted"] = True
+            self._alert(item, f"interrupt to {_recipient(item)}: its outcome is unknown, and it is not repeated;"
+                              " held until it is acknowledged")
+        log(f"interrupt ({item['channel']}) to {item.get('target')} held: {why[:120]}")
+
+    def recover(self, cfg):
+        """Interrupts left by an earlier pass or process (section 3.7): one still in
+        intent, or held, is reconciled only by exact-identity proof; without it,
+        it is held. Durable accept and settled states are kept as they are."""
+        changed = False
+        for item in [i for i in self.items if i.get("phase") in ("intent", "held")]:
+            if self._proof(item):
+                item.update(phase="accept", next_at=time.time() + INTERRUPT_ACK_WAIT)
+                if item.get("delivered_announced") is not True:
+                    item["delivered_announced"] = False  # owed, by the same entry id: never a second post
+                    item.setdefault("delivered_text", f"interrupt → {item['target']}: instruction delivered;"
+                                                      " waiting for its acknowledgement")
+                changed = True
+                log(f"interrupt ({item['channel']}) to {item.get('target')}: delivered, by its ledger line")
+            elif item["phase"] == "intent":
+                self._hold(item, "its outcome is unknown after a restart")
+                changed = True
+        return changed
 
     def _dead(self, item, detail, cfg, reason=None):
         """Give up on a delivery. Every dead-lettered wake-up tells the owner,
@@ -391,9 +465,12 @@ class Deliveries:
                                        {**item, "dl_key": key, "dead_at": now_iso(), "last_detail": detail},
                                        "dl_key", key)
         self._record(item, False, f"dead-lettered: {detail}")
-        self.items.remove(item)  # only once its dead-letter line and its ledger line are durable
+        if self._owes(item):  # its ledger line or announcement is still owed: kept, settled, until durable
+            item["phase"] = "settled"
+        else:
+            self.items.remove(item)  # only once its dead-letter line and its ledger line are durable
         log(f"{item['kind']} DEAD-LETTERED ({item['channel']}): {detail}")
-        if item["kind"] == "ring":
+        if item["kind"] == "ring" and not item.get("held_alerted"):
             self._alert(item, f"delivery to {_recipient(item)} {reason or 'failed: ' + detail[:80]}")
 
     def _alert(self, item, text):
@@ -405,19 +482,24 @@ class Deliveries:
         a direct delivery (an interrupt) the agent it was for. An interrupt whose
         delivered announcement is still owed stays, accepted, until it is durable."""
         for item in [i for i in self.items if i["kind"] == "ring" and i["msgid"] == msgid
-                     and i.get("phase") != "accepted"]:
+                     and i.get("phase") != "settled"]:
             owner = item.get("target") or cfg.get("projects", {}).get(item["project"], {}).get("manager")
             if owner != by:
                 continue
             self._record(item, True, f"accepted by {by} ({how})")
             if self._owes(item):  # C5: what its delivery still owes is done first
-                item["phase"] = "accepted"
+                item["phase"] = "settled"
             else:
                 self.items.remove(item)  # only once its ledger line is durable
             if item.get("agent_msg_id"):  # the queued cmux copy is now redundant
                 _cmux("rpc", "agent.message.mark_read", json.dumps({"ids": [item["agent_msg_id"]]}))
             log(f"ring accepted ({item['channel']}) by {by} ({how})")
-            self._save()
+            try:
+                self._save()
+                self.unsaved = False
+            except Exception as err:  # saved again at every pass; the acknowledgement is in acks.jsonl too
+                self.unsaved = True
+                log(f"pending deliveries not saved: {err!r:.100}; saved again next pass")
 
     @staticmethod
     def _owes(item):
@@ -454,13 +536,35 @@ class Deliveries:
                 return changed
             item["delivered_announced"] = True
             changed = True
-        if item.get("phase") == "accepted":
-            self.items.remove(item)  # acknowledged already: nothing more is owed for it
+        if item.get("phase") == "settled":
+            self.items.remove(item)  # acknowledged or dead-lettered already: nothing more is owed for it
+        return changed
+
+    def recovered_acknowledgements(self, cfg):
+        """At the first pass of a process: an interrupt whose acknowledgement is
+        already in acks.jsonl, but whose settling was never saved, is settled."""
+        if getattr(self, "_acks_checked", False):
+            return False
+        self._acks_checked = True
+        pending = {i["msgid"]: i for i in self.items if i["kind"] == "ring" and i.get("interrupt")
+                   and i.get("phase") in ("accept", "held")}
+        if not pending:
+            return False
+        try:
+            rows = [json.loads(x) for x in ACKS.read_text().splitlines() if x.strip()] if ACKS.exists() else []
+        except (OSError, ValueError):
+            return False
+        changed = False
+        for row in rows:
+            item = pending.get(row.get("reply_to")) if isinstance(row, dict) else None
+            if item is not None and item in self.items and row.get("by") == item.get("target"):
+                self.accept(item["msgid"], row["by"], row.get("how") or "recovered", cfg)
+                changed = True
         return changed
 
     def process(self, cfg):
-        changed = self.retry_owed(cfg)
-        due = [i for i in self.items if i["next_at"] <= time.time() and i.get("phase") != "accepted"]
+        changed = self.recover(cfg) | self.recovered_acknowledgements(cfg) | self.retry_owed(cfg)
+        due = [i for i in self.items if i["next_at"] <= time.time() and i.get("phase") not in ("settled", "intent")]
         for item in due:
             try:
                 self._process_one(item, cfg)
@@ -475,6 +579,10 @@ class Deliveries:
                 log(f"pending deliveries not saved: {err!r:.100}; saved again next pass")
 
     def _process_one(self, item, cfg):
+        if item.get("phase") == "held":  # never rung again: dead-lettered truthfully when its wait ends
+            self._dead(item, f"interrupt outcome unknown; not repeated ({item.get('held_detail', '')[:80]})", cfg,
+                       reason="has an interrupt whose outcome is unknown; it was not repeated")
+            return
         if item.get("phase") == "accept":  # delivered, but never accepted in time
             if item.get("interrupt"):  # re-sending would interrupt it again
                 self._dead(item, "interrupted, but never acknowledged", cfg,
@@ -490,10 +598,28 @@ class Deliveries:
             self._dead(item, "delivered but never accepted by the manager", cfg,
                        reason=f"was never accepted (from {item['sender']})")
             return
-        if item["kind"] == "push":
-            ok, detail = push_owner(cfg, item)
-        else:
-            ok, detail = (ring_agent if item.get("target") else ring_manager)(cfg, item)
+        interrupt = item["kind"] == "ring" and bool(item.get("interrupt"))
+        acts = _ACTS[0]
+        INTENT[0] = self._commit_intent if interrupt else None
+        try:
+            if item["kind"] == "push":
+                ok, detail = push_owner(cfg, item)
+            else:
+                ok, detail = (ring_agent if item.get("target") else ring_manager)(cfg, item)
+        except Exception as err:
+            if interrupt and item.get("phase") == "intent":
+                ok, detail = False, f"{err!r:.100}"  # classified below, never raised again into a re-ring
+            else:
+                raise
+        finally:
+            INTENT[0] = None
+        if interrupt and item.get("phase") == "intent" and ok is not True:
+            if _ACTS[0] != acts:  # it may have acted, with no proved submission: held, never repeated
+                self._hold(item, detail)
+                return
+            for k in ("intent_id", "intent_surface", "intent_session", "intent_at"):  # proved no action
+                item.pop(k, None)
+            item["phase"] = "deliver"
         if ok is WAITING:  # cmux is holding it, or the recipient is busy: follow it, don't count it
             self._record(item, None, detail)
             if item.get("interrupt") and detail.startswith("held") and not item.get("held_announced"):
@@ -593,10 +719,23 @@ def _split_prompt(screen, brand="claude"):
     return "\n".join(lines[:i]), "\n".join(box).lstrip().removeprefix(mark)
 
 
+# Owner amendment 6 (design revision 9, section 3.7): an interrupt's durable intent
+# comes before its first agent-affecting command, and a command issued is never
+# taken back. Every such command (a key, typed text) goes through _act, which counts
+# it, so an attempt that issued none has provably done nothing.
+_ACTS = [0]
+INTENT = [None]  # set by Deliveries around one interrupt attempt: records its intent durably; False means do nothing
+
+
+def _act(*args):
+    _ACTS[0] += 1
+    return _cmux(*args)
+
+
 def _clear_draft(surface, idle=False):
     st = _input_state(surface)
     if st.get("state") == "draft" and (idle or st.get("lifecycle") != "running"):
-        _cmux("send-key", "--surface", surface, "ctrl+c")  # Claude: clears a non-empty prompt
+        _act("send-key", "--surface", surface, "ctrl+c")  # Claude: clears a non-empty prompt
 
 
 def _type_into_prompt(surface, text, brand="claude", idle=False):
@@ -609,14 +748,14 @@ def _type_into_prompt(surface, text, brand="claude", idle=False):
     if brand == "codex" and _codex_browsing(_screen(surface)):
         return WAITING, "held: Codex is browsing its transcript; not typing"
     line = " ".join(text.split())
-    if _cmux("send", "--surface", surface, "--", line)[0] != 0:
+    if _act("send", "--surface", surface, "--", line)[0] != 0:
         return False, "send failed"
     time.sleep(0.8)
     _, box = _split_prompt(_cmux("read-screen", "--surface", surface)[1], brand)
     if _input_state(surface).get("state") != "draft" or _flat(box) != _flat(line):
         _clear_draft(surface, idle)
         return False, "draft on screen did not match exactly; cleared, not submitted"
-    if _cmux("send-key", "--surface", surface, "enter")[0] != 0:
+    if _act("send-key", "--surface", surface, "enter")[0] != 0:
         _clear_draft(surface, idle)
         return False, "Enter failed; draft cleared"
     for _ in range(16):
@@ -701,7 +840,7 @@ def _stop_turn(surface, brand):
     """Stop a running turn with Esc, as the owner would. Returns (stopped, detail):
     True once stopped, None if no turn was running, False if Esc didn't stop it.
     cmux's lifecycle stays "running" after an interrupt, so this reads the screen."""
-    esc = lambda: _cmux("send-key", "--surface", surface, "escape")
+    esc = lambda: _act("send-key", "--surface", surface, "escape")
     if brand == "codex":
         if _input_state(surface).get("lifecycle") != "running" or _codex_interrupted(_screen(surface)):
             return None, "not working"
@@ -733,6 +872,9 @@ def _interrupt(item, surface, brand, label):
         return WAITING, f"held: {label}'s prompt holds a draft someone is typing"
     if brand == "codex" and _codex_browsing(_screen(surface)):
         return WAITING, f"held: {label} is browsing its transcript; not interrupting"
+    commit = INTENT[0]
+    if commit is not None and not commit(item, surface):  # no durable intent: no command at all
+        return WAITING, f"intent not recorded durably; nothing done to {label}"
     stopped, detail = _stop_turn(surface, brand)
     if stopped is False:
         return False, f"{detail}: {label} {surface[:8]}"
@@ -740,13 +882,13 @@ def _interrupt(item, surface, brand, label):
         item["stopped_at"] = now_iso()
     if brand == "claude":
         if stopped and _input_state(surface).get("state") == "draft":
-            _cmux("send-key", "--surface", surface, "ctrl+c")  # Claude restored the prompt it was stopped on
+            _act("send-key", "--surface", surface, "ctrl+c")  # Claude restored the prompt it was stopped on
             time.sleep(0.5)
         if "-- INSERT --" not in _footer(_screen(surface)):
-            _cmux("send", "--surface", surface, "--", "i")  # vim normal mode: back to insert
+            _act("send", "--surface", surface, "--", "i")  # vim normal mode: back to insert
             time.sleep(0.5)
             if "-- INSERT --" not in _footer(_screen(surface)) and _input_state(surface).get("state") == "draft":
-                _cmux("send-key", "--surface", surface, "ctrl+c")  # not vim after all: the i was typed
+                _act("send-key", "--surface", surface, "ctrl+c")  # not vim after all: the i was typed
                 time.sleep(0.5)
     limit = 300 if brand == "codex" else 700  # Codex folds a long typed burst into a paste placeholder
     ok, detail = _type_into_prompt(surface, "[chat interrupt] " + _wake_text(item, limit=limit), brand, idle=True)

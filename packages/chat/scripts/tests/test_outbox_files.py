@@ -653,6 +653,100 @@ class BoundedDrainTests(FilesCase):
         self.assertEqual(counts, [2, 4, 5])
 
 
+class ChangedFallbackTests(FilesCase):
+    """Design test 47 (code review slot 8, finding 2): a fallback file whose
+    removal failed after its import, and whose content is then changed outside
+    this design, is held with its exact bytes, and removed only after that
+    hold's transaction commits. A failed or cancelled hold keeps the file. The
+    original obligation is unchanged."""
+
+    def imported_but_kept(self):
+        self.ds.publish_fallback(self.fs, self.authority.paths, dict(self.row("[status] original"), id="o" * 32),
+                                 clock=self.clock)
+        [path] = self.fallback_files()
+        real = self.fs.unlink
+
+        def unlink(p):
+            if Path(p) == path:
+                raise PermissionError(13, "permission denied (fake)")
+            return real(p)
+        with mock.patch.object(self.fs, "unlink", unlink):
+            self.flush()
+        self.assertTrue(path.exists(), "imported, but its removal failed")
+        return path
+
+    def test_the_changed_bytes_are_held_before_the_file_is_removed(self):
+        for changed in (b'{"v": "outbox/2", "text": "changed outside the design"}\n', b"\xff\xfe not text \x00"):
+            with self.subTest(changed=changed[:12]):
+                self.fresh()
+                path = self.imported_but_kept()
+                path.write_bytes(changed)
+                self.fs.durable(path)
+                self.flush()
+                self.assertFalse(path.exists(), "removed once the hold committed")
+                held = self.sql("SELECT raw, why FROM held WHERE file = ?", path.name)
+                self.assertEqual([bytes(h["raw"]) if isinstance(h["raw"], (bytes, memoryview)) else h["raw"]
+                                  for h in held], [changed], "the exact changed bytes")
+                import hashlib
+                key = f"held:{path.name}:{hashlib.sha256(changed).hexdigest()}"
+                self.assertEqual(len([a for a in self.alerts() if a["alert_key"] == key]), 1, "one alert")
+                self.assertEqual(self.published_texts(), ["[status] original"], "the original obligation, once")
+                self.flush()
+                self.assertEqual(len(self.sql("SELECT * FROM held")), 1)
+
+    def test_a_power_loss_between_the_hold_and_the_removal(self):
+        path = self.imported_but_kept()
+        changed = b"changed outside the design"
+        path.write_bytes(changed)
+        self.fs.durable(path)
+        real = self.fs.unlink
+
+        def unlink(p):
+            if Path(p) == path:
+                raise Crash()  # the hold has committed; the removal never happens
+            return real(p)
+        with mock.patch.object(self.fs, "unlink", unlink), self.assertRaises(Crash):
+            self.importer.import_fallback_files()
+        self.fs.power_loss()
+        self.restart_bridge()
+        self.authority.close()
+        self.authority = self.new_authority(fs=self.fs)
+        self.importer = self.ds.Importer(self.authority)
+        for _ in range(2):
+            self.flush()
+        self.assertFalse(path.exists(), "removed after the restart")
+        held = self.sql("SELECT raw FROM held WHERE file = ?", path.name)
+        self.assertEqual([bytes(h["raw"]) if not isinstance(h["raw"], str) else h["raw"] for h in held], [changed],
+                         "held once, with its exact bytes")
+        self.assertEqual(self.published_texts(), ["[status] original"], "the original obligation, once")
+
+    def test_a_failed_or_cancelled_hold_keeps_the_file(self):
+        for how in ("fails", "cancelled"):
+            with self.subTest(how=how):
+                self.fresh()
+                path = self.imported_but_kept()
+                path.write_bytes(b"changed")
+                self.fs.durable(path)
+                real = self.authority.run_tx
+                calls = []
+
+                def run_tx(fn, how=how):
+                    if "hold_changed" in getattr(fn, "__code__", None).co_names:
+                        calls.append(how)
+                        if how == "fails":
+                            raise sqlite3.OperationalError("disk I/O error (fake)")
+                        return self.ds.CANCELLED
+                    return real(fn)
+                with mock.patch.object(self.authority, "run_tx", run_tx):
+                    self.importer.import_fallback_files()
+                self.assertEqual(calls, [how])
+                self.assertTrue(path.exists(), "kept: its changed content is not lost")
+                self.assertEqual(path.read_bytes(), b"changed")
+                self.importer.import_fallback_files()  # a later flush, with the hold working
+                self.assertFalse(path.exists())
+                self.assertEqual(len(self.sql("SELECT * FROM held")), 1)
+
+
 class StagingIdentityTests(FilesCase):
     """Self-audit, classes A and C: a staging file whose writer identity in its
     name is incomplete or odd is kept while its pid lives, and never stops the flush."""

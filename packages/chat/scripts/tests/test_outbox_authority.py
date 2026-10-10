@@ -346,6 +346,45 @@ class AcceptFloodTests(AuthorityCase):
         a.sel.unregister(a.listener)
 
 
+class SandboxTests(AuthorityCase):
+    """The canonical approval's clarifications: every database a test opens is
+    under _isolation.CHAT_STATE (an audit hook on sqlite3.connect while a whole
+    post, its queueing and a flush run), and no designation interface exists."""
+
+    def test_every_database_opened_lies_under_the_sandbox(self):
+        import _isolation
+        opened = SandboxTests.opened = getattr(SandboxTests, "opened", [])
+        if not getattr(SandboxTests, "hooked", False):
+            sys.addaudithook(lambda event, args: SandboxTests.opened.append(os.fsdecode(args[0]))
+                             if event == "sqlite3.connect" and getattr(SandboxTests, "watching", False) else None)
+            SandboxTests.hooked = True
+        del opened[:]
+        SandboxTests.watching = True
+        try:
+            self.authority.close()
+            self.authority = self.new_authority()  # a start opens the database
+            self.server.refuse_login = {"sam"}
+            self.post("[status] queued", channel="#beta", account="sam")
+            self.server.refuse_login = set()
+            self.flush()
+        finally:
+            SandboxTests.watching = False
+        root = Path(_isolation.CHAT_STATE).resolve()
+        self.assertTrue(opened)
+        for path in opened:
+            self.assertTrue(Path(path).resolve().is_relative_to(root), path)
+
+    def test_no_designation_interface_exists(self):
+        """No command, option, request or chat-config key designates an account:
+        designation exists only as rows, which tests set directly."""
+        self.assertNotIn("designate", self.ds.CLIENT_OPS)
+        for name in ("pchat", "chatlib.py", "agentcli.py", "chat-bridge"):
+            text = (SCRIPTS / name).read_text()
+            for marker in (".designate(", "\"designate\"", "'designate'", "add_parser(\"designat",
+                           "cfg.get(\"designat", "cfg[\"designat", "--designat"):
+                self.assertNotIn(marker, text, f"{name}: {marker}")
+
+
 class LockFailureTests(AuthorityCase):
     """Self-audit, class B: a lock that cannot be taken, for any reason, leaves no file open."""
 

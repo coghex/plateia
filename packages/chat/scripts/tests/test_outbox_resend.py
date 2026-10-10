@@ -17,7 +17,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _isolation  # noqa: E402,F401  (first: sandbox home and live-state guard)
-from outbox_fakes import CFG, LONG, T0, OTHER_PID, Crash, OutboxCase  # noqa: E402
+from outbox_fakes import CFG, LONG, T0, OTHER_PID, Crash, OutboxCase, iso  # noqa: E402
 import test_bridge  # noqa: E402,F401  (puts the scripts on the path, under the sandbox)
 
 import agentcli  # noqa: E402
@@ -180,6 +180,26 @@ class RestartTests(OutboxCase):
         self.flush()
         self.assertEqual(self.entry()["state"], "done")
         self.assertEqual(len(self.server.published), 3)
+
+    def test_a_reloaded_bridge_module_continues_from_the_recorded_progress(self):
+        """Acceptance 6 as written: the bridge module itself is loaded again on the same state."""
+        import importlib.machinery
+        import importlib.util
+        self.server.plan = ["ok", "ok", "error"]
+        self.pchat("post", "#alpha", LONG)
+        self.server.published.pop()
+        self.restart_bridge()
+        path = Path(self.bridge.__file__)
+        loader = importlib.machinery.SourceFileLoader("chat_bridge_reloaded", str(path))
+        fresh = importlib.util.module_from_spec(importlib.util.spec_from_loader("chat_bridge_reloaded", loader))
+        loader.exec_module(fresh)
+        self.assertIsNot(fresh, self.bridge)
+        self.cover(T0 - 3600, T0 + 600)
+        self.clock.advance(60)
+        with mock.patch.object(fresh, "_now", self.clock):
+            fresh.flush_outbox(CFG, authority=self.authority, deliveries=fresh.Deliveries())
+        self.assertEqual(self.entry()["state"], "done")
+        self.assertEqual(len(self.server.published), 3, "parts 1 and 2 are never rewritten")
 
     def test_a_flush_killed_after_writing_a_part_recovers_from_the_database(self):
         self.server.refuse_login = {"alp-solver-2"}
@@ -610,6 +630,156 @@ class ClosedConnectionTests(OutboxCase):
         self.flush()
         self.assertEqual([t.split(" (delayed")[0] for t in self.server.texts()], ["[status] once"], "delivered once")
         self.assertEqual(self.states(), ["confirmed"])
+
+
+class NegativeReconciliationTests(OutboxCase):
+    """Design test 48 (code review slot 8, finding 3; the original review's
+    addition): a message with the part's exact text never makes the part
+    delivered when it comes from another account, an unverified sender,
+    another channel, or before the attempt's window; and nothing is resent
+    blindly. Through the caller and the flush."""
+
+    def uncertain_part(self):
+        self.designate("alp-solver-2", T0 - 60)
+        self.server.plan = ["ok", "ok", "timeout"]
+        self.pchat("post", "#alpha", LONG)
+        return self.server.published[2]
+
+    def test_wrong_account_unverified_wrong_channel_and_too_early_never_deliver(self):
+        for case in ("another account", "unverified", "another channel", "before the window"):
+            with self.subTest(case=case):
+                self.fresh()
+                part3 = self.uncertain_part()
+                self.server.published.pop()  # the record holds only the message below
+                [a] = [x for x in self.attempts() if x["n"] == 2]
+                if case == "another account":
+                    self.see(part3, account="sam", msgid="x1")
+                elif case == "unverified":
+                    entry = {"verified": False, "msgid": "x1", "channel": "#alpha", "from": "alp-solver-2",
+                             "text": part3["text"], "at": iso(part3["at"])}
+                    self.assertTrue(self.bridge.index_message(entry, self.authority))
+                elif case == "another channel":
+                    self.see(part3, channel="#beta", msgid="x1")
+                else:
+                    self.see(part3, at=a["written_at"] - self.ds.A - 30, msgid="x1")
+                self.cover(T0 - 3600, T0 + 3600)
+                self.clock.advance(30)
+                for _ in range(2):
+                    self.flush()
+                self.assertEqual(self.states(), ["confirmed", "confirmed", "uncertain"])
+                self.assertEqual(self.sql("SELECT * FROM attributions WHERE msgid = 'x1'"), [])
+                self.assertEqual(len(self.server.published), 2, "nothing resent blindly")
+
+
+class SameAccountFlowTests(OutboxCase):
+    """Design test 48 (the original review's addition; R6): another queued entry
+    of the SAME account, with another text, gets its bounded attempt in the same
+    flush while the first is uncertain, and while it is failing; on both
+    transports."""
+
+    def queued_second(self):
+        with self.unavailable():
+            code, _ = self.pchat("post", "#alpha", "[status] second, same account")
+        self.assertEqual(code, 3)
+
+    def second_delivered(self):
+        return [m for m in self.server.by("alp-solver-2") if m["text"].startswith("[status] second")]
+
+    def test_the_same_accounts_next_entry_flows_while_the_first_is_uncertain(self):
+        for multiline in (True, False):
+            with self.subTest(multiline=multiline):
+                self.fresh()
+                self.server.multiline = multiline
+                self.server.plan = ["ok", "timeout"]
+                self.pchat("post", "#alpha", LONG)
+                before = list(self.states())
+                self.queued_second()
+                self.flush()
+                self.assertEqual(len(self.second_delivered()), 1, "delivered in the same flush")
+                first = [e for e in self.entries() if e["text"] == LONG][0]
+                self.assertEqual(self.states(first), before, "the first keeps its state")
+
+    def test_the_same_accounts_next_entry_flows_while_the_first_is_failing(self):
+        # the first entry's part was fixed as a multiline batch the server can no longer carry: it fails at every flush
+        self.server.refuse_login = {"alp-solver-2"}
+        self.post("[status] first\nsecond line")
+        self.server.refuse_login = set()
+        first = self.entry()
+        self.tx(lambda s: s.fix_parts(first["id"], [{"kind": "multiline", "text": "[status] first\nsecond line",
+                                                     "lines": [["[status] first", False], ["second line", False]]}]))
+        self.server.multiline = False
+        self.queued_second()
+        for _ in range(2):
+            self.flush()
+        self.assertEqual(len(self.second_delivered()), 1, "delivered while the first keeps failing")
+        self.assertEqual(len(self.server.published), 1, "the first is never re-split")
+        self.assertEqual(self.states(self.entry(first["id"])), ["unsent"])
+
+
+class PartShapeTests(OutboxCase):
+    """The original review's addition on both transports: an uncertain middle
+    part followed by unsent parts; and a part fixed as a multiline batch that
+    the server can no longer carry stays unsent and visible, never re-split."""
+
+    def test_an_uncertain_middle_part_then_unsent_parts_on_both_transports(self):
+        for multiline in (True, False):
+            with self.subTest(multiline=multiline):
+                self.fresh()
+                self.server.multiline = multiline
+                self.server.plan = ["ok", "timeout"]
+                code, _ = self.pchat("post", "#alpha", LONG)
+                self.assertEqual(code, 3)
+                states = self.states()
+                self.assertEqual(states[:2], ["confirmed", "uncertain"])
+                self.assertTrue(states[2:] and all(s == "unsent" for s in states[2:]))
+                sent = len(self.server.published)
+                for _ in range(2):
+                    self.flush()
+                self.assertEqual(len(self.server.published), sent, "nothing resent while part 2 is uncertain")
+                self.assertEqual(self.states(), states)
+
+    def test_a_part_the_server_can_no_longer_carry_stays_unsent_and_visible(self):
+        self.server.refuse_login = {"alp-solver-2"}
+        self.post(LONG)
+        self.server.refuse_login = set()
+        e = self.entry()
+        parts = [{"kind": "multiline", "lines": [["north", False], ["south", False]], "text": "north\nsouth"}]
+        self.tx(lambda s: s.fix_parts(e["id"], parts))  # fixed as one multiline batch, on a server that offered it
+        self.server.multiline = False
+        for _ in range(2):
+            self.flush()
+        self.assertEqual(self.server.published, [], "never re-split into lines")
+        e = self.entry()
+        self.assertEqual([(p["kind"], p["lines"], p["state"]) for p in e["parts"]],
+                         [("multiline", [["north", False], ["south", False]], "unsent")])
+        from test_outbox_regressions import pchat
+        self.assertIn("1 waiting to post", "\n".join(pchat.outbox_status()), "visible as waiting")
+
+
+class BridgeRefusalTests(OutboxCase):
+    """The original review's addition (requirement 7): a FAIL in the middle of
+    the bridge's own delivery of a queued post dead-letters it with its
+    confirmed parts listed, and nothing is retried; on both transports."""
+
+    def test_a_mid_post_fail_in_the_bridges_flush(self):
+        for multiline in (True, False):
+            with self.subTest(multiline=multiline):
+                self.fresh()
+                self.server.multiline = multiline
+                self.server.refuse_login = {"alp-solver-2"}
+                self.post(LONG)
+                self.server.refuse_login = set()
+                self.server.plan = ["ok", "fail"]
+                self.flush()
+                sent = len(self.server.published)
+                self.assertEqual(self.entry()["state"], "terminal")
+                for _ in range(2):
+                    self.flush()
+                self.assertEqual(len(self.server.published), sent, "never retried")
+                [dl] = [d for d in self.dead_letters() if d.get("kind") == "post"]
+                states = [p["state"] for p in dl["parts"]]
+                self.assertEqual(states[:2], ["confirmed", "refused"])
+                self.assertTrue(all(s == "unsent" for s in states[2:]))
 
 
 class LateOutcomeTests(OutboxCase):

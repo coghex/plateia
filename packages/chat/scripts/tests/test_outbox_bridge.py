@@ -804,6 +804,311 @@ class DeliveredAnnouncementTests(BridgeCase):
         self.assertEqual(deliveries.items, [], "it leaves once its announcement is durable")
 
 
+class InterruptCase(BridgeCase):
+    """An interrupt for alp-solver-2 through the real interrupt path (owner
+    amendment 6), with a fake agent screen and keys (test_bridge.FakeAgent),
+    no real waits, and the bridge's own announcements on the fake server."""
+
+    def setUp(self):
+        super().setUp()
+        from test_bridge import FakeAgent
+        self.FakeAgent = FakeAgent
+        for p in (mock.patch.object(self.bridge, "agent_surface", lambda name: ("S", "claude")),
+                  mock.patch.object(self.bridge.time, "sleep", lambda s: None),
+                  mock.patch.object(self.bridge, "log", lambda m: None)):
+            p.start()
+            self.patches.append(p)
+
+    def item(self):
+        return {"kind": "ring", "msgid": "m-int", "channel": "#alpha", "sender": "pat", "project": "alpha",
+                "target": "alp-solver-2", "phase": "deliver", "interrupt": True, "needs_ack": True, "attempt": 0,
+                "next_at": 0, "text": "!! stop and read #alpha"}
+
+    def queued(self):
+        d = self.bridge.Deliveries()
+        d.items = [self.item()]
+        d._save()  # durably queued, as handle() leaves it
+        return d
+
+    def passes(self, agent, n=1, deliveries=None):
+        d = deliveries if deliveries is not None else self.bridge.Deliveries()
+        with mock.patch.object(self.bridge, "_cmux", agent):
+            for _ in range(n):
+                d.process(CFG)
+        return d
+
+    def on_disk(self):
+        return self.bridge.Deliveries().items
+
+    def interrupts(self, *agents):
+        return sum(a.keys.count("enter") for a in agents)
+
+    def announcements(self):
+        return [m for m in self.server.published if m["text"] and "instruction delivered" in m["text"]]
+
+    def ledger(self):
+        path = self.bridge.DELIVERIES
+        return [json.loads(x) for x in path.read_text().splitlines() if x.strip()] if path.is_file() else []
+
+    def alerts(self, items=None):
+        """The owner alerts about this interrupt: pushes still pending, and pushes already sent (the ledger)."""
+        pending = [i for i in (items or []) if i["kind"] == "push" and i.get("msgid") == "m-int"]
+        sent = [r for r in self.ledger() if r.get("kind") == "push" and r.get("msgid") == "m-int" and r.get("ok")]
+        return pending + sent
+
+
+class CrashingAgent:
+    """A fake agent that is killed (Crash) at its n-th agent-affecting command,
+    or at a read-only call when n is "read"."""
+
+    def __init__(self, agent, n):
+        self.agent, self.n, self.acts = agent, n, 0
+        self.keys = agent.keys
+
+    def __call__(self, *args):
+        if args[0] in ("send", "send-key"):
+            if self.n == self.acts:
+                raise Crash()
+            self.acts += 1
+        elif self.n == "read" or (isinstance(self.n, tuple) and self.acts >= self.n[1]):
+            raise Crash()  # a read before the intent; or one after the submission, before its evidence is saved
+        return self.agent(*args)
+
+
+class InterruptIntentTests(InterruptCase):
+    """Design tests 41 and 42 (owner amendment 6; the scope review's correction
+    and first addition): durable intent before the first agent-affecting
+    command, the preparatory Escape included; with no intent, no action; and
+    from the intent on, no crash ever leads to a second interrupt."""
+
+    def test_the_intent_is_durable_before_the_first_command(self):
+        seen = []
+        agent = self.FakeAgent()
+
+        def watching(*args):
+            if args[0] in ("send", "send-key") and not seen:
+                seen.append([i.get("phase") for i in self.on_disk()])
+            return agent(*args)
+        watching.keys = agent.keys
+        self.queued()
+        self.passes(watching)
+        self.assertEqual(seen, [["intent"]], "intent is on disk before the preparatory Escape")
+        self.assertEqual(self.interrupts(agent), 1)
+
+    def test_without_a_durable_intent_nothing_is_done(self):
+        agent = self.FakeAgent()
+        real_save, failed = self.bridge.Deliveries._save, []
+
+        def save(d):
+            if any(i.get("phase") == "intent" for i in d.items) and not failed:
+                failed.append(1)
+                raise OSError(28, "no space left on device (fake)")
+            return real_save(d)
+        d = self.queued()
+        with mock.patch.object(self.bridge.Deliveries, "_save", save):
+            self.passes(agent, deliveries=d)
+        self.assertEqual(agent.keys, [], "no command without the intent")
+        self.assertEqual([i["phase"] for i in self.on_disk()], ["deliver"])
+        d.items[0]["next_at"] = 0
+        self.passes(agent, deliveries=d)
+        self.assertEqual(self.interrupts(agent), 1, "tried again once the intent can be recorded")
+
+    def test_a_crash_at_any_boundary_after_the_intent_never_interrupts_again(self):
+        for n in (0, 1, 2, 3, 4, ("read after", 5)):  # the vim Escape, the stop, the "i", the typing, the Enter
+            with self.subTest(killed_at_command=n):
+                self.fresh()
+                first = self.FakeAgent()
+                self.queued()
+                with self.assertRaises(Crash):
+                    self.passes(CrashingAgent(first, n))
+                second = self.FakeAgent()
+                after = self.passes(second, 3)  # a restart: the state on disk
+                self.assertEqual(second.keys, [], "never rung again")
+                self.assertEqual([i["phase"] for i in after.items if i["kind"] == "ring"], ["held"])
+                self.assertEqual(len(self.alerts(after.items)), 1, "one content-free owner alert")
+
+    def test_a_crash_before_the_intent_is_retried_as_today(self):
+        self.queued()
+        with self.assertRaises(Crash):
+            self.passes(CrashingAgent(self.FakeAgent(), "read"))
+        agent = self.FakeAgent()
+        self.passes(agent)
+        self.assertEqual(self.interrupts(agent), 1, "nothing was done: it is delivered after the restart")
+
+
+class InterruptOutcomeTests(InterruptCase):
+    """Design tests 43 to 45, with the scope review's two additions: save,
+    ledger and announcement failures after a proved submission; a proved
+    no-action, a partial step, and a delivered interrupt kept distinct; and
+    proof that is not proof."""
+
+    def failing_saves(self, persistent):
+        real, failed = self.bridge.Deliveries._save, []
+
+        def save(d):
+            if any(i.get("phase") in ("accept", "settled") for i in d.items) and (persistent or not failed):
+                failed.append(1)
+                raise OSError(28, "no space left on device (fake)")
+            return real(d)
+        return save
+
+    def test_save_failures_after_delivery_never_interrupt_again(self):
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent):
+                self.fresh()
+                first = self.FakeAgent()
+                d = self.queued()
+                with mock.patch.object(self.bridge.Deliveries, "_save", self.failing_saves(persistent)):
+                    self.passes(first, 1 if not persistent else 3, deliveries=d)
+                # the bridge dies at once, with the delivered state never saved
+                second = self.FakeAgent()
+                after = self.passes(second, 2)
+                self.assertEqual(self.interrupts(first, second), 1, "rung exactly once")
+                self.assertEqual([i["phase"] for i in after.items], ["accept"], "reconciled by its ledger line")
+                self.assertEqual(len(self.announcements()), 1)
+
+    def test_with_no_surviving_proof_it_is_held_alerted_once_and_settled_by_the_acknowledgement(self):
+        real_record = self.bridge.Deliveries._record
+
+        def record(d, item, ok, detail):
+            if ok is True:
+                raise OSError(28, "no space left on device (fake)")
+            return real_record(d, item, ok, detail)
+        first = self.FakeAgent()
+        d = self.queued()
+        with mock.patch.object(self.bridge.Deliveries, "_save", self.failing_saves(True)), \
+                mock.patch.object(self.bridge.Deliveries, "_record", record):
+            self.passes(first, 2, deliveries=d)
+        second = self.FakeAgent()
+        after = self.passes(second, 2)
+        self.assertEqual(self.interrupts(first, second), 1)
+        [held] = [i for i in after.items if i["kind"] == "ring"]
+        self.assertEqual(held["phase"], "held")
+        self.assertEqual(len(self.alerts(after.items)), 1)
+        after.accept("m-int", "alp-solver-2", "reply", CFG)
+        self.assertEqual([i for i in self.on_disk() if i["kind"] == "ring"], [], "settled by the acknowledgement")
+
+    def no_delivery_line(self):
+        real = self.bridge.Deliveries._record
+
+        def record(d, item, ok, detail):
+            if ok is True and "submitted" in str(detail):
+                raise OSError(28, "no space left on device (fake)")
+            return real(d, item, ok, detail)
+        return record
+
+    def test_an_acknowledgement_while_work_is_owed_then_a_restart(self):
+        for save_fails in (False, True):
+            with self.subTest(acknowledgement_save_fails=save_fails):
+                self.fresh()
+                agent = self.FakeAgent()
+                d = self.queued()
+                with mock.patch.object(self.bridge, "announce", lambda *a: False), \
+                        mock.patch.object(self.bridge.Deliveries, "_record", self.no_delivery_line()):
+                    self.passes(agent, deliveries=d)
+                    acks = self.bridge.Acks()
+                    with mock.patch.object(self.bridge.Deliveries, "_save",
+                                           self.failing_saves(True) if save_fails else self.bridge.Deliveries._save):
+                        self.bridge.accepted(CFG, d, acks, msgid="m-ack", reply_to="m-int", sender="alp-solver-2",
+                                             channel="#alpha", at="2026-10-09T00:00:00Z", how="reply")
+                # restart at once
+                second = self.FakeAgent()
+                after = self.passes(second, 2)
+                self.assertEqual(self.interrupts(agent, second), 1, "no further interrupt")
+                self.assertEqual(len(self.announcements()), 1, "the owed announcement is made, once")
+                delivered = [r for r in self.ledger() if r.get("intent") and r.get("ok") is True
+                             and "submitted" in str(r.get("detail"))]
+                self.assertEqual(len(delivered), 1, "the owed ledger line is written once, with its original identity")
+                self.assertEqual([i for i in after.items if i["kind"] == "ring"], [], "kept until its work was durable")
+
+    def test_a_proved_no_action_is_retried_and_a_partial_step_is_held(self):
+        with mock.patch.object(self.bridge, "_stop_turn", lambda s, b: (None, "not working")), \
+                mock.patch.object(self.bridge, "_type_into_prompt",
+                                  lambda *a, **k: (False, "prompt not empty; not typing")):
+            d = self.queued()
+            agent = self.FakeAgent()
+            self.passes(agent, deliveries=d)
+        self.assertEqual([i["phase"] for i in self.on_disk()], ["deliver"], "proved no-action: tried again")
+        self.assertEqual(agent.keys, [])
+        for how in ("typing mismatch", "enter acts but fails", "failure after the escape"):
+            with self.subTest(how=how):
+                self.fresh()
+                agent = self.FakeAgent()
+                base = agent
+
+                def acting(*args, how=how):
+                    if how == "typing mismatch" and args[0] == "send" and len(args[-1]) > 1:
+                        return base(*args[:-1], args[-1] + " (garbled)")
+                    if how == "enter acts but fails" and args[0] == "send-key" and args[-1] == "enter":
+                        base(*args)
+                        return 1, "", "cmux: send-key failed (fake)"
+                    if how == "failure after the escape" and args[0] == "send-key" and base.keys.count("escape") == 1:
+                        raise OSError(5, "cmux died (fake)")
+                    return base(*args)
+                acting.keys = agent.keys
+                d = self.queued()
+                self.passes(acting, deliveries=d)
+                self.assertEqual([i["phase"] for i in self.on_disk() if i["kind"] == "ring"], ["held"])
+                again = self.FakeAgent()
+                self.passes(again, 2, deliveries=d)
+                for i in d.items:
+                    i["next_at"] = 0  # its acknowledgement wait is over
+                self.passes(again, 2, deliveries=d)
+                self.assertEqual(again.keys, [], "a partial or unclear step is never repeated")
+                self.assertEqual([i for i in d.items if i["kind"] == "ring"], [])
+                [dl] = [r for r in self.dead_letters() if r.get("msgid") == "m-int"]
+                self.assertIn("outcome unknown; not repeated", dl["last_detail"], "dead-lettered truthfully")
+
+    def test_proof_that_is_not_proof_leaves_it_held(self):
+        intent = {"phase": "intent", "intent_id": "i" * 32, "intent_surface": "S", "intent_session": None}
+        good = {"msgid": "m-int", "ok": True, "intent": "i" * 32, "target": "alp-solver-2", "surface": "S",
+                "session": None}
+        cases = {"another intent": dict(good, intent="j" * 32), "another target": dict(good, target="sam"),
+                 "another surface": dict(good, surface="T"), "no intent": {k: v for k, v in good.items()
+                                                                            if k != "intent"},
+                 "not ok": dict(good, ok=False), "unreadable": None, "exact": good}
+        for name, line in cases.items():
+            with self.subTest(case=name):
+                self.fresh()
+                d = self.bridge.Deliveries()
+                d.items = [dict(self.item(), **intent)]
+                d._save()
+                if line is None:
+                    self.bridge.DELIVERIES.mkdir(parents=True)  # an unreadable ledger
+                else:
+                    self.bridge.DELIVERIES.write_text(json.dumps(line) + "\n")
+                try:
+                    agent = self.FakeAgent()
+                    after = self.passes(agent, 2)
+                finally:
+                    if self.bridge.DELIVERIES.is_dir():
+                        self.bridge.DELIVERIES.rmdir()
+                self.assertEqual(agent.keys, [], "never rung again")
+                want = "accept" if name == "exact" else "held"
+                self.assertEqual([i["phase"] for i in after.items if i["kind"] == "ring"], [want])
+
+
+class OwedAnnouncementExpiryTests(InterruptCase):
+    """Design test 46 (code review slot 8, finding 1): an announcement still
+    owed when the acknowledgement wait expires survives the dead letter and a
+    restart, and is made once, with no second interrupt."""
+
+    def test_an_owed_announcement_survives_the_expiry_and_a_restart(self):
+        agent = self.FakeAgent()
+        d = self.queued()
+        with mock.patch.object(self.bridge, "announce", lambda *a: False):
+            self.passes(agent, deliveries=d)
+            d.items[0]["next_at"] = 0  # the acknowledgement wait is over
+            self.passes(agent, deliveries=d)
+        self.assertEqual(len([r for r in self.dead_letters() if r.get("msgid") == "m-int"]), 1, "dead-lettered")
+        self.assertEqual(self.announcements(), [])
+        second = self.FakeAgent()
+        after = self.passes(second, 2)  # a restart, with announcing working again
+        self.assertEqual(len(self.announcements()), 1, "the owed announcement is made, once")
+        self.assertEqual(self.interrupts(agent, second), 1, "never rung again")
+        self.assertEqual([i for i in after.items if i["kind"] == "ring"], [])
+
+
 class AnnounceTests(BridgeCase):
     """Tests 29 and 36: the bridge's own announcement, its fallback file, and E9."""
 
