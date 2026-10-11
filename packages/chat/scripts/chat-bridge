@@ -158,6 +158,17 @@ def mentions(text, accounts):
     return {a for a in found if a in accounts}
 
 
+def _recovery_lines(path):
+    """A recovery file's lines (pending deliveries' acknowledgements and
+    ledger). Only FileNotFoundError is absence; any other failure to inspect,
+    open or read it raises: unknown, never an empty file (code review CODE14).
+    Read directly: Path.exists() can hide a failing stat()."""
+    try:
+        return path.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+
+
 def _append_jsonl(path, obj):
     with path.open("a") as f:
         f.write(json.dumps(obj) + "\n")
@@ -384,14 +395,14 @@ class Deliveries:
         delivery_store.durable_replace(delivery_store.FS_DEFAULT, PENDING, json.dumps(self.items))
 
     def ledger_has(self, key):
-        if not DELIVERIES.exists():
-            return False
-        for raw in DELIVERIES.read_text().splitlines():
+        """Whether the ledger records this alert. A ledger that cannot be read raises: unknown, never "no"."""
+        for raw in _recovery_lines(DELIVERIES):
             try:
-                if json.loads(raw).get("alert_key") == key:
-                    return True
+                row = json.loads(raw)
             except ValueError:
                 continue
+            if isinstance(row, dict) and row.get("alert_key") == key:  # a malformed line is skipped, as elsewhere
+                return True
         return False
 
     def add_all(self, new_items):
@@ -429,7 +440,7 @@ class Deliveries:
         if any((i["msgid"], i.get("target")) == key for i in self.items if i["kind"] == "ring"):
             return True
         try:
-            lines = DELIVERIES.read_text().splitlines() if DELIVERIES.exists() else []
+            lines = _recovery_lines(DELIVERIES)
         except (OSError, ValueError) as err:
             item.update(phase="intent", intent_at=time.time())  # unknown: possibly acted before; never rung
             self._hold(item, f"cannot check for an earlier interrupt ({err!r:.60})")
@@ -465,7 +476,7 @@ class Deliveries:
         if not want["intent"]:
             return False
         try:
-            lines = DELIVERIES.read_text().splitlines() if DELIVERIES.exists() else []
+            lines = _recovery_lines(DELIVERIES)
         except (OSError, ValueError):
             return False
         for raw in lines:
@@ -638,7 +649,7 @@ class Deliveries:
             self._acks_checked, self.acks_unreadable = True, False
             return False
         try:
-            lines = ACKS.read_text().splitlines() if ACKS.exists() else []
+            lines = _recovery_lines(ACKS)
         except (OSError, ValueError) as err:
             if not getattr(self, "acks_unreadable", False):
                 log(f"acknowledgements not read ({err!r:.80}); their interrupts wait, and it is read again next pass")
@@ -1490,15 +1501,34 @@ def write_unavailable_status(paths, reason, since):
 
 class Acks:
     def __init__(self):
-        self.seen = set()
-        if ACKS.exists():
-            for raw in ACKS.read_text().splitlines():
-                try:
-                    self.seen.add(json.loads(raw).get("msgid"))
-                except ValueError:
-                    pass
+        self.seen, self.load_error = set(), None
+        self._load()
+
+    def _load(self):
+        """The recorded acknowledgements' msgids. A file that cannot be read
+        leaves the set unknown (code review CODE14): nothing is recorded, or
+        settled, as if it were empty; each add() reads it again first."""
+        try:
+            lines = _recovery_lines(ACKS)
+        except (OSError, ValueError) as err:
+            if self.load_error is None:
+                log(f"acknowledgements unreadable ({err!r:.100}); none is recorded until they can be read")
+            self.load_error = err
+            return False
+        seen = set()
+        for raw in lines:
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue  # a torn or malformed line, as before
+            if isinstance(row, dict):
+                seen.add(row.get("msgid"))
+        self.seen, self.load_error = seen, None
+        return True
 
     def add(self, msgid, entry):
+        if self.load_error is not None and not self._load():  # the message stays unlogged, for replay
+            raise OSError(f"acknowledgements unreadable ({self.load_error!r:.80}); not recorded")
         if msgid and msgid in self.seen:
             return False
         # durable, file then directory, before it counts as recorded and before recovery can rely on it

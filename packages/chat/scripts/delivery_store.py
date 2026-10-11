@@ -612,6 +612,25 @@ def is_published_name(name):
     return name.endswith(".json") and not name.startswith(".") and "-" in name
 
 
+def _make_state_tree(fs, path):
+    """The state directory and any missing parent, as the old outbox path's
+    STATE_DIR.mkdir(parents=True) made them (the default mode), each new entry
+    made durable in its parent: a first post before the bridge ever started
+    (code review CODE14). One that cannot be made raises."""
+    path = Path(path)
+    try:
+        os.mkdir(path)
+    except FileExistsError:
+        return
+    except FileNotFoundError:
+        _make_state_tree(fs, path.parent)
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            return
+    fs.sync_dir(path.parent)
+
+
 def publish_fallback(fs, paths, row, *, clock=time.time):
     """Publish one complete, immutable fallback file for row["id"]: exclusive
     creation under tmp/, the whole content synced, a link() that never replaces
@@ -619,6 +638,7 @@ def publish_fallback(fs, paths, row, *, clock=time.time):
     An OSError up to those syncs means nothing was reported queued (the caller
     fails as today); after them the call is queued, and removing the tmp/
     copy is cleanup only (clean_staging removes it later, once linked)."""
+    _make_state_tree(fs, paths.state)
     fs.mkdir(paths.fallback)
     fs.mkdir(paths.staging)
     writer = row.get("writer") or {}

@@ -1584,6 +1584,198 @@ class UnreadableAcknowledgementsTests(ReplayCase):
         self.assertEqual(self.interrupts(agent), 1)
 
 
+def inspection_fails(*paths, how="stat"):
+    """A recovery file that cannot be inspected. "stat": stat() fails, so Path.exists() reports False
+    (as on Python 3.14, which suppresses the error) and the read raises PermissionError. "read": it
+    exists, and reading it fails."""
+    targets = {Path(p) for p in paths}
+    real_exists, real_read = Path.exists, Path.read_text
+
+    def exists(path, *a, **k):
+        if Path(path) in targets and how == "stat":
+            return False
+        return real_exists(path, *a, **k)
+
+    def read_text(path, *a, **k):
+        if Path(path) in targets:
+            raise PermissionError(13, "permission denied (fake)") if how == "stat" else OSError(5, "I/O error (fake)")
+        return real_read(path, *a, **k)
+    stack = contextlib.ExitStack()
+    stack.enter_context(mock.patch.object(Path, "exists", exists))
+    stack.enter_context(mock.patch.object(Path, "read_text", read_text))
+    return stack
+
+
+class RecoveryInputTests(ReplayCase):
+    """Code review CODE14, finding 1, and the bounded systematic check: for the
+    bridge's recovery files (pending state, acks.jsonl, the delivery ledger),
+    only FileNotFoundError is absence. A file that cannot be inspected (stat
+    failing, which Path.exists() hides) or read is unknown: nothing is done on
+    the strength of it (no key, no dead letter, no removal, no repeated
+    obligation, no record or settling as if it were empty), it is tried again,
+    and independent work goes on. The map is in docs/chat_outbox_test_matrix.md."""
+
+    def an_owner_push(self, d):
+        d.items.append({"kind": "push", "msgid": "m-other", "channel": "#beta", "sender": "pat", "project": "beta",
+                        "attempt": 0, "next_at": 0, "text": "@sam a question for you"})
+
+    def pushed(self):
+        return [r for r in self.ledger() if r.get("kind") == "push" and r.get("msgid") == "m-other" and r.get("ok")]
+
+    def saved_ack(self):
+        self.bridge.Acks().add("m-ack", {"at": "2026-10-09T10:02:00Z", "msgid": "m-ack", "reply_to": "m-int",
+                                         "by": "alp-solver-2", "channel": "#alpha", "project": "alpha",
+                                         "how": "reply"})
+
+    # acks.jsonl, read by acknowledgement recovery
+    def test_acknowledgement_recovery_with_a_stat_failure_defers_a_ready_interrupt(self):
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks())
+        d = state[1]
+        agent = self.FakeAgent()
+        self.passes(agent, deliveries=d)
+        self.saved_ack()  # recorded before its instruction is replayed
+        self.bridge.handle(self.message(), CFG, *state, replayed=True)
+        self.an_owner_push(d)
+        with inspection_fails(self.bridge.ACKS):
+            self.passes(agent, 3, deliveries=d)
+            self.assertEqual(agent.keys, [], "no Escape, no Enter while unchecked")
+            self.assertEqual([i["phase"] for i in self.rings(d)], ["deliver"], "kept")
+            self.assertEqual(len(self.pushed()), 1, "independent work goes on")
+        self.passes(agent, 2, deliveries=d)
+        self.assertEqual((agent.keys, self.rings(d)), ([], []), "settled by its acknowledgement, never rung")
+
+    def test_acknowledgement_recovery_with_a_stat_failure_keeps_an_expired_interrupt(self):
+        item = dict(self.item(), phase="accept", attempt=1, next_at=0, intent_id="i" * 32, intent_surface="S",
+                    intent_session=None, delivered_announced=False, delivered_text="interrupt → alp-solver-2: it "
+                    "was not working; instruction delivered; waiting for its acknowledgement")
+        d = self.bridge.Deliveries()
+        d.items = [item]
+        d._save()
+        self.saved_ack()
+        after = self.bridge.Deliveries()
+        agent = self.FakeAgent()
+        with inspection_fails(self.bridge.ACKS), mock.patch.object(self.bridge, "announce", lambda *a: False):
+            self.passes(agent, 3, deliveries=after)
+            self.assertEqual([r for r in self.dead_letters() if r.get("kind") == "ring"], [], "no false dead letter")
+            self.assertEqual([i["phase"] for i in self.rings(after)], ["accept"], "not removed")
+        self.passes(agent, 2, deliveries=after)
+        self.assertEqual(self.rings(after), [], "settled")
+        self.assertEqual([r for r in self.dead_letters() if r.get("kind") == "ring"], [])
+        self.assertEqual(len(self.announcements()), 1, "its owed announcement, made once")
+
+    # the delivery ledger, read for an earlier interrupt on replay
+    def test_a_replay_with_a_ledger_stat_failure_is_never_rung(self):
+        d = self.ingest_unlogged(self.message())
+        agent = self.FakeAgent()
+        self.passes(agent, deliveries=d)
+        self.bridge.accepted(CFG, d, self.bridge.Acks(), msgid="m-ack", reply_to="m-int", sender="alp-solver-2",
+                             channel="#alpha", at="2026-10-09T10:01:00Z", how="reply")
+        self.assertEqual(self.rings(d), [], "settled and removed: only the ledger shows it")
+        with inspection_fails(self.bridge.DELIVERIES):
+            after = self.replay(self.message())
+            self.assertEqual([i["phase"] for i in self.rings(after)], ["held"], "a possible repeat is held")
+            self.passes(agent, 2, deliveries=after)
+        self.passes(agent, 2, deliveries=after)
+        self.assertEqual(self.interrupts(agent), 1, "never rung again")
+        self.assertEqual(self.rings(after), [], "settled by the acknowledgement already recorded for it")
+        self.assertEqual([r for r in self.dead_letters() if r.get("kind") == "ring"], [])
+
+    # the delivery ledger, read for an interrupt's proof (already conservative: a control)
+    def test_proof_with_a_ledger_stat_failure_is_no_proof_until_it_can_be_read(self):
+        d = self.bridge.Deliveries()
+        d.items = [dict(self.item(), phase="intent", intent_id="i" * 32, intent_surface="S", intent_session=None,
+                        intent_at=0)]
+        d._save()
+        self.bridge.DELIVERIES.write_text(json.dumps({"msgid": "m-int", "kind": "ring", "ok": True, "intent": "i" * 32,
+                                                      "target": "alp-solver-2", "surface": "S", "session": None})
+                                          + "\n")
+        agent = self.FakeAgent()
+        after = self.bridge.Deliveries()
+        with inspection_fails(self.bridge.DELIVERIES):
+            self.passes(agent, 2, deliveries=after)
+            self.assertEqual([i["phase"] for i in self.rings(after)], ["held"])
+        self.passes(agent, deliveries=after)
+        self.assertEqual([i["phase"] for i in self.rings(after)], ["accept"], "reconciled once it can be read")
+        self.assertEqual(agent.keys, [])
+
+    # the delivery ledger, read to export an alert once
+    def test_alert_export_with_a_ledger_stat_failure_queues_no_second_push(self):
+        for how in ("stat", "read"):
+            with self.subTest(how=how):
+                self.fresh()
+                self.alert_export_unknown(how)
+
+    def alert_export_unknown(self, how):
+        key = "held:outbox.claimed-1-a.jsonl"
+        self.tx(lambda s: s.raise_alert(key, "held", "outbox.claimed-1-a.jsonl", "rows are held (fake)"))
+        self.bridge.DELIVERIES.write_text(json.dumps({"kind": "push", "msgid": key, "alert_key": key, "ok": True})
+                                          + "\n")  # pushed before; its export was never marked
+        d = self.bridge.Deliveries()
+        flusher = self.bridge.Flusher(self.authority)
+        with inspection_fails(self.bridge.DELIVERIES, how=how):
+            flusher.export_alerts(d)
+        self.assertEqual([i for i in d.items if i.get("alert_key") == key], [], "no second push")
+        self.assertIsNone(self.sql("SELECT exported_at FROM alerts WHERE alert_key = ?", key)[0]["exported_at"])
+        flusher.export_alerts(d)
+        self.assertEqual([i for i in d.items if i.get("alert_key") == key], [])
+        self.assertIsNotNone(self.sql("SELECT exported_at FROM alerts WHERE alert_key = ?", key)[0]["exported_at"])
+
+    # acks.jsonl, read for the acknowledgement dedup set
+    def test_an_unreadable_acknowledgement_set_never_records_or_settles_as_if_empty(self):
+        from test_bridge import privmsg
+        for how in ("stat", "read"):
+            with self.subTest(how=how):
+                self.fresh()
+                d = self.bridge.Deliveries()
+                d.items = [dict(self.item(), phase="accept", attempt=1, next_at=self.bridge.time.time() + 600,
+                                intent_id="i" * 32, intent_surface="S", intent_session=None,
+                                delivered_announced=True)]
+                d._save()
+                self.saved_ack()  # recorded; its settling was never saved
+                ack = privmsg("alp-solver-2", "[status] stopped as asked", "m-ack", channel="#alpha",
+                              reply_to="m-int", t="2026-10-09T10:02:00.000Z")
+                with inspection_fails(self.bridge.ACKS, how=how):
+                    acks = self.bridge.Acks()  # a restart that cannot read its set
+                    state = (self.bridge.Record(), self.bridge.Deliveries(), acks)
+                    with self.assertRaises(OSError):
+                        self.bridge.handle(ack, CFG, *state, replayed=True)
+                    self.assertEqual([i["phase"] for i in self.rings(state[1])], ["accept"], "not settled")
+                self.assertEqual(len(self.bridge.ACKS.read_text().splitlines()), 1, "not recorded again")
+                self.bridge.handle(ack, CFG, *state, replayed=True)  # readable again: the replay
+                self.assertEqual(self.rings(state[1]), [], "settled")
+                self.assertEqual(len(self.bridge.ACKS.read_text().splitlines()), 1, "recorded once")
+
+    # the existing torn and malformed line rule, for every JSONL reader (controls)
+    def test_every_recovery_reader_skips_a_torn_line_and_keeps_the_rest(self):
+        key = "held:outbox.claimed-1-a.jsonl"
+        lines = ['{"torn', "[1, 2]",
+                 json.dumps({"msgid": "m-int", "kind": "ring", "ok": True, "intent": "i" * 32,
+                             "target": "alp-solver-2", "surface": "S", "session": None}),
+                 json.dumps({"kind": "push", "msgid": key, "alert_key": key, "ok": True})]
+        self.bridge.DELIVERIES.write_text("\n".join(lines) + "\n")
+        self.bridge.ACKS.write_text('{"torn\n' + json.dumps({"msgid": "m-ack", "reply_to": "m-int",
+                                                              "by": "alp-solver-2"}) + "\n")
+        d = self.bridge.Deliveries()
+        item = dict(self.item(), phase="intent", intent_id="i" * 32, intent_surface="S", intent_session=None)
+        self.assertTrue(d._proof(item), "proof")
+        self.assertTrue(d._earlier_interrupt(dict(self.item())), "replay detection")
+        self.assertTrue(d.ledger_has(key), "alert export")
+        acks = self.bridge.Acks()
+        self.assertIn("m-ack", acks.seen, "the acknowledgement set")
+        self.assertFalse(acks.add("m-ack", {"msgid": "m-ack"}), "a duplicate, not recorded again")
+
+    # pending.json (already read directly: a control)
+    def test_pending_state_with_a_stat_failure_stays_unloaded(self):
+        d = self.ingest_unlogged(self.message())
+        original = self.bridge.PENDING.read_bytes()
+        with inspection_fails(self.bridge.PENDING):
+            after = self.bridge.Deliveries()
+            self.assertIsNotNone(after.load_error)
+            self.passes(self.FakeAgent(), 2, deliveries=after)
+        self.assertEqual(self.bridge.PENDING.read_bytes(), original)
+        del d
+
+
 class LiveAcknowledgementRetryTests(InterruptCase):
     """Code review slot 10, finding 2: a live acknowledgement is durable in
     acks.jsonl, but settling it fails in the ledger. The SAME Deliveries instance

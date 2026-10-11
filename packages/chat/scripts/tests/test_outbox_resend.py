@@ -782,6 +782,74 @@ class BridgeRefusalTests(OutboxCase):
                 self.assertTrue(all(s == "unsent" for s in states[2:]))
 
 
+class FirstStartTests(OutboxCase):
+    """Code review CODE14, finding 2: before the bridge has ever started, the
+    state tree may not exist. A first post or acknowledgement with no
+    authority creates it, durably (each new directory's entry synced in its
+    parent), and publishes its one fallback file under its original id, which
+    the bridge imports once. A publication that is genuinely impossible fails
+    as before, and reports nothing queued."""
+
+    def no_state_tree(self, depth):
+        import shutil
+        self.authority.close()  # nothing has started yet
+        gone = self.chatlib.STATE_DIR if depth == 1 else self.chatlib.STATE_DIR.parent
+        shutil.rmtree(gone)
+        return gone
+
+    def recording_syncs(self):
+        """Every directory sync the real filesystem layer makes."""
+        synced, real = [], self.ds.FS.sync_dir
+
+        def sync_dir(fs, path):
+            synced.append(Path(path))
+            return real(fs, path)
+        return mock.patch.object(self.ds.FS, "sync_dir", sync_dir), synced
+
+    def test_a_first_post_and_acknowledgement_before_any_start(self):
+        for depth in (1, 2):
+            with self.subTest(missing_levels=depth):
+                self.fresh()
+                gone = self.no_state_tree(depth)
+                recording, synced = self.recording_syncs()
+                self.server.refuse_login = {"alp-solver-2"}
+                with self.unavailable(), recording:
+                    code, out = self.pchat("post", "#alpha", "[status] the first post")
+                    self.assertEqual(code, 3, out)
+                    code, out = self.pchat("ack", "#alpha", "m-earlier")
+                    self.assertEqual(code, 3, out)
+                created = [gone] + ([self.chatlib.STATE_DIR] if depth == 2 else []) + \
+                          [self.chatlib.STATE_DIR / "outbox.d", self.chatlib.STATE_DIR / "outbox.d" / "tmp"]
+                for d in created:
+                    self.assertIn(d.parent, synced, f"{d.name}'s entry made durable")
+                self.assertEqual(len(self.fallback_files()), 2, "one file per call")
+                self.server.refuse_login = set()
+                self.authority = self.new_authority()  # the bridge's first start
+                for _ in range(2):
+                    self.flush()
+                self.assertEqual(self.fallback_files(), [])
+                self.assertEqual([m["text"].split(" (delayed")[0] for m in self.server.by("alp-solver-2") if m["text"]],
+                                 ["[status] the first post"], "posted once")
+                self.assertEqual(sorted(e["state"] for e in self.entries()), ["done", "done"], "each once")
+
+    def test_a_publication_that_cannot_be_made_reports_nothing_queued(self):
+        """A control: the state directory's parent is a file, so no tree can be made."""
+        gone = self.no_state_tree(2)
+        gone.write_text("not a directory")
+        self.server.refuse_login = {"alp-solver-2"}
+        try:
+            with self.unavailable():
+                code, out = self.pchat("post", "#alpha", "[status] cannot be queued")
+            self.assertEqual(code, 2, out)
+            self.assertIn("the outbox cannot be written", out, "a truthful failure: nothing reported queued")
+            self.assertNotIn("queued in the outbox", out)
+        finally:
+            gone.unlink()
+            gone.mkdir()
+            self.chatlib.STATE_DIR.mkdir()
+            self.authority = self.new_authority()
+
+
 class LateOutcomeTests(OutboxCase):
     """Test 10 (F6): a paused writer resumes after E7's export: version 2 supersedes version 1."""
 
