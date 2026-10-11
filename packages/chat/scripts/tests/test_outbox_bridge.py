@@ -1879,6 +1879,86 @@ class AcknowledgementSyncTests(ReplayCase):
         self.assertEqual([r for r in self.dead_letters() if r.get("kind") == "ring"], [])
 
 
+class FullFlushTests(InterruptCase):
+    """Code review CODE16, finding 2: on macOS a durable sync is F_FULLFSYNC. A
+    full flush that fails (EIO and the like) is a failure, never retried as a
+    plain fsync that would report success: nothing it was to make durable may
+    count as durable. Only "not supported here" (ENOTSUP or EOPNOTSUPP, EINVAL,
+    ENOTTY), or a platform without F_FULLFSYNC, falls back to os.fsync."""
+
+    def full_flush(self, err):
+        """macOS, with F_FULLFSYNC failing with `err` (None: it succeeds); os.fsync always works."""
+        import errno as _errno
+        import types
+        calls = {"fsync": 0}
+
+        def fcntl(fd, op, *a):
+            if op == 51 and err is not None:
+                raise OSError(err, _errno.errorcode.get(err, "error") + " (fake)")
+            return 0
+        real_fsync = os.fsync
+
+        def fsync(fd):
+            calls["fsync"] += 1
+            return real_fsync(fd)
+        stack = contextlib.ExitStack()
+        ds = self.bridge.delivery_store
+        stack.enter_context(mock.patch.object(ds, "fcntl", types.SimpleNamespace(F_FULLFSYNC=51, fcntl=fcntl,
+                                                                                    flock=ds.fcntl.flock,
+                                                                                    LOCK_EX=ds.fcntl.LOCK_EX,
+                                                                                    LOCK_NB=ds.fcntl.LOCK_NB,
+                                                                                    LOCK_UN=ds.fcntl.LOCK_UN)))
+        stack.enter_context(mock.patch.object(ds, "sys", types.SimpleNamespace(platform="darwin")))
+        stack.enter_context(mock.patch.object(os, "fsync", fsync))
+        return stack, calls
+
+    def a_file(self):
+        path = self.chatlib.STATE_DIR / "flush-probe"
+        path.write_text("x")
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        return path
+
+    def test_a_full_flush_io_error_is_a_failure_even_though_fsync_would_work(self):
+        import errno as _errno
+        path = self.a_file()
+        stack, calls = self.full_flush(_errno.EIO)
+        with stack, self.assertRaises(OSError) as raised:
+            self.bridge.delivery_store.FS().sync_file(path)
+        self.assertEqual(raised.exception.errno, _errno.EIO)
+        self.assertEqual(calls["fsync"], 0, "never retried as a plain fsync")
+
+    def test_an_intent_whose_full_flush_fails_takes_no_action(self):
+        import errno as _errno
+        d = self.bridge.Deliveries()
+        d.items = [self.item()]
+        d._save()  # queued earlier, durably
+        agent = self.FakeAgent()
+        stack, _ = self.full_flush(_errno.EIO)
+        with stack:
+            self.passes(agent, deliveries=d)
+        self.assertEqual(agent.keys, [], "the intent never became durable: no Escape, no Enter")
+        self.assertEqual([i["phase"] for i in d.items if i["kind"] == "ring"], ["deliver"])
+
+    def test_an_unsupported_full_flush_falls_back_to_fsync(self):
+        """A control: these say the filesystem does not support the full flush."""
+        import errno as _errno
+        path = self.a_file()
+        for err in (_errno.ENOTSUP, _errno.EOPNOTSUPP, _errno.EINVAL, _errno.ENOTTY):
+            with self.subTest(errno=_errno.errorcode[err]):
+                stack, calls = self.full_flush(err)
+                with stack:
+                    self.bridge.delivery_store.FS().sync_file(path)
+                self.assertEqual(calls["fsync"], 1)
+
+    def test_a_full_flush_that_works_is_enough(self):
+        """A control: ordinary success, with no plain fsync after it."""
+        path = self.a_file()
+        stack, calls = self.full_flush(None)
+        with stack:
+            self.bridge.delivery_store.FS().sync_file(path)
+        self.assertEqual(calls["fsync"], 0)
+
+
 class LiveAcknowledgementRetryTests(InterruptCase):
     """Code review slot 10, finding 2: a live acknowledgement is durable in
     acks.jsonl, but settling it fails in the ledger. The SAME Deliveries instance

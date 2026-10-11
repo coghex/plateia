@@ -121,13 +121,23 @@ class FS:
     """Every file operation the durability proofs rely on. "fsync" is the
     platform's full flush; a durable sync is the file, then its directory."""
 
+    # F_FULLFSYNC errors that mean "this filesystem or descriptor does not
+    # support the full flush" (code review CODE16), so a plain fsync is the
+    # strongest flush there is: ENOTSUP/EOPNOTSUPP (a filesystem without it,
+    # such as some network and FUSE mounts), EINVAL (the request is invalid for
+    # this descriptor's filesystem) and ENOTTY (an fcntl the file does not
+    # handle). Every other error, EIO first, is a failed flush: it propagates,
+    # and what it was to make durable never counts as durable.
+    FULLFSYNC_UNSUPPORTED = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY})
+
     def fsync_fd(self, fd):
         if sys.platform == "darwin" and hasattr(fcntl, "F_FULLFSYNC"):
             try:
                 fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
                 return
-            except OSError:
-                pass
+            except OSError as err:
+                if err.errno not in self.FULLFSYNC_UNSUPPORTED:
+                    raise
         os.fsync(fd)
 
     def _sync(self, path):
@@ -1734,8 +1744,10 @@ class Authority:
 
     def _open(self):
         """Steps 1-4: the authority lock, then the database. Raises, having
-        opened nothing and released the lock."""
-        self.paths.state.mkdir(parents=True, exist_ok=True)
+        opened nothing and released the lock. First the state tree, made
+        durable entry by entry (whoever made it, the bridge's main() included)
+        before anything is served, imported or acknowledged (code review CODE16)."""
+        _make_state_tree(self.fs, self.paths.state)
         f = open(self.paths.auth_lock, "a")
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)

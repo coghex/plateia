@@ -868,6 +868,63 @@ class FirstStartTests(OutboxCase):
                 self.assertEqual([m["text"].split(" (delayed")[0] for m in self.server.by("alp-solver-2")],
                                  ["[status] once"], "the obligation survives, once")
 
+    def recording_listings(self, fail_once=None):
+        """Every successful directory sync, with what it listed; optionally failing one path's first sync."""
+        import os
+        real, synced, failed = self.ds.FS.sync_dir, [], []
+
+        def sync_dir(fs, path):
+            if fail_once is not None and Path(path) == fail_once and not failed:
+                failed.append(1)
+                raise OSError(5, "input/output error (fake)")
+            real(fs, path)
+            synced.append((Path(path), set(os.listdir(path))))
+        return mock.patch.object(self.ds.FS, "sync_dir", sync_dir), synced
+
+    @staticmethod
+    def durable_entries(levels, synced):
+        """The modelled power loss: an entry survives only if a successful sync of its parent listed it."""
+        return [lv.name for lv in levels if any(p == lv.parent and lv.name in names for p, names in synced)]
+
+    def test_a_first_authority_start_makes_the_state_tree_durable_before_any_ack(self):
+        """Code review CODE16, finding 1: the authority's start creates (or finds, as the bridge's
+        main() leaves it) the state tree and syncs each entry in its parent before it serves; a post
+        it queues and acknowledges, with no fallback file, survives the power loss and is imported once."""
+        for depth, premade in ((1, False), (2, False), (2, True)):
+            with self.subTest(missing_levels=depth, made_by_main=premade):
+                self.fresh()
+                gone = self.no_state_tree(depth)
+                levels = [gone] + ([self.chatlib.STATE_DIR] if depth == 2 else [])
+                if premade:
+                    self.chatlib.STATE_DIR.mkdir(parents=True)  # as chat-bridge's main() does, unsynced
+                recording, synced = self.recording_listings()
+                with recording:
+                    self.authority = self.new_authority()  # the bridge's first start
+                    before_ack = list(synced)
+                    self.server.refuse_login = {"alp-solver-2"}
+                    code, out = self.pchat("post", "#alpha", "[status] queued at first start")
+                self.assertEqual(code, 3, out)
+                self.assertIn("queued in the outbox", out)
+                self.assertEqual(self.fallback_files(), [], "queued by the authority, with no fallback file")
+                self.assertEqual(self.durable_entries(levels, before_ack), [lv.name for lv in levels],
+                                 "every entry durable before the ack")
+                self.server.refuse_login = set()
+                self.restart_bridge()  # after the power loss
+                for _ in range(2):
+                    self.flush()
+                self.assertEqual([m["text"].split(" (delayed")[0] for m in self.server.by("alp-solver-2")],
+                                 ["[status] queued at first start"], "the original obligation, once")
+
+    def test_an_authority_start_whose_parent_sync_fails_is_retried(self):
+        gone = self.no_state_tree(1)
+        recording, synced = self.recording_listings(fail_once=gone.parent)
+        with recording:
+            with self.assertRaises(OSError):
+                self.new_authority()  # fails truthfully: nothing served, nothing acknowledged
+            self.authority = self.new_authority()  # the next start
+        self.assertEqual(self.durable_entries([gone], synced), [gone.name])
+        self.assertIsNotNone(self.authority.store.con)
+
     def test_a_publication_that_cannot_be_made_reports_nothing_queued(self):
         """A control: the state directory's parent is a file, so no tree can be made."""
         gone = self.no_state_tree(2)
