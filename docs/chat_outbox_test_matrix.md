@@ -5,7 +5,7 @@ item 20) requires. It maps every requirement, acceptance item, binding
 correction and spec addition of #19, design revision 9's tests 1–48
 ([`chat_outbox_state.md`](chat_outbox_state.md), section 9), owner
 amendment 6, and the code reviews' findings, to the named tests that assert
-them, with a status for each. It describes PR #20 at `556c5c4`.
+them, with a status for each. It describes PR #20 at `7f2d4c1`.
 
 How to read it:
 - Each row's **Requirement** or **Item** column (for design tests, the
@@ -385,6 +385,20 @@ Failed first at `119610e` except where the note says control.
 | Y3 | A state directory outside the home directory, in a new parent: an ancestor made by an earlier attempt whose parent sync failed is synced again before anything is reported queued; while the sync keeps failing, publication keeps failing (nothing reported queued); the obligation is imported once after a restart | resend.FirstStartTests.test_an_external_state_tree_retries_a_failed_ancestor_sync (one and three failed syncs) | COVERED | Every level up to the mount point is synced; the power loss is modelled from the syncs that succeeded. |
 | Y4 | A state directory outside the home directory with every sync working: published as before | resend.FirstStartTests.test_an_external_state_tree_with_every_sync_working | COVERED | A control. |
 
+## 23. Code review 6105167473 (CODE19)
+
+Each failure was reproduced first at `556c5c4`; controls as noted.
+
+| ID | Item | Tests | Status | Note |
+|---|---|---|---|---|
+| Z1 | An interrupt left in intent while its ledger proof could not be synced, with its acknowledgement already saved: once the proof syncs in the same process and recovery accepts it, acknowledgement recovery reopens and settles it; no false "never acknowledged" dead letter, no command | bridge.ProofThenAcknowledgementTests.test_a_saved_acknowledgement_settles_once_the_proof_becomes_durable | COVERED | Failing first: a false dead letter. |
+| Z2 | The same with the proof synced the first time | bridge.ProofThenAcknowledgementTests.test_a_proof_synced_the_first_time_settles_by_its_acknowledgement | COVERED | A control. |
+| Z3 | Login's writes (CAP, NICK, USER) share its one deadline (LOGIN_WAIT, 30 s): a 25 s connect then 10 s writes fail by 30 s, with nothing assumed | resend.SetupWriteDeadlineTests.test_a_slow_connect_and_slow_login_writes_stay_within_login_wait | COVERED | Failing first: 55 s. Fake clock and socket. |
+| Z4 | Channel setup's writes (JOIN, NAMES) share its deadline (CHANNEL_WAIT, 15 s): 10 s writes fail by 15 s | resend.SetupWriteDeadlineTests.test_slow_channel_setup_writes_stay_within_channel_wait | COVERED | Failing first: 20 s. |
+| Z5 | A timely login and channel setup succeed as before | resend.SetupWriteDeadlineTests.test_a_timely_login_and_channel_setup | COVERED | A control. |
+| Z6 | One outbox.sock request's connect and write share IPC_WAIT (5 s): a 4 s connect then a blocked write ends by 5 s with no reply, never an acceptance | resend.IpcDeadlineTests.test_a_slow_connect_then_a_blocked_write_stays_within_ipc_wait | COVERED | Failing first: 9 s. |
+| Z7 | A timely exchange returns its reply | resend.IpcDeadlineTests.test_a_timely_exchange | COVERED | A control. |
+
 ## Counts
 
 | Section | COVERED | PARTIAL | MISSING |
@@ -411,16 +425,17 @@ Failed first at `119610e` except where the note says control.
 | 20. Code review 6104445458 (CODE16) | 8 | 0 | 0 |
 | 21. Code review 6104694236 (CODE17) | 5 | 0 | 0 |
 | 22. Code review 6104897754 (CODE18) | 4 | 0 | 0 |
-| **Total (213 rows)** | **213** | **0** | **0** |
+| 23. Code review 6105167473 (CODE19) | 7 | 0 | 0 |
+| **Total (220 rows)** | **220** | **0** | **0** |
 
 History: at `97db1bf`, before amendment 6's round, 104 of the then 130 rows
 were COVERED, 15 PARTIAL and 11 MISSING. That round closed them and added
 section 13. The final round added design tests 41–48 as their own rows in
-section 11, and section 14. The recovery rounds added sections 15 and 16, the durability round section 17, the acknowledgement-read round section 18, and the systematic round section 19 (V1 to V26; its follow-up added V27 to V30), the CODE16 round section 20, the CODE17 round section 21, and the CODE18 round section 22.
+section 11, and section 14. The recovery rounds added sections 15 and 16, the durability round section 17, the acknowledgement-read round section 18, and the systematic round section 19 (V1 to V26; its follow-up added V27 to V30), the CODE16 round section 20, the CODE17 round section 21, the CODE18 round section 22, and the CODE19 round section 23.
 
 ## Appendix A. The test methods of every class named above
 
-Generated from the test tree at `556c5c4`. A module named on its own (such as `rb` or `sil`) stands
+Generated from the test tree at `7f2d4c1`. A module named on its own (such as `rb` or `sil`) stands
 for all of its classes, listed here.
 
 ### `resend`: `packages/chat/scripts/tests/test_outbox_resend.py`
@@ -436,6 +451,7 @@ for all of its classes, listed here.
 - **FirstStartTests**: `test_a_first_post_and_acknowledgement_before_any_start`, `test_a_retry_after_a_failed_parent_sync_makes_every_entry_durable`, `test_a_first_authority_start_makes_the_state_tree_durable_before_any_ack`, `test_an_authority_start_whose_parent_sync_fails_is_retried`, `test_an_external_state_tree_retries_a_failed_ancestor_sync`, `test_an_external_state_tree_with_every_sync_working`, `test_a_publication_that_cannot_be_made_reports_nothing_queued`
 - **HostProbeTests**: `test_only_values_known_on_both_sides_are_compared`, `test_malformed_identities_prove_nothing_and_raise_nothing`, `test_a_socket_table_that_cannot_be_read_proves_nothing`, `test_a_start_time_is_read_from_one_source_per_platform`
 - **IndependentDeliveryTests**: `test_another_accounts_entry_flows_while_one_awaits_its_check`, `test_a_refused_and_a_failing_entry_never_stop_the_others`
+- **IpcDeadlineTests**: `test_a_slow_connect_then_a_blocked_write_stays_within_ipc_wait`, `test_a_timely_exchange`
 - **LateOutcomeTests**: `test_a_late_outcome_exports_a_superseding_version`
 - **LegacyFlushTests**: `test_a_legacy_post_whose_final_confirmation_times_out_is_not_reposted`, `test_legacy_posts_and_acks_go_out_as_before`
 - **NegativeReconciliationTests**: `test_wrong_account_unverified_wrong_channel_and_too_early_never_deliver`
@@ -447,6 +463,7 @@ for all of its classes, listed here.
 - **RestartTests**: `test_a_restarted_bridge_continues_from_the_recorded_progress`, `test_a_reloaded_bridge_module_continues_from_the_recorded_progress`, `test_a_flush_killed_after_writing_a_part_recovers_from_the_database`
 - **SameAccountFlowTests**: `test_the_same_accounts_next_entry_flows_while_the_first_is_uncertain`, `test_the_same_accounts_next_entry_flows_while_the_first_is_failing`
 - **SameFlushTests**: `test_one_flush_resolves_every_obligation_of_a_text`
+- **SetupWriteDeadlineTests**: `test_a_slow_connect_and_slow_login_writes_stay_within_login_wait`, `test_slow_channel_setup_writes_stay_within_channel_wait`, `test_a_timely_login_and_channel_setup`
 - **StatusTests**: `test_status_counts_waiting_checking_and_files_awaiting_import`
 - **StorageFailureTests**: `test_pchat_retries_then_hands_off_the_rest`, `test_an_outcome_never_recorded_travels_as_an_attested_outcome`, `test_with_the_handoff_unanswered_too_the_fallback_file_carries_the_outcome`, `test_an_agent_notice_does_the_same`
 - **UnchangedPathTests**: `test_a_confirmed_post_exits_0_and_queues_nothing`, `test_a_server_that_cannot_be_reached_queues_the_whole_post_once`, `test_ack_exits_0_and_is_one_tagmsg`
@@ -499,6 +516,7 @@ for all of its classes, listed here.
 - **LedgerProofSyncTests**: `test_recovery_syncs_the_ledger_before_it_accepts_the_proof`, `test_while_the_ledger_cannot_be_synced_the_proof_is_unknown`, `test_a_durable_proof_reconciles_as_before`
 - **LiveAcknowledgementRetryTests**: `test_a_live_acknowledgement_is_settled_after_a_transient_ledger_failure`
 - **OwedAnnouncementExpiryTests**: `test_an_owed_announcement_survives_the_expiry_and_a_restart`
+- **ProofThenAcknowledgementTests**: `test_a_saved_acknowledgement_settles_once_the_proof_becomes_durable`, `test_a_proof_synced_the_first_time_settles_by_its_acknowledgement`
 - **QueuedOnlyWhenSavedTests**: `test_a_failed_queue_save_then_a_same_instance_replay_then_a_crash`, `test_a_failed_save_of_a_held_replay_leaves_no_alert_behind`
 - **RecoveryInputTests**: `test_acknowledgement_recovery_with_a_stat_failure_defers_a_ready_interrupt`, `test_acknowledgement_recovery_with_a_stat_failure_keeps_an_expired_interrupt`, `test_a_replay_with_a_ledger_stat_failure_is_never_rung`, `test_proof_with_a_ledger_stat_failure_is_no_proof_until_it_can_be_read`, `test_alert_export_with_a_ledger_stat_failure_queues_no_second_push`, `test_an_unreadable_acknowledgement_set_never_records_or_settles_as_if_empty`, `test_every_recovery_reader_skips_a_torn_line_and_keeps_the_rest`, `test_pending_state_with_a_stat_failure_stays_unloaded`
 - **ReplayedInterruptTests**: `test_a_replayed_interrupt_keeps_one_obligation_whatever_its_outcome`, `test_another_recipient_of_the_same_message_stays_independent`, `test_an_ordinary_wake_up_keeps_its_baseline`, `test_a_replay_with_an_unreadable_ledger_is_never_rung`
