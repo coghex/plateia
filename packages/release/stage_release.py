@@ -924,25 +924,51 @@ def load_activation(path=None):
     except (OSError, ValueError) as e:
         raise Refused(f"{shown(path)} can't be read: {e.__class__.__name__}") from None
     t = spec.get("transition") if isinstance(spec, dict) else None
-    if spec.get("schema") != ACTIVATION_SCHEMA or not isinstance(t, dict) or not isinstance(t.get("name"), str) \
+    if not isinstance(spec, dict) or spec.get("schema") != ACTIVATION_SCHEMA or not isinstance(t, dict) or not isinstance(t.get("name"), str) \
             or not isinstance(t.get("changed"), dict) or not isinstance(t.get("added"), dict) \
-            or sorted(spec.get("first_writes", {})) != sorted(FIRST_WRITES + ("note",)) \
-            or not isinstance(spec.get("targets"), list):
+            or not isinstance(spec.get("first_writes"), dict) \
+            or sorted(spec["first_writes"]) != sorted(FIRST_WRITES + ("note",)) \
+            or not isinstance(spec.get("bootstrap"), dict) \
+            or not all(isinstance(spec["bootstrap"].get(k), str) for k in ("schema", "file")) \
+            or not isinstance(spec.get("targets"), list) or not all(isinstance(n, str) for n in spec["targets"]):
         raise Refused(f"{shown(path)} is not an activation spec ({ACTIVATION_SCHEMA})")
     return spec
 
 
-def first_write_evidence(state=None):
+def first_write_evidence(state=None, expect=None):
     """{boundary: "absent" | "written: ..." | "unknown: ..."} for D-74's three
     first-write boundaries, judged from the chat state directory alone: never
-    from a journal, and without opening the outbox database. Anything that
-    can't be read is unknown, which never counts as absent."""
-    state = Path(state or chat_state())
+    from a journal, and without opening the outbox database. The directory is
+    read through one pinned descriptor. With `expect` (the realpath, device and
+    inode an activation plan sealed), a root that is missing, replaced or
+    unreadable makes every boundary unknown; anything that can't be read is
+    unknown too, which never counts as absent."""
+    path = os.path.realpath(state or chat_state())
+    if expect is not None and (not isinstance(expect, dict) or expect.get("path") != path):
+        return {b: "unknown: the chat state root is not the activation plan's" for b in FIRST_WRITES}
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        if expect is None:  # no state at all, before any activation: nothing was ever written
+            return {b: "absent" for b in FIRST_WRITES}
+        return {b: "unknown: the chat state root is missing" for b in FIRST_WRITES}
+    except OSError as e:
+        return {b: f"unknown: the chat state root can't be opened ({e.strerror or e})" for b in FIRST_WRITES}
+    try:
+        st = os.fstat(fd)
+        if expect is not None and (st.st_dev, st.st_ino) != (expect.get("dev"), expect.get("ino")):
+            return {b: "unknown: the chat state root was replaced (another device or inode)" for b in FIRST_WRITES}
+        return _first_writes_at(fd)
+    finally:
+        os.close(fd)
+
+
+def _first_writes_at(fd):
     out = {}
 
     def exists(name):
         try:
-            os.lstat(state / name)
+            os.stat(name, dir_fd=fd, follow_symlinks=False)
             return True
         except FileNotFoundError:
             return False
@@ -956,25 +982,45 @@ def first_write_evidence(state=None):
     except OSError as e:
         out["outbox/2"] = f"unknown: {e.strerror or e.__class__.__name__}"
     try:
-        data = (state / "dead-letters.jsonl").read_bytes()
+        dfd = os.open("dead-letters.jsonl", os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=fd)
     except FileNotFoundError:
         out["delivery-records/2"] = "absent"
+        return out
     except OSError as e:
         out["delivery-records/2"] = f"unknown: dead-letters.jsonl {e.strerror or e.__class__.__name__}"
-    else:
-        verdict = "absent"
-        for n, raw in enumerate(data.splitlines(), 1):
-            if not raw.strip():
-                continue
-            try:
-                row = json.loads(raw)
-            except ValueError:
-                verdict = f"unknown: dead-letters.jsonl line {n} can't be read"
+        return out
+    try:
+        if not stat.S_ISREG(os.fstat(dfd).st_mode):
+            out["delivery-records/2"] = "unknown: dead-letters.jsonl is not a regular file"
+            return out
+        chunks = []
+        while True:
+            chunk = os.read(dfd, 1 << 20)
+            if not chunk:
                 break
-            if isinstance(row, dict) and ("version" in row or "supersedes" in row):
-                verdict = f"written: dead-letters.jsonl line {n} is a versioned record"
-                break
-        out["delivery-records/2"] = verdict
+            chunks.append(chunk)
+        data = b"".join(chunks)
+    except OSError as e:
+        out["delivery-records/2"] = f"unknown: dead-letters.jsonl {e.strerror or e.__class__.__name__}"
+        return out
+    finally:
+        os.close(dfd)
+    verdict = "absent"
+    for n, raw in enumerate(data.splitlines(), 1):
+        if not raw.strip():
+            continue
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            verdict = f"unknown: dead-letters.jsonl line {n} can't be read"
+            break
+        if not isinstance(row, dict):
+            verdict = f"unknown: dead-letters.jsonl line {n} is not a record"
+            break
+        if "version" in row or "supersedes" in row:
+            verdict = f"written: dead-letters.jsonl line {n} is a versioned record"
+            break
+    out["delivery-records/2"] = verdict
     return out
 
 

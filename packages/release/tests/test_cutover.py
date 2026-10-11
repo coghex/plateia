@@ -135,6 +135,7 @@ DRIVER = textwrap.dedent('''
     steps["restart"] = database(a)
     flush(2)
     steps["published_after_restart"] = len(server.published) - before
+    steps["live_status"] = delivery_store.Client(delivery_store.LocalTransport(a), clock=clock).call("status", None)
     steps["published"] = texts()
     live["authority"].close()
     with open(out_path, "w") as f:
@@ -226,6 +227,8 @@ class CutoverTests(ActivationCase):
         with self.assertRaisesRegex(Refused, "repair or roll-forward"):
             self.rollback(path)
         self.ops.bridge = {"running": True, "release": plan["release"]}
+        self.assertFalse(self.postcheck(path)["ok"], "no live answer: nothing proves the authority serves")
+        self.ops.live = steps["live_status"]  # the real authority's answer to the read-only status request
         report = self.postcheck(path)
         self.assertTrue(report["ok"], report)
         self.assertEqual({k for k, v in report["first_writes"].items() if v.startswith("written")},

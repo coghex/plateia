@@ -52,6 +52,7 @@ import secrets
 import stat
 import subprocess
 import sys
+import types
 import zipfile
 from pathlib import Path
 
@@ -97,14 +98,6 @@ def sha256_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def fsync_dir(path):
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
 # --- what the controller reads about services, processes and checkpoints -------
 
 class LiveOps:
@@ -125,20 +118,29 @@ class LiveOps:
         except (OSError, subprocess.SubprocessError) as e:
             return {"running": None, "release": None, "unknown": f"launchctl print failed ({e.__class__.__name__})"}
         if out.returncode != 0:
-            return {"running": False, "release": None}
+            if out.returncode == 113 or "could not find service" in (out.stdout + out.stderr).lower():
+                return {"running": False, "release": None}
+            return {"running": None, "release": None, "unknown": f"launchctl print exited {out.returncode}"}
         running = re.search(r"^\s*state = running\s*$", out.stdout, re.M) is not None
         program = re.search(r"^\s*program = (\S+)\s*$", out.stdout, re.M)
         found = re.search(r"/releases/([^/]+)/env/bin/chat-bridge$", program.group(1)) if program else None
         return {"running": running, "release": found.group(1) if found else "skills-tree"}
 
+    EVIDENCE_MAX_AGE = 900  # seconds: older checkpoint evidence is stale, and so unknown
+
     def _evidence(self):
+        """The operator's checkpoint evidence, only while current: it must say
+        when it was observed (`observed_at`, ISO 8601 with a time zone), no more
+        than EVIDENCE_MAX_AGE ago. Stale or undated evidence is unknown."""
         if self.evidence is None:
             return None
         try:
             data = json.loads(self.evidence.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            at = datetime.datetime.fromisoformat(data["observed_at"]).timestamp()
+        except (OSError, ValueError, TypeError, KeyError):
             return None
-        return data if isinstance(data, dict) else None
+        age = datetime.datetime.now(datetime.timezone.utc).timestamp() - at
+        return data if isinstance(data, dict) and -60 <= age <= self.EVIDENCE_MAX_AGE else None
 
     def writers(self):
         data = self._evidence()
@@ -147,6 +149,18 @@ class LiveOps:
     def producers(self):
         data = self._evidence()
         return data.get("producers") if data and isinstance(data.get("producers"), dict) else None
+
+    def authority_status(self, plan):
+        """The bridge authority's live answer to the existing read-only status
+        request (outbox-authority/1) over its socket, through the pinned
+        release's own client and within its bounded deadline; None when nothing
+        answers. It never opens the outbox database."""
+        try:
+            store = load_release_module(plan, "delivery_store")
+            sock = Path(plan["state_root"]["path"]) / "outbox.sock"
+            return store.Client(store.UnixTransport(sock, wait=5.0)).call("status", None)
+        except Exception:  # no answer, whatever failed: never serving evidence
+            return None
 
 
 def bridge_verdict(ops, plan):
@@ -165,23 +179,32 @@ def bridge_verdict(ops, plan):
 
 
 def check_quiet(ops, plan):
-    """Refused unless the old writers are quiet: every legacy writer (old
-    bridge, flusher, helper, already-running or cached producer) at an
-    acknowledged checkpoint, and every designated account's producers tracked.
-    A delivered quiet request is not an acknowledgement; anything unknown is
-    never assumed quiet. Nothing is interrupted, restarted or killed (A3)."""
+    """Refused unless the old writers are quiet. Every writer the sealed plan
+    names, and every legacy writer the current evidence lists (old bridge,
+    flusher, helper, running or cached producer), must be at an acknowledged
+    checkpoint or verifiably retired; a writer the plan names that the evidence
+    omits is unknown. Every designated account's producers must be tracked. A
+    delivered request is not an acknowledgement; anything unknown is never
+    assumed quiet. Nothing is interrupted, restarted or killed (A3)."""
     writers = ops.writers()
     if writers is None:
         raise Refused("blocked: no checkpoint evidence for the old writers; nothing was changed")
+    if not isinstance(writers, list) or not all(
+            isinstance(w, dict) and isinstance(w.get("name"), str) and isinstance(w.get("kind"), str)
+            and (w.get("checkpoint") is None or isinstance(w.get("checkpoint"), str)) for w in writers):
+        raise Refused("blocked: the checkpoint evidence is malformed; nothing was changed")
+    by_name = {w["name"]: w for w in writers}
+    for c in plan["checkpoints"]:
+        if c["name"] not in by_name:
+            raise Refused(f"blocked: {c['name']}, which the activation plan names, has no current checkpoint "
+                          "evidence: unknown, never assumed quiet; nothing was changed")
     for w in writers:
-        if not isinstance(w, dict) or not isinstance(w.get("name"), str):
-            raise Refused("blocked: the checkpoint evidence is malformed; nothing was changed")
         if w.get("release") == plan["release"]:
             continue
-        if w.get("kind") not in LEGACY_KINDS:
+        if w["kind"] not in LEGACY_KINDS:
             raise Refused(f"blocked: {w['name']}: an unknown kind of writer; nothing was changed")
         state = w.get("checkpoint")
-        if state == "acknowledged":
+        if state in ("acknowledged", "retired"):
             continue
         if state == "requested":
             raise Refused(f"blocked: {w['name']}: a quiet request was delivered but not acknowledged; "
@@ -190,13 +213,13 @@ def check_quiet(ops, plan):
                       "nothing was changed")
     producers = ops.producers()
     if plan["designations"]:
-        if producers is None:
+        if not isinstance(producers, dict):
             raise Refused("blocked: no producer evidence for the designated accounts; nothing was changed")
         for account in plan["designations"]:
             if producers.get(account) != "tracked":
                 raise Refused(f"blocked: account {account}: its producers are not all tracked "
-                              f"({producers.get(account) or 'unknown'}); the designation list is never changed "
-                              "silently, and nothing was changed")
+                              f"({producers.get(account) if isinstance(producers.get(account), str) else 'unknown'}); "
+                              "the designation list is never changed silently, and nothing was changed")
 
 
 # --- the plan ----------------------------------------------------------------------
@@ -267,10 +290,148 @@ def load_plan(path):
         raise Refused(f"the activation plan can't be read ({e.__class__.__name__})") from None
     if not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA or plan.get("digest") != plan_digest(plan):
         raise Refused("not an activation plan, or one altered after it was made")
+    problem = plan_problem(plan)
+    if problem:
+        raise Refused(f"not a well-formed activation plan: {problem}")
     return plan
 
 
-# --- the designation bootstrap record (#21's owner amendment, sections 2 and 4) -------
+PLAN_FIELDS = {"operation": str, "made_at": str, "release": str, "release_path": str, "manifest_sha256": str,
+               "source_commit": str, "dest": str, "staged_release": str, "root": str, "activation_sha256": str,
+               "designations": list, "targets": list, "artifacts": list, "checkpoints": list, "state_root": dict,
+               "transition": dict, "importers": dict, "state_snapshot": dict}
+
+
+def plan_problem(plan):
+    """What is malformed in a plan's shape (a digest proves only that it is
+    unchanged since someone computed it, not that it is well formed)."""
+    for field, kind in PLAN_FIELDS.items():
+        if not isinstance(plan.get(field), kind):
+            return f"its {field} is missing or of the wrong type"
+    if not re.fullmatch(r"activate-[0-9a-f]{16}", plan["operation"]):
+        return "its operation id is malformed"
+    names = plan["designations"]
+    if not all(isinstance(n, str) and ACCOUNT.fullmatch(n) for n in names) or names != sorted(set(names)):
+        return "its designation list is not sorted distinct account names"
+    root = plan["state_root"]
+    if set(root) != {"path", "dev", "ino"} or not isinstance(root["path"], str) \
+            or not all(type(root[k]) is int for k in ("dev", "ino")):
+        return "its state root is malformed"
+    if not all(isinstance(t, dict) and isinstance(t.get("name"), str) and isinstance(t.get("digest"), str)
+               for t in plan["targets"]):
+        return "its targets are malformed"
+    if not all(isinstance(c, dict) and isinstance(c.get("name"), str) for c in plan["checkpoints"]):
+        return "its checkpoints are malformed"
+    for field in ("dest", "staged_release", "root", "release_path"):
+        if not os.path.isabs(plan[field]):
+            return f"its {field} is not an absolute path"
+    return None
+
+
+O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+FOLDERS = ("skill-folder", "import-location")
+
+
+# --- pinned descriptors ----------------------------------------------------------------
+# Every directory the controller changes or judges is opened once and then used
+# only through its descriptor: a path swapped, renamed or replaced after it was
+# checked is never written through (code review slot 2 on PR #22).
+
+def ident(st):
+    return [st.st_dev, st.st_ino]
+
+
+def open_dir(path, expect=None, follow=False, what=None):
+    """A descriptor of the directory at `path` (its last component never a
+    symlink unless `follow`); with `expect`, refused unless it is that
+    directory (device and inode)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | O_DIRECTORY | (0 if follow else O_NOFOLLOW))
+    except OSError as e:
+        raise Refused(f"blocked: {what or shown(path)} can't be opened as a directory ({e.strerror or e}); "
+                      "nothing more was changed") from None
+    if expect is not None and ident(os.fstat(fd)) != list(expect):
+        os.close(fd)
+        raise Refused(f"blocked: {what or shown(path)} was moved or replaced since it was recorded; nothing more "
+                      "was changed")
+    return fd
+
+
+def still_there(path, fd, follow=False):
+    """`path` still names the directory `fd` holds."""
+    try:
+        st = os.stat(path) if follow else os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and ident(st) == ident(os.fstat(fd))
+
+
+def read_fd(fd, cap=None):
+    chunks, size = [], 0
+    while True:
+        chunk = os.read(fd, 1 << 16)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        size += len(chunk)
+        if cap is not None and size > cap:
+            raise Refused(f"a file is over {cap} bytes")
+
+
+def write_fd(fd, data):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def read_private_at(dir_fd, name, cap=None):
+    """(bytes, stat) of a private regular file of this user, opened without
+    following links relative to `dir_fd`; FileNotFoundError, or Refused."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | O_NOFOLLOW, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise
+    except OSError as e:
+        raise Refused(f"{name} can't be opened ({e.strerror or e})") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise Refused(f"{name} is not a private regular file of this user")
+        return read_fd(fd, cap), st
+    finally:
+        os.close(fd)
+
+
+def write_private_at(dir_fd, name, data):
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    try:
+        os.fchmod(fd, 0o600)
+        write_fd(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def subdir(base_fd, parts, create=False):
+    """A descriptor of base/parts..., each a real directory (created 0700 if
+    `create`), never following a link."""
+    fd = os.dup(base_fd)
+    try:
+        for part in parts:
+            if create:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, 0o700, dir_fd=fd)
+            nxt = os.open(part, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+# --- the designation bootstrap record (#21's owner amendments 1 and 2) ----------------
 
 def release_fields(plan):
     """The record's two release fields, from the sealed plan (#21's owner
@@ -290,30 +451,26 @@ def bootstrap_bytes(plan):
     return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
-def bootstrap_path(plan):
-    return Path(plan["state_root"]["path"]) / load_activation()["bootstrap"]["file"]
+def bootstrap_name():
+    return load_activation()["bootstrap"]["file"]
 
 
-def read_private(path):
-    """(bytes, (dev, ino), ctime_ns) of a private regular file of this user,
-    opened without following links; FileNotFoundError, or Refused otherwise."""
+def open_state_root(plan):
+    """The chat state root the plan sealed, pinned: refused if missing, a link,
+    or another directory (device and inode)."""
+    root = plan["state_root"]
+    if os.path.realpath(root["path"]) != root["path"]:
+        raise Refused("blocked: the chat state root's path no longer resolves to itself; nothing more was changed")
+    return open_dir(root["path"], [root["dev"], root["ino"]], what="the chat state root")
+
+
+def fsync_dir(fd_or_path):
+    if isinstance(fd_or_path, int):
+        os.fsync(fd_or_path)
+        return
+    fd = os.open(fd_or_path, os.O_RDONLY)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
-    except FileNotFoundError:
-        raise
-    except OSError as e:
-        raise Refused(f"{shown(path)} can't be opened ({e.strerror or e})") from None
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-            raise Refused(f"{shown(path)} is not a private regular file of this user")
-        chunks = []
-        while True:
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        return b"".join(chunks), (st.st_dev, st.st_ino), st.st_ctime_ns
+        os.fsync(fd)
     finally:
         os.close(fd)
 
@@ -322,162 +479,255 @@ def publish_bootstrap(journal, plan):
     """Publish the record and journal D; returns D, or Refused with everything
     retained.
 
+    Everything happens through one pinned descriptor of the plan's state root.
     Each step is journaled: an intent naming the temporary file; that file
     created exclusively, written and synced, its inode journaled; link() to
-    the final path, which never replaces a file; the directory synced. Then
+    the final name, which never replaces a file; the directory synced. Then
     reconciliation (#21's APPROVE, spec addition 2): the final record is the
-    very inode this operation's journal staged, holds exactly the plan's bytes,
-    sits in the plan's state root (path, device and inode) and is durable.
-    Only then is D journaled. A record whose ownership this operation's own
-    journal can't show is foreign: it is retained, and the activation stops."""
+    very inode this operation's journal staged, holds exactly the plan's bytes
+    and is durable. Only then is D journaled, with the record's change time (an
+    inode number alone can be reused once the staged copy is gone). A record
+    whose ownership this operation's own journal can't show is foreign: it is
+    retained, and the activation stops."""
     op = plan["operation"]
     data = bootstrap_bytes(plan)
     d = sha256_bytes(data)
-    final = bootstrap_path(plan)
-    if state_root_identity(plan["state_root"]["path"]) != plan["state_root"]:
-        raise Refused("blocked: the chat state root is not the plan's (its path, device or inode differ); "
-                      "nothing more was changed")
-    mine = [r for r in journal.records if r.get("op") == op]
-    last = lambda kind: next((r for r in reversed(mine) if r["kind"] == kind), None)  # noqa: E731
-    done = last("bootstrap")
-    if done is not None:
-        if done.get("digest") != d:
-            raise Refused("the journaled bootstrap digest is not this plan's; nothing more was changed")
-        reconcile_bootstrap(plan, data, tuple(done["inode"]), done.get("ctime_ns"))
-        return d
-    published = last("bootstrap-published")
-    if published is not None:
-        inode = tuple(published["inode"])
-        reconcile_bootstrap(plan, data, inode)
-    else:
-        staged, inode = last("bootstrap-staged"), None
-        if staged is not None:
-            inode = tuple(staged["inode"])
-            try:
-                found = os.lstat(final)
-            except FileNotFoundError:
-                found = None
-            if found is not None and (found.st_dev, found.st_ino) != inode:
-                raise Refused(f"blocked: {shown(final)} is not the record this operation staged (another inode): "
-                              "it is retained, and this needs an owner decision")
-            if found is None:
-                try:
-                    st = os.lstat(final.parent / staged["tmp"])
-                except FileNotFoundError:
-                    st = None
-                if st is None or (st.st_dev, st.st_ino) != inode:
-                    inode = None  # the staged copy is gone or replaced: stage again, under a new name
-                else:
-                    os.link(final.parent / staged["tmp"], final)
-        elif os.path.lexists(final):
-            raise Refused(f"blocked: {shown(final)} exists, and this operation's journal never staged a record: "
-                          "it is retained, never replaced, and this needs an owner decision")
-        if inode is None:
-            if os.path.lexists(final):
-                raise Refused(f"blocked: {shown(final)} appeared, and this operation didn't publish it: it is "
-                              "retained, and this needs an owner decision")
-            attempt = sum(1 for r in mine if r["kind"] == "bootstrap-intent") + 1
-            tmp = final.parent / f".designation-bootstrap.{op}.{attempt}.tmp"
-            journal.append({"op": op, "kind": "bootstrap-intent", "tmp": tmp.name, "digest": d})
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            try:
-                os.write(fd, data)
-                os.fsync(fd)
-                st = os.fstat(fd)
-            finally:
-                os.close(fd)
-            inode = (st.st_dev, st.st_ino)
-            journal.append({"op": op, "kind": "bootstrap-staged", "tmp": tmp.name, "inode": list(inode)})
-            os.link(tmp, final)  # FileExistsError: something else published first; nothing is replaced
-        fsync_dir(final.parent)
-        reconcile_bootstrap(plan, data, inode)
-        journal.append({"op": op, "kind": "bootstrap-published", "inode": list(inode)})
-    debt = []
-    for r in journal.records:
-        if r.get("op") != op or r["kind"] not in ("bootstrap-intent", "bootstrap-staged"):
-            continue
-        tmp = final.parent / r["tmp"]
-        try:
-            st = os.lstat(tmp)
-        except FileNotFoundError:
-            continue
-        if r["kind"] == "bootstrap-staged" and (st.st_dev, st.st_ino) == tuple(r["inode"]):
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)  # this operation's own staged copy of the published record: cleanup only
-        elif not any(s.get("tmp") == r["tmp"] for s in journal.records
-                     if s.get("op") == op and s["kind"] == "bootstrap-staged"):
-            debt.append(r["tmp"])  # never journaled as ours: kept, and reported
-    # Once the staged copy is gone nothing holds the inode, and a file system may
-    # give its number to a replacement: the change time is journaled with it.
-    ctime_ns = reconcile_bootstrap(plan, data, inode)
-    journal.append({"op": op, "kind": "bootstrap", "digest": d, "inode": list(inode), "ctime_ns": ctime_ns,
-                    "cleanup_debt": debt})
-    return d
-
-
-def reconcile_bootstrap(plan, data, inode, ctime_ns=None):
-    """The published record is this operation's, exact and durable; returns its
-    change time. Refused otherwise, with everything retained. `ctime_ns`, once
-    journaled with D, must match too: an inode number alone can be reused."""
-    final = bootstrap_path(plan)
+    final = bootstrap_name()
+    sfd = open_state_root(plan)
     try:
-        found, ident, ctime = read_private(final)
+        mine = [r for r in journal.records if r.get("op") == op]
+        last = lambda kind: next((r for r in reversed(mine) if r["kind"] == kind), None)  # noqa: E731
+        done = last("bootstrap")
+        if done is not None:
+            if done["digest"] != d:
+                raise Refused("the journaled bootstrap digest is not this plan's; nothing more was changed")
+            reconcile_bootstrap(sfd, data, tuple(done["inode"]), done["ctime_ns"])
+            return d
+
+        def lstat_at(name):
+            try:
+                return os.stat(name, dir_fd=sfd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+        published = last("bootstrap-published")
+        if published is not None:
+            inode = tuple(published["inode"])
+            reconcile_bootstrap(sfd, data, inode)
+        else:
+            staged, inode = last("bootstrap-staged"), None
+            if staged is not None:
+                inode = tuple(staged["inode"])
+                found = lstat_at(final)
+                if found is not None and (found.st_dev, found.st_ino) != inode:
+                    raise Refused(f"blocked: {final} is not the record this operation staged (another inode): it is "
+                                  "retained, and this needs an owner decision")
+                if found is None:
+                    st = lstat_at(staged["tmp"])
+                    if st is None or (st.st_dev, st.st_ino) != inode:
+                        inode = None  # the staged copy is gone or replaced: stage again, under a new name
+                    else:
+                        os.link(staged["tmp"], final, src_dir_fd=sfd, dst_dir_fd=sfd)
+            elif lstat_at(final) is not None:
+                raise Refused(f"blocked: {final} exists, and this operation's journal never staged a record: it is "
+                              "retained, never replaced, and this needs an owner decision")
+            if inode is None:
+                if lstat_at(final) is not None:
+                    raise Refused(f"blocked: {final} appeared, and this operation didn't publish it: it is "
+                                  "retained, and this needs an owner decision")
+                attempt = sum(1 for r in mine if r["kind"] == "bootstrap-intent") + 1
+                tmp = f".designation-bootstrap.{op}.{attempt}.tmp"
+                journal.append({"op": op, "kind": "bootstrap-intent", "tmp": tmp, "digest": d})
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o600, dir_fd=sfd)
+                try:
+                    write_fd(fd, data)
+                    os.fsync(fd)
+                    st = os.fstat(fd)
+                finally:
+                    os.close(fd)
+                inode = (st.st_dev, st.st_ino)
+                journal.append({"op": op, "kind": "bootstrap-staged", "tmp": tmp, "inode": list(inode)})
+                os.link(tmp, final, src_dir_fd=sfd, dst_dir_fd=sfd)  # never replaces a file
+            fsync_dir(sfd)
+            reconcile_bootstrap(sfd, data, inode)
+            journal.append({"op": op, "kind": "bootstrap-published", "inode": list(inode)})
+        debt = []
+        staged_names = {r["tmp"]: tuple(r["inode"]) for r in journal.records
+                        if r.get("op") == op and r["kind"] == "bootstrap-staged"}
+        for r in [r for r in journal.records if r.get("op") == op and r["kind"] == "bootstrap-intent"]:
+            st = lstat_at(r["tmp"])
+            if st is None:
+                continue
+            if staged_names.get(r["tmp"]) == (st.st_dev, st.st_ino):
+                with contextlib.suppress(OSError):
+                    os.unlink(r["tmp"], dir_fd=sfd)  # this operation's own staged copy, once published: cleanup
+            else:
+                debt.append(r["tmp"])  # never journaled as ours: kept, and reported
+        fsync_dir(sfd)
+        ctime_ns = reconcile_bootstrap(sfd, data, inode)
+        journal.append({"op": op, "kind": "bootstrap", "digest": d, "inode": list(inode), "ctime_ns": ctime_ns,
+                        "cleanup_debt": debt})
+        return d
+    finally:
+        os.close(sfd)
+
+
+def reconcile_bootstrap(sfd, data, inode, ctime_ns=None):
+    """The published record, read through the pinned state root, is this
+    operation's, exact and durable; returns its change time. Refused otherwise,
+    with everything retained. `ctime_ns`, once journaled with D, must match too."""
+    final = bootstrap_name()
+    try:
+        found, st = read_private_at(sfd, final, cap=1 << 16)
     except FileNotFoundError:
-        raise Refused(f"blocked: {shown(final)} is missing after this operation published it; nothing more was "
+        raise Refused(f"blocked: {final} is missing after this operation published it; nothing more was "
                       "changed") from None
-    if ident != inode or (ctime_ns is not None and ctime != ctime_ns):
-        raise Refused(f"blocked: {shown(final)} is not the file this operation published (another inode, or "
-                      "replaced since); it is retained")
+    if (st.st_dev, st.st_ino) != tuple(inode) or (ctime_ns is not None and st.st_ctime_ns != ctime_ns):
+        raise Refused(f"blocked: {final} is not the file this operation published (another inode, or replaced "
+                      "since); it is retained")
     if found != data:
-        raise Refused(f"blocked: {shown(final)} doesn't hold this plan's exact record; it is retained")
-    if state_root_identity(plan["state_root"]["path"]) != plan["state_root"]:
-        raise Refused("blocked: the chat state root is not the plan's; nothing more was changed")
-    fd = os.open(final, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        raise Refused(f"blocked: {final} doesn't hold this plan's exact record; it is retained")
+    fd = os.open(final, os.O_RDONLY | O_NOFOLLOW, dir_fd=sfd)
     try:
         os.fsync(fd)
     finally:
         os.close(fd)
-    fsync_dir(final.parent)
-    return ctime
+    fsync_dir(sfd)
+    return st.st_ctime_ns
 
 
 # --- the journal ----------------------------------------------------------------------
 
+RECORD_FIELDS = {  # what each journal record must carry, by kind (shape checks on decoded JSON)
+    "admitted": {"plan_sha256": str}, "backup": {"target": str, "folder": str, "digest": str},
+    "bootstrap-intent": {"tmp": str, "digest": str}, "bootstrap-staged": {"tmp": str, "inode": list},
+    "bootstrap-published": {"inode": list}, "bootstrap": {"digest": str, "inode": list, "ctime_ns": int},
+    "binding": {"target": str}, "entry-binding": {"target": str, "rel": str, "tmp": str, "to": str},
+    "entry-bound": {"target": str, "rel": str}, "bound": {"target": str},
+    "entry-restoring": {"target": str, "rel": str, "tmp": str}, "entry-restored": {"target": str, "rel": str},
+    "restored": {"target": str}}
+
+
+def record_problem(r):
+    if not isinstance(r, dict) or not isinstance(r.get("kind"), str) or ("op" in r and not isinstance(r["op"], str)):
+        return "a record is malformed"
+    for field, kind in RECORD_FIELDS.get(r["kind"], {}).items():
+        if not isinstance(r.get(field), kind) or isinstance(r.get(field), bool):
+            return f"a {r['kind']} record's {field} is malformed"
+    for field in ("inode", "container"):
+        value = r.get(field)
+        if value is not None and (not isinstance(value, list) or len(value) != 2
+                                  or not all(type(v) is int for v in value)):
+            return f"a {r['kind']} record's {field} is malformed"
+    return None
+
+
+def parse_journal(data):
+    """The complete records (each ended by a newline) and the torn suffix after
+    the last newline; Refused when a complete record is damaged."""
+    cut = data.rfind(b"\n") + 1
+    records = []
+    for line in data[:cut].split(b"\n"):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            raise Refused("the activation journal is damaged before its last record; nothing was changed") from None
+        problem = record_problem(record)
+        if problem:
+            raise Refused(f"the activation journal is damaged: {problem}; nothing was changed")
+        records.append(record)
+    return records, data[cut:]
+
+
 class Journal:
-    """The activation journal in the private root, behind an exclusive lock: a
-    concurrent upgrader is refused, never interleaved. Each record is appended
-    and synced; a torn last record is dropped on reading."""
+    """The activation journal in the private root, fenced: the root, the lock
+    and the journal file are opened once, never through a link, and kept as
+    descriptors; every append first checks that the root's path still names
+    that directory and its names those files, so a renamed or replaced root
+    can't split an operation across two journals, and a second activation is
+    refused, never interleaved. A torn suffix (a record cut short by a crash)
+    is kept privately, then truncated and synced, before anything is appended."""
 
     def __init__(self, root, crash=None):
         self.root, self.crash = Path(root), crash
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.lock = open(self.root / LOCK, "a")
+        self.root_fd = self.lock_fd = self.fd = None
         try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            self.lock.close()
-            raise Refused("blocked: another activation holds the journal lock; nothing was changed") from None
-        try:
-            self.records = read_journal(self.root)
+            if not os.path.lexists(self.root):
+                os.makedirs(self.root, mode=0o700)
+            self.root_fd = open_dir(self.root, what="the activation root")
+            st = os.fstat(self.root_fd)
+            if st.st_uid != os.getuid() or st.st_mode & 0o022:
+                raise Refused("blocked: the activation root is not this user's own, or others can write it")
+            self.ident = ident(st)
+            self.lock_fd = self._file(LOCK, os.O_RDWR | os.O_CREAT)
+            try:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Refused("blocked: another activation holds the journal lock; nothing was changed") from None
+            self.fd = self._file(JOURNAL, os.O_RDWR | os.O_CREAT | os.O_APPEND)
+            self.check_fence()
+            self.records = self._load()
         except BaseException:
             self.close()
             raise
 
-    def append(self, record):
-        record = dict(record, schema=JOURNAL_SCHEMA, at=now())
-        fd = os.open(self.root / JOURNAL, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    def _file(self, name, flags):
         try:
-            os.write(fd, (json.dumps(record, sort_keys=True) + "\n").encode())
-            os.fsync(fd)
-        finally:
+            fd = os.open(name, flags | O_NOFOLLOW, 0o600, dir_fd=self.root_fd)
+        except OSError as e:
+            raise Refused(f"blocked: the activation {name} can't be opened as a regular file ({e.strerror or e}); "
+                          "nothing was changed") from None
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
             os.close(fd)
+            raise Refused(f"blocked: the activation {name} is not this user's regular file; nothing was changed")
+        return fd
+
+    def check_fence(self):
+        try:
+            st = os.lstat(self.root)
+            ok = stat.S_ISDIR(st.st_mode) and ident(st) == self.ident and all(
+                ident(os.stat(name, dir_fd=self.root_fd, follow_symlinks=False)) == ident(os.fstat(fd))
+                for name, fd in ((LOCK, self.lock_fd), (JOURNAL, self.fd)))
+        except OSError:
+            ok = False
+        if not ok:
+            raise Refused("blocked: the activation journal's root, lock or file was moved or replaced; nothing more "
+                          "was changed")
+
+    def _load(self):
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        data = read_fd(self.fd)
+        records, torn = parse_journal(data)
+        if torn:
+            kept = f"journal-torn-{len(data) - len(torn)}.bin"
+            write_private_at(self.root_fd, kept, torn)
+            os.ftruncate(self.fd, len(data) - len(torn))
+            os.fsync(self.fd)
+            fsync_dir(self.root_fd)
+            self.records = records
+            self.append({"kind": "journal-repaired", "dropped_bytes": len(torn), "kept": kept})
+            return self.records
+        return records
+
+    def append(self, record):
+        self.check_fence()
+        record = dict(record, schema=JOURNAL_SCHEMA, at=now())
+        write_fd(self.fd, (json.dumps(record, sort_keys=True) + "\n").encode())
+        os.fsync(self.fd)
         self.records.append(record)
         if self.crash:
             self.crash(record)
 
     def close(self):
-        fcntl.flock(self.lock, fcntl.LOCK_UN)
-        self.lock.close()
+        for fd in (self.fd, self.lock_fd, self.root_fd):
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    if fd == self.lock_fd:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+        self.fd = self.lock_fd = self.root_fd = None
 
     def __enter__(self):
         return self
@@ -487,21 +737,18 @@ class Journal:
 
 
 def read_journal(root):
+    """The journal's complete records, read without the lock (status,
+    post-check); a torn suffix is ignored, and repaired by the next writer."""
     try:
-        lines = (Path(root) / JOURNAL).read_text(encoding="utf-8").split("\n")
+        fd = os.open(Path(root) / JOURNAL, os.O_RDONLY | O_NOFOLLOW)
     except FileNotFoundError:
         return []
-    records = []
-    for n, line in enumerate(lines):
-        if not line.strip():
-            continue
-        try:
-            records.append(json.loads(line))
-        except ValueError:
-            if n == len(lines) - 1:  # a torn last record: the step it began is reconciled from reality
-                break
-            raise Refused("the activation journal is damaged before its last record; nothing was changed") from None
-    return records
+    except OSError as e:
+        raise Refused(f"the activation journal can't be read ({e.strerror or e})") from None
+    try:
+        return parse_journal(read_fd(fd))[0]
+    finally:
+        os.close(fd)
 
 
 def operation_state(records, op):
@@ -511,71 +758,230 @@ def operation_state(records, op):
             "rolled_back": "rolled-back" in kinds,
             "bound": {r["target"] for r in mine if r["kind"] == "bound"},
             "backups": {r["target"]: r for r in mine if r["kind"] == "backup"},
-            "digest": next((r["digest"] for r in mine if r["kind"] == "bootstrap"), None)}
+            "digest": next((r["digest"] for r in mine if r["kind"] == "bootstrap"), None),
+            "written": {(r["target"], r["rel"]): r["to"] for r in mine if r["kind"] == "entry-binding"}}
 
 
-# --- the staged release and the seven targets ------------------------------------------
+# --- the staged release ------------------------------------------------------------------
+
+def stage_operation(plan):
+    """The completed stage operation this plan admitted, from the stager's
+    journal: (records, operation)."""
+    records = stage_release.read_journal(Path(plan["dest"]) / stage_release.JOURNAL)
+    found = [op for op in stage_release.operations(records).values()
+             if op["complete"] and isinstance(op["binding"], dict)
+             and (op["binding"].get("admission") or {}).get("plan_sha256") == plan["digest"]]
+    if len(found) != 1:
+        raise Refused("the release is not staged under this plan's admission; run stage --plan first")
+    b = found[0]["binding"]
+    if b.get("release") != plan["release"] or b.get("manifest_sha256") != plan["manifest_sha256"] \
+            or os.path.abspath(b.get("release_dir", "")) != plan["staged_release"]:
+        raise Refused("the staged release's recorded binding is not this plan's release")
+    return records, found[0]
+
+
+def verify_staged_release(plan):
+    """The staged release verified as the stager verifies a completed operation
+    (stage_release.verify_staged): the artifacts against the manifest hash, the
+    environment against its recorded inventory, the interpreter and the import
+    check. Refused, naming the problem, on any change since staging."""
+    records, op = stage_operation(plan)
+    b = op["binding"]
+    begin = next((r for r in records if r.get("op") == op["id"] and r.get("kind") == "begin"), None)
+    installed = [r for r in records if r.get("op") == op["id"] and r.get("kind") == "outcome"
+                 and r.get("step") == "install-package" and r.get("result") == "ok"]
+    if begin is None or not isinstance(begin.get("manifest"), dict) or not installed:
+        raise Refused("the stager's journal doesn't hold this release's staging record")
+    writer = stage_release.Writer(Path(plan["dest"]), build_release.live_roots())
+    try:
+        writer.load(records, op["id"])
+        stage_release.verify_staged(writer, f"{stage_release.RELEASES}/{plan['release']}", b["manifest_sha256"],
+                                    begin["manifest"], b["interpreter"], installed[-1].get("inventory_sha256"))
+    except Refused as e:
+        raise Refused(f"blocked: the staged release doesn't verify ({e}); nothing was changed") from None
+    except (TypeError, KeyError, ValueError, AttributeError) as e:
+        raise Refused(f"blocked: the stager's record of this release is malformed ({e.__class__.__name__}); "
+                      "nothing was changed") from None
+    finally:
+        writer.close()
+
+
+def seal_staged_release(plan):
+    """The release's package directories made read-only (0555), through pinned
+    descriptors: Python then never writes bytecode into them, so the staged
+    environment stays exactly the inventory staging recorded (directory modes
+    are not part of it) however its commands are run, and the post-check's
+    verification holds after real use. Returns True if anything changed."""
+    sites = sorted((Path(plan["staged_release"]) / "env").glob("lib/python*/site-packages/plateia_chat"))
+    if len(sites) != 1:
+        raise Refused("the staged environment has no single plateia_chat package")
+    changed = False
+    fd = open_dir(sites[0], what="the staged plateia_chat package")
+    try:
+        for part in (None, "scripts"):
+            dfd = fd if part is None else subdir(fd, [part])
+            try:
+                if stat.S_IMODE(os.fstat(dfd).st_mode) != 0o555:
+                    os.fchmod(dfd, 0o555)
+                    changed = True
+            finally:
+                if dfd != fd:
+                    os.close(dfd)
+    finally:
+        os.close(fd)
+    return changed
+
 
 def staged_layout(plan):
-    """Where the staged release's commands, scripts and skill are; the stage
-    operation must be complete and admitted by this plan."""
-    complete = [op for op in stage_release.operations(
-        stage_release.read_journal(Path(plan["dest"]) / stage_release.JOURNAL)).values()
-        if op["complete"] and (op["binding"] or {}).get("release") == plan["release"]]
-    if not any((op["binding"] or {}).get("admission", {}).get("plan_sha256") == plan["digest"] for op in complete):
-        raise Refused("the release is not staged under this plan's admission; run stage --plan first")
+    """Where the staged release's commands, scripts and skill are (read after
+    verify_staged_release)."""
+    stage_operation(plan)
     rel = Path(plan["staged_release"])
     env = rel / "env"
     sites = sorted(env.glob("lib/python*/site-packages/plateia_chat/scripts"))
     if len(sites) != 1:
         raise Refused("the staged environment has no single plateia_chat/scripts")
-    manifest = json.loads((rel / "artifacts" / MANIFEST).read_text(encoding="utf-8"))
-    with zipfile.ZipFile(io.BytesIO((rel / "artifacts" / manifest["skill"]["artifact"]).read_bytes())) as z:
+    manifest = verified_manifest(plan)
+    with zipfile.ZipFile(io.BytesIO(verified_artifact(plan, manifest, manifest["skill"]["artifact"]))) as z:
         skill_md = z.read(f"{manifest['skill']['name']}/SKILL.md")
     files = sorted(p.name for p in sites[0].iterdir() if p.is_file())
     return {"env": env, "bin": env / "bin", "scripts": sites[0], "skill": skill_md, "files": files}
 
 
+def verified_manifest(plan):
+    """The staged release's manifest, read once and accepted only if its bytes
+    are the ones the plan pinned (the manifest hash)."""
+    fd = open_dir(Path(plan["staged_release"]) / "artifacts", what="the staged artifacts")
+    try:
+        data = read_fd_at(fd, MANIFEST)
+    finally:
+        os.close(fd)
+    if sha256_bytes(data) != plan["manifest_sha256"]:
+        raise Refused("blocked: the staged manifest is not the one the plan pinned; nothing was changed")
+    manifest = json.loads(data)
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("artifacts"), list):
+        raise Refused("blocked: the staged manifest is malformed; nothing was changed")
+    return manifest
+
+
+def verified_artifact(plan, manifest, name):
+    """One staged artifact's bytes, read once and accepted only if they hash to
+    the manifest's entry for it."""
+    want = next((a.get("sha256") for a in manifest["artifacts"] if isinstance(a, dict) and a.get("name") == name),
+                None)
+    fd = open_dir(Path(plan["staged_release"]) / "artifacts", what="the staged artifacts")
+    try:
+        data = read_fd_at(fd, name)
+    finally:
+        os.close(fd)
+    if want is None or sha256_bytes(data) != want:
+        raise Refused(f"blocked: the staged artifact {name} is not the manifest's; nothing was changed")
+    return data
+
+
+def read_fd_at(dir_fd, name):
+    fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Refused(f"{name} is not a regular file")
+        return read_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def load_release_module(plan, name):
+    """A module of the pinned release's own chat code, executed from the
+    hash-verified wheel artifact under a private name: never from an installed
+    file that could have changed, never from a source checkout, never on
+    sys.path."""
+    manifest = verified_manifest(plan)
+    wheel = verified_artifact(plan, manifest, manifest["package"]["artifact"])
+    with zipfile.ZipFile(io.BytesIO(wheel)) as z:
+        source = z.read(f"{manifest['package'].get('import_name', 'plateia_chat')}/scripts/{name}.py")
+    module = types.ModuleType(f"plateia_activation_{name}")
+    module.__file__ = f"<{manifest['release']} wheel>/{name}.py"
+    exec(compile(source, module.__file__, "exec"), module.__dict__)
+    return module
+
+
+# --- the seven targets ----------------------------------------------------------------------
+
 def target_paths(spec_targets, skills):
     return {t["name"]: (t, stage_release.expand(t["path"], skills)) for t in spec_targets}
 
 
-def file_entry(p):
-    """A regular file's (sha256, mode, bytes); None when missing; anything else
-    (a symlink swapped in, say) as what it is, never followed."""
+def container_of(t, path):
+    """The directory a target's entries live in: a folder target is its own; a
+    link or a LaunchAgent lives in its parent."""
+    return path if t["kind"] in FOLDERS else path.parent
+
+
+def entry_name(t, path, rel):
+    return rel if t["kind"] in FOLDERS else path.name
+
+
+def open_container(t, path, expect=None):
+    """A descriptor of the target's directory: a folder target is never reached
+    through a link; with `expect` (recorded at backup), refused unless it is
+    that directory. None when it is missing and nothing was recorded."""
+    folder = t["kind"] in FOLDERS
     try:
-        st = os.lstat(p)
+        fd = os.open(container_of(t, path), os.O_RDONLY | O_DIRECTORY | (O_NOFOLLOW if folder else 0))
+    except FileNotFoundError:
+        if expect is None:
+            return None
+        raise Refused(f"blocked: {t['name']}'s directory is missing; nothing more was changed") from None
+    except OSError as e:
+        if expect is None and folder:
+            return "not-a-directory"
+        raise Refused(f"blocked: {t['name']}'s directory can't be opened ({e.strerror or e}); nothing more was "
+                      "changed") from None
+    if expect is not None and ident(os.fstat(fd)) != list(expect):
+        os.close(fd)
+        raise Refused(f"blocked: {t['name']}'s directory was moved or replaced since it was backed up; nothing "
+                      "more was changed")
+    return fd
+
+
+def entry_at(fd, name, link=False):
+    """One entry, read relative to its pinned directory and never followed: a
+    link's target, a regular file's (sha256, mode, bytes), None if missing, or
+    what else it is."""
+    try:
+        st = os.stat(name, dir_fd=fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
+    if link:
+        return {"link": os.readlink(name, dir_fd=fd)} if stat.S_ISLNK(st.st_mode) else {"not-a-link": True}
     if not stat.S_ISREG(st.st_mode):
-        return {"not-a-file": os.readlink(p) if stat.S_ISLNK(st.st_mode) else stat.S_IFMT(st.st_mode)}
-    data = Path(p).read_bytes()
-    return {"sha256": sha256_bytes(data), "mode": st.st_mode & 0o777, "bytes": data}
-
-
-def dir_entry(p):
+        return {"not-a-file": os.readlink(name, dir_fd=fd) if stat.S_ISLNK(st.st_mode) else stat.S_IFMT(st.st_mode)}
+    efd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | O_NOFOLLOW, dir_fd=fd)
     try:
-        st = os.lstat(p)
-    except FileNotFoundError:
-        return None
-    return {"directory": True} if stat.S_ISDIR(st.st_mode) else {"not-a-directory": stat.S_IFMT(st.st_mode)}
+        data = read_fd(efd)
+        mode = os.fstat(efd).st_mode & 0o777
+    finally:
+        os.close(efd)
+    return {"sha256": sha256_bytes(data), "mode": mode, "bytes": data}
 
 
-def read_target(t, path, layout):
-    """A target's current state, as {rel: entry}: a symlink's target, a file's
-    (sha256, mode, bytes), a folder's own kind (".") or None for a missing
-    entry. Nothing is followed through a link."""
-    if t["kind"] == "symlink":
-        return {"": {"link": os.readlink(path)} if os.path.islink(path) else
-                ({"not-a-link": True} if os.path.lexists(path) else None)}
-    if t["kind"] == "launchagent":
-        return {"": file_entry(path)}
-    folder = {".": dir_entry(path)}
-    if folder["."] != {"directory": True}:
-        return folder
-    if t["kind"] == "skill-folder":
-        return dict(folder, **{"SKILL.md": file_entry(path / "SKILL.md")})
-    return dict(folder, **{n: file_entry(path / n) for n in layout["files"]})
+def observe_target(t, path, layout, expect=None):
+    """(state, container identity): the target's entries read through its
+    pinned directory ("." is a folder target's own kind)."""
+    fd = open_container(t, path, expect)
+    folder = t["kind"] in FOLDERS
+    if fd is None:
+        return ({".": None} if folder else {"": None}), None
+    if fd == "not-a-directory":
+        return {".": {"not-a-directory": True}}, None
+    try:
+        if folder:
+            names = ["SKILL.md"] if t["kind"] == "skill-folder" else layout["files"]
+            state = {".": {"directory": True}, **{n: entry_at(fd, n) for n in names}}
+        else:
+            state = {"": entry_at(fd, path.name, link=t["kind"] == "symlink")}
+        return state, ident(os.fstat(fd))
+    finally:
+        os.close(fd)
 
 
 def effective_executable(plist):
@@ -601,10 +1007,15 @@ def desired_target(t, path, layout, original, d=None):
         dest = layout["bin"] / "pchat" if t["name"] == "pchat" else layout["scripts"] / "role_colors.py"
         return {"": {"link": str(dest)}}
     if t["kind"] == "launchagent":
-        old = original[""]
-        if old is None:
-            raise Refused(f"blocked: {t['name']} is missing")
-        data = plistlib.loads(old["bytes"])
+        old = (original or {}).get("")
+        if not isinstance(old, dict) or "bytes" not in old:
+            raise Refused(f"blocked: {t['name']} was not a regular file when it was backed up")
+        try:
+            data = plistlib.loads(old["bytes"])
+        except (plistlib.InvalidFileException, ValueError):
+            raise Refused(f"blocked: {t['name']} is not a readable property list") from None
+        if not isinstance(data, dict):
+            raise Refused(f"blocked: {t['name']} is not a property-list dictionary")
         data.pop("Program", None)  # a retained Program would override ProgramArguments[0] (review correction C1)
         data["ProgramArguments"] = desired_invocation(t, layout, d)
         new = plistlib.dumps(data)
@@ -621,16 +1032,17 @@ def desired_target(t, path, layout, original, d=None):
     return out
 
 
-def invocation_problem(t, path, layout, d):
-    """For a bound LaunchAgent: None when launchd would run exactly the desired
-    invocation (its effective executable and its arguments); else why not."""
-    entry = file_entry(path)
-    if entry is None:
-        return "missing"
+def invocation_problem(t, entry, layout, d):
+    """For a bound LaunchAgent's entry: None when launchd would run exactly the
+    desired invocation (its effective executable and its arguments)."""
+    if not isinstance(entry, dict) or "bytes" not in entry:
+        return "missing or not a regular file"
     try:
         plist = plistlib.loads(entry["bytes"])
     except (plistlib.InvalidFileException, ValueError):
         return "not a readable property list"
+    if not isinstance(plist, dict):
+        return "not a property-list dictionary"
     want = desired_invocation(t, layout, d)
     if plist.get("ProgramArguments") != want:
         return "its ProgramArguments are not the pinned release's invocation"
@@ -639,81 +1051,155 @@ def invocation_problem(t, path, layout, d):
     return None
 
 
+def entry_digest(entry):
+    return digest(None if entry is None else {k: v for k, v in entry.items() if k != "bytes"})
+
+
 def summary_of(state):
     """A state's comparable digest, without the bytes."""
     return digest({k: (None if v is None else {kk: vv for kk, vv in v.items() if kk != "bytes"})
                    for k, v in sorted(state.items())})
 
 
-def write_target(t, path, state):
-    """Make the target `state`, entry by entry, each atomically (a same-
-    directory temporary, synced, renamed into place)."""
-    if state.get(".", {"directory": True}) != {"directory": True}:
-        raise Refused(f"{t['name']} is not a real directory; nothing was written into it")
-    for rel, entry in sorted(state.items()):
-        if rel == ".":
-            continue  # the folder itself is never written: only checked
-        p = path / rel if rel else path
-        if entry is None:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(p)
-            continue
-        tmp = p.parent / f".plateia-activation-{secrets.token_hex(4)}"
-        if "link" in entry:
-            os.symlink(entry["link"], tmp)
-        else:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, entry["mode"])
-            try:
-                os.write(fd, entry["bytes"])
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.chmod(tmp, entry["mode"])
-        os.replace(tmp, p)
-        fsync_dir(p.parent)
+def write_entry_at(fd, name, entry, tmp):
+    """One entry made `entry` relative to its pinned directory, atomically: a
+    temporary created exclusively, synced, renamed into place; then the
+    directory synced. Never follows a link."""
+    if entry is None:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name, dir_fd=fd)
+    elif "link" in entry:
+        os.symlink(entry["link"], tmp, dir_fd=fd)
+        os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+    else:
+        efd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, entry["mode"], dir_fd=fd)
+        try:
+            write_fd(efd, entry["bytes"])
+            os.fchmod(efd, entry["mode"])
+            os.fsync(efd)
+        finally:
+            os.close(efd)
+        os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+    os.fsync(fd)
 
 
-def private_write(path, data):
-    """A new private file (0600), synced: backups can hold a LaunchAgent's
-    environment, which is never shown or copied anywhere else."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+def clear_own_temporaries(journal, plan, t, path, backup):
+    """A crash between creating an entry's temporary and renaming it leaves the
+    temporary in the target's folder. Each one this operation journaled (its
+    random name chosen and journaled before the exclusive create) is removed
+    before writing resumes; nothing it didn't journal is touched."""
+    names = [r["tmp"] for r in journal.records if r.get("op") == plan["operation"]
+             and r["kind"] in ("entry-binding", "entry-restoring") and r["target"] == t["name"]]
+    if not names:
+        return
+    fd = open_container(t, path, backup.get("container"))
+    if not isinstance(fd, int):
+        return
     try:
-        os.fchmod(fd, 0o600)
-        os.write(fd, data)
+        for name in names:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(name, dir_fd=fd)
         os.fsync(fd)
     finally:
         os.close(fd)
 
 
-def backup_target(root, op, t, state):
-    """The target's original state, kept privately under the root (D-27)."""
-    folder = Path(root) / BACKUPS / op / re.sub(r"[^A-Za-z0-9._-]+", "_", t["name"])
-    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-    index = {}
-    for rel, entry in sorted(state.items()):
-        if entry is None or "bytes" not in entry:
-            index[rel] = entry
-            continue
-        name = f"entry-{len(index)}"
-        private_write(folder / name, entry["bytes"])
-        index[rel] = {"sha256": entry["sha256"], "mode": entry["mode"], "file": name}
-    private_write(folder / "index.json", (json.dumps(index, sort_keys=True) + "\n").encode())
-    fsync_dir(folder)
-    return folder
+def apply_entries(journal, plan, t, path, backup, writes, kind):
+    """Write each (rel, before, after) entry of one target through its pinned
+    directory, journaled entry by entry (`kind` "binding" or "restoring"): each
+    entry is checked against what was judged just before it is replaced, and
+    the directory's path is checked after every write."""
+    op = plan["operation"]
+    clear_own_temporaries(journal, plan, t, path, backup)
+    fd = open_container(t, path, backup.get("container"))
+    if not isinstance(fd, int):
+        raise Refused(f"blocked: {t['name']}'s directory is missing; nothing more was changed")
+    follow = t["kind"] not in FOLDERS
+    try:
+        for rel, before, after in writes:
+            name = entry_name(t, path, rel)
+            if entry_digest(entry_at(fd, name, link=t["kind"] == "symlink")) != entry_digest(before):
+                raise Refused(f"blocked: {t['name']} ({rel or name}) changed just before it was written; nothing more "
+                              "was changed")
+            tmp = f".plateia-activation-{secrets.token_hex(6)}"
+            journal.append({"op": op, "kind": f"entry-{kind}", "target": t["name"], "rel": rel, "tmp": tmp,
+                            "from": entry_digest(before), "to": entry_digest(after)})
+            write_entry_at(fd, name, after, tmp)
+            journal.append({"op": op, "kind": "entry-bound" if kind == "binding" else "entry-restored",
+                            "target": t["name"], "rel": rel, "digest": entry_digest(after)})
+            if not still_there(container_of(t, path), fd, follow=follow):
+                raise Refused(f"blocked: {t['name']}'s directory was moved or replaced during the write; nothing "
+                              "more was changed")
+    finally:
+        os.close(fd)
 
 
-def restore_state(folder):
-    index = json.loads((Path(folder) / "index.json").read_text())
-    out = {}
-    for rel, entry in index.items():
-        if entry is None or "file" not in entry:
-            out[rel] = entry
+def judge_entries(t, state, original, allowed_after, plan_name):
+    """Each entry is as recorded before (original) or as this operation made or
+    makes it (allowed_after: rel -> digests); anything else was changed by
+    something else. Returns the rels whose current entry is not yet `target`."""
+    if t["kind"] in FOLDERS and state.get(".") != {"directory": True}:
+        raise Refused(f"blocked: {plan_name} is not a real directory; nothing was changed")
+    for rel in set(state) | set(original):
+        if rel == ".":
             continue
-        data = (Path(folder) / entry["file"]).read_bytes()
-        if sha256_bytes(data) != entry["sha256"]:
-            raise Refused(f"the private backup {shown(folder)} doesn't verify; nothing was restored")
-        out[rel] = {"sha256": entry["sha256"], "mode": entry["mode"], "bytes": data}
-    return out
+        current = entry_digest(state.get(rel))
+        if current != entry_digest(original.get(rel)) and current not in allowed_after.get(rel, set()):
+            raise Refused(f"blocked: {plan_name} ({rel or 'its entry'}) is neither as recorded before activation "
+                          "nor as this operation wrote it: it was changed by something else; nothing more was "
+                          "changed")
+
+
+def backup_target(journal, op, t, state):
+    """The target's original state, kept privately under the pinned root (D-27):
+    mode 0600 files and an index. Returns the folder, relative to the root."""
+    parts = [BACKUPS, op, re.sub(r"[^A-Za-z0-9._-]+", "_", t["name"])]
+    fd = subdir(journal.root_fd, parts, create=True)
+    try:
+        index = {}
+        for rel, entry in sorted(state.items()):
+            if entry is None or "bytes" not in entry:
+                index[rel] = entry
+                continue
+            name = f"entry-{len(index)}"
+            write_private_at(fd, name, entry["bytes"])
+            index[rel] = {"sha256": entry["sha256"], "mode": entry["mode"], "file": name}
+        write_private_at(fd, "index.json", (json.dumps(index, sort_keys=True) + "\n").encode())
+        fsync_dir(fd)
+    finally:
+        os.close(fd)
+    return "/".join(parts)
+
+
+def restore_state(root_fd, folder):
+    """A backed-up state, read through the pinned root and verified."""
+    parts = folder.split("/")
+    if parts[0] != BACKUPS or any(p in ("", ".", "..") for p in parts):
+        raise Refused("the journal names a backup outside the private root")
+    fd = subdir(root_fd, parts)
+    try:
+        raw, _ = read_private_at(fd, "index.json")
+        try:
+            index = json.loads(raw)
+        except ValueError:
+            index = None
+        if not isinstance(index, dict):
+            raise Refused(f"the private backup {folder} is malformed; nothing was restored")
+        out = {}
+        for rel, entry in index.items():
+            if entry is None or (isinstance(entry, dict) and "file" not in entry):
+                out[rel] = entry
+                continue
+            if not isinstance(entry, dict) or not isinstance(entry.get("file"), str) \
+                    or not isinstance(entry.get("sha256"), str) or type(entry.get("mode")) is not int:
+                raise Refused(f"the private backup {folder} is malformed; nothing was restored")
+            data, _ = read_private_at(fd, entry["file"])
+            if sha256_bytes(data) != entry["sha256"]:
+                raise Refused(f"the private backup {folder} doesn't verify; nothing was restored")
+            out[rel] = {"sha256": entry["sha256"], "mode": entry["mode"], "bytes": data}
+        return out
+    finally:
+        os.close(fd)
 
 
 def skills_change(skills, layout, paths):
@@ -768,8 +1254,9 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
             return dict(postcheck(plan_path, ops, spec_path), state="already selected")
         if not mine["admitted"]:
             stage_release.admission(plan, plan["release_path"], spec_path, activation_path)
-        elif [r for r in mine["records"] if r["kind"] == "admitted"][0].get("plan_sha256") != plan["digest"]:
+        elif [r for r in mine["records"] if r["kind"] == "admitted"][0]["plan_sha256"] != plan["digest"]:
             raise Refused("the journaled operation was admitted with other inputs; nothing was changed")
+        verify_staged_release(plan)  # before every activation and resume: nothing changed since staging
         layout = staged_layout(plan)
         # The expected new bridge, started under this operation, allows only a
         # read-only reconcile; any other running bridge blocks (review correction 2).
@@ -789,7 +1276,8 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
             # Every original is backed up before anything is published or bound,
             # so a target still unbacked has not been touched: it must still be
             # exactly as the plan observed it, or nothing more happens.
-            if read_only or any(r["kind"] in ("binding", "bound", "bootstrap-intent") for r in mine["records"]):
+            if read_only or any(r["kind"] in ("binding", "entry-binding", "bound", "bootstrap-intent")
+                                for r in mine["records"]):
                 raise Refused(f"blocked: {', '.join(pending)} has no backup, but this operation already went past "
                               "its backups; nothing was changed")
             now_targets = stage_release.make_plan(plan["release_path"], None, spec_path)["targets"]
@@ -800,47 +1288,46 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
                               "nothing more was changed")
             for name in pending:
                 t, path = paths[name]
-                current = read_target(t, path, layout)
-                folder = backup_target(plan["root"], plan["operation"], t, current)
-                journal.append({"op": plan["operation"], "kind": "backup", "target": name,
-                                "folder": str(folder), "digest": summary_of(current)})
+                current, container = observe_target(t, path, layout)
+                folder = backup_target(journal, plan["operation"], t, current)
+                journal.append({"op": plan["operation"], "kind": "backup", "target": name, "folder": folder,
+                                "digest": summary_of(current), "container": container})
             mine = operation_state(journal.records, plan["operation"])
         d = sha256_bytes(bootstrap_bytes(plan))  # the plan alone determines D
         if mine["digest"] not in (None, d):
             raise Refused("the journaled bootstrap digest is not this plan's; nothing was changed")
         steps = []
-        for t_plan in plan["targets"]:  # every target is checked before anything is published or written
+        for t_plan in plan["targets"]:  # every target is judged before anything is published or written
             t, path = paths[t_plan["name"]]
-            current = read_target(t, path, layout)
-            original = restore_state(mine["backups"][t["name"]]["folder"])
+            backup = mine["backups"][t["name"]]
+            current, _ = observe_target(t, path, layout, backup.get("container"))
+            original = restore_state(journal.root_fd, backup["folder"])
             desired = desired_target(t, path, layout, original, d)
-            if summary_of(current) == summary_of(desired):
-                steps.append((t, path, desired, False))
-                continue
-            if read_only:
+            allowed = {rel: {entry_digest(e)} for rel, e in desired.items()}
+            judge_entries(t, current, original, allowed, t["name"])
+            writes = [(rel, current.get(rel), desired.get(rel)) for rel in sorted(set(current) | set(desired))
+                      if rel != "." and entry_digest(current.get(rel)) != entry_digest(desired.get(rel))]
+            if writes and read_only:
                 raise Refused(f"blocked: {t['name']} isn't bound while a bridge runs; binding waits for it to stop "
                               "at an acknowledged checkpoint; nothing was changed")
-            if summary_of(current) != summary_of(original):
-                raise Refused(f"blocked: {t['name']} is neither as recorded before activation nor as bound: it was "
-                              "changed by something else; nothing more was changed")
-            steps.append((t, path, desired, True))
+            steps.append((t, path, backup, original, desired, writes))
         if not read_only:
+            if seal_staged_release(plan):
+                journal.append({"op": plan["operation"], "kind": "release-sealed", "mode": "0555"})
             publish_bootstrap(journal, plan)
-        for t, path, desired, write in steps:
-            if not write:
-                if t["name"] not in mine["bound"]:
-                    journal.append({"op": plan["operation"], "kind": "bound", "target": t["name"],
-                                    "digest": summary_of(desired)})
-                continue
-            journal.append({"op": plan["operation"], "kind": "binding", "target": t["name"],
-                            "from": summary_of(original), "to": summary_of(desired)})
-            write_target(t, path, desired)
+        for t, path, backup, original, desired, writes in steps:
+            if writes:
+                journal.append({"op": plan["operation"], "kind": "binding", "target": t["name"],
+                                "from": summary_of(original), "to": summary_of(desired)})
+                apply_entries(journal, plan, t, path, backup, writes, "binding")
             if t["kind"] == "launchagent":
-                problem = invocation_problem(t, path, layout, d)
+                bound, _ = observe_target(t, path, layout, backup.get("container"))
+                problem = invocation_problem(t, bound.get(""), layout, d)
                 if problem:
                     raise Refused(f"{t['name']} doesn't run the pinned release after binding: {problem}")
-            journal.append({"op": plan["operation"], "kind": "bound", "target": t["name"],
-                            "digest": summary_of(desired)})
+            if writes or t["name"] not in mine["bound"]:
+                journal.append({"op": plan["operation"], "kind": "bound", "target": t["name"],
+                                "digest": summary_of(desired)})
         change = skills_change(skills, layout, paths)
         journal.append({"op": plan["operation"], "kind": "selected", "release": plan["release"],
                         "skills_repository_change": change})
@@ -850,30 +1337,42 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
                         "complete only when postcheck passes"}
 
 
-def authority_serving(plan, since):
-    """Read-only, without the database: the authority's status snapshot
-    (outbox-db/1's outbox-status.json, written only while it serves) reports
-    it serving, written after this operation's bootstrap was journaled."""
-    try:
-        status = json.loads((Path(plan["state_root"]["path"]) / "outbox-status.json").read_text())
-    except (OSError, ValueError):
-        return False
-    return isinstance(status, dict) and status.get("unavailable") is None and since is not None \
-        and isinstance(status.get("written_at"), (int, float)) and status["written_at"] >= since
+def serving_evidence(reply):
+    """A live, well-formed answer to the read-only status request: the current
+    authority instance (its epoch) serving."""
+    epoch = reply.get("authority_epoch") if isinstance(reply, dict) else None
+    return isinstance(reply, dict) and reply.get("v") == "outbox-authority/1" and reply.get("result") == "ok" \
+        and type(epoch) is int and epoch >= 1 and isinstance(reply.get("status"), dict)
 
 
 def postcheck(plan_path, ops, spec_path=None):
-    """Read-only: recomputes the record and D from the sealed plan and compares
-    them with the state-root record and every bound target, the LaunchAgents by
-    their effective executable and exact arguments; checks the first-write
-    evidence and the bridge. It never opens the outbox database. The
-    activation is complete only when every check passes."""
+    """Read-only: verifies the staged release, recomputes the record and D from
+    the sealed plan and compares them with the state-root record and every
+    bound target (each LaunchAgent by its effective executable and exact
+    arguments), checks the bridge and asks its authority, live, for its
+    status. It never opens the outbox database. The activation is complete
+    only when every check passes.
+
+    The live answer ties the evidence to this activation: once the record
+    exists, a bridge launched without its exact digest is UNKNOWN and never
+    binds its socket, so an authority that answers was started for this D."""
     plan = load_plan(plan_path)
     mine = operation_state(read_journal(plan["root"]), plan["operation"])
-    layout = staged_layout(plan)
     data = bootstrap_bytes(plan)
     d = sha256_bytes(data)
     checks = [("bootstrap digest", "matches" if mine["digest"] == d else "not journaled as this plan's")]
+    try:
+        verify_staged_release(plan)
+        checks.append(("staged release", "matches"))
+    except Refused as e:
+        checks.append(("staged release", f"differs: {e}"))
+    try:
+        layout = staged_layout(plan)
+    except Refused as e:  # the targets can't be judged against a release that doesn't verify
+        checks.append(("staged release layout", f"unreadable: {e}"))
+        return {"operation": plan["operation"], "selected": mine["selected"], "checks": checks,
+                "bridge": "not checked", "authority_serving": False, "authority_epoch": None,
+                "first_writes": first_write_evidence(plan["state_root"]["path"], plan["state_root"]), "ok": False}
     # The record's two release fields against the pinned release itself (#21's owner amendment 2): the
     # staged release's own manifest hash and its directory's identity.
     staged = Path(plan["staged_release"])
@@ -885,37 +1384,57 @@ def postcheck(plan_path, ops, spec_path=None):
     checks.append(("pinned release", "matches" if staged_sha == fields["release"] and staged.name == fields[
         "release_id"] else "the staged release's manifest or identity is not the record's"))
     try:
-        found, _, _ = read_private(bootstrap_path(plan))
+        sfd = open_state_root(plan)
+        try:
+            found, _ = read_private_at(sfd, bootstrap_name(), cap=1 << 16)
+        finally:
+            os.close(sfd)
         checks.append(("bootstrap record", "matches" if found == data else "differs from the plan's"))
     except (FileNotFoundError, Refused) as e:
         checks.append(("bootstrap record", f"missing or unreadable ({e.__class__.__name__})"))
     paths = target_paths(stage_release.load_spec(spec_path)[0]["targets"], skills_root(spec_path))
-    for name, (t, path) in paths.items():
-        backup = mine["backups"].get(name)
-        if backup is None:
-            checks.append((name, "not bound by this operation"))
-            continue
-        want = desired_target(t, path, layout, restore_state(backup["folder"]), d)
-        same = summary_of(read_target(t, path, layout)) == summary_of(want)
-        problem = invocation_problem(t, path, layout, d) if t["kind"] == "launchagent" else None
-        checks.append((name, "bound" if same and not problem else "differs" + (f": {problem}" if problem else "")))
+    root_fd = None
+    try:
+        root_fd = open_dir(plan["root"], what="the activation root")
+        for name, (t, path) in paths.items():
+            backup = mine["backups"].get(name)
+            if backup is None:
+                checks.append((name, "not bound by this operation"))
+                continue
+            try:
+                current, _ = observe_target(t, path, layout, backup.get("container"))
+                want = desired_target(t, path, layout, restore_state(root_fd, backup["folder"]), d)
+            except Refused as e:
+                checks.append((name, f"differs: {e}"))
+                continue
+            same = summary_of(current) == summary_of(want)
+            problem = invocation_problem(t, current.get(""), layout, d) if t["kind"] == "launchagent" else None
+            checks.append((name, "bound" if same and not problem else "differs" + (f": {problem}" if problem else "")))
+    except Refused as e:
+        checks.append(("activation root", f"unreadable: {e}"))
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
     try:
         bridge = bridge_verdict(ops, plan)
     except Refused as e:
         bridge = f"blocks any mutation: {e}"
-    since = next((r["at"] for r in mine["records"] if r["kind"] == "bootstrap"), None)
-    serving = authority_serving(plan, datetime.datetime.fromisoformat(since).timestamp() if since else None)
+    reply = ops.authority_status(plan) if bridge == "expected" else None
+    serving = serving_evidence(reply)
     ok = mine["selected"] and bridge == "expected" and serving and all(c[1] in ("bound", "matches") for c in checks)
     return {"operation": plan["operation"], "selected": mine["selected"], "checks": checks, "bridge": bridge,
-            "authority_serving": serving, "first_writes": first_write_evidence(plan["state_root"]["path"]),
-            "ok": ok}
+            "authority_serving": serving, "authority_epoch": reply.get("authority_epoch") if serving else None,
+            "first_writes": first_write_evidence(plan["state_root"]["path"], plan["state_root"]), "ok": ok}
 
 
 def rollback(plan_path, ops, spec_path=None, crash=None):
     """Before the first new-format write only: restore the recorded targets
-    exactly (D-27), which removes the launch option. The bootstrap record is
-    left in place, and journaled. After the first write, refused: the recovery
-    is a reviewed repair or a roll-forward that keeps the newer state (D-74)."""
+    exactly (D-27), entry by entry, which removes the launch option. The
+    bootstrap record is left in place, and journaled. The first writes are
+    judged in the plan's sealed state root alone (its realpath, device and
+    inode): a missing, replaced or unreadable root is unknown, and refuses.
+    After the first write, refused: the recovery is a reviewed repair or a
+    roll-forward that keeps the newer state (D-74)."""
     plan = load_plan(plan_path)
     with Journal(plan["root"], crash) as journal:
         mine = operation_state(journal.records, plan["operation"])
@@ -927,36 +1446,53 @@ def rollback(plan_path, ops, spec_path=None, crash=None):
         if bridge.get("running") is not False:
             raise Refused("rollback refused for now: a bridge is running, or its state is unknown; it must stop at an "
                           "acknowledged checkpoint first; nothing was changed")
-        evidence = first_write_evidence(plan["state_root"]["path"])
+        evidence = first_write_evidence(plan["state_root"]["path"], plan["state_root"])
         written = {k: v for k, v in evidence.items() if v != "absent"}
         if written:
             journal.append({"op": plan["operation"], "kind": "rollback-refused", "evidence": evidence})
             raise Refused("rollback refused: " + "; ".join(f"{k}: {v}" for k, v in sorted(written.items()))
-                          + ". Old code can't read the new state, so the recovery is repair or roll-forward: a "
-                            "reviewed repair, or a roll-forward that keeps the newer state (D-74). The recorded "
-                            "targets, backups and the new state are kept, and nothing was changed")
+                          + ". Old code can't read the new state, or nothing shows it wasn't written, so the "
+                            "recovery is repair or roll-forward: a reviewed repair, or a roll-forward that keeps the "
+                            "newer state (D-74). The recorded targets, backups and the state are kept, and nothing "
+                            "was changed")
         layout = staged_layout(plan)
         paths = target_paths(stage_release.load_spec(spec_path)[0]["targets"], skills_root(spec_path))
-        plans = []
+        steps = []
         for t_plan in reversed(plan["targets"]):
             t, path = paths[t_plan["name"]]
             backup = mine["backups"].get(t["name"])
             if backup is None:
                 continue
-            original = restore_state(backup["folder"])
-            current = read_target(t, path, layout)
-            desired = desired_target(t, path, layout, original, mine["digest"])
-            if summary_of(current) not in (summary_of(original), summary_of(desired)):
-                raise Refused(f"rollback blocked: {t['name']} was changed by something else since activation; "
-                              "nothing was changed")
-            plans.append((t, path, original, current))
-        for t, path, original, current in plans:
-            if summary_of(current) != summary_of(original):
+            original = restore_state(journal.root_fd, backup["folder"])
+            current, _ = observe_target(t, path, layout, backup.get("container"))
+            # Ownership evidence, entry by entry: what this operation journaled
+            # writing, and what the staged release makes it now.
+            allowed = {}
+            for (target, rel), to in mine["written"].items():
+                if target == t["name"]:
+                    allowed.setdefault(rel, set()).add(to)
+            if mine["digest"] is not None:
+                for rel, e in desired_target(t, path, layout, original, mine["digest"]).items():
+                    allowed.setdefault(rel, set()).add(entry_digest(e))
+            judge_entries(t, current, original, allowed, t["name"])
+            writes = [(rel, current.get(rel), original.get(rel)) for rel in sorted(set(current) | set(original))
+                      if rel != "." and entry_digest(current.get(rel)) != entry_digest(original.get(rel))]
+            steps.append((t, path, backup, writes))
+        for t, path, backup, writes in steps:
+            if writes:
                 journal.append({"op": plan["operation"], "kind": "restoring", "target": t["name"]})
-                write_target(t, path, original)
+                apply_entries(journal, plan, t, path, backup, writes, "restoring")
             journal.append({"op": plan["operation"], "kind": "restored", "target": t["name"]})
-        journal.append({"op": plan["operation"], "kind": "bootstrap-retained",
-                        "present": os.path.lexists(bootstrap_path(plan)), "digest": mine["digest"]})
+        try:
+            sfd = open_state_root(plan)
+            try:
+                present = entry_at(sfd, bootstrap_name()) is not None
+            finally:
+                os.close(sfd)
+        except Refused:
+            present = None
+        journal.append({"op": plan["operation"], "kind": "bootstrap-retained", "present": present,
+                        "digest": mine["digest"]})
         journal.append({"op": plan["operation"], "kind": "rolled-back"})
         return {"state": "rolled-back", "operation": plan["operation"], "release": plan["release"],
                 "bootstrap_record": "left in place"}

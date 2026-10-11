@@ -65,6 +65,11 @@ class FakeOps:
     def producers(self):
         return None if self.producer_map is None else dict(self.producer_map)
 
+    def authority_status(self, plan):
+        """A live answer from the bridge's authority over its socket, as the
+        status request returns it; None when nothing answers."""
+        return dict(self.live) if getattr(self, "live", None) else None
+
 
 def ops(bridge=None, writers="default", producers="default"):
     return FakeOps(bridge, writers, producers)
@@ -190,10 +195,13 @@ class ActivationCase(unittest.TestCase):
                 raise Crash(f"killed after journal record {n}")
         return hook
 
-    def serving(self):
-        """The new bridge's authority serving: its status snapshot, as it writes it."""
+    def serving(self, epoch=2):
+        """The new bridge's authority serving: its status snapshot, as it writes
+        it, and a live answer to the read-only status request."""
         _staging.write(self.state / "outbox-status.json",
-                       json.dumps({"waiting": 0, "epoch": 1, "unavailable": None, "written_at": time.time() + 5}))
+                       json.dumps({"waiting": 0, "epoch": epoch, "unavailable": None, "written_at": time.time() + 5}))
+        self.ops.live = {"v": "outbox-authority/1", "result": "ok", "authority_epoch": epoch,
+                         "status": {"waiting": 0, "checking": 0, "held": 0, "suspended": [], "dead": 0, "epoch": epoch}}
 
     def rewrite_plan(self, path, change):
         plan = json.loads(path.read_text())
@@ -396,7 +404,7 @@ class BootstrapPublicationTests(ActivationCase):
         real, calls = activate_release.fsync_dir, []
 
         def fsync_dir(p):
-            if Path(p) == self.state:
+            if isinstance(p, int) and os.path.samestat(os.fstat(p), os.stat(self.state)):
                 calls.append(p)
                 if len(calls) == 1:
                     raise Crash("killed after the link, before the directory sync")
@@ -612,14 +620,14 @@ class ResumeTests(ActivationCase):
 
     def test_a_crash_inside_a_target_write_resumes(self):
         plan, path = self.prepared()
-        real, calls = activate_release.write_target, []
+        real, calls = activate_release.write_entry_at, []
 
-        def write_target(t, p, state):
-            calls.append(t["name"])
-            real(t, p, state)
+        def write_entry_at(fd, name, entry, tmp):
+            calls.append(name)
+            real(fd, name, entry, tmp)
             if len(calls) == 3:
                 raise Crash("killed after the write, before it was journaled")
-        with mock.patch.object(activate_release, "write_target", write_target), self.assertRaises(Crash):
+        with mock.patch.object(activate_release, "write_entry_at", write_entry_at), self.assertRaises(Crash):
             self.activate(path)
         self.activate(path)
         self.assertChecksPass(self.postcheck(path))
@@ -658,7 +666,7 @@ class ResumeTests(ActivationCase):
                     shutil.rmtree(scripts)
                     scripts.symlink_to(self.where / "elsewhere")
                 held = _staging.snapshot_tree(self.home)
-                with self.assertRaisesRegex(Refused, "changed by something else|not a real directory"):
+                with self.assertRaisesRegex(Refused, "changed by something else|not a real directory|can't be opened"):
                     self.activate(path)
                 self.assertEqual(_staging.snapshot_tree(self.home), held)
 
@@ -856,6 +864,274 @@ class PreservationTests(ActivationCase):
                                        "plan_sha256", "time"}, "no config or credential is migrated")
         for secret in _staging.SECRETS:
             self.assertNotIn(secret, self.record_path().read_text())
+
+
+class SlotTwoFindingTests(ActivationCase):
+    """Code review slot 2 on PR #22 (6110706975): each finding, reproduced on
+    invented fixtures before its fix."""
+
+    # 1. Rollback judges the sealed state root, not whatever is at its path.
+    def test_a_replaced_missing_or_unreadable_state_root_refuses_rollback(self):
+        for how in ("replaced", "missing", "unreadable"):
+            with self.subTest(root=how):
+                self.fresh()
+                plan, path = self.activated()
+                (self.state / "outbox.db").write_bytes(b"SQLite format 3\x00 invented first write")
+                moved = self.state.with_name("chat-moved")
+                self.state.rename(moved)
+                if how == "replaced":
+                    self.state.mkdir()
+                elif how == "unreadable":
+                    self.state.mkdir()
+                    self.state.chmod(0)
+                bound = self.targets_snapshot() if how != "unreadable" else None
+                try:
+                    with self.assertRaisesRegex(Refused, "repair or roll-forward"):
+                        self.rollback(path)
+                finally:
+                    if self.state.exists():
+                        self.state.chmod(0o700)
+                if bound is not None:
+                    self.assertEqual(self.targets_snapshot(), bound, "nothing was rolled back")
+
+    # 2. A target swapped after it was checked is never written through.
+    def test_a_folder_or_parent_swapped_mid_binding_is_never_written_through(self):
+        for target, folder in (("chat/scripts import location", "chat/scripts"), ("pchat", "../../.local/bin")):
+            with self.subTest(target=target):
+                self.fresh()
+                plan, path = self.prepared()
+                real = (self.skills / folder).resolve()
+                elsewhere = self.where / "elsewhere"
+
+                def swap(record):
+                    if record["kind"] == "binding" and record["target"] == target and not elsewhere.exists():
+                        shutil.copytree(real, elsewhere, symlinks=True)
+                        shutil.rmtree(real)
+                        real.symlink_to(elsewhere)
+                with self.assertRaises(Refused):
+                    self.activate(path, crash=swap)
+                copy = _staging.snapshot_tree(elsewhere)
+                self.assertNotIn("selected", self.kinds())
+                with self.assertRaises(Refused):
+                    self.activate(path)
+                self.assertEqual(_staging.snapshot_tree(elsewhere), copy, "nothing written into the other folder")
+
+    # 3. The journal is fenced: its root, lock and file are pinned.
+    def test_a_renamed_or_replaced_journal_root_cannot_split_the_operation(self):
+        self.root.mkdir(parents=True)
+        first = activate_release.Journal(self.root)
+        try:
+            self.root.rename(self.root.with_name("activation-moved"))
+            self.root.mkdir()
+            second = activate_release.Journal(self.root)
+            second.close()
+            with self.assertRaisesRegex(Refused, "journal"):
+                first.append({"op": "activate-0000000000000000", "kind": "admitted"})
+            self.assertEqual(activate_release.read_journal(self.root), [], "nothing reached the new root's journal")
+        finally:
+            first.close()
+
+    def test_a_symlinked_journal_root_lock_or_file_is_refused(self):
+        other = self.where / "other"
+        other.mkdir()
+        for what in ("root", "lock", "journal"):
+            with self.subTest(substituted=what):
+                root = self.where / f"root-{what}"
+                if what == "root":
+                    root.symlink_to(other)
+                else:
+                    root.mkdir()
+                    name = activate_release.LOCK if what == "lock" else activate_release.JOURNAL
+                    (root / name).symlink_to(other / name)
+                with self.assertRaises(Refused):
+                    activate_release.Journal(root).close()
+                self.assertEqual(os.listdir(other), [])
+
+    # 4. The staged release is verified against its recorded inventory, not trusted.
+    def test_a_changed_staged_release_blocks_activation_and_fails_the_postcheck(self):
+        def tamper(plan):
+            target = Path(plan["staged_release"]) / "env/bin/chat-bridge"
+            target.chmod(0o755)
+            with open(target, "a") as f:
+                f.write("# changed after staging\n")
+        plan, path = self.prepared()
+        tamper(plan)
+        with self.assertRaisesRegex(Refused, "staged"):
+            self.activate(path)
+        self.assertEqual(self.targets_snapshot(), self.before_targets())
+        self.fresh()
+        plan, path = self.activated()
+        self.serving()
+        self.ops.bridge = {"running": True, "release": plan["release"]}
+        self.assertTrue(self.postcheck(path)["ok"])
+        tamper(plan)
+        self.assertFalse(self.postcheck(path)["ok"])
+
+    # 5. Every writer the sealed plan names needs current evidence.
+    def test_a_writer_the_plan_names_needs_a_current_acknowledgement_or_retirement(self):
+        plan, path = self.prepared()
+        named = ops().writer_list
+        for name, writers in (("no writers at all", []), ("one omitted", named[1:])):
+            with self.subTest(evidence=name):
+                self.ops = ops(writers=writers)
+                with self.assertRaisesRegex(Refused, "blocked"):
+                    self.activate(path)
+                self.assertEqual(self.targets_snapshot(), self.before_targets())
+        self.ops = ops(writers=[dict(named[0], checkpoint="retired")] + named[1:])
+        self.assertEqual(self.activate(path)["state"], "selected", "a verified retirement counts")
+
+    # 6. A folder interrupted between two entries resumes, and rolls back.
+    def test_an_interruption_between_script_replacements_resumes_and_rolls_back(self):
+        for then in ("resume", "rollback"):
+            with self.subTest(then=then):
+                self.fresh()
+                plan, path = self.prepared()
+                real_replace, calls = os.replace, []
+
+                def replace(src, dst, **kw):
+                    real_replace(src, dst, **kw)
+                    if str(dst).endswith(".py"):
+                        calls.append(dst)
+                        if len(calls) == 2:
+                            raise Crash("killed between two script replacements")
+                with mock.patch.object(activate_release.os, "replace", replace), self.assertRaises(Crash):
+                    self.activate(path)
+                if then == "resume":
+                    self.assertEqual(self.activate(path)["state"], "selected")
+                    self.assertChecksPass(self.postcheck(path))
+                else:
+                    self.rollback(path)
+                    self.assertEqual(self.targets_snapshot(), self.before_targets())
+
+    # 7. Only a live answer from the current authority proves it serves.
+    def test_an_old_status_snapshot_proves_nothing(self):
+        plan, path = self.activated()
+        self.serving()
+        self.ops.bridge = {"running": True, "release": plan["release"]}
+        self.assertTrue(self.postcheck(path)["ok"])
+        self.ops.live = None  # the bridge restarted into UNKNOWN: its old snapshot stays
+        report = self.postcheck(path)
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["authority_serving"])
+        self.ops.live = {"v": "outbox-authority/1", "result": "refused", "authority_epoch": 3}
+        self.assertFalse(self.postcheck(path)["ok"], "a refusal is not serving")
+
+    # 9. A torn journal suffix is repaired under the lock before appending.
+    def test_a_torn_journal_suffix_is_repaired_before_appending(self):
+        self.root.mkdir(parents=True)
+        complete = json.dumps({"op": "activate-0000000000000000", "kind": "admitted", "plan_sha256": "0" * 64,
+                               "schema": "x", "at": "t"})
+        (self.root / activate_release.JOURNAL).write_text(complete + "\n" + '{"op": "activate-00', encoding="utf-8")
+        with activate_release.Journal(self.root) as journal:
+            journal.append({"op": "activate-0000000000000000", "kind": "selected"})
+        kinds = [r["kind"] for r in activate_release.read_journal(self.root)]
+        self.assertEqual(kinds, ["admitted", "journal-repaired", "selected"])
+        kept = list(self.root.glob("journal-torn-*"))
+        self.assertEqual(len(kept), 1, "the dropped fragment is kept privately")
+        self.assertEqual(kept[0].read_bytes(), b'{"op": "activate-00')
+
+    def test_a_crash_during_a_journal_write_resumes(self):
+        plan, path = self.prepared()
+        real_write, writes = os.write, []
+
+        def write(fd, data):
+            data = bytes(data)
+            if data.endswith(b"\n") and b'"kind": "binding"' in data:
+                writes.append(data)
+                if len(writes) == 2:
+                    real_write(fd, data[: len(data) // 2])
+                    raise Crash("killed during a journal write")
+            return real_write(fd, data)
+        with mock.patch.object(activate_release.os, "write", write), self.assertRaises(Crash):
+            self.activate(path)
+        self.assertEqual(self.activate(path)["state"], "selected")
+        self.assertChecksPass(self.postcheck(path))
+
+
+class SweepTests(ActivationCase):
+    """The same classes as slot 2's findings, swept across the controller:
+    crash windows, stale or absent evidence, and decoded shapes."""
+
+    def test_a_crash_between_a_temporary_and_its_rename_leaves_nothing_behind(self):
+        plan, path = self.prepared()
+        real_replace, calls = os.replace, []
+
+        scripts_stat = os.stat(self.skills / "chat/scripts")
+
+        def replace(src, dst, **kw):
+            if "dst_dir_fd" in kw and os.path.samestat(os.fstat(kw["dst_dir_fd"]), scripts_stat):
+                calls.append(dst)
+                if len(calls) == 1:
+                    raise Crash("killed after the temporary was written, before its rename")
+            return real_replace(src, dst, **kw)
+        with mock.patch.object(activate_release.os, "replace", replace), self.assertRaises(Crash):
+            self.activate(path)
+        scripts = self.skills / "chat/scripts"
+        self.assertTrue([n for n in os.listdir(scripts) if n.startswith(".plateia-activation-")])
+        self.assertEqual(self.activate(path)["state"], "selected")
+        self.assertEqual([n for n in os.listdir(scripts) if n.startswith(".plateia-activation-")], [])
+        self.assertChecksPass(self.postcheck(path))
+
+    def test_checkpoint_evidence_must_be_current(self):
+        evidence = self.where / "evidence.json"
+        live = activate_release.LiveOps(evidence)
+        writers = [{"name": "pchat flusher", "kind": "flusher", "checkpoint": "acknowledged"}]
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        for name, observed, expect in (("undated", None, None),
+                                       ("stale", (now - __import__("datetime").timedelta(hours=2)).isoformat(), None),
+                                       ("current", now.isoformat(), writers)):
+            with self.subTest(evidence=name):
+                data = {"writers": writers, "producers": {}}
+                if observed:
+                    data["observed_at"] = observed
+                evidence.write_text(json.dumps(data))
+                self.assertEqual(live.writers(), expect)
+
+    def test_a_failed_service_query_is_unknown_not_stopped(self):
+        live = activate_release.LiveOps()
+        for code, err, running in ((113, "Could not find service", False), (1, "Operation not permitted", None),
+                                   (5, "", None)):
+            with self.subTest(code=code), mock.patch.object(activate_release.subprocess, "run", return_value=mock.Mock(
+                    returncode=code, stdout="", stderr=err)):
+                self.assertIs(live.bridge_state()["running"], running)
+
+    def test_the_status_client_comes_from_the_verified_wheel(self):
+        plan, path = self.prepared()
+        installed = next((Path(plan["staged_release"]) / "env").glob(
+            "lib/python*/site-packages/plateia_chat/scripts/delivery_store.py"))
+        installed.chmod(0o644)
+        installed.write_text("raise SystemExit('the installed copy must never run')\n")
+        module = activate_release.load_release_module(plan, "delivery_store")
+        self.assertEqual(module.PROTOCOL, "outbox-authority/1")
+        self.assertTrue(module.__file__.startswith("<"))
+        artifacts = Path(plan["staged_release"]) / "artifacts"
+        wheel = next(artifacts.glob("*.whl"))
+        wheel.chmod(0o644)
+        with open(wheel, "ab") as f:
+            f.write(b"\0")
+        with self.assertRaisesRegex(Refused, "not the manifest's"):
+            activate_release.load_release_module(plan, "delivery_store")
+
+    def test_malformed_plans_and_journals_are_refused_not_crashed(self):
+        plan, path = self.plan()
+        for name, change in (("designations not names", lambda p: p.update(designations=[1])),
+                             ("a state root of the wrong shape", lambda p: p.update(state_root={"path": 1})),
+                             ("targets not records", lambda p: p.update(targets=["pchat"])),
+                             ("a relative root", lambda p: p.update(root="activation"))):
+            with self.subTest(plan=name):
+                bad = dict(json.loads(path.read_text()))
+                change(bad)
+                bad["digest"] = stage_release.plan_digest(bad)  # anyone can recompute a digest
+                bad_path = self.where / "bad-plan.json"
+                bad_path.write_text(json.dumps(bad))
+                with self.assertRaisesRegex(Refused, "well-formed"):
+                    activate_release.load_plan(bad_path)
+        self.root.mkdir(parents=True)
+        for line in ('{"kind": 7}', '{"op": "x", "kind": "backup", "target": "pchat"}', '[1, 2]'):
+            with self.subTest(journal=line):
+                (self.root / activate_release.JOURNAL).write_text(line + "\n")
+                with self.assertRaisesRegex(Refused, "damaged"):
+                    activate_release.read_journal(self.root)
 
 
 class OperatorPlanTests(ActivationCase):
