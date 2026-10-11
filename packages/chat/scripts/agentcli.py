@@ -27,9 +27,13 @@ def notify(record, text, kind='status'):
         return
     cfg = chatlib.load_config()
     try:
-        chatlib.post(channel, message, record['name'], cfg, cont=tag)
-    except (OSError, chatlib.ChatError):
-        chatlib.outbox_append([dict(channel=channel, text=message, cont=tag, **{'as': record['name']}, at=ids.now())])
+        chatlib.post(channel, message, record['name'], cfg, cont=tag, origin='notify')
+    except chatlib.Refused as err:  # the server refused it: retrying can't help; the bridge dead-letters it
+        print(f'pchat agent: notice refused: {err}', file=sys.stderr)
+    except chatlib.Queued:  # durably queued, or its rest handed off: the bridge posts it
+        pass
+    except (OSError, chatlib.ChatError) as err:  # nothing could be queued: say so, as before
+        print(f'pchat agent: notice not posted: {err}', file=sys.stderr)
 
 
 def run_agent(a):

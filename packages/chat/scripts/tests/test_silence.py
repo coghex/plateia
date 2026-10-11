@@ -1,6 +1,9 @@
 """A silent child run's posts are refused in Python, at every shared path:
 pchat post, the pchat agent run notices, and chatlib's own post and outbox
-(so a direct call cannot go around pchat). Fakes only."""
+(so a direct call cannot go around pchat). A refused post is never queued in
+any form: no fallback file, and no create, queue or handoff request to the
+outbox authority (#19). Its acknowledgements are still kept, and an entry
+queued before the run keeps its delivery. Fakes only."""
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -28,6 +31,7 @@ _spec = importlib.util.spec_from_loader("pchat_cli", _loader)
 pchat = importlib.util.module_from_spec(_spec)
 _loader.exec_module(pchat)
 _isolation.check_bound(agentcli, binding, chatlib, runstore, pchat)
+import delivery_store  # noqa: E402
 
 P = "beta"
 PARENT = {"project": P, "role": "manager", "name": "bet-manager", "brand": "claude", "provider_session_id": "m1",
@@ -42,11 +46,12 @@ class SilenceCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir=_isolation.HOME)
         root = Path(self.tmp.name)
-        self.posts, self.queued, self.logins = [], [], []
+        self.posts, self.queued, self.logins, self.requests = [], [], [], []
         self.patches = [mock.patch.object(runstore, "PM_STATE", root / "pm"),
                         mock.patch.object(binding, "CHAT_STATE", root / "chat"),
-                        mock.patch.object(chatlib, "OUTBOX", root / "outbox.jsonl"),
-                        mock.patch.object(chatlib, "_OUTBOX_LOCK", root / "outbox.lock"),
+                        mock.patch.object(chatlib, "STATE_DIR", root / "chat"),
+                        mock.patch.object(chatlib, "client_factory", self.client),
+                        mock.patch.object(delivery_store, "PROBES", delivery_store.FakeProbes()),
                         mock.patch.object(chatlib, "login", self.login),
                         mock.patch.object(chatlib, "load_config", lambda: {}),
                         mock.patch.object(pchat, "who", lambda args, cfg, required=True: "bet-solver-3"),
@@ -67,10 +72,30 @@ class SilenceCase(unittest.TestCase):
     def registry(self, agents):
         (binding.CHAT_STATE / "identities.json").write_text(json.dumps({"agents": agents}))
 
-    def login(self, account, cfg=None, caps=()):
+    def login(self, account, cfg=None, caps=(), **kwargs):
         """Reaching login means the post was allowed: record it, then stop."""
         self.logins.append(account)
         raise chatlib.ChatError("test: no server")
+
+    def client(self):
+        """The outbox authority never answers here: every request is recorded."""
+        test = self
+
+        class Recording:
+            def exchange(self, request):
+                test.requests.append(request)
+                return None
+        return delivery_store.Client(Recording())
+
+    def queued_anything(self):
+        """Any trace of queueing: a request to the authority, or a fallback file."""
+        files = list((binding.CHAT_STATE / "outbox.d").glob("*.json")) if (binding.CHAT_STATE / "outbox.d").exists() \
+            else []
+        return bool(self.requests or files)
+
+    def fallback_rows(self):
+        d = binding.CHAT_STATE / "outbox.d"
+        return [json.loads(f.read_text()) for f in sorted(d.glob("*.json"))] if d.exists() else []
 
     def run_(self, publish="none", child=CHILD):
         run_id = runstore.new_run_id()
@@ -108,7 +133,7 @@ class PchatTests(SilenceCase):
         code, err = self.post()
         self.assertEqual(code, 4)
         self.assertIn(run_id, err)
-        self.assertEqual((self.posts, chatlib.OUTBOX.exists()), ([], False))
+        self.assertEqual((self.posts, self.queued_anything()), ([], False))
 
     def test_an_account_name_or_an_old_key_alone_never_silences(self):
         self.run_()  # bet-solver-3 is the bound child, and the registry still lists its old session key
@@ -148,27 +173,29 @@ class SharedPathTests(SilenceCase):
         with self.assertRaises(chatlib.Refused):
             chatlib.post("#bet-issue-5", "done", "any-account", {})  # the invocation, whatever it claims
         self.assertEqual(self.logins, [])
+        self.assertFalse(self.queued_anything(), "never queued in any form: no file, no queue or handoff")
 
     def test_the_silent_invocation_never_queues_a_post_but_keeps_acks(self):
         os.environ["CHAT_RUN_ID"] = self.run_()
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            chatlib.outbox_append([{"channel": "#c", "as": "bet-solver-3", "text": "done"},
-                                   {"channel": "#c", "as": "bet-solver-3", "ack": "m1"}])
-        queued = [json.loads(line) for line in chatlib.OUTBOX.read_text().splitlines()]
-        self.assertEqual([(q.get("text"), q.get("ack")) for q in queued], [(None, "m1")])
-        self.assertIn("not queued", err.getvalue())
+        with self.assertRaises(chatlib.Refused):
+            chatlib.post("#c", "done", "bet-solver-3", {})
+        self.assertFalse(self.queued_anything())
+        with self.assertRaises(chatlib.Queued):  # an ack is allowed: queued when the server can't be reached
+            chatlib.ack("#c", "m1", "bet-solver-3", {})
+        self.assertEqual([(r.get("text"), r.get("ack")) for r in self.fallback_rows()], [(None, "m1")])
+        self.assertEqual([r["op"] for r in self.requests], ["queue"])
 
     def test_a_pre_run_outbox_entry_keeps_its_delivery(self):
         """Queued before the run by the same account, flushed later by the bridge (no run environment):
         it is that earlier job's post, not this run's, and goes out as it would have."""
-        chatlib.outbox_append([{"channel": "#c", "as": "bet-solver-3", "text": "written before the run"}])
+        with self.assertRaises(chatlib.Queued):
+            chatlib.post("#c", "written before the run", "bet-solver-3", {})
+        [entry] = self.fallback_rows()
         self.run_()  # the account is now a silent run's child
-        [entry] = [json.loads(line) for line in chatlib.OUTBOX.read_text().splitlines()]
         with self.assertRaises(chatlib.ChatError) as e:  # reached the (fake) server: allowed
             chatlib.post(entry["channel"], entry["text"], entry["as"], {})
         self.assertNotIsInstance(e.exception, chatlib.Refused)
-        self.assertEqual(self.logins, ["bet-solver-3"])
+        self.assertEqual(self.logins, ["bet-solver-3", "bet-solver-3"])
 
 
 class AgentWrapperTests(SilenceCase):
@@ -178,7 +205,7 @@ class AgentWrapperTests(SilenceCase):
         with contextlib.redirect_stderr(err):
             agentcli.notify({"channel": "#bet-issue-5", "request": "r-1", "name": "bet-reviewer-9"}, "start PR #5")
         self.assertIn("notice withheld", err.getvalue())
-        self.assertEqual((self.logins, chatlib.OUTBOX.exists()), ([], False))
+        self.assertEqual((self.logins, self.queued_anything()), ([], False))
         os.environ.pop("CHAT_RUN_ID")
         with contextlib.redirect_stderr(io.StringIO()):
             agentcli.notify({"channel": "#bet-issue-5", "request": "r-1", "name": "bet-reviewer-9"}, "start PR #5")

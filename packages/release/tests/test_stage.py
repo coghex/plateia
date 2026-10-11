@@ -39,7 +39,9 @@ class StageCase(unittest.TestCase):
     def setUpClass(cls):
         cls.sandbox = _support.Sandbox()
         repo, _ = make_repo(cls.sandbox.root)
-        cls.release, _ = build_release.build(repo, cls.sandbox.root / "releases")
+        # The fixture release declares the live baseline's formats (#19 option A); see ReleaseOf19Tests.
+        baseline = _staging.baseline_release_spec(cls.sandbox.root / "release-baseline.json")
+        cls.release, _ = build_release.build(repo, cls.sandbox.root / "releases", spec_path=baseline)
         cls.manifest = build_release.verify(cls.release)
 
     @classmethod
@@ -163,6 +165,33 @@ class StageCase(unittest.TestCase):
         self.addCleanup(writer.close)
         writer.load(self.journal(), self.journal()[1]["op"])
         return writer
+
+
+class ReleaseOf19Tests(StageCase):
+    """#19's real release, built from the checkout's own release.json, writes
+    outbox/2 and delivery-records/2 and declares formats the live tools don't
+    use. Against the live baseline it is refused at preflight, and nothing is
+    staged: the correct outcome until a separately approved activation and
+    cutover (the fifth amendment's E1)."""
+
+    def test_preflight_refuses_19s_release_against_the_live_baseline(self):
+        repo, _ = make_repo(self.where / "repo")
+        release, _ = build_release.build(repo, self.where / "releases")  # the real release.json
+        report = self.preflight(release=release)
+        refused = {line.split(":", 1)[0] for line in report["refused"]}
+        self.assertTrue({"outbox", "delivery-records", "outbox-db", "outbox-authority", "boot-id",
+                         "tcp-sockets"} <= refused, report["refused"])
+        self.assertIn("the release writes outbox/2, which the live tools (outbox/1) don't read",
+                      "\n".join(report["refused"]))
+        self.assertNothingStaged(r"preflight refused: .*outbox", release=release)
+        self.assertNoServiceOrIdentityCall()
+
+    def test_the_fixture_release_is_not_19s_manifest(self):
+        formats = {f["name"]: f for f in self.manifest["formats"]}
+        self.assertEqual((formats["outbox"]["read"], formats["outbox"]["write"]), (["outbox/1"], "outbox/1"))
+        self.assertNotIn("outbox-db", formats)
+        real = {f["name"] for f in _support.SPEC["formats"]}
+        self.assertIn("outbox-db", real, "the checkout's own release.json is #19's")
 
 
 class HappyPathTests(StageCase):
@@ -1529,8 +1558,9 @@ class EnvironmentIntegrityTests(StageCase):
                                 build_release.INIT_PATH.read_text() + "\nraise RuntimeError('invented import "
                                                                       "failure')\n")
         repo, _ = make_repo(self.where / "repo")
+        baseline = _staging.baseline_release_spec(self.where / "release-baseline.json")
         with mock.patch.object(build_release, "INIT_PATH", broken):
-            release, _ = build_release.build(repo, self.where / "releases")
+            release, _ = build_release.build(repo, self.where / "releases", spec_path=baseline)
         build_release.verify(release)
         with self.assertRaisesRegex(Refused, r"verify-environment failed: the staged environment can't import "
                                              r"plateia_chat \(RuntimeError: invented import failure\)"):

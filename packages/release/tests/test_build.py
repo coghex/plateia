@@ -101,6 +101,13 @@ class BuildTests(BuildCase):
             r"checkpoints\.json": ("checkpoints", True, True),
             r"outbox\.jsonl": ("outbox", True, True),
             r"childrun/2": ("child-runs", True, True),
+            # #19: the outbox authority, its fallback files, versioned dead letters and two host probes
+            r"outbox\.db": ("outbox-db", True, True),
+            r"outbox-authority/1": ("outbox-authority", True, True),
+            r"\"outbox/2\"": ("outbox", True, True),
+            r"\"supersedes\"": ("delivery-records", True, True),
+            r"kern\.bootsessionuuid|random/boot_id": ("boot-id", True, False),
+            r"-iTCP": ("tcp-sockets", True, False),
         }
         manifest = build_release.verify(self.build()[0])
         formats = {f["name"]: f for f in manifest["formats"]}
@@ -112,6 +119,34 @@ class BuildTests(BuildCase):
                 self.assertIn(name, formats)
                 self.assertEqual(bool(formats[name]["read"]), reads)
                 self.assertEqual(bool(formats[name]["write"]), writes)
+
+    def test_the_versions_the_shipped_code_embeds_are_the_declared_ones(self):
+        """#19: outbox/2's fallback file, the outbox-authority frame and the
+        outbox-db meta row each carry their version, and declare where."""
+        manifest = build_release.verify(self.build()[0])
+        formats = {f["name"]: f for f in manifest["formats"]}
+        code = (_support.CHECKOUT / "packages/chat/scripts/delivery_store.py").read_text()
+        for name, constant, field in (("outbox", 'FALLBACK_FORMAT = "outbox/2"', "v"),
+                                      ("outbox-authority", 'PROTOCOL = "outbox-authority/1"', "v"),
+                                      ("outbox-db", 'DB_FORMAT = "outbox-db/1"', "meta.schema")):
+            with self.subTest(format=name):
+                self.assertIn(constant, code)
+                self.assertTrue(formats[name]["embedded_version"])
+                self.assertEqual(formats[name]["field"], field)
+                self.assertEqual(formats[name]["write"], constant.split('"')[1])
+        self.assertEqual(formats["outbox"]["read"], ["outbox/1", "outbox/2"])
+        self.assertIn("sqlite3", manifest["dependencies"]["interpreter"]["note"])
+
+    def test_every_runtime_module_passes_the_unchanged_privacy_scan(self):
+        """#19: a module named like chat state would make the build refuse the
+        wheel; the new store is named so it does not, and the scan is not changed."""
+        for f in _support.SPEC["package"]["files"]:
+            with self.subTest(file=f):
+                self.assertIsNone(build_release.STATE_NAMES.search(f"plateia_chat/scripts/{f}"))
+        self.assertIsNotNone(build_release.STATE_NAMES.search("plateia_chat/scripts/outbox_store.py"),
+                             "a negative control: a name starting with outbox would be refused")
+        self.assertIn("delivery_store.py", _support.SPEC["package"]["files"])
+
 
     def test_payload_bytes_come_from_the_recorded_commit(self):
         target, _ = self.build()
@@ -400,6 +435,54 @@ class RefusalTests(BuildCase):
         os.remove(self.repo / "stray.txt")
         self.build()
         self.assertEqual([p.name for p in self.out.iterdir() if p.name.startswith(".")], [])
+
+
+# The declarative content of release.json that #19 leaves exactly as it was:
+# everything but package.files, the interpreter note and the outbox,
+# delivery-records, outbox-db, outbox-authority, boot-id and tcp-sockets
+# format entries (the second to fifth amendments of #19, acceptance 11).
+UNCHANGED_DECLARATIVE = "f2895cb0c6145ded6b845e214ab21cc06ae5f68426d73cb71bfecadb66602f81"
+CHANGED_BY_19 = {"outbox", "delivery-records", "outbox-db", "outbox-authority", "boot-id", "tcp-sockets"}
+GENERATED = ("release", "source", "builder", "build_interpreter", "artifacts")
+
+
+class UnchangedTests(BuildCase):
+    """Acceptance 11, as corrected: release.json's and the built manifest's
+    declarative content is unchanged apart from what #19 declares; the fields
+    the builder generates from the commit, the payload and the build
+    environment are not compared."""
+
+    @staticmethod
+    def declarative(spec):
+        spec = json.loads(json.dumps(spec))
+        spec["package"].pop("files")
+        spec["dependencies"]["interpreter"].pop("note")
+        spec["formats"] = [f for f in spec["formats"] if f["name"] not in CHANGED_BY_19]
+        return spec
+
+    def test_release_json_is_unchanged_apart_from_19s_declarations(self):
+        import hashlib
+        digest = hashlib.sha256(json.dumps(self.declarative(_support.SPEC), sort_keys=True).encode()).hexdigest()
+        self.assertEqual(digest, UNCHANGED_DECLARATIVE)
+
+    def test_any_other_declarative_change_is_caught(self):
+        import hashlib
+        spec = json.loads(json.dumps(_support.SPEC))
+        next(f for f in spec["formats"] if f["name"] == "checkpoints")["write"] = "checkpoints/2"
+        digest = hashlib.sha256(json.dumps(self.declarative(spec), sort_keys=True).encode()).hexdigest()
+        self.assertNotEqual(digest, UNCHANGED_DECLARATIVE)
+
+    def test_manifests_of_two_commits_differ_only_in_generated_fields(self):
+        def stripped(manifest):
+            manifest = {k: v for k, v in manifest.items() if k not in GENERATED}
+            manifest["package"] = {k: v for k, v in manifest["package"].items() if k not in ("version", "artifact")}
+            manifest["skill"] = {k: v for k, v in manifest["skill"].items() if k not in ("version", "artifact")}
+            return manifest
+        first = build_release.verify(self.build()[0])
+        commit_file(self.repo, "packages/chat/scripts/rotate-logs", "#!/usr/bin/env python3\n# a later commit\n")
+        second = build_release.verify(self.build()[0])
+        self.assertNotEqual(first["source"]["commit"], second["source"]["commit"])
+        self.assertEqual(stripped(first), stripped(second))
 
 
 if __name__ == "__main__":
