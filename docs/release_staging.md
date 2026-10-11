@@ -604,7 +604,10 @@ activate_release status --root <private dir>
      journaled temporary file, linked to `$CHAT_STATE/designation-bootstrap.json`
      (never replacing anything), and the directory is synced. It is then
      reconciled as this operation's own: the journaled inode, the exact bytes,
-     the root identity, durability. Only then is D, its sha256, journaled. A
+     the root identity, durability. Only then is D, its sha256, journaled,
+     with the record's change time: an inode number alone can be reused by a
+     replacement once the staged copy is gone, so every later reconcile
+     checks both. A
      record this operation can't show it published is retained and stops the
      activation for an owner decision.
   4. **The seven targets are bound**, all checked before any is written: the
