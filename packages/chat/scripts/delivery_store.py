@@ -614,21 +614,28 @@ def is_published_name(name):
 
 def _make_state_tree(fs, path):
     """The state directory and any missing parent, as the old outbox path's
-    STATE_DIR.mkdir(parents=True) made them (the default mode), each new entry
-    made durable in its parent: a first post before the bridge ever started
-    (code review CODE14). One that cannot be made raises."""
+    STATE_DIR.mkdir(parents=True) made them (the default mode): a first post
+    before the bridge ever started (code review CODE14). Every level this or
+    an earlier attempt may have made (each one below the home directory, and
+    any that is missing) has its entry synced in its parent at every call,
+    whether it already exists or not: an earlier attempt's sync may have
+    failed (code review CODE15). One that cannot be made raises."""
     path = Path(path)
-    try:
-        os.mkdir(path)
-    except FileExistsError:
-        return
-    except FileNotFoundError:
-        _make_state_tree(fs, path.parent)
+    home = Path(os.path.realpath(os.path.expanduser("~")))
+    levels = [path]
+    while True:
+        parent = levels[-1].parent
+        if parent == levels[-1] or parent == home:
+            break
+        if home not in parent.parents and os.path.lexists(parent):
+            break
+        levels.append(parent)
+    for level in reversed(levels):  # top down
         try:
-            os.mkdir(path)
+            os.mkdir(level)
         except FileExistsError:
-            return
-    fs.sync_dir(path.parent)
+            pass
+        fs.sync_dir(level.parent)
 
 
 def publish_fallback(fs, paths, row, *, clock=time.time):

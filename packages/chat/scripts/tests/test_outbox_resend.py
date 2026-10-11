@@ -832,6 +832,42 @@ class FirstStartTests(OutboxCase):
                                  ["[status] the first post"], "posted once")
                 self.assertEqual(sorted(e["state"] for e in self.entries()), ["done", "done"], "each once")
 
+    def test_a_retry_after_a_failed_parent_sync_makes_every_entry_durable(self):
+        """Code review CODE15, finding 2: a directory made by an earlier attempt whose parent sync
+        failed is synced again by the retry before anything is reported queued. The power loss is
+        modelled from the syncs that succeeded: a new directory's entry survives only if a later
+        successful sync of its parent listed it (the fake filesystem keeps directories as they are)."""
+        import os
+        for depth in (1, 2):
+            with self.subTest(missing_levels=depth):
+                self.fresh()
+                gone = self.no_state_tree(depth)
+                created = [gone] + ([self.chatlib.STATE_DIR] if depth == 2 else [])
+                real, synced, failed = self.ds.FS.sync_dir, [], []
+
+                def sync_dir(fs, path, gone=gone):
+                    if Path(path) == gone.parent and not failed:
+                        failed.append(1)
+                        raise OSError(5, "input/output error (fake)")
+                    real(fs, path)
+                    synced.append((Path(path), set(os.listdir(path))))
+                self.server.refuse_login = {"alp-solver-2"}
+                with self.unavailable(), mock.patch.object(self.ds.FS, "sync_dir", sync_dir):
+                    code, out = self.pchat("post", "#alpha", "[status] once")
+                    self.assertEqual(code, 2, out)  # the first attempt fails truthfully
+                    self.assertTrue(gone.exists(), "its directory was made")
+                    code, out = self.pchat("post", "#alpha", "[status] once")
+                    self.assertEqual(code, 3, out)  # the retry is queued
+                for level in created:
+                    self.assertTrue(any(p == level.parent and level.name in names for p, names in synced),
+                                    f"{level.name}'s entry is durable")
+                self.server.refuse_login = set()
+                self.authority = self.new_authority()
+                for _ in range(2):
+                    self.flush()
+                self.assertEqual([m["text"].split(" (delayed")[0] for m in self.server.by("alp-solver-2")],
+                                 ["[status] once"], "the obligation survives, once")
+
     def test_a_publication_that_cannot_be_made_reports_nothing_queued(self):
         """A control: the state directory's parent is a file, so no tree can be made."""
         gone = self.no_state_tree(2)

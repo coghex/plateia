@@ -1776,6 +1776,109 @@ class RecoveryInputTests(ReplayCase):
         del d
 
 
+class AcknowledgementSyncTests(ReplayCase):
+    """Code review CODE15, finding 1: an acknowledgement line can be written
+    while its sync fails. After a restart, a line read from acks.jsonl counts as
+    evidence only once this process has synced the file and its directory;
+    until then it is unknown (settling deferred, nothing recorded as a
+    duplicate). So a failed settling save and a power loss never lose it."""
+
+    def delivered(self, **extra):
+        item = dict(self.item(), phase="accept", attempt=1, next_at=self.bridge.time.time() + 600,
+                    intent_id="i" * 32, intent_surface="S", intent_session=None, delivered_announced=True)
+        item.update(extra)
+        return item
+
+    def simfs(self):
+        from outbox_fakes import SimFS
+        fs = SimFS(self.chatlib.STATE_DIR)
+        p = mock.patch.object(self.bridge.delivery_store, "FS_DEFAULT", fs)
+        p.start()
+        self.addCleanup(p.stop)
+        return fs
+
+    def failing_ack_sync(self, fs, times=1):
+        real, failed = fs.durable, []
+
+        def durable(path):
+            if Path(path) == self.bridge.ACKS and len(failed) < times:
+                failed.append(1)
+                raise OSError(5, "input/output error (fake)")
+            return real(path)
+        return mock.patch.object(fs, "durable", durable)
+
+    def failing_saves(self):
+        def save(d):
+            raise OSError(28, "no space left on device (fake)")
+        return mock.patch.object(self.bridge.Deliveries, "_save", save)
+
+    def ack_written_unsynced(self, fs, d):
+        with self.failing_ack_sync(fs), self.assertRaises(OSError):
+            self.bridge.accepted(CFG, d, self.bridge.Acks(), msgid="m-ack", reply_to="m-int", sender="alp-solver-2",
+                                 channel="#alpha", at="2026-10-09T10:02:00Z", how="reply")
+        self.assertTrue(self.bridge.ACKS.read_text(), "the line is there, but never synced")
+
+    def outcome_after_power_loss(self, fs, agent):
+        fs.power_loss()
+        final = self.bridge.Deliveries()  # the next restart
+        self.passes(agent, 2, deliveries=final)
+        for i in final.items:
+            i["next_at"] = 0
+        self.passes(agent, 2, deliveries=final)
+        self.assertEqual([r for r in self.dead_letters() if r.get("kind") == "ring"], [], "no false dead letter")
+        self.assertEqual(self.rings(final), [], "settled")
+        self.assertEqual(agent.keys, [])
+
+    def test_recovery_makes_an_unsynced_acknowledgement_durable_before_settling(self):
+        fs = self.simfs()
+        d = self.bridge.Deliveries()
+        d.items = [self.delivered()]
+        d._save()
+        agent = self.FakeAgent()
+        self.passes(agent, deliveries=d)  # the first scan: nothing recorded yet
+        self.ack_written_unsynced(fs, d)
+        after = self.bridge.Deliveries()  # a restart
+        with self.failing_saves():
+            self.passes(agent, deliveries=after)  # recovery settles; its save fails
+        self.outcome_after_power_loss(fs, agent)
+
+    def test_a_duplicate_acknowledgement_is_made_durable_before_it_counts(self):
+        fs = self.simfs()
+        d = self.bridge.Deliveries()
+        d.items = [self.delivered()]
+        d._save()
+        agent = self.FakeAgent()
+        self.passes(agent, deliveries=d)
+        self.ack_written_unsynced(fs, d)
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks())  # a restart
+        state[1]._acks_checked = True  # this pass settles by the replayed acknowledgement, not by recovery
+        ack = {"tags": {"account": "alp-solver-2", "msgid": "m-ack", "+draft/reply": "m-int", "+draft/react": "ok",
+                        "time": "2026-10-09T10:02:00.000Z"},
+               "prefix": "alp-solver-2!u@h", "command": "TAGMSG", "params": ["#alpha"]}
+        with self.failing_saves():
+            self.bridge.handle_tagmsg(ack, CFG, state[1], state[2])  # a duplicate of the recorded line
+        self.outcome_after_power_loss(fs, agent)
+
+    def test_while_the_acknowledgement_cannot_be_synced_settling_waits(self):
+        fs = self.simfs()
+        d = self.bridge.Deliveries()
+        d.items = [self.delivered()]
+        d._save()
+        agent = self.FakeAgent()
+        self.passes(agent, deliveries=d)
+        self.ack_written_unsynced(fs, d)
+        after = self.bridge.Deliveries()
+        for i in after.items:
+            i["next_at"] = 0  # its deadline has passed
+        with self.failing_ack_sync(fs, times=99):
+            self.passes(agent, 3, deliveries=after)
+            self.assertEqual([i["phase"] for i in self.rings(after)], ["accept"], "deferred: not settled or removed")
+            self.assertEqual([r for r in self.dead_letters() if r.get("kind") == "ring"], [], "no dead letter")
+        self.passes(agent, 2, deliveries=after)
+        self.assertEqual(self.rings(after), [], "settled once its evidence is durable")
+        self.assertEqual([r for r in self.dead_letters() if r.get("kind") == "ring"], [])
+
+
 class LiveAcknowledgementRetryTests(InterruptCase):
     """Code review slot 10, finding 2: a live acknowledgement is durable in
     acks.jsonl, but settling it fails in the ledger. The SAME Deliveries instance
