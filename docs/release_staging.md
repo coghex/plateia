@@ -806,7 +806,8 @@ The earlier tests cover:
   record, digest, option and manifest mismatches fail it; an unexpected or
   unknown bridge blocks; the expected bridge allows only a read-only
   reconcile.
-- **Crashes and races (A6):** a crash after every journal record, and inside
+- **Crashes and races (A6):** a crash after the first and the last record of
+  every kind the activation journals, and inside
   a target write, resumes to the same bindings; a changed plan can't resume;
   a concurrent upgrader is refused; a target changed or swapped for a symlink
   mid-activation blocks; the staged release and the 0600 backups are kept.
