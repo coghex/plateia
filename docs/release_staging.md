@@ -608,19 +608,37 @@ activate_release status --root <private dir>
        directories are sealed: the staged environment's
        `site-packages/plateia_chat` package directory and its `scripts/`
        subdirectory. Each is opened through pinned descriptors.
-       - **Before sealing,** each directory's baseline must be verified:
-         mode exactly 0755, owned by this user, and its identity (device and
-         inode) and access metadata (ACL and flags) readable. A stricter,
-         different or unknown mode, or any ambiguity about identity or
-         access, refuses, and nothing changes.
-       - **The originals are recorded.** The controller records each
-         directory's original mode, owner and identity, then sets that
-         directory's mode bits to 0555 and nothing else: ownership, ACLs,
-         flags and every parent's permissions are unchanged. It journals
+       - **Before sealing,** both directories' baselines are verified before
+         either changes:
+         - mode exactly 0755, and owned by this user;
+         - a definite identity (device and inode);
+         - access metadata that is readable and can't defeat the seal.
+
+         Any extended ACL refuses: it could grant writes a 0555 mode doesn't,
+         and on Linux the mode change would rewrite its mask. On macOS any
+         file flag refuses; on Linux an immutable or append-only flag does.
+         A stricter, different or unknown mode, an unjournaled 0555, another
+         owner, or any ambiguity about identity or access refuses, and
+         nothing changes.
+       - **The originals are recorded.** The controller journals each
+         directory's original mode, owner, identity and access metadata
+         (`release-seal-baseline`) before the first change. It then sets
+         each directory's mode bits to 0555 with `fchmod` on its pinned
+         descriptor, and nothing else: ownership, ACLs, flags and every
+         parent's permissions are unchanged. Finally it journals
          `release-sealed` with the recorded originals.
        - **Resume** accepts an existing 0555 only for this operation's
-         journaled seal, with matching identities. Otherwise the state is
-         unknown, and the activation stops.
+         journaled seal, with matching identities. A crash between the
+         baseline and `release-sealed` resumes from the journaled originals.
+         Otherwise the state is unknown, the activation stops, and no mode
+         is restored.
+       - **A sealed release that drifted blocks.** Resume, reconciliation and
+         every post-check compare both directories with the journaled seal:
+         the identities, the 0555 modes, the owners, the ACLs and the flags.
+         A mode put back, or a directory replaced even by one with identical
+         contents, blocks completion, and is never sealed again silently. The
+         stager's inventory records directories only as `["dir"]`, so it
+         can't see this.
        - **Rollback keeps the seal,** because the release is retained (A6). A
          later cleanup, which needs its own authorization, restores the
          recorded modes before removing anything.
@@ -728,8 +746,31 @@ activate_release status --root <private dir>
 
 ### Activation tests
 
-`test_activate.py` (54 tests) and `test_cutover.py` (1 end-to-end test), all
-on invented homes. The slot-2 review of PR #22 added its nine findings, each
+`test_activate.py` (63 tests) and `test_cutover.py` (1 end-to-end test), all
+on invented homes. The guarded seal has its own tests (`GuardedSealTests`):
+
+- a seal from 0755, with the originals journaled and owners, ACLs, flags and
+  parents unchanged;
+- each refused baseline, with the first directory left unchanged when the
+  second is invalid: 0700, an unjournaled 0555, 0775, 0750, another owner,
+  an ACL that could grant writes, an unreadable ACL, and an ambiguous
+  identity. On macOS this includes a real ACL, shown first to let a write
+  through a 0555 directory;
+- resume after the seal, and an unjournaled 0555 (unknown, nothing
+  restored);
+- a crash before and after each `fchmod` and after `release-sealed`, which
+  resumes from the journaled originals, and a directory replaced mid-seal
+  (unknown);
+- drift that blocks and is never resealed: a mode put back, and a directory
+  replaced with identical contents;
+- rollback keeping the seal;
+- real use with bytecode deliberately enabled: no `-B`, no
+  `PYTHONDONTWRITEBYTECODE`, no cache prefix. Imports try to write caches
+  in both sealed directories, none appears, and the strict post-check
+  passes. An unsealed control does get `__pycache__`, and then fails
+  verification.
+
+The slot-2 review of PR #22 added its nine findings, each
 reproduced before its fix, and a sweep of the same classes:
 
 - the state root moved, removed or unreadable;
