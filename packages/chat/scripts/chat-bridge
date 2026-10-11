@@ -627,19 +627,24 @@ class Deliveries:
         interrupt whose acknowledgement is already there, but whose settling was
         never saved, is settled. Each recipient of one message by its own
         acknowledgement; a malformed line is skipped, and a read or settling that
-        fails is tried again at the next pass."""
+        fails is tried again at the next pass. A read that fails is not "nothing
+        changed": it sets acks_unreadable, and process() then defers every
+        interrupt an acknowledgement could settle until the file can be read
+        (code review CODE13)."""
         if getattr(self, "_acks_checked", False):
             return False
-        pending = {(i["msgid"], i.get("target")): i for i in self.items if i["kind"] == "ring"
-                   and i.get("interrupt") and i.get("phase") in ("deliver", "accept", "held")}
+        pending = {(i["msgid"], i.get("target")): i for i in self.items if self._ack_settles(i)}
         if not pending:
-            self._acks_checked = True
+            self._acks_checked, self.acks_unreadable = True, False
             return False
         try:
             lines = ACKS.read_text().splitlines() if ACKS.exists() else []
         except (OSError, ValueError) as err:
-            log(f"acknowledgements not read ({err!r:.80}); read again next pass")
+            if not getattr(self, "acks_unreadable", False):
+                log(f"acknowledgements not read ({err!r:.80}); their interrupts wait, and it is read again next pass")
+            self.acks_unreadable = True
             return False
+        self.acks_unreadable = False
         self._acks_checked = True  # a settling below that fails sets it back, for the next pass
         changed = False
         for raw in lines:
@@ -657,11 +662,19 @@ class Deliveries:
                 changed = True
         return changed
 
+    @staticmethod
+    def _ack_settles(item):
+        """An interrupt that a recorded acknowledgement would settle."""
+        return item["kind"] == "ring" and bool(item.get("interrupt")) and item.get("phase") in ("deliver", "accept",
+                                                                                                "held")
+
     def process(self, cfg):
         if self.load_error is not None and not self._load():
             return  # nothing is delivered, recovered or saved until the saved state can be read
         changed = self.recover(cfg) | self.recovered_acknowledgements(cfg) | self.retry_owed(cfg)
         due = [i for i in self.items if i["next_at"] <= time.time() and i.get("phase") not in ("settled", "intent")]
+        if getattr(self, "acks_unreadable", False):  # unchecked: no key, no dead letter, no removal; the rest goes on
+            due = [i for i in due if not self._ack_settles(i)]
         for item in due:
             try:
                 self._process_one(item, cfg)

@@ -1487,6 +1487,103 @@ class AcknowledgementPowerLossTests(InterruptCase):
                 self.assertEqual(len(self.announcements()), 1 if owed else 0, "owed work kept and done")
 
 
+class UnreadableAcknowledgementsTests(ReplayCase):
+    """Code review CODE13: while acks.jsonl cannot be read, an acknowledgement
+    already saved there cannot be checked. The interrupts it could settle are
+    deferred (no Escape or Enter, no dead letter, no removal; an elapsed
+    deadline is no substitute for the check), independent work goes on, and
+    once the file can be read they are settled by it."""
+
+    def unreadable_acks(self):
+        real, acks = Path.read_text, self.bridge.ACKS
+
+        def read_text(path, *a, **k):
+            if Path(path) == acks:
+                raise OSError(5, "input/output error (fake)")
+            return real(path, *a, **k)
+        return mock.patch.object(Path, "read_text", read_text)
+
+    def saved_ack(self):
+        from test_bridge import privmsg
+        return privmsg("alp-solver-2", "[status] stopped as asked", "m-ack", channel="#alpha", reply_to="m-int",
+                       t="2026-10-09T10:02:00.000Z")
+
+    def an_owner_push(self, d):
+        d.items.append({"kind": "push", "msgid": "m-other", "channel": "#beta", "sender": "pat", "project": "beta",
+                        "attempt": 0, "next_at": 0, "text": "@sam a question for you"})
+
+    def pushed(self):
+        return [r for r in self.ledger() if r.get("kind") == "push" and r.get("msgid") == "m-other" and r.get("ok")]
+
+    def test_a_ready_interrupt_is_deferred_until_its_saved_acknowledgement_can_be_read(self):
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks())
+        d = state[1]
+        agent = self.FakeAgent()
+        self.passes(agent, deliveries=d)  # the first scan: nothing pending
+        self.bridge.handle(self.saved_ack(), CFG, *state)  # the acknowledgement, before its instruction
+        self.bridge.handle(self.message(), CFG, *state, replayed=True)  # the instruction, from history
+        self.an_owner_push(d)
+        with self.unreadable_acks():
+            self.passes(agent, 3, deliveries=d)
+            self.assertEqual(agent.keys, [], "no Escape, no Enter while the acknowledgement cannot be checked")
+            self.assertEqual([i["phase"] for i in self.rings(d)], ["deliver"], "the original obligation, kept")
+            self.assertEqual(len(self.pushed()), 1, "independent work goes on")
+        self.passes(agent, 2, deliveries=d)  # readable again
+        self.assertEqual(agent.keys, [], "settled by its acknowledgement, never rung")
+        self.assertEqual(self.rings(d), [])
+        self.assertEqual(len([r for r in self.ledger() if str(r.get("detail")).startswith("accepted by")]), 1)
+
+    def test_an_expired_interrupt_is_not_dead_lettered_while_its_acknowledgement_cannot_be_read(self):
+        for owed in (False, True):
+            with self.subTest(announcement_owed=owed):
+                self.fresh()
+                item = dict(self.item(), phase="accept", attempt=1, next_at=0, intent_id="i" * 32,
+                            intent_surface="S", intent_session=None, delivered_announced=True)
+                if owed:
+                    item.update(delivered_announced=False, delivered_text="interrupt → alp-solver-2: it was not "
+                                "working; instruction delivered; waiting for its acknowledgement")
+                d = self.bridge.Deliveries()
+                d.items = [item]
+                d._save()
+                self.bridge.Acks().add("m-ack", {"at": "2026-10-09T10:02:00Z", "msgid": "m-ack", "reply_to": "m-int",
+                                                 "by": "alp-solver-2", "channel": "#alpha", "project": "alpha",
+                                                 "how": "reply"})
+                after = self.bridge.Deliveries()  # a restart
+                self.an_owner_push(after)
+                agent = self.FakeAgent()
+                with self.unreadable_acks(), mock.patch.object(self.bridge, "announce", lambda *a: False):
+                    self.passes(agent, 3, deliveries=after)  # its deadline has passed
+                    self.assertEqual([r for r in self.dead_letters() if r.get("kind") == "ring"], [],
+                                     "no unacknowledged dead letter")
+                    self.assertEqual([i["phase"] for i in self.rings(after)], ["accept"], "not removed")
+                    self.assertEqual(len(self.pushed()), 1, "independent work goes on")
+                self.passes(agent, 2, deliveries=after)  # readable again
+                self.assertEqual(self.rings(after), [], "settled")
+                self.assertEqual([r for r in self.dead_letters() if r.get("kind") == "ring"], [])
+                self.assertEqual(agent.keys, [])
+                self.assertEqual(len(self.announcements()), 1 if owed else 0, "owed work kept and done")
+
+    def test_an_expired_interrupt_with_no_acknowledgement_is_dead_lettered_as_before(self):
+        """A control: the file can be read, and holds no acknowledgement for it."""
+        d = self.bridge.Deliveries()
+        d.items = [dict(self.item(), phase="accept", attempt=1, next_at=0, intent_id="i" * 32, intent_surface="S",
+                        intent_session=None, delivered_announced=True)]
+        d._save()
+        self.bridge.ACKS.write_text("")
+        self.passes(self.FakeAgent(), 2, deliveries=self.bridge.Deliveries())
+        [dl] = [r for r in self.dead_letters() if r.get("kind") == "ring"]
+        self.assertEqual(dl["last_detail"], "interrupted, but never acknowledged")
+
+    def test_with_no_acknowledgement_file_a_ready_interrupt_is_delivered(self):
+        """A control: no acks.jsonl at all is no acknowledgement, never an unreadable one."""
+        self.assertFalse(self.bridge.ACKS.exists())
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks())
+        self.bridge.handle(self.message(), CFG, *state)
+        agent = self.FakeAgent()
+        self.passes(agent, deliveries=state[1])
+        self.assertEqual(self.interrupts(agent), 1)
+
+
 class LiveAcknowledgementRetryTests(InterruptCase):
     """Code review slot 10, finding 2: a live acknowledgement is durable in
     acks.jsonl, but settling it fails in the ledger. The SAME Deliveries instance
