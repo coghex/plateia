@@ -5,7 +5,7 @@ item 20) requires. It maps every requirement, acceptance item, binding
 correction and spec addition of #19, design revision 9's tests 1–48
 ([`chat_outbox_state.md`](chat_outbox_state.md), section 9), owner
 amendment 6, and the code reviews' findings, to the named tests that assert
-them, with a status for each. It describes PR #20 at `119610e`.
+them, with a status for each. It describes PR #20 at `556c5c4`.
 
 How to read it:
 - Each row's **Requirement** or **Item** column (for design tests, the
@@ -374,6 +374,17 @@ The findings carried no priority. Failed first at `02be8f2` except where the not
 | X4 | While that proof cannot be synced, it is unknown: the item is left as it is (neither accepted nor held, no action); accepted once the sync succeeds, its record durable through a power loss | bridge.LedgerProofSyncTests.test_while_the_ledger_cannot_be_synced_the_proof_is_unknown | COVERED | |
 | X5 | A proof line synced when written reconciles as before | bridge.LedgerProofSyncTests.test_a_durable_proof_reconciles_as_before | COVERED | A control. |
 
+## 22. Code review 6104897754 (CODE18)
+
+Failed first at `119610e` except where the note says control.
+
+| ID | Item | Tests | Status | Note |
+|---|---|---|---|---|
+| Y1 | A part's confirmation deadline (PART_WAIT, then DRAIN_WAIT: 60 s) bounds every buffered line and every PONG written for a buffered PING: 40 buffered PINGs whose writes take 2 s each end within 60 s, with no confirmation invented | resend.ConfirmationDeadlineTests.test_buffered_pings_with_slow_writes_stay_within_the_deadline | COVERED | On a fake clock and socket; 80 s before the fix. |
+| Y2 | A timely confirmation behind buffered PINGs is still seen, and each PING answered | resend.ConfirmationDeadlineTests.test_a_timely_confirmation_behind_buffered_pings_is_still_seen | COVERED | A control. |
+| Y3 | A state directory outside the home directory, in a new parent: an ancestor made by an earlier attempt whose parent sync failed is synced again before anything is reported queued; while the sync keeps failing, publication keeps failing (nothing reported queued); the obligation is imported once after a restart | resend.FirstStartTests.test_an_external_state_tree_retries_a_failed_ancestor_sync (one and three failed syncs) | COVERED | Every level up to the mount point is synced; the power loss is modelled from the syncs that succeeded. |
+| Y4 | A state directory outside the home directory with every sync working: published as before | resend.FirstStartTests.test_an_external_state_tree_with_every_sync_working | COVERED | A control. |
+
 ## Counts
 
 | Section | COVERED | PARTIAL | MISSING |
@@ -399,16 +410,17 @@ The findings carried no priority. Failed first at `02be8f2` except where the not
 | 19. Code review 6103950289 (CODE14) and the bounded recovery-input map | 30 | 0 | 0 |
 | 20. Code review 6104445458 (CODE16) | 8 | 0 | 0 |
 | 21. Code review 6104694236 (CODE17) | 5 | 0 | 0 |
-| **Total (209 rows)** | **209** | **0** | **0** |
+| 22. Code review 6104897754 (CODE18) | 4 | 0 | 0 |
+| **Total (213 rows)** | **213** | **0** | **0** |
 
 History: at `97db1bf`, before amendment 6's round, 104 of the then 130 rows
 were COVERED, 15 PARTIAL and 11 MISSING. That round closed them and added
 section 13. The final round added design tests 41–48 as their own rows in
-section 11, and section 14. The recovery rounds added sections 15 and 16, the durability round section 17, the acknowledgement-read round section 18, and the systematic round section 19 (V1 to V26; its follow-up added V27 to V30), the CODE16 round section 20, and the CODE17 round section 21.
+section 11, and section 14. The recovery rounds added sections 15 and 16, the durability round section 17, the acknowledgement-read round section 18, and the systematic round section 19 (V1 to V26; its follow-up added V27 to V30), the CODE16 round section 20, the CODE17 round section 21, and the CODE18 round section 22.
 
 ## Appendix A. The test methods of every class named above
 
-Generated from the test tree at `119610e`. A module named on its own (such as `rb` or `sil`) stands
+Generated from the test tree at `556c5c4`. A module named on its own (such as `rb` or `sil`) stands
 for all of its classes, listed here.
 
 ### `resend`: `packages/chat/scripts/tests/test_outbox_resend.py`
@@ -418,9 +430,10 @@ for all of its classes, listed here.
 - **BridgeRefusalTests**: `test_a_mid_post_fail_in_the_bridges_flush`
 - **ClosedConnectionTests**: `test_a_403_recorded_only_on_a_retry_is_handed_off_and_delivered_once`
 - **CommittedThenTimeoutTests**: `test_pchat_queues_only_the_unconfirmed_part_and_never_writes_it_again`, `test_the_line_transport_behaves_the_same`, `test_an_uncertain_part_never_proves_absence_by_a_timeout`
+- **ConfirmationDeadlineTests**: `test_buffered_pings_with_slow_writes_stay_within_the_deadline`, `test_a_timely_confirmation_behind_buffered_pings_is_still_seen`
 - **DirectPostDuringFlushTests**: `test_a_direct_posts_message_never_satisfies_an_older_part_too`
 - **FailureBeforeE1Tests**: `test_a_failed_login_queues_by_q0_with_no_fallback_file`, `test_with_the_authority_unavailable_the_fallback_file_carries_it`, `test_an_e1_commit_whose_reply_is_lost_is_handed_off_not_duplicated`, `test_a_q0_commit_whose_reply_is_lost_plus_its_fallback_file_is_one_entry`, `test_two_calls_with_identical_text_are_two_entries`
-- **FirstStartTests**: `test_a_first_post_and_acknowledgement_before_any_start`, `test_a_retry_after_a_failed_parent_sync_makes_every_entry_durable`, `test_a_first_authority_start_makes_the_state_tree_durable_before_any_ack`, `test_an_authority_start_whose_parent_sync_fails_is_retried`, `test_a_publication_that_cannot_be_made_reports_nothing_queued`
+- **FirstStartTests**: `test_a_first_post_and_acknowledgement_before_any_start`, `test_a_retry_after_a_failed_parent_sync_makes_every_entry_durable`, `test_a_first_authority_start_makes_the_state_tree_durable_before_any_ack`, `test_an_authority_start_whose_parent_sync_fails_is_retried`, `test_an_external_state_tree_retries_a_failed_ancestor_sync`, `test_an_external_state_tree_with_every_sync_working`, `test_a_publication_that_cannot_be_made_reports_nothing_queued`
 - **HostProbeTests**: `test_only_values_known_on_both_sides_are_compared`, `test_malformed_identities_prove_nothing_and_raise_nothing`, `test_a_socket_table_that_cannot_be_read_proves_nothing`, `test_a_start_time_is_read_from_one_source_per_platform`
 - **IndependentDeliveryTests**: `test_another_accounts_entry_flows_while_one_awaits_its_check`, `test_a_refused_and_a_failing_entry_never_stop_the_others`
 - **LateOutcomeTests**: `test_a_late_outcome_exports_a_superseding_version`
