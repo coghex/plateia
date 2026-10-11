@@ -684,6 +684,51 @@ class BootstrapUnknownTests(BootstrapCase):
         self.assertFalse((self.state / "outbox.db").exists())
 
 
+class BootstrapTypeTests(BootstrapCase):
+    """Code review slot 2 on PR #22 (6110706975), finding 8: a digest-matching
+    record or a committed M of the wrong types is UNKNOWN, never an ordinary
+    failure (which would rewrite the status snapshot and let recovery run)."""
+
+    def test_a_digest_matching_record_with_malformed_accounts_is_unknown(self):
+        written = []
+        for accounts in ([{}], [1, "sam"], [["alp-solver-2"]], [None], "alp-solver-2", [True]):
+            with self.subTest(accounts=accounts), self.no_database_open(), \
+                    mock.patch.object(self.bridge, "write_unavailable_status", lambda *a: written.append(a)):
+                real = os.path.realpath(self.state)
+                st = os.stat(real)
+                rec = {"v": "designation-bootstrap/1", "operation": OPERATION, "release": "0" * 64,
+                       "release_id": RELEASE_ID, "state_root": {"path": real, "dev": st.st_dev, "ino": st.st_ino},
+                       "accounts": accounts, "plan_sha256": "1" * 64, "time": "2026-10-11T00:00:00+00:00"}
+                self.bridge.BOOTSTRAP_UNKNOWN = "an earlier state"
+                self.assertUnknown(self.launch(self.publish(self.bridge.canonical_bytes(rec))))
+        self.assertEqual(written, [], "the status snapshot is never rewritten")
+
+    def test_malformed_committed_fields_are_unknown(self):
+        d = self.publish(self.record(["alp-solver-2"]))
+        self.launch(d)
+        meta, _ = self.rows()
+        good = json.loads(meta["designation_bootstrap"])
+        for name, change in (("effective_at a bool", {"effective_at": True}),
+                             ("effective_at a string", {"effective_at": "now"}),
+                             ("already_present an object", {"already_present": {}}),
+                             ("already_present not names", {"already_present": [1]}),
+                             ("a digest of another type", {"digest": 7}),
+                             ("an operation of another type", {"operation": None})):
+            with self.subTest(case=name):
+                con = sqlite3.connect(self.state / "outbox.db")
+                con.execute("UPDATE meta SET value = ? WHERE name = 'designation_bootstrap'",
+                            (json.dumps(dict(good, **change), sort_keys=True),))
+                con.commit()
+                con.close()
+                before, accounts = self.rows()
+                with mock.patch.object(self.ds.Store, "designate", side_effect=AssertionError("designated")):
+                    self.assertUnknown(self.launch(d), created=True)
+                self.assertEqual(self.rows(), (before, accounts), "nothing was committed")
+
+    def no_database_open(self):
+        return mock.patch.object(self.ds.sqlite3, "connect", side_effect=AssertionError("the database was opened"))
+
+
 class BootstrapCrashTests(BootstrapCase):
     """Crashes around the bridge's commit: inside it nothing is committed; after
     it, a restart is the replay."""

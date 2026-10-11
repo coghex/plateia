@@ -70,6 +70,7 @@ Runs as a service (launchd). Logged in as the `chatbridge` account, it:
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -1922,13 +1923,13 @@ def release_problem(record):
     return None
 
 
-def read_bootstrap(state):
+def read_bootstrap(state_fd):
     """R: (None, None) when there is no record; else (data, reason), where reason
     is None only for a private regular file of this user, opened without
-    following links and read whole within BOOTSTRAP_MAX."""
-    path = Path(state) / BOOTSTRAP_FILE
+    following links, relative to the pinned state root, and read whole within
+    BOOTSTRAP_MAX."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(BOOTSTRAP_FILE, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=state_fd)
     except FileNotFoundError:
         return None, None
     except OSError as err:
@@ -1953,35 +1954,34 @@ def read_bootstrap(state):
     return b"".join(chunks), None
 
 
-def bootstrap_record(data, expected, state):
+def is_name_list(value):
+    """A sorted list of distinct account names: every element's type is checked
+    before anything compares, hashes or sorts them."""
+    return isinstance(value, list) and all(isinstance(a, str) and BOOTSTRAP_ACCOUNT.fullmatch(a) for a in value) \
+        and value == sorted(set(value))
+
+
+def bootstrap_record(data, expected, real, root_stat):
     """The record when R is VALID against E: its bytes' sha256 equals E, it is
     exactly designation-bootstrap/1 in canonical form, for this bridge's release
-    and this state root (realpath, device and inode). Raises BootstrapUnknown."""
+    and this state root (realpath, device and inode, as pinned). Raises
+    BootstrapUnknown."""
     if hashlib.sha256(data).hexdigest() != expected:
         raise BootstrapUnknown("the record's bytes don't match the launch digest")
     try:
         record = json.loads(data)
     except ValueError:
         raise BootstrapUnknown("the record is not valid JSON") from None
-    root = record.get("state_root") if isinstance(record, dict) else None
-    accounts = record.get("accounts") if isinstance(record, dict) else None
     if not isinstance(record, dict) or set(record) != BOOTSTRAP_FIELDS or record["v"] != BOOTSTRAP_FORMAT \
             or not all(isinstance(record[k], str) and record[k] for k in ("operation", "release", "release_id",
                                                                          "plan_sha256", "time")) \
-            or not isinstance(root, dict) or set(root) != {"path", "dev", "ino"} \
-            or not isinstance(accounts, list) or accounts != sorted(set(accounts)) \
-            or not all(isinstance(a, str) and BOOTSTRAP_ACCOUNT.fullmatch(a) for a in accounts) \
-            or canonical_bytes(record) != data:
+            or not isinstance(record["state_root"], dict) or set(record["state_root"]) != {"path", "dev", "ino"} \
+            or not is_name_list(record["accounts"]) or canonical_bytes(record) != data:
         raise BootstrapUnknown(f"the record is not {BOOTSTRAP_FORMAT} in canonical form")
     problem = release_problem(record)
     if problem:
         raise BootstrapUnknown(f"the record is not for this release: {problem}")
-    real = os.path.realpath(state)
-    try:
-        st = os.stat(real)
-    except OSError as err:
-        raise BootstrapUnknown(f"the state root can't be read ({err.strerror or err})") from None
-    if root != {"path": real, "dev": st.st_dev, "ino": st.st_ino}:
+    if record["state_root"] != {"path": real, "dev": root_stat.st_dev, "ino": root_stat.st_ino}:
         raise BootstrapUnknown("the record is for another chat state root")
     return record
 
@@ -1991,19 +1991,52 @@ def canonical_bytes(record):
 
 
 def classify_launch(state, expected):
-    """E and R, judged before any database is opened or created: None when no
-    activation is involved (S1 so far), the VALID record for an activated
-    launch (S2 or S3, by M), or BootstrapUnknown."""
-    data, reason = read_bootstrap(state)
-    if expected is None:
-        if data is not None:
-            raise BootstrapUnknown("a bootstrap record is present, but this launch names no digest")
-        return None
-    if data is None:
-        raise BootstrapUnknown("this launch names a bootstrap digest, but there is no record")
-    if reason:
-        raise BootstrapUnknown(f"the bootstrap record {reason}")
-    return bootstrap_record(data, expected, state)
+    """E and R, judged before any database is opened or created, through one
+    pinned descriptor of the state root: None when no activation is involved
+    (S1 so far), the VALID record for an activated launch (S2 or S3, by M), or
+    BootstrapUnknown. Anything that can't be judged is UNKNOWN, never an
+    ordinary failure."""
+    real = os.path.realpath(state)
+    try:
+        state_fd = os.open(real, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        if expected is not None:
+            raise BootstrapUnknown("this launch names a bootstrap digest, but the state root is missing") from None
+        return None  # no state at all: no record, no database, S1 so far
+    except OSError as err:
+        raise BootstrapUnknown(f"the state root can't be opened ({err.strerror or err})") from None
+    try:
+        data, reason = read_bootstrap(state_fd)
+        if expected is None:
+            if data is not None:
+                raise BootstrapUnknown("a bootstrap record is present, but this launch names no digest")
+            return None
+        if data is None:
+            raise BootstrapUnknown("this launch names a bootstrap digest, but there is no record")
+        if reason:
+            raise BootstrapUnknown(f"the bootstrap record {reason}")
+        return bootstrap_record(data, expected, real, os.fstat(state_fd))
+    except BootstrapUnknown:
+        raise
+    except Exception as err:  # a shape or type nobody foresaw: never the ordinary failure path
+        raise BootstrapUnknown(f"the bootstrap record can't be judged ({type(err).__name__})") from None
+    finally:
+        os.close(state_fd)
+
+
+def valid_meta(committed, record, expected):
+    """M is well formed and consistent with this record and launch digest; every
+    field has its exact type (a bool is not a number)."""
+    at = committed.get("effective_at") if isinstance(committed, dict) else None
+    return isinstance(committed, dict) and set(committed) == BOOTSTRAP_META_FIELDS \
+        and isinstance(committed["operation"], str) and isinstance(committed["digest"], str) \
+        and type(at) in (int, float) and math.isfinite(at) \
+        and committed["version"] == {"format": record["v"], "release": record["release"],
+                                     "release_id": record["release_id"]} \
+        and is_name_list(committed["accounts"]) and committed["accounts"] == record["accounts"] \
+        and is_name_list(committed["already_present"]) \
+        and set(committed["already_present"]) <= set(record["accounts"]) \
+        and committed["digest"] == expected and committed["operation"] == record["operation"]
 
 
 class BootstrapStore(delivery_store.Store):
@@ -2036,17 +2069,15 @@ class BootstrapStore(delivery_store.Store):
             return "applied"
         try:
             committed = json.loads(raw)
-        except ValueError:
+        except (TypeError, ValueError):
             committed = None
-        if not isinstance(committed, dict) or set(committed) != BOOTSTRAP_META_FIELDS \
-                or not isinstance(committed.get("effective_at"), (int, float)) \
-                or committed.get("version") != {"format": self.record["v"], "release": self.record["release"],
-                                                "release_id": self.record["release_id"]} \
-                or committed.get("accounts") != self.record["accounts"]:
-            raise BootstrapUnknown("the committed bootstrap record is malformed or inconsistent")
-        if committed["digest"] != self.expected or committed["operation"] != self.record["operation"]:
-            raise BootstrapUnknown(f"another bootstrap (operation {committed['operation']}) is committed; "
-                                   "a different activation needs its own approval")
+        try:
+            ok = valid_meta(committed, self.record, self.expected)
+        except Exception:  # a shape nobody foresaw is malformed, never an ordinary failure
+            ok = False
+        if not ok:
+            raise BootstrapUnknown("the committed bootstrap record is malformed, inconsistent, or another "
+                                   "activation's (which needs its own approval)")
         return "replayed"  # S3: designation is never applied again, so no suspension is cleared
 
     def apply(self):
