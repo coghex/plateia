@@ -16,7 +16,7 @@
       "files": [
         "chat/SKILL.md"
       ],
-      "summary": "workflow: bound machine quiet to timing measurements \u2014 adds the 7-line \"Timing reservations\" paragraph to chat/SKILL.md",
+      "summary": "workflow: bound machine quiet to timing measurements — adds the 7-line \"Timing reservations\" paragraph to chat/SKILL.md",
       "carried_in": "PLT-15 (#12)"
     }
   ],
@@ -295,7 +295,7 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
       "capture": "changed",
-      "sha256": "59293532b4ea12eca7c77f555d7dc92fa9069889d80f146041fcb4bc96a6c1f8",
+      "sha256": "af7da909fc16e932ee266b48913b50f55a35a0377354d171140d7543a0b1de24",
       "changes": [
         {
           "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
@@ -304,6 +304,10 @@
         {
           "change": "The bridge runs the outbox authority (delivery_store.Authority: the only opener of outbox.db, on its own thread, serving outbox.sock; started all or nothing, and started again whole at the next pass after any failure or a dead thread) and its flush, in which one step's or one item's failure never stops another: it imports fallback files and the legacy outbox without outbox.lock, ends gone writers' attempts, abandons (E8) or, for its own announcements, adopts (E9) their entries, reconciles from current state (R1, R2), dead-letters after 24 hours with a content-free alert row, gives every eligible entry its attempt, and retires claims and writes dead letters under a bounded outbox.lock. It indexes every verified message (V1) before its checkpoint moves, with the server's own time, msgid and account only (one without them is a failed index, never given a local substitute); a new channel gets a durable replay boundary when joined, from the server's join time only (without one: no coverage from that join, and a boundary before all of its history); a failed index invalidates any catch-up of that channel, which completes nothing until a replay from the preserved checkpoint indexes it; keeps record coverage in the authority, writes the pending queue, ledger and dead letters durably (a delivery leaves only once its ledger line is durable, and one that cannot be written blocks no other), and announces with a derived entry id, saving held_announced only once the announcement is durable; an interrupt records its durable intent before its first agent-affecting command, and takes none without it; one that may have acted without a proved submission, or is found in intent after a restart, is held, never rung again, settled only by exact-identity proof in the ledger or by its acknowledgement, and otherwise dead-lettered truthfully; a delivered interrupt's ledger line, announcement and the save of its state are each done again until durable, across its acknowledgement or dead letter; an acknowledgement already recorded settles each recipient's interrupt after a restart, read again until it succeeds, including after a live settling fails in the ledger; a replayed message adds no second interrupt for the same recipient, an interrupt counts as queued only once saved, and a new one reopens acknowledgement recovery; an acknowledgement counts as recorded only once durable (delivery_store.durable_append), and while acks.jsonl cannot be read the interrupts it could settle are neither rung nor dead-lettered; for the pending, acknowledgement and ledger files only a missing file is absence, and any other failure to inspect or read one is unknown, never empty; a line read from acks.jsonl, or a ledger line taken as an interrupt's proof, counts only once the file and its directory are synced; an interrupt's intent is committed only once the state directory's ancestry is durable, and acknowledgement recovery reopens when recovery accepts or holds an interrupt; only a missing pending.json is an empty queue, and one that cannot be read or parsed is never replaced, nothing new is queued and nothing delivered until it can be read; and each owner alert's dead letter is its own (#19 owner amendment 6, 2026-10-10). The file-based claimed-outbox, reservation and attribution state is removed.",
           "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
+        },
+        {
+          "change": "The bridge applies the activation's designation bootstrap (designation-bootstrap/1) at its authority's start. Its one launch option, --activation-bootstrap sha256:<D>, names the record; before any database open it checks the record's exact bytes against D, the schema, its own running release and the actual state root, and inside the authority's opening transaction it classifies the committed bootstrap row: no activation (S1); a first commit that designates the listed accounts (none for an explicit empty list) and records the operation, digest, effective time and version (S2); or an exact replay that changes nothing and never designates again (S3). Any other state is UNKNOWN: the authority does not start, nothing is committed (not even the epoch), deleted or rewritten, the status snapshot is not replaced, and the bridge neither serves nor recovers until it is resolved.",
+          "reason": "PLT-14 (#21), its owner amendment of 2026-10-11 and its APPROVE (D-74, D-26): the activation's designation list reaches the bridge bound to the activation plan, and only the bridge's authority commits it, before serving, import or recovery. The running bridge keeps the baseline behavior until activation."
         }
       ]
     },
@@ -509,11 +513,11 @@
     },
     {
       "path": "packages/chat/scripts/tests/test_outbox_authority.py",
-      "purpose": "The bridge-only authority and its request protocol over socketpairs: stopped clients, floods, replays, epochs, unavailability and the one opener (#19)."
+      "purpose": "The bridge-only authority and its request protocol over socketpairs: stopped clients, floods, replays, epochs, unavailability and the one opener (#19). Its no-designation-interface test admits only the bridge's one bootstrap commit (#21)."
     },
     {
       "path": "packages/chat/scripts/tests/test_outbox_bridge.py",
-      "purpose": "The bridge's outbox side: coverage and indexing, bounded setup, its announcements and E9, and the authority thread (#19)."
+      "purpose": "The bridge's outbox side: coverage and indexing, bounded setup, its announcements and E9, and the authority thread (#19). The designation bootstrap at the authority's start: S1, S2, S3 and every UNKNOWN state, crashes and retries (#21)."
     },
     {
       "path": "packages/chat/scripts/tests/test_outbox_crashes.py",
