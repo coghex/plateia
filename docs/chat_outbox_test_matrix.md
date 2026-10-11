@@ -5,7 +5,7 @@ item 20) requires. It maps every requirement, acceptance item, binding
 correction and spec addition of #19, design revision 9's tests 1–48
 ([`chat_outbox_state.md`](chat_outbox_state.md), section 9), owner
 amendment 6, and the code reviews' findings, to the named tests that assert
-them, with a status for each. It describes PR #20 at `7439dd9`.
+them, with a status for each. It describes PR #20 at `fc29738`.
 
 How to read it:
 - Each row's **Requirement** or **Item** column (for design tests, the
@@ -307,6 +307,7 @@ missing file is absence; any other failure to inspect or read is unknown.
 "Stat or inspection failure" is tested as Python 3.14 shows it, on both
 supported Pythons: `Path.exists()` reports False and the read raises. This
 map is bounded to these readers; it is not a certification of every input.
+A line written to `acks.jsonl` whose sync failed is not evidence until it is synced (V27 to V29).
 `pchat`'s own reads of `pending.json` are for display only and out of scope.
 
 | ID | Reader (file: use) | Condition | Invariant | Tests | Status | Note |
@@ -337,6 +338,10 @@ map is bounded to these readers; it is not a certification of every input.
 | V24 | delivery ledger: `ledger_has` | a torn or malformed line (including JSON that is not an object) | skipped; a valid line still counts | bridge.RecoveryInputTests.test_every_recovery_reader_skips_a_torn_line_and_keeps_the_rest | COVERED | Failing first at `5f87d47`: a JSON line that was not an object raised. |
 | V25 | fallback publication: `publish_fallback` (first start) | the state directory, or it and its parent, missing; no authority | created (default mode), each new entry synced in its parent; one durable file per call under its original id; imported once | resend.FirstStartTests.test_a_first_post_and_acknowledgement_before_any_start (one and two missing levels; a post and an acknowledgement) | COVERED | Failing first at `5f87d47`. |
 | V26 | fallback publication: `publish_fallback` | the tree cannot be made (a parent is a file) | fails truthfully: nothing reported queued | resend.FirstStartTests.test_a_publication_that_cannot_be_made_reports_nothing_queued | COVERED | Control. |
+| V27 | `acks.jsonl`: `Acks._load` | a line written, but its sync failed | not evidence until this process has synced the file and its directory; a duplicate counts only then | bridge.AcknowledgementSyncTests.test_a_duplicate_acknowledgement_is_made_durable_before_it_counts | COVERED | Failing first at `7439dd9`. |
+| V28 | `acks.jsonl`: `recovered_acknowledgements` | a line written, but its sync failed | synced before it settles anything: a failed settling save and a power loss lose nothing | bridge.AcknowledgementSyncTests.test_recovery_makes_an_unsynced_acknowledgement_durable_before_settling | COVERED | Failing first at `7439dd9`. |
+| V29 | `acks.jsonl`: `recovered_acknowledgements` | the sync before trusting it fails | unknown: settling deferred (no removal, no dead letter); settled once the sync succeeds | bridge.AcknowledgementSyncTests.test_while_the_acknowledgement_cannot_be_synced_settling_waits | COVERED | Failing first at `7439dd9`. |
+| V30 | fallback publication: `publish_fallback` | an earlier attempt made a directory, but its parent sync failed; a retry | every entry the publication may have made is synced in its parent before anything is reported queued; the obligation is imported once | resend.FirstStartTests.test_a_retry_after_a_failed_parent_sync_makes_every_entry_durable (one and two missing levels) | COVERED | Failing first at `7439dd9`. The power loss is modelled from the syncs that succeeded (the fake filesystem keeps directories). |
 
 ## Counts
 
@@ -360,17 +365,17 @@ map is bounded to these readers; it is not a certification of every input.
 | 16. Code review 6103073520 (slot 11) and the bounded check | 4 | 0 | 0 |
 | 17. Code review 6103285015 (slot 12) | 4 | 0 | 0 |
 | 18. Code review 6103685016 (CODE13) | 4 | 0 | 0 |
-| 19. Code review 6103950289 (CODE14) and the bounded recovery-input map | 26 | 0 | 0 |
-| **Total (192 rows)** | **192** | **0** | **0** |
+| 19. Code review 6103950289 (CODE14) and the bounded recovery-input map | 30 | 0 | 0 |
+| **Total (196 rows)** | **196** | **0** | **0** |
 
 History: at `97db1bf`, before amendment 6's round, 104 of the then 130 rows
 were COVERED, 15 PARTIAL and 11 MISSING. That round closed them and added
 section 13. The final round added design tests 41–48 as their own rows in
-section 11, and section 14. The recovery rounds added sections 15 and 16, the durability round section 17, the acknowledgement-read round section 18, and the systematic round section 19.
+section 11, and section 14. The recovery rounds added sections 15 and 16, the durability round section 17, the acknowledgement-read round section 18, and the systematic round section 19 (V1 to V26; its follow-up added V27 to V30).
 
 ## Appendix A. The test methods of every class named above
 
-Generated from the test tree at `7439dd9`. A module named on its own (such as `rb` or `sil`) stands
+Generated from the test tree at `fc29738`. A module named on its own (such as `rb` or `sil`) stands
 for all of its classes, listed here.
 
 ### `resend`: `packages/chat/scripts/tests/test_outbox_resend.py`
@@ -382,7 +387,7 @@ for all of its classes, listed here.
 - **CommittedThenTimeoutTests**: `test_pchat_queues_only_the_unconfirmed_part_and_never_writes_it_again`, `test_the_line_transport_behaves_the_same`, `test_an_uncertain_part_never_proves_absence_by_a_timeout`
 - **DirectPostDuringFlushTests**: `test_a_direct_posts_message_never_satisfies_an_older_part_too`
 - **FailureBeforeE1Tests**: `test_a_failed_login_queues_by_q0_with_no_fallback_file`, `test_with_the_authority_unavailable_the_fallback_file_carries_it`, `test_an_e1_commit_whose_reply_is_lost_is_handed_off_not_duplicated`, `test_a_q0_commit_whose_reply_is_lost_plus_its_fallback_file_is_one_entry`, `test_two_calls_with_identical_text_are_two_entries`
-- **FirstStartTests**: `test_a_first_post_and_acknowledgement_before_any_start`, `test_a_publication_that_cannot_be_made_reports_nothing_queued`
+- **FirstStartTests**: `test_a_first_post_and_acknowledgement_before_any_start`, `test_a_retry_after_a_failed_parent_sync_makes_every_entry_durable`, `test_a_publication_that_cannot_be_made_reports_nothing_queued`
 - **HostProbeTests**: `test_only_values_known_on_both_sides_are_compared`, `test_malformed_identities_prove_nothing_and_raise_nothing`, `test_a_socket_table_that_cannot_be_read_proves_nothing`, `test_a_start_time_is_read_from_one_source_per_platform`
 - **IndependentDeliveryTests**: `test_another_accounts_entry_flows_while_one_awaits_its_check`, `test_a_refused_and_a_failing_entry_never_stop_the_others`
 - **LateOutcomeTests**: `test_a_late_outcome_exports_a_superseding_version`
@@ -428,6 +433,7 @@ for all of its classes, listed here.
 - **AcknowledgementDurabilityTests**: `test_a_failed_acknowledgement_append_is_written_on_replay`
 - **AcknowledgementPowerLossTests**: `test_an_acknowledgement_survives_a_failed_settling_save_and_a_power_loss`
 - **AcknowledgementRecoveryTests**: `test_every_recipient_of_one_interrupt_is_recovered_after_a_failed_settling_save`, `test_a_failed_read_is_retried_at_a_later_pass_and_a_malformed_line_is_skipped`
+- **AcknowledgementSyncTests**: `test_recovery_makes_an_unsynced_acknowledgement_durable_before_settling`, `test_a_duplicate_acknowledgement_is_made_durable_before_it_counts`, `test_while_the_acknowledgement_cannot_be_synced_settling_waits`
 - **AlertIdentityTests**: `test_two_recipients_alerts_are_each_dead_lettered`
 - **AnnounceTests**: `test_with_its_requests_failing_it_publishes_a_fallback_file_without_outbox_lock`, `test_with_nothing_durable_the_flag_stays_unset_and_a_repeat_is_one_entry`, `test_deliveries_saves_held_announced_only_after_the_announcement_is_durable`, `test_a_crash_after_e1_and_before_a1_is_adopted_after_the_restart_and_sent_once`, `test_an_ordinary_post_killed_after_e1_is_still_abandoned`
 - **AuthorityThreadTests**: `test_the_thread_serves_a_client_and_the_bridges_requests`
