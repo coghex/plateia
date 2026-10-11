@@ -427,16 +427,24 @@ class BootstrapPublicationTests(ActivationCase):
 
     def test_a_record_this_operation_did_not_publish_is_retained_and_stops_it(self):
         def same_bytes_new_inode(plan):
+            time.sleep(0.05)  # past the file system's timestamp granularity
             data = self.record_path().read_bytes()
-            self.record_path().unlink()
+            self.record_path().unlink()  # a file system may hand the replacement the same inode number
             _staging.write(self.record_path(), data.decode(), 0o600)
+
+        def rewritten_in_place(plan):
+            time.sleep(0.05)
+            data = self.record_path().read_bytes()
+            with open(self.record_path(), "r+b") as f:  # the same inode, the same bytes, written again
+                f.write(data)
 
         def appears(plan):
             _staging.write(self.record_path(), activate_release.bootstrap_bytes(plan).decode(), 0o600)
         cases = {"published by someone else first": (None, appears),
                  "published by someone else after it was staged": ("bootstrap-staged", appears),
                  "replaced after publication": ("bootstrap-published", same_bytes_new_inode),
-                 "replaced after D was journaled": ("bootstrap", same_bytes_new_inode)}
+                 "replaced after D was journaled": ("bootstrap", same_bytes_new_inode),
+                 "rewritten in place after D was journaled": ("bootstrap", rewritten_in_place)}
         for name, (kind, change) in cases.items():
             with self.subTest(case=name):
                 self.fresh()

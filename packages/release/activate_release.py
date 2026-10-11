@@ -295,8 +295,8 @@ def bootstrap_path(plan):
 
 
 def read_private(path):
-    """(bytes, (dev, ino)) of a private regular file of this user, opened
-    without following links; FileNotFoundError, or Refused otherwise."""
+    """(bytes, (dev, ino), ctime_ns) of a private regular file of this user,
+    opened without following links; FileNotFoundError, or Refused otherwise."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
@@ -313,7 +313,7 @@ def read_private(path):
             if not chunk:
                 break
             chunks.append(chunk)
-        return b"".join(chunks), (st.st_dev, st.st_ino)
+        return b"".join(chunks), (st.st_dev, st.st_ino), st.st_ctime_ns
     finally:
         os.close(fd)
 
@@ -343,7 +343,7 @@ def publish_bootstrap(journal, plan):
     if done is not None:
         if done.get("digest") != d:
             raise Refused("the journaled bootstrap digest is not this plan's; nothing more was changed")
-        reconcile_bootstrap(plan, data, tuple(done["inode"]))
+        reconcile_bootstrap(plan, data, tuple(done["inode"]), done.get("ctime_ns"))
         return d
     published = last("bootstrap-published")
     if published is not None:
@@ -407,21 +407,27 @@ def publish_bootstrap(journal, plan):
         elif not any(s.get("tmp") == r["tmp"] for s in journal.records
                      if s.get("op") == op and s["kind"] == "bootstrap-staged"):
             debt.append(r["tmp"])  # never journaled as ours: kept, and reported
-    journal.append({"op": op, "kind": "bootstrap", "digest": d, "inode": list(inode), "cleanup_debt": debt})
+    # Once the staged copy is gone nothing holds the inode, and a file system may
+    # give its number to a replacement: the change time is journaled with it.
+    ctime_ns = reconcile_bootstrap(plan, data, inode)
+    journal.append({"op": op, "kind": "bootstrap", "digest": d, "inode": list(inode), "ctime_ns": ctime_ns,
+                    "cleanup_debt": debt})
     return d
 
 
-def reconcile_bootstrap(plan, data, inode):
-    """The published record is this operation's, exact and durable: Refused
-    otherwise, with everything retained."""
+def reconcile_bootstrap(plan, data, inode, ctime_ns=None):
+    """The published record is this operation's, exact and durable; returns its
+    change time. Refused otherwise, with everything retained. `ctime_ns`, once
+    journaled with D, must match too: an inode number alone can be reused."""
     final = bootstrap_path(plan)
     try:
-        found, ident = read_private(final)
+        found, ident, ctime = read_private(final)
     except FileNotFoundError:
         raise Refused(f"blocked: {shown(final)} is missing after this operation published it; nothing more was "
                       "changed") from None
-    if ident != inode:
-        raise Refused(f"blocked: {shown(final)} is not the inode this operation published; it is retained")
+    if ident != inode or (ctime_ns is not None and ctime != ctime_ns):
+        raise Refused(f"blocked: {shown(final)} is not the file this operation published (another inode, or "
+                      "replaced since); it is retained")
     if found != data:
         raise Refused(f"blocked: {shown(final)} doesn't hold this plan's exact record; it is retained")
     if state_root_identity(plan["state_root"]["path"]) != plan["state_root"]:
@@ -432,6 +438,7 @@ def reconcile_bootstrap(plan, data, inode):
     finally:
         os.close(fd)
     fsync_dir(final.parent)
+    return ctime
 
 
 # --- the journal ----------------------------------------------------------------------
@@ -878,7 +885,7 @@ def postcheck(plan_path, ops, spec_path=None):
     checks.append(("pinned release", "matches" if staged_sha == fields["release"] and staged.name == fields[
         "release_id"] else "the staged release's manifest or identity is not the record's"))
     try:
-        found, _ = read_private(bootstrap_path(plan))
+        found, _, _ = read_private(bootstrap_path(plan))
         checks.append(("bootstrap record", "matches" if found == data else "differs from the plan's"))
     except (FileNotFoundError, Refused) as e:
         checks.append(("bootstrap record", f"missing or unreadable ({e.__class__.__name__})"))
