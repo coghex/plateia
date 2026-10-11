@@ -5,7 +5,7 @@ item 20) requires. It maps every requirement, acceptance item, binding
 correction and spec addition of #19, design revision 9's tests 1–48
 ([`chat_outbox_state.md`](chat_outbox_state.md), section 9), owner
 amendment 6, and the code reviews' findings, to the named tests that assert
-them, with a status for each. It describes PR #20 at `02be8f2`.
+them, with a status for each. It describes PR #20 at `119610e`.
 
 How to read it:
 - Each row's **Requirement** or **Item** column (for design tests, the
@@ -362,6 +362,18 @@ on both supported Pythons, with a fake `fcntl`.
 | W7 | A full flush the filesystem does not support (ENOTSUP or EOPNOTSUPP, EINVAL, ENOTTY) falls back to os.fsync | bridge.FullFlushTests.test_an_unsupported_full_flush_falls_back_to_fsync | COVERED | A control. |
 | W8 | A full flush that works is enough: no plain fsync after it | bridge.FullFlushTests.test_a_full_flush_that_works_is_enough | COVERED | A control. |
 
+## 21. Code review 6104694236 (CODE17)
+
+The findings carried no priority. Failed first at `02be8f2` except where the note says control.
+
+| ID | Item | Tests | Status | Note |
+|---|---|---|---|---|
+| X1 | The state directory made by the bridge's `main()`, never synced in its parent, and an authority start whose parent sync fails: an interrupt sends no command (Escape, mode change, draft cleanup, Enter) and commits no intent until the directory's entry is durable; then it is delivered once, its ancestry durable before the first command | bridge.IntentAncestryTests.test_no_command_until_the_state_directory_entry_is_durable | COVERED | The power loss is modelled from the syncs that succeeded. |
+| X2 | Every sync working: an interrupt is delivered as before | bridge.IntentAncestryTests.test_with_every_sync_working_an_interrupt_is_delivered | COVERED | A control. |
+| X3 | A ledger proof line written but not synced, and the save of accept failing: after a restart, recovery syncs the ledger before accepting, so after a power loss the accepted interrupt keeps its ledger record, never rung again | bridge.LedgerProofSyncTests.test_recovery_syncs_the_ledger_before_it_accepts_the_proof | COVERED | |
+| X4 | While that proof cannot be synced, it is unknown: the item is left as it is (neither accepted nor held, no action); accepted once the sync succeeds, its record durable through a power loss | bridge.LedgerProofSyncTests.test_while_the_ledger_cannot_be_synced_the_proof_is_unknown | COVERED | |
+| X5 | A proof line synced when written reconciles as before | bridge.LedgerProofSyncTests.test_a_durable_proof_reconciles_as_before | COVERED | A control. |
+
 ## Counts
 
 | Section | COVERED | PARTIAL | MISSING |
@@ -386,16 +398,17 @@ on both supported Pythons, with a fake `fcntl`.
 | 18. Code review 6103685016 (CODE13) | 4 | 0 | 0 |
 | 19. Code review 6103950289 (CODE14) and the bounded recovery-input map | 30 | 0 | 0 |
 | 20. Code review 6104445458 (CODE16) | 8 | 0 | 0 |
-| **Total (204 rows)** | **204** | **0** | **0** |
+| 21. Code review 6104694236 (CODE17) | 5 | 0 | 0 |
+| **Total (209 rows)** | **209** | **0** | **0** |
 
 History: at `97db1bf`, before amendment 6's round, 104 of the then 130 rows
 were COVERED, 15 PARTIAL and 11 MISSING. That round closed them and added
 section 13. The final round added design tests 41–48 as their own rows in
-section 11, and section 14. The recovery rounds added sections 15 and 16, the durability round section 17, the acknowledgement-read round section 18, and the systematic round section 19 (V1 to V26; its follow-up added V27 to V30), and the CODE16 round section 20.
+section 11, and section 14. The recovery rounds added sections 15 and 16, the durability round section 17, the acknowledgement-read round section 18, and the systematic round section 19 (V1 to V26; its follow-up added V27 to V30), the CODE16 round section 20, and the CODE17 round section 21.
 
 ## Appendix A. The test methods of every class named above
 
-Generated from the test tree at `02be8f2`. A module named on its own (such as `rb` or `sil`) stands
+Generated from the test tree at `119610e`. A module named on its own (such as `rb` or `sil`) stands
 for all of its classes, listed here.
 
 ### `resend`: `packages/chat/scripts/tests/test_outbox_resend.py`
@@ -466,9 +479,11 @@ for all of its classes, listed here.
 - **FlushContainmentTests**: `test_each_failing_step_leaves_the_others_running`, `test_one_failing_reconciliation_key_leaves_the_others_decided`, `test_a_writer_with_an_impossible_pid_never_stops_a_flush`, `test_an_export_that_cannot_be_written_stays_due_and_blocks_nothing`
 - **FullFlushTests**: `test_a_full_flush_io_error_is_a_failure_even_though_fsync_would_work`, `test_an_intent_whose_full_flush_fails_takes_no_action`, `test_an_unsupported_full_flush_falls_back_to_fsync`, `test_a_full_flush_that_works_is_enough`
 - **IndexTimeTests**: `test_server_fields_missing_or_malformed_are_never_replaced_by_local_ones`, `test_an_unreadable_time_is_a_failed_index`
+- **IntentAncestryTests**: `test_no_command_until_the_state_directory_entry_is_durable`, `test_with_every_sync_working_an_interrupt_is_delivered`
 - **InterruptIntentTests**: `test_the_intent_is_durable_before_the_first_command`, `test_without_a_durable_intent_nothing_is_done`, `test_a_crash_at_any_boundary_after_the_intent_never_interrupts_again`, `test_a_crash_after_the_evidence_never_interrupts_again`, `test_a_crash_before_the_intent_is_retried_as_today`
 - **InterruptOutcomeTests**: `test_save_failures_after_delivery_never_interrupt_again`, `test_with_no_surviving_proof_it_is_held_alerted_once_and_settled_by_the_acknowledgement`, `test_an_acknowledgement_while_work_is_owed_then_a_restart`, `test_a_proved_no_action_is_retried_and_a_partial_step_is_held`, `test_proof_that_is_not_proof_leaves_it_held`
 - **JoinWithoutServerTimeTests**: `test_a_failed_first_index_after_an_untimed_join_is_never_skipped_and_proves_nothing`, `test_a_timed_join_takes_its_boundary_from_the_server_alone`, `test_a_failed_index_mid_catch_up_never_restores_completeness_or_moves_the_checkpoint`, `test_a_successful_replay_restores_completeness_from_the_preserved_checkpoint`
+- **LedgerProofSyncTests**: `test_recovery_syncs_the_ledger_before_it_accepts_the_proof`, `test_while_the_ledger_cannot_be_synced_the_proof_is_unknown`, `test_a_durable_proof_reconciles_as_before`
 - **LiveAcknowledgementRetryTests**: `test_a_live_acknowledgement_is_settled_after_a_transient_ledger_failure`
 - **OwedAnnouncementExpiryTests**: `test_an_owed_announcement_survives_the_expiry_and_a_restart`
 - **QueuedOnlyWhenSavedTests**: `test_a_failed_queue_save_then_a_same_instance_replay_then_a_crash`, `test_a_failed_save_of_a_held_replay_leaves_no_alert_behind`
