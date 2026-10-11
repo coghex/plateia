@@ -1134,6 +1134,285 @@ class SweepTests(ActivationCase):
                     activate_release.read_journal(self.root)
 
 
+BYTECODE_PROBE = """
+import importlib.machinery, json, sys
+attempts = []
+real = importlib.machinery.SourceFileLoader.set_data
+def spy(self, path, data, *, _mode=0o666):
+    attempts.append(path)
+    return real(self, path, data, _mode=_mode)
+importlib.machinery.SourceFileLoader.set_data = spy
+assert sys.dont_write_bytecode is False and sys.pycache_prefix is None, "bytecode must be enabled"
+import plateia_chat
+sys.path.insert(0, str(plateia_chat.SCRIPTS))
+import chatlib, identities, delivery_store
+print(json.dumps({"attempts": attempts, "dont_write_bytecode": sys.dont_write_bytecode,
+                  "pycache_prefix": sys.pycache_prefix}))
+"""
+
+
+class GuardedSealTests(ActivationCase):
+    """Owner amendment 3 (6111420402), section 7, and its APPROVE's four spec
+    additions (6111462237): the guarded seal of exactly two staged directories."""
+
+    def seal_dirs(self, plan):
+        site = next((Path(plan["staged_release"]) / "env").glob("lib/python*/site-packages"))
+        return [site / "plateia_chat", site / "plateia_chat/scripts"]
+
+    @staticmethod
+    def mode(p):
+        return os.stat(p).st_mode & 0o777
+
+    def seal_records(self):
+        return [r for r in self.journal() if r["kind"] in ("release-seal-baseline", "release-sealed")]
+
+    def test_a_seal_from_0755_journals_the_originals_and_changes_nothing_else(self):
+        plan, path = self.prepared()
+        dirs = self.seal_dirs(plan)
+        parents = [dirs[0].parent, dirs[0].parent.parent, dirs[0].parent.parent.parent,
+                   Path(plan["staged_release"]) / "env"]
+        before = {p: (os.stat(p).st_mode, os.stat(p).st_uid) for p in parents}
+        owners = [os.stat(p).st_uid for p in dirs]
+        self.activate(path)
+        self.assertEqual([self.mode(p) for p in dirs], [0o555, 0o555])
+        self.assertEqual([os.stat(p).st_uid for p in dirs], owners, "ownership unchanged")
+        self.assertEqual({p: (os.stat(p).st_mode, os.stat(p).st_uid) for p in parents}, before, "parents unchanged")
+        kinds = self.kinds()
+        self.assertLess(kinds.index("release-seal-baseline"), kinds.index("release-sealed"))
+        self.assertLess(kinds.index("release-sealed"), kinds.index("binding"), "sealed before any target is bound")
+        sealed = next(r for r in self.journal() if r["kind"] == "release-sealed")
+        self.assertEqual([d["mode"] for d in sealed["dirs"]], [0o755, 0o755], "the originals are journaled")
+        self.assertEqual([[d["dev"], d["ino"]] for d in sealed["dirs"]],
+                         [[os.stat(p).st_dev, os.stat(p).st_ino] for p in dirs])
+        for d, p in zip(sealed["dirs"], dirs):
+            fd = os.open(p, os.O_RDONLY)
+            try:
+                self.assertEqual(activate_release.access_metadata(fd), d["access"], "ACL and flags unchanged")
+            finally:
+                os.close(fd)
+
+    def test_every_other_baseline_refuses_before_either_directory_changes(self):
+        def second_only(change):
+            """Make only the second directory (scripts/) invalid: the first stays 0755."""
+            return lambda dirs: change(dirs[1])
+        cases = {
+            "a stricter mode (0700)": (second_only(lambda p: p.chmod(0o700)), None),
+            "a stricter mode (0555, unjournaled)": (second_only(lambda p: p.chmod(0o555)), None),
+            "a different mode (0775)": (second_only(lambda p: p.chmod(0o775)), None),
+            "a different mode (0750)": (second_only(lambda p: p.chmod(0o750)), None),
+            "another owner": (None, ("current_uid", lambda: os.getuid() + 1)),
+            "an ACL that could grant writes": (None, "acl"),
+            "an unreadable ACL": (None, "unreadable"),
+            "an ambiguous identity": (None, "identity"),
+        }
+        real_access = activate_release.access_metadata
+        for name, (change, patch) in cases.items():
+            with self.subTest(baseline=name):
+                self.fresh()
+                plan, path = self.prepared()
+                dirs = self.seal_dirs(plan)
+                if change:
+                    change(dirs)
+                calls = []
+
+                def access(fd):
+                    calls.append(fd)
+                    if len(calls) == 2 and patch == "acl":
+                        raise Refused("it has an ACL, which could grant writes the seal forbids")
+                    if len(calls) == 2 and patch == "unreadable":
+                        raise Refused("its ACL can't be read (EIO)")
+                    return real_access(fd)
+                patches = [mock.patch.object(activate_release, "access_metadata", access)]
+                if isinstance(patch, tuple):
+                    patches.append(mock.patch.object(activate_release, patch[0], patch[1]))
+                if patch == "identity":
+                    real_fstat, second = os.fstat, os.stat(dirs[1])
+
+                    def fstat(fd):
+                        st = real_fstat(fd)
+                        if (st.st_dev, st.st_ino) == (second.st_dev, second.st_ino):
+                            return os.stat_result((st.st_mode, 0, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+                                                   st.st_size, 0, 0, 0))
+                        return st
+                    patches.append(mock.patch.object(activate_release.os, "fstat", fstat))
+                with contextlib.ExitStack() as stack:
+                    for p in patches:
+                        stack.enter_context(p)
+                    with self.assertRaisesRegex(Refused, "blocked"):
+                        self.activate(path)
+                self.assertEqual(self.mode(dirs[0]), 0o755, "the first directory is unchanged")
+                if not change:
+                    self.assertEqual(self.mode(dirs[1]), 0o755)
+                self.assertEqual(self.seal_records(), [], "nothing was journaled as sealed")
+                self.assertEqual(self.targets_snapshot(), self.before_targets(), "nothing else changed")
+
+    @unittest.skipUnless(sys.platform == "darwin", "a real extended ACL is set here with macOS chmod +a")
+    def test_a_real_acl_that_defeats_the_seal_is_refused(self):
+        plan, path = self.prepared()
+        dirs = self.seal_dirs(plan)
+        user = __import__("pwd").getpwuid(os.getuid()).pw_name
+        subprocess.run(["/bin/chmod", "+a", f"{user} allow add_file,add_subdirectory", str(dirs[1])], check=True)
+        probe = dirs[1].parent.parent / "acl-probe"
+        probe.mkdir()
+        try:  # the effective access a 0555 mode would not stop
+            subprocess.run(["/bin/chmod", "+a", f"{user} allow add_file", str(probe)], check=True)
+            probe.chmod(0o555)
+            (probe / "written").write_text("an ACL let this through a 0555 directory\n")
+        finally:
+            probe.chmod(0o755)
+            shutil.rmtree(probe)
+        with self.assertRaisesRegex(Refused, "ACL"):
+            self.activate(path)
+        self.assertEqual([self.mode(p) for p in dirs], [0o755, 0o755])
+        self.assertEqual(self.seal_records(), [])
+
+    def test_resume_accepts_only_this_operations_journaled_seal(self):
+        plan, path = self.prepared()
+        with self.assertRaises(Crash):
+            self.activate(path, crash=self.crash_on("release-sealed"))
+        self.assertEqual(self.activate(path)["state"], "selected")
+        self.assertEqual(self.kinds().count("release-sealed"), 1)
+        self.fresh()
+        plan, path = self.prepared()
+        for p in self.seal_dirs(plan):
+            p.chmod(0o555)  # a 0555 this operation never journaled
+        with self.assertRaisesRegex(Refused, "unknown"):
+            self.activate(path)
+        self.assertEqual([self.mode(p) for p in self.seal_dirs(plan)], [0o555, 0o555], "nothing is restored")
+        self.assertEqual(self.targets_snapshot(), self.before_targets())
+
+    def test_a_crash_at_each_fchmod_and_at_the_journal_boundary_resumes(self):
+        for point in ("before the first fchmod", "after the first fchmod", "after the second fchmod",
+                      "after release-sealed"):
+            with self.subTest(crash=point):
+                self.fresh()
+                plan, path = self.prepared()
+                real, calls = os.fchmod, []
+
+                def fchmod(fd, mode):
+                    if mode != 0o555:  # the private backups' own 0600: not the seal
+                        return real(fd, mode)
+                    calls.append(fd)
+                    if point == "before the first fchmod" and len(calls) == 1:
+                        raise Crash(point)
+                    real(fd, mode)
+                    if (point, len(calls)) in (("after the first fchmod", 1), ("after the second fchmod", 2)):
+                        raise Crash(point)
+                crash = self.crash_on("release-sealed") if point == "after release-sealed" else None
+                with mock.patch.object(activate_release.os, "fchmod", fchmod), self.assertRaises(Crash):
+                    self.activate(path, crash=crash)
+                self.assertEqual([r["kind"] for r in self.seal_records()][:1], ["release-seal-baseline"],
+                                 "the originals were journaled before the first change")
+                self.assertEqual(self.activate(path)["state"], "selected")
+                self.assertEqual([self.mode(p) for p in self.seal_dirs(plan)], [0o555, 0o555])
+                sealed = [r for r in self.seal_records() if r["kind"] == "release-sealed"]
+                self.assertEqual(len(sealed), 1)
+                self.assertEqual([d["mode"] for d in sealed[0]["dirs"]], [0o755, 0o755], "originals retained")
+
+    def test_a_crash_mid_seal_then_a_replaced_directory_is_unknown(self):
+        plan, path = self.prepared()
+        real, calls = os.fchmod, []
+
+        def fchmod(fd, mode):
+            real(fd, mode)
+            if mode == 0o555:
+                raise Crash("after the first fchmod")
+        with mock.patch.object(activate_release.os, "fchmod", fchmod), self.assertRaises(Crash):
+            self.activate(path)
+        first, scripts = self.seal_dirs(plan)
+        first.chmod(0o755)
+        scripts.rename(first / "scripts-old")
+        shutil.copytree(first / "scripts-old", scripts)
+        shutil.rmtree(first / "scripts-old")
+        first.chmod(0o555)
+        with self.assertRaisesRegex(Refused, "unknown"):
+            self.activate(path)
+        self.assertEqual(self.mode(scripts), 0o755, "nothing was sealed or restored")
+
+    def test_a_drifted_seal_blocks_and_is_never_resealed(self):
+        def mode_only(dirs):
+            dirs[1].chmod(0o755)
+
+        def replaced_with_identical_contents(dirs):
+            dirs[0].chmod(0o755)
+            dirs[1].rename(dirs[0] / "scripts-old")
+            shutil.copytree(dirs[0] / "scripts-old", dirs[1])
+            (dirs[0] / "scripts-old").chmod(0o755)
+            shutil.rmtree(dirs[0] / "scripts-old")
+            dirs[1].chmod(0o555)
+            dirs[0].chmod(0o555)
+        for name, drift in (("mode only", mode_only), ("replaced with identical contents",
+                                                       replaced_with_identical_contents)):
+            with self.subTest(drift=name):
+                self.fresh()
+                plan, path = self.activated()
+                self.serving()
+                self.ops.bridge = {"running": True, "release": plan["release"]}
+                self.assertTrue(self.postcheck(path)["ok"])
+                drift(self.seal_dirs(plan))
+                report = self.postcheck(path)
+                self.assertFalse(report["ok"])
+                self.assertTrue(dict(report["checks"])["release seal"].startswith("drifted"))
+                self.assertEqual(dict(report["checks"])["staged release"], "matches",
+                                 "the inventory alone can't see it: directories are recorded as [\"dir\"]")
+                self.fresh()
+                plan, path = self.prepared()
+                with self.assertRaises(Crash):
+                    self.activate(path, crash=self.crash_on("release-sealed"))
+                drift(self.seal_dirs(plan))
+                modes = [self.mode(p) for p in self.seal_dirs(plan)]
+                with self.assertRaisesRegex(Refused, "drifted"):
+                    self.activate(path)
+                self.assertEqual([self.mode(p) for p in self.seal_dirs(plan)], modes, "never sealed again silently")
+
+    def test_rollback_keeps_the_seal(self):
+        plan, path = self.activated()
+        self.rollback(path)
+        self.assertEqual([self.mode(p) for p in self.seal_dirs(plan)], [0o555, 0o555])
+        self.assertEqual(self.targets_snapshot(), self.before_targets())
+
+    def bytecode_probe(self, plan):
+        """Run the staged interpreter with bytecode deliberately enabled: no -B,
+        no PYTHONDONTWRITEBYTECODE (which CI sets), no cache prefix."""
+        python = Path(plan["staged_release"]) / "env/bin/python"
+        env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+        done = subprocess.run([str(python), "-I", "-c", BYTECODE_PROBE], capture_output=True, text=True, env=env,
+                              timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        found = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertFalse(found["dont_write_bytecode"])
+        self.assertIsNone(found["pycache_prefix"])
+        return found["attempts"]
+
+    def pycache(self, plan):
+        return [p for d in self.seal_dirs(plan) for p in d.glob("__pycache__")]
+
+    def test_real_use_with_bytecode_enabled_writes_nothing_and_the_strict_postcheck_passes(self):
+        # The control: an unsealed staged release does get bytecode, so the proof below is not vacuous.
+        plan, path = self.prepared()
+        attempts = self.bytecode_probe(plan)
+        self.assertEqual({Path(a).parent.parent for a in attempts} & set(self.seal_dirs(plan)),
+                         set(self.seal_dirs(plan)))
+        self.assertEqual(len(self.pycache(plan)), 2, "without the seal, both directories get __pycache__")
+        with self.assertRaisesRegex(Refused, "doesn't verify"):
+            activate_release.verify_staged_release(plan)
+        # Sealed: the same use attempts to write caches in both directories, and none appears.
+        self.fresh()
+        plan, path = self.activated()
+        attempts = self.bytecode_probe(plan)
+        self.assertEqual({Path(a).parent.parent for a in attempts} & set(self.seal_dirs(plan)),
+                         set(self.seal_dirs(plan)), "imports tried to write caches in both sealed directories")
+        bound = subprocess.run([str(self.home / ".local/bin/pchat"), "--help"], capture_output=True, text=True,
+                               env={"HOME": str(self.home), "PATH": "/usr/bin:/bin"}, timeout=60)
+        self.assertEqual(bound.returncode, 0, bound.stderr)
+        self.assertEqual(self.pycache(plan), [], "no cache appeared")
+        self.serving()
+        self.ops.bridge = {"running": True, "release": plan["release"]}
+        report = self.postcheck(path)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(dict(report["checks"])["staged release"], "matches", "strict verification, unchanged")
+
+
 class OperatorPlanTests(ActivationCase):
     """A9: the private operator plan names everything an operator publishes."""
 

@@ -41,6 +41,7 @@ the published plan (D-74).
 import argparse
 import contextlib
 import datetime
+import errno
 import fcntl
 import hashlib
 import io
@@ -604,7 +605,7 @@ RECORD_FIELDS = {  # what each journal record must carry, by kind (shape checks 
     "binding": {"target": str}, "entry-binding": {"target": str, "rel": str, "tmp": str, "to": str},
     "entry-bound": {"target": str, "rel": str}, "bound": {"target": str},
     "entry-restoring": {"target": str, "rel": str, "tmp": str}, "entry-restored": {"target": str, "rel": str},
-    "restored": {"target": str}}
+    "restored": {"target": str}, "release-seal-baseline": {"dirs": list}, "release-sealed": {"dirs": list}}
 
 
 def record_problem(r):
@@ -613,6 +614,12 @@ def record_problem(r):
     for field, kind in RECORD_FIELDS.get(r["kind"], {}).items():
         if not isinstance(r.get(field), kind) or isinstance(r.get(field), bool):
             return f"a {r['kind']} record's {field} is malformed"
+    if r["kind"] in ("release-seal-baseline", "release-sealed") and (
+            len(r["dirs"]) != len(SEAL_DIRS) or not all(
+                isinstance(d, dict) and d.get("rel") == rel and all(type(d.get(k)) is int for k in ("dev", "ino", "mode",
+                                                                                                    "uid"))
+                and isinstance(d.get("access"), dict) for d, rel in zip(r["dirs"], SEAL_DIRS))):
+        return f"a {r['kind']} record's directories are malformed"
     for field in ("inode", "container"):
         value = r.get(field)
         if value is not None and (not isinstance(value, list) or len(value) != 2
@@ -806,30 +813,188 @@ def verify_staged_release(plan):
         writer.close()
 
 
-def seal_staged_release(plan):
-    """The release's package directories made read-only (0555), through pinned
-    descriptors: Python then never writes bytecode into them, so the staged
-    environment stays exactly the inventory staging recorded (directory modes
-    are not part of it) however its commands are run, and the post-check's
-    verification holds after real use. Returns True if anything changed."""
-    sites = sorted((Path(plan["staged_release"]) / "env").glob("lib/python*/site-packages/plateia_chat"))
-    if len(sites) != 1:
-        raise Refused("the staged environment has no single plateia_chat package")
-    changed = False
-    fd = open_dir(sites[0], what="the staged plateia_chat package")
+# --- the guarded seal (#21's owner amendment 3; its APPROVE's four additions) -----------
+
+SEAL_DIRS = ("plateia_chat", "plateia_chat/scripts")  # under the staged site-packages; nothing else is sealed
+SEAL_BASELINE, SEAL_MODE = 0o755, 0o555
+DARWIN_ACL_EXTENDED = 0x00000100  # acl_type_t ACL_TYPE_EXTENDED
+LINUX_ACL_XATTRS = ("system.posix_acl_access", "system.posix_acl_default")
+LINUX_FS_IOC_GETFLAGS = 0x80086601
+LINUX_RESTRICTIVE_FLAGS = 0x00000010 | 0x00000020  # FS_IMMUTABLE_FL, FS_APPEND_FL
+
+
+def current_uid():
+    return os.getuid()
+
+
+def _darwin_acl(fd):
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    get = libc.acl_get_fd_np
+    get.restype, get.argtypes = ctypes.c_void_p, [ctypes.c_int, ctypes.c_int]
+    libc.acl_free.argtypes = [ctypes.c_void_p]
+    ctypes.set_errno(0)
+    acl = get(fd, DARWIN_ACL_EXTENDED)
+    if acl:
+        libc.acl_free(acl)
+        return "present"
+    err = ctypes.get_errno()
+    if err == errno.ENOENT:
+        return "none"
+    raise Refused(f"its ACL can't be read ({errno.errorcode.get(err, err)})")
+
+
+def _linux_flags(fd):
+    import fcntl as _fcntl
     try:
-        for part in (None, "scripts"):
-            dfd = fd if part is None else subdir(fd, [part])
-            try:
-                if stat.S_IMODE(os.fstat(dfd).st_mode) != 0o555:
-                    os.fchmod(dfd, 0o555)
-                    changed = True
-            finally:
-                if dfd != fd:
-                    os.close(dfd)
+        raw = _fcntl.ioctl(fd, LINUX_FS_IOC_GETFLAGS, bytes(8))
+    except OSError as e:
+        if e.errno in (errno.ENOTTY, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL):
+            return None  # this file system keeps no inode flags
+        raise Refused(f"its flags can't be read ({e.strerror or e})") from None
+    return int.from_bytes(raw[:4], sys.byteorder)
+
+
+def access_metadata(fd):
+    """A directory's access metadata, read through its descriptor: its ACL
+    state and its flags. Refused when it can't be read, is ambiguous, or could
+    defeat the seal or be altered by the mode change: any extended ACL (it can
+    grant writes a 0555 mode doesn't, and on Linux the mode change would
+    rewrite its mask), and any flag on macOS, or an immutable or append-only
+    flag on Linux."""
+    if sys.platform == "darwin":
+        if _darwin_acl(fd) != "none":
+            raise Refused("it has an ACL, which could grant writes the seal forbids")
+        flags = os.fstat(fd).st_flags
+        if flags:
+            raise Refused(f"it has file flags ({flags:#x}), whose effect on the seal is not established")
+        return {"acl": "none", "flags": flags}
+    if sys.platform.startswith("linux"):
+        try:
+            names = os.listxattr(fd)
+        except OSError as e:
+            if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise Refused(f"its extended attributes can't be read ({e.strerror or e})") from None
+            names = []
+        if any(n in LINUX_ACL_XATTRS for n in names):
+            raise Refused("it has a POSIX ACL, which the mode change would alter and which could grant writes")
+        flags = _linux_flags(fd)
+        if flags is not None and flags & LINUX_RESTRICTIVE_FLAGS:
+            raise Refused(f"it has immutable or append-only flags ({flags:#x})")
+        return {"acl": "none", "flags": flags}
+    raise Refused(f"its access metadata can't be read on {sys.platform}")
+
+
+def dir_metadata(fd, rel):
+    """(identity, mode, owner, access metadata) of one pinned directory;
+    Refused, naming it, when any of it is unreadable or ambiguous."""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode) or type(st.st_dev) is not int or type(st.st_ino) is not int \
+                or st.st_ino <= 0:
+            raise Refused("its identity is ambiguous")
+        return {"rel": rel, "dev": st.st_dev, "ino": st.st_ino, "mode": stat.S_IMODE(st.st_mode),
+                "uid": st.st_uid, "access": access_metadata(fd)}
+    except Refused as e:
+        raise Refused(f"blocked: the staged {rel} can't be sealed: {e}; nothing was changed") from None
+
+
+@contextlib.contextmanager
+def pinned_seal_dirs(plan):
+    """The two directories the seal may change, pinned: the package directory
+    is never reached through a link, and scripts/ is opened relative to it."""
+    sites = sorted((Path(plan["staged_release"]) / "env").glob("lib/python*/site-packages"))
+    if len(sites) != 1:
+        raise Refused("the staged environment has no single site-packages")
+    site = open_dir(sites[0], what="the staged site-packages")
+    fds = []
+    try:
+        for rel in SEAL_DIRS:
+            fds.append((rel, subdir(site, rel.split("/"))))
+        yield fds
     finally:
-        os.close(fd)
-    return changed
+        for _, fd in fds:
+            os.close(fd)
+        os.close(site)
+
+
+def seal_problem(recorded, found):
+    """Why `found` (now) is not the journaled seal of `recorded` (the
+    originals): another directory, owner or access metadata, or a mode other
+    than 0555."""
+    for o, m in zip(recorded, found):
+        if (o["dev"], o["ino"]) != (m["dev"], m["ino"]):
+            return f"{o['rel']} is another directory now (replaced)"
+        if (o["uid"], o["access"]) != (m["uid"], m["access"]):
+            return f"{o['rel']}'s owner or access metadata changed"
+        if m["mode"] != SEAL_MODE:
+            return f"{o['rel']}'s mode is {m['mode']:#o}, not the sealed 0555"
+    return None
+
+
+def seal_release(journal, plan, read_only=False):
+    """The guarded seal (amendment 3), or the verification of a seal already
+    journaled. Both baselines are verified before either directory changes:
+    mode exactly 0755, this user's, a definite identity, and access metadata
+    that can't defeat the seal. The originals are journaled
+    (release-seal-baseline) before the first fchmod; each directory is then
+    set to 0555 through its pinned descriptor, nothing else changes, and
+    release-sealed is journaled with the originals. A resume accepts 0555 only
+    for this operation's journaled seal, with matching identities; a 0555 this
+    operation didn't journal is unknown, and nothing is restored. A completed
+    seal that drifted blocks, and is never sealed again silently."""
+    op = plan["operation"]
+    mine = [r for r in journal.records if r.get("op") == op]
+    sealed = next((r for r in reversed(mine) if r["kind"] == "release-sealed"), None)
+    intent = next((r for r in reversed(mine) if r["kind"] == "release-seal-baseline"), None)
+    with pinned_seal_dirs(plan) as dirs:
+        found = [dir_metadata(fd, rel) for rel, fd in dirs]
+        if sealed is not None:
+            problem = seal_problem(sealed["dirs"], found)
+            if problem:
+                raise Refused(f"blocked: the release's seal drifted ({problem}); it is never sealed again silently, "
+                              "and nothing more was changed")
+            return
+        if read_only:
+            raise Refused("blocked: a bridge of this release is running, but this operation never journaled its "
+                          "seal; nothing was changed")
+        if intent is not None:
+            originals = intent["dirs"]
+            for o, m in zip(originals, found):
+                if (o["dev"], o["ino"], o["uid"], o["access"]) != (m["dev"], m["ino"], m["uid"], m["access"]) \
+                        or m["mode"] not in (SEAL_BASELINE, SEAL_MODE):
+                    raise Refused(f"blocked: {o['rel']} is not as this operation recorded it before sealing "
+                                  "(unknown); nothing was changed")
+        else:
+            for m in found:  # both baselines, before either changes
+                if m["mode"] != SEAL_BASELINE:
+                    raise Refused(f"blocked: the staged {m['rel']}'s mode is {m['mode']:#o}, not 0755 (stricter, "
+                                  "different, or a seal this operation never journaled: unknown); nothing was "
+                                  "changed")
+                if m["uid"] != current_uid():
+                    raise Refused(f"blocked: the staged {m['rel']} is owned by another user; nothing was changed")
+            originals = found
+            journal.append({"op": op, "kind": "release-seal-baseline", "dirs": originals})
+        for (rel, fd), m in zip(dirs, found):
+            if m["mode"] != SEAL_MODE:
+                os.fchmod(fd, SEAL_MODE)
+        problem = seal_problem(originals, [dir_metadata(fd, rel) for rel, fd in dirs])
+        if problem:
+            raise Refused(f"blocked: the seal didn't take as recorded ({problem}); nothing more was changed")
+        journal.append({"op": op, "kind": "release-sealed", "dirs": originals})
+
+
+def seal_report(plan, mine):
+    """The post-check's view of the seal: "matches", or why not (read-only)."""
+    sealed = next((r for r in reversed(mine["records"]) if r["kind"] == "release-sealed"), None)
+    if sealed is None:
+        return "not journaled by this operation"
+    try:
+        with pinned_seal_dirs(plan) as dirs:
+            problem = seal_problem(sealed["dirs"], [dir_metadata(fd, rel) for rel, fd in dirs])
+    except Refused as e:
+        return f"unreadable: {e}"
+    return f"drifted: {problem}" if problem else "matches"
 
 
 def staged_layout(plan):
@@ -1311,9 +1476,8 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
                 raise Refused(f"blocked: {t['name']} isn't bound while a bridge runs; binding waits for it to stop "
                               "at an acknowledged checkpoint; nothing was changed")
             steps.append((t, path, backup, original, desired, writes))
+        seal_release(journal, plan, read_only)  # before any target is written: verified, or guarded and journaled
         if not read_only:
-            if seal_staged_release(plan):
-                journal.append({"op": plan["operation"], "kind": "release-sealed", "mode": "0555"})
             publish_bootstrap(journal, plan)
         for t, path, backup, original, desired, writes in steps:
             if writes:
@@ -1380,6 +1544,7 @@ def postcheck(plan_path, ops, spec_path=None):
         staged_sha = stage_release.drift_check.sha256(staged / "artifacts" / MANIFEST)
     except OSError:
         staged_sha = None
+    checks.append(("release seal", seal_report(plan, mine)))
     fields = release_fields(plan)
     checks.append(("pinned release", "matches" if staged_sha == fields["release"] and staged.name == fields[
         "release_id"] else "the staged release's manifest or identity is not the record's"))
@@ -1538,7 +1703,32 @@ def render_operator_plan(plan):
               "keeping the newer state",
               "  skills repository: the expected change to the chat skill folder and chat/scripts is reported "
               "by activate; the owner commits it (D-27)"]
+    lines += seal_plan_lines(plan)
     return "\n".join(lines)
+
+
+def seal_plan_lines(plan):
+    """The guarded seal in the operator plan (amendment 3, section 6): the
+    exact staged paths and, once staged, their baselines as observed now
+    (read-only). A live seal needs the owner's confirmation at that time."""
+    sites = sorted((Path(plan["staged_release"]) / "env").glob("lib/python*/site-packages"))
+    base = sites[0] if len(sites) == 1 else Path(plan["staged_release"]) / "env/lib/python<X.Y>/site-packages"
+    lines = ["  guarded seal (a permission change: the owner confirms it at the time, against these paths and an "
+             "independently verified baseline): 0755 -> 0555, mode bits only; rollback keeps it"]
+    for rel in SEAL_DIRS:
+        path = base / rel
+        try:
+            fd = open_dir(path, what=f"the staged {rel}")
+            try:
+                m = dir_metadata(fd, rel)
+                seen = (f"mode {m['mode']:#o}, owner uid {m['uid']}, device {m['dev']} inode {m['ino']}, "
+                        f"ACL {m['access']['acl']}, flags {m['access']['flags']}")
+            finally:
+                os.close(fd)
+        except Refused as e:
+            seen = f"not verifiable now ({e})"
+        lines.append(f"    {shown(path)}: {seen}")
+    return lines
 
 
 # --- command line ----------------------------------------------------------------------
