@@ -5,7 +5,7 @@ item 20) requires. It maps every requirement, acceptance item, binding
 correction and spec addition of #19, design revision 9's tests 1–48
 ([`chat_outbox_state.md`](chat_outbox_state.md), section 9), owner
 amendment 6, and the code reviews' findings, to the named tests that assert
-them, with a status for each. It describes PR #20 at `5f87d47`.
+them, with a status for each. It describes PR #20 at `7439dd9`.
 
 How to read it:
 - Each row's **Requirement** or **Item** column (for design tests, the
@@ -298,6 +298,46 @@ Failed first at `654b81e` except where the note says control.
 | Q3 | A readable file with no acknowledgement for an expired interrupt: dead-lettered as before | bridge.UnreadableAcknowledgementsTests.test_an_expired_interrupt_with_no_acknowledgement_is_dead_lettered_as_before | COVERED | A control. |
 | Q4 | No acks.jsonl at all is no acknowledgement, never an unreadable one: a ready interrupt is delivered | bridge.UnreadableAcknowledgementsTests.test_with_no_acknowledgement_file_a_ready_interrupt_is_delivered | COVERED | A control. |
 
+## 19. Code review 6103950289 (CODE14) and the bounded recovery-input map
+
+The bridge's recovery readers of the pending state, `acks.jsonl` and the
+delivery ledger, and first-start fallback publication: each failure
+condition, the invariant it keeps, and the named test. Only a genuinely
+missing file is absence; any other failure to inspect or read is unknown.
+"Stat or inspection failure" is tested as Python 3.14 shows it, on both
+supported Pythons: `Path.exists()` reports False and the read raises. This
+map is bounded to these readers; it is not a certification of every input.
+`pchat`'s own reads of `pending.json` are for display only and out of scope.
+
+| ID | Reader (file: use) | Condition | Invariant | Tests | Status | Note |
+|---|---|---|---|---|---|---|
+| V1 | `pending.json`: `Deliveries._load` (the queue) | missing | an empty queue | bridge.UnreadablePendingTests.test_a_missing_pending_file_is_an_empty_queue | COVERED | Control. |
+| V2 | `pending.json`: `Deliveries._load` | stat or inspection failure | unloaded: never replaced, nothing queued or delivered, read again each pass | bridge.RecoveryInputTests.test_pending_state_with_a_stat_failure_stays_unloaded | COVERED | Control (already read directly). |
+| V3 | `pending.json`: `Deliveries._load` | open or read failure | unloaded, as V2 | bridge.UnreadablePendingTests.test_a_possibly_acted_intent_survives_an_unreadable_pending_state (read error) | COVERED | Failing first at `ab79c93`. |
+| V4 | `pending.json`: `Deliveries._load` | parse failure (or not a list of items) | unloaded, as V2 | bridge.UnreadablePendingTests.test_a_possibly_acted_intent_survives_an_unreadable_pending_state (parse error) | COVERED | Failing first at `ab79c93`. |
+| V5 | `acks.jsonl`: `Acks._load` (the recorded set) | missing | an empty set: the first acknowledgement is recorded | bridge.AcknowledgementDurabilityTests.test_a_failed_acknowledgement_append_is_written_on_replay | COVERED |  |
+| V6 | `acks.jsonl`: `Acks._load` | stat or inspection failure | unknown: nothing recorded or settled as if empty; read again before each record | bridge.RecoveryInputTests.test_an_unreadable_acknowledgement_set_never_records_or_settles_as_if_empty (stat) | COVERED | Failing first at `5f87d47`. |
+| V7 | `acks.jsonl`: `Acks._load` | open or read failure | unknown, as V6 | bridge.RecoveryInputTests.test_an_unreadable_acknowledgement_set_never_records_or_settles_as_if_empty (read) | COVERED | Failing first at `5f87d47` (the set could not even be built). |
+| V8 | `acks.jsonl`: `Acks._load` | a torn or malformed line | skipped; the other lines kept | bridge.RecoveryInputTests.test_every_recovery_reader_skips_a_torn_line_and_keeps_the_rest | COVERED | The existing rule. |
+| V9 | `acks.jsonl`: `recovered_acknowledgements` (settling) | missing | no acknowledgement: interrupts proceed | bridge.UnreadableAcknowledgementsTests.test_with_no_acknowledgement_file_a_ready_interrupt_is_delivered | COVERED | Control. |
+| V10 | `acks.jsonl`: `recovered_acknowledgements` | stat or inspection failure | the interrupts it could settle are deferred (no key, no dead letter, no removal); settled once readable | bridge.RecoveryInputTests.test_acknowledgement_recovery_with_a_stat_failure_defers_a_ready_interrupt; bridge.RecoveryInputTests.test_acknowledgement_recovery_with_a_stat_failure_keeps_an_expired_interrupt | COVERED | Failing first at `5f87d47`. |
+| V11 | `acks.jsonl`: `recovered_acknowledgements` | open or read failure | deferred, as V10 | bridge.UnreadableAcknowledgementsTests.test_a_ready_interrupt_is_deferred_until_its_saved_acknowledgement_can_be_read; bridge.UnreadableAcknowledgementsTests.test_an_expired_interrupt_is_not_dead_lettered_while_its_acknowledgement_cannot_be_read | COVERED | Failing first at `654b81e`. |
+| V12 | `acks.jsonl`: `recovered_acknowledgements` | a torn or malformed line | skipped; the valid records used | bridge.AcknowledgementRecoveryTests.test_a_failed_read_is_retried_at_a_later_pass_and_a_malformed_line_is_skipped | COVERED | Failing first at `10c6df5`. |
+| V13 | delivery ledger: `_proof` (submission proof) | missing, or no matching line | no proof: held | bridge.InterruptOutcomeTests.test_with_no_surviving_proof_it_is_held_alerted_once_and_settled_by_the_acknowledgement | COVERED |  |
+| V14 | delivery ledger: `_proof` | stat or inspection failure | no proof: held; reconciled once readable | bridge.RecoveryInputTests.test_proof_with_a_ledger_stat_failure_is_no_proof_until_it_can_be_read | COVERED | Control (already conservative). |
+| V15 | delivery ledger: `_proof` | open or read failure | no proof: held | bridge.InterruptOutcomeTests.test_proof_that_is_not_proof_leaves_it_held (unreadable) | COVERED |  |
+| V16 | delivery ledger: `_proof` | a torn or malformed line | skipped; a valid proof line still counts | bridge.RecoveryInputTests.test_every_recovery_reader_skips_a_torn_line_and_keeps_the_rest | COVERED | The existing rule. |
+| V17 | delivery ledger: `_earlier_interrupt` (replay detection) | missing | no earlier obligation: the interrupt is queued | bridge.UnreadableAcknowledgementsTests.test_with_no_acknowledgement_file_a_ready_interrupt_is_delivered | COVERED | Control. |
+| V18 | delivery ledger: `_earlier_interrupt` | stat or inspection failure | a possible repeat: held, never rung | bridge.RecoveryInputTests.test_a_replay_with_a_ledger_stat_failure_is_never_rung | COVERED | Failing first at `5f87d47`. |
+| V19 | delivery ledger: `_earlier_interrupt` | open or read failure | held, as V18 | bridge.ReplayedInterruptTests.test_a_replay_with_an_unreadable_ledger_is_never_rung | COVERED | Failing first at `5aec2b8`. |
+| V20 | delivery ledger: `_earlier_interrupt` | a torn or malformed line | skipped; a valid earlier line still counts | bridge.RecoveryInputTests.test_every_recovery_reader_skips_a_torn_line_and_keeps_the_rest | COVERED | The existing rule. |
+| V21 | delivery ledger: `ledger_has` (alert export) | missing | not yet exported: queued once | store.AlertTests.test_an_expired_entry_raises_one_row_and_one_pending_item | COVERED |  |
+| V22 | delivery ledger: `ledger_has` | stat or inspection failure | unknown: not exported now, no second push; exported once readable | bridge.RecoveryInputTests.test_alert_export_with_a_ledger_stat_failure_queues_no_second_push (stat) | COVERED | Failing first at `5f87d47`. |
+| V23 | delivery ledger: `ledger_has` | open or read failure | unknown, as V22 | bridge.RecoveryInputTests.test_alert_export_with_a_ledger_stat_failure_queues_no_second_push (read) | COVERED | Control. |
+| V24 | delivery ledger: `ledger_has` | a torn or malformed line (including JSON that is not an object) | skipped; a valid line still counts | bridge.RecoveryInputTests.test_every_recovery_reader_skips_a_torn_line_and_keeps_the_rest | COVERED | Failing first at `5f87d47`: a JSON line that was not an object raised. |
+| V25 | fallback publication: `publish_fallback` (first start) | the state directory, or it and its parent, missing; no authority | created (default mode), each new entry synced in its parent; one durable file per call under its original id; imported once | resend.FirstStartTests.test_a_first_post_and_acknowledgement_before_any_start (one and two missing levels; a post and an acknowledgement) | COVERED | Failing first at `5f87d47`. |
+| V26 | fallback publication: `publish_fallback` | the tree cannot be made (a parent is a file) | fails truthfully: nothing reported queued | resend.FirstStartTests.test_a_publication_that_cannot_be_made_reports_nothing_queued | COVERED | Control. |
+
 ## Counts
 
 | Section | COVERED | PARTIAL | MISSING |
@@ -320,16 +360,17 @@ Failed first at `654b81e` except where the note says control.
 | 16. Code review 6103073520 (slot 11) and the bounded check | 4 | 0 | 0 |
 | 17. Code review 6103285015 (slot 12) | 4 | 0 | 0 |
 | 18. Code review 6103685016 (CODE13) | 4 | 0 | 0 |
-| **Total (166 rows)** | **166** | **0** | **0** |
+| 19. Code review 6103950289 (CODE14) and the bounded recovery-input map | 26 | 0 | 0 |
+| **Total (192 rows)** | **192** | **0** | **0** |
 
 History: at `97db1bf`, before amendment 6's round, 104 of the then 130 rows
 were COVERED, 15 PARTIAL and 11 MISSING. That round closed them and added
 section 13. The final round added design tests 41–48 as their own rows in
-section 11, and section 14. The recovery rounds added sections 15 and 16, the durability round section 17, and the acknowledgement-read round section 18.
+section 11, and section 14. The recovery rounds added sections 15 and 16, the durability round section 17, the acknowledgement-read round section 18, and the systematic round section 19.
 
 ## Appendix A. The test methods of every class named above
 
-Generated from the test tree at `5f87d47`. A module named on its own (such as `rb` or `sil`) stands
+Generated from the test tree at `7439dd9`. A module named on its own (such as `rb` or `sil`) stands
 for all of its classes, listed here.
 
 ### `resend`: `packages/chat/scripts/tests/test_outbox_resend.py`
@@ -341,6 +382,7 @@ for all of its classes, listed here.
 - **CommittedThenTimeoutTests**: `test_pchat_queues_only_the_unconfirmed_part_and_never_writes_it_again`, `test_the_line_transport_behaves_the_same`, `test_an_uncertain_part_never_proves_absence_by_a_timeout`
 - **DirectPostDuringFlushTests**: `test_a_direct_posts_message_never_satisfies_an_older_part_too`
 - **FailureBeforeE1Tests**: `test_a_failed_login_queues_by_q0_with_no_fallback_file`, `test_with_the_authority_unavailable_the_fallback_file_carries_it`, `test_an_e1_commit_whose_reply_is_lost_is_handed_off_not_duplicated`, `test_a_q0_commit_whose_reply_is_lost_plus_its_fallback_file_is_one_entry`, `test_two_calls_with_identical_text_are_two_entries`
+- **FirstStartTests**: `test_a_first_post_and_acknowledgement_before_any_start`, `test_a_publication_that_cannot_be_made_reports_nothing_queued`
 - **HostProbeTests**: `test_only_values_known_on_both_sides_are_compared`, `test_malformed_identities_prove_nothing_and_raise_nothing`, `test_a_socket_table_that_cannot_be_read_proves_nothing`, `test_a_start_time_is_read_from_one_source_per_platform`
 - **IndependentDeliveryTests**: `test_another_accounts_entry_flows_while_one_awaits_its_check`, `test_a_refused_and_a_failing_entry_never_stop_the_others`
 - **LateOutcomeTests**: `test_a_late_outcome_exports_a_superseding_version`
@@ -403,6 +445,7 @@ for all of its classes, listed here.
 - **LiveAcknowledgementRetryTests**: `test_a_live_acknowledgement_is_settled_after_a_transient_ledger_failure`
 - **OwedAnnouncementExpiryTests**: `test_an_owed_announcement_survives_the_expiry_and_a_restart`
 - **QueuedOnlyWhenSavedTests**: `test_a_failed_queue_save_then_a_same_instance_replay_then_a_crash`, `test_a_failed_save_of_a_held_replay_leaves_no_alert_behind`
+- **RecoveryInputTests**: `test_acknowledgement_recovery_with_a_stat_failure_defers_a_ready_interrupt`, `test_acknowledgement_recovery_with_a_stat_failure_keeps_an_expired_interrupt`, `test_a_replay_with_a_ledger_stat_failure_is_never_rung`, `test_proof_with_a_ledger_stat_failure_is_no_proof_until_it_can_be_read`, `test_alert_export_with_a_ledger_stat_failure_queues_no_second_push`, `test_an_unreadable_acknowledgement_set_never_records_or_settles_as_if_empty`, `test_every_recovery_reader_skips_a_torn_line_and_keeps_the_rest`, `test_pending_state_with_a_stat_failure_stays_unloaded`
 - **ReplayedInterruptTests**: `test_a_replayed_interrupt_keeps_one_obligation_whatever_its_outcome`, `test_another_recipient_of_the_same_message_stays_independent`, `test_an_ordinary_wake_up_keeps_its_baseline`, `test_a_replay_with_an_unreadable_ledger_is_never_rung`
 - **ServerEvidenceTests**: `test_a_late_message_without_server_time_never_proves_absence`, `test_a_failed_first_index_without_a_checkpoint_is_replayed_and_never_skipped`, `test_a_failed_index_mid_catch_up_never_restores_completeness_or_moves_the_checkpoint`, `test_a_successful_replay_restores_completeness_from_the_preserved_checkpoint`
 - **StartupCleanupTests**: `test_a_failed_sync_of_the_database_files_releases_everything`, `test_a_failed_bind_or_thread_start_releases_everything`, `test_a_dead_authority_thread_is_not_running_and_is_replaced`
