@@ -206,20 +206,31 @@ class Connection:
     def send(self, line: str) -> None:
         self.sock.sendall(line.encode() + b"\r\n")
 
+    def _left(self) -> float | None:
+        """The time left before the absolute deadline, if one is set; past it, TimeoutError."""
+        if self.deadline is None:
+            return None
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("timed out")
+        return left
+
     def lines(self, timeout: float | None = None):
         self.sock.settimeout(timeout)
         while True:
             while b"\r\n" in self.buf:
+                self._left()  # the deadline bounds every buffered line, not only each read (code review CODE18)
                 raw, self.buf = self.buf.split(b"\r\n", 1)
                 msg = parse_line(raw.decode(errors="replace"))
                 if msg["command"] == "PING":
+                    left = self._left()
+                    if left is not None:
+                        self.sock.settimeout(left)  # the PONG gets only the time left
                     self.send("PONG :" + (msg["params"][-1] if msg["params"] else ""))
                     continue
                 yield msg
-            if self.deadline is not None:
-                left = self.deadline - time.monotonic()
-                if left <= 0:
-                    raise TimeoutError("timed out")
+            left = self._left()
+            if left is not None:
                 self.sock.settimeout(left)
             data = self.sock.recv(65536)
             if not data:

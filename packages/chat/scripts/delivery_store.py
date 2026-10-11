@@ -626,19 +626,23 @@ def _make_state_tree(fs, path):
     """The state directory and any missing parent, as the old outbox path's
     STATE_DIR.mkdir(parents=True) made them (the default mode): a first post
     before the bridge ever started (code review CODE14). Every level this or
-    an earlier attempt may have made (each one below the home directory, and
-    any that is missing) has its entry synced in its parent at every call,
-    whether it already exists or not: an earlier attempt's sync may have
-    failed (code review CODE15). One that cannot be made raises."""
+    an earlier attempt may have made has its entry synced in its parent at
+    every call, whether it already exists or not: an earlier attempt's sync
+    may have failed (code review CODE15). Under the home directory, those are
+    the levels below it. Elsewhere, an ancestor an earlier attempt made can no
+    longer be told from one that was always there, so every level up to the
+    filesystem's mount point is synced (code review CODE18). A level that
+    cannot be made, or a sync that fails, raises: none is ever skipped."""
     path = Path(path)
     home = Path(os.path.realpath(os.path.expanduser("~")))
+    inside = home in path.parents
     levels = [path]
     while True:
         parent = levels[-1].parent
         if parent == levels[-1] or parent == home:
             break
-        if home not in parent.parents and os.path.lexists(parent):
-            break
+        if not inside and os.path.ismount(parent):
+            break  # the mount point's own entry belongs to another filesystem; levels[-1]'s is synced in it
         levels.append(parent)
     for level in reversed(levels):  # top down
         try:

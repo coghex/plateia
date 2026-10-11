@@ -645,6 +645,7 @@ class BoundedSetupTests(BridgeCase):
             def send(self, line):
                 pass
             lines = self.chatlib.Connection.lines
+            _left = self.chatlib.Connection._left  # the deadline helper lines() uses
         started = time.monotonic()
         with self.assertRaises((TimeoutError, self.chatlib.ChatError)):
             self.chatlib.ensure_channel(Conn(), "#alpha", wait=0.2)

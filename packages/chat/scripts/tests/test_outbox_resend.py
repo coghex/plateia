@@ -925,6 +925,69 @@ class FirstStartTests(OutboxCase):
         self.assertEqual(self.durable_entries([gone], synced), [gone.name])
         self.assertIsNotNone(self.authority.store.con)
 
+    def external_state(self):
+        """A state directory outside the home directory, in a new parent: <temp>/new-parent/chat."""
+        import shutil
+        import tempfile
+        root = Path(os.path.realpath(tempfile.mkdtemp(prefix="chat-ext-")))
+        self.addCleanup(shutil.rmtree, root, True)
+        return root, root / "new-parent" / "chat"
+
+    def test_an_external_state_tree_retries_a_failed_ancestor_sync(self):
+        """Code review CODE18, finding 2: outside the home directory, an ancestor made by an earlier
+        attempt whose parent sync failed is synced again by the next one, before anything is reported
+        queued; while that sync keeps failing, publication keeps failing truthfully."""
+        for failures in (1, 3):
+            with self.subTest(failed_syncs=failures):
+                root, state = self.external_state()
+                paths = self.ds.Paths(state)
+                count = {"n": 0}
+                real = self.ds.FS.sync_dir
+                synced = []
+
+                def sync_dir(fs, path, root=root):
+                    if Path(path) == root and count["n"] < failures:
+                        count["n"] += 1
+                        raise OSError(5, "input/output error (fake)")
+                    real(fs, path)
+                    synced.append((Path(path), set(os.listdir(path))))
+                row = dict(self.row("[status] external"), id="e" * 32)
+                with mock.patch.object(self.ds.FS, "sync_dir", sync_dir):
+                    for _ in range(failures):
+                        with self.assertRaises(OSError):
+                            self.ds.publish_fallback(self.ds.FS(), paths, row, clock=self.clock)
+                        self.assertEqual(self.fallback_names(paths), [], "nothing reported queued")
+                    self.assertTrue((root / "new-parent").is_dir(), "made by the failed attempt")
+                    self.ds.publish_fallback(self.ds.FS(), paths, row, clock=self.clock)
+                self.assertTrue(any(p == root and "new-parent" in names for p, names in synced),
+                                "new-parent's entry durable before the publication is reported")
+                self.assertTrue(any(p == root / "new-parent" and "chat" in names for p, names in synced))
+                authority = self.ds.Authority(state, clock=self.clock, mono=self.clock.mono, probes=self.probes)
+                authority.start()  # a restart, on that state
+                try:
+                    self.ds.Importer(authority).import_fallback_files()
+                    count_rows = authority.run_tx(lambda s: s.con.execute("SELECT COUNT(*) FROM entries").fetchone()[0])
+                    self.assertEqual(count_rows, 1, "the obligation, once")
+                finally:
+                    authority.close()
+
+    def fallback_names(self, paths):
+        try:
+            return [n for n in os.listdir(paths.fallback) if self.ds.is_published_name(n)]
+        except FileNotFoundError:
+            return []
+
+    def row(self, text):
+        return {"channel": "#alpha", "as": "alp-solver-2", "text": text, "at": "2026-10-09T00:00:00"}
+
+    def test_an_external_state_tree_with_every_sync_working(self):
+        """A control: outside the home directory, nothing failing."""
+        root, state = self.external_state()
+        paths = self.ds.Paths(state)
+        self.ds.publish_fallback(self.ds.FS(), paths, dict(self.row("[status] external"), id="f" * 32),
+                                 clock=self.clock)
+        self.assertEqual(len(self.fallback_names(paths)), 1)
+
     def test_a_publication_that_cannot_be_made_reports_nothing_queued(self):
         """A control: the state directory's parent is a file, so no tree can be made."""
         gone = self.no_state_tree(2)
@@ -941,6 +1004,59 @@ class FirstStartTests(OutboxCase):
             gone.mkdir()
             self.chatlib.STATE_DIR.mkdir()
             self.authority = self.new_authority()
+
+
+class ConfirmationDeadlineTests(OutboxCase):
+    """Code review CODE18, finding 1: the absolute confirmation deadline
+    (PART_WAIT, then DRAIN_WAIT: 60 s) bounds every buffered line and every
+    PONG the connection writes for a buffered PING, not only its reads: a write
+    gets only the time left. On a fake clock and socket."""
+
+    class SlowSocket:
+        """Writes take `cost` seconds of the fake clock; one that would outlast the timeout times out."""
+
+        def __init__(self, now, cost=2.0):
+            self.now, self.cost, self.timeout, self.sent = now, cost, None, []
+
+        def settimeout(self, t):
+            self.timeout = t
+
+        def sendall(self, data):
+            if self.timeout is not None and self.cost > self.timeout:
+                self.now[0] += self.timeout
+                raise TimeoutError("timed out")
+            self.now[0] += self.cost
+            self.sent.append(data)
+
+        def recv(self, n):
+            self.now[0] += self.timeout or 0
+            raise TimeoutError("timed out")
+
+    def confirm(self, buffered):
+        import types
+        now = [1000.0]
+        conn = object.__new__(self.chatlib.Connection)
+        conn.sock, conn.buf, conn.deadline = self.SlowSocket(now), buffered, None
+        part, drain = now[0] + self.ds.PART_WAIT, now[0] + self.ds.PART_WAIT + self.ds.DRAIN_WAIT
+        with mock.patch.object(self.chatlib, "time", types.SimpleNamespace(monotonic=lambda: now[0])):
+            result = self.chatlib._confirm(conn, part, drain)
+        return result, now[0] - 1000.0, conn
+
+    def test_buffered_pings_with_slow_writes_stay_within_the_deadline(self):
+        pings = b"".join(f"PING :x{i}\r\n".encode() for i in range(40))
+        (seen, pong_at, drained), elapsed, conn = self.confirm(pings)
+        self.assertLessEqual(elapsed, self.ds.PART_WAIT + self.ds.DRAIN_WAIT, "never past the 60 s deadline")
+        self.assertIsNone(pong_at, "no confirmation was received: none is invented")
+        self.assertTrue(drained)
+
+    def test_a_timely_confirmation_behind_buffered_pings_is_still_seen(self):
+        """A control: a few PINGs, then the PONG for the part, well within the deadline."""
+        buffered = b"PING :a\r\nPING :b\r\n:server 001 x :hi\r\n:server PONG server :round\r\n"
+        (seen, pong_at, drained), elapsed, conn = self.confirm(buffered)
+        self.assertIsNotNone(pong_at, "confirmed")
+        self.assertIn("001", seen)
+        self.assertFalse(drained)
+        self.assertEqual(len(conn.sock.sent), 2, "both PINGs answered")
 
 
 class LateOutcomeTests(OutboxCase):
