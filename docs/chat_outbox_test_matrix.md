@@ -5,7 +5,7 @@ item 20) requires. It maps every requirement, acceptance item, binding
 correction and spec addition of #19, design revision 9's tests 1–48
 ([`chat_outbox_state.md`](chat_outbox_state.md), section 9), owner
 amendment 6, and the code reviews' findings, to the named tests that assert
-them, with a status for each. It describes PR #20 at `fc29738`.
+them, with a status for each. It describes PR #20 at `02be8f2`.
 
 How to read it:
 - Each row's **Requirement** or **Item** column (for design tests, the
@@ -343,6 +343,25 @@ A line written to `acks.jsonl` whose sync failed is not evidence until it is syn
 | V29 | `acks.jsonl`: `recovered_acknowledgements` | the sync before trusting it fails | unknown: settling deferred (no removal, no dead letter); settled once the sync succeeds | bridge.AcknowledgementSyncTests.test_while_the_acknowledgement_cannot_be_synced_settling_waits | COVERED | Failing first at `7439dd9`. |
 | V30 | fallback publication: `publish_fallback` | an earlier attempt made a directory, but its parent sync failed; a retry | every entry the publication may have made is synced in its parent before anything is reported queued; the obligation is imported once | resend.FirstStartTests.test_a_retry_after_a_failed_parent_sync_makes_every_entry_durable (one and two missing levels) | COVERED | Failing first at `7439dd9`. The power loss is modelled from the syncs that succeeded (the fake filesystem keeps directories). |
 
+## 20. Code review 6104445458 (CODE16)
+
+The authority's start and the durable-sync primitive. The power loss for
+directories is modelled from the syncs that succeeded (a new entry survives
+only if a later successful sync of its parent listed it), since the fake
+filesystem keeps directories. The full flush is exercised as macOS runs it,
+on both supported Pythons, with a fake `fcntl`.
+
+| ID | Item | Tests | Status | Note |
+|---|---|---|---|---|
+| W1 | A first authority start with the state directory missing: its entry is synced in its parent before anything is served; a post it queues and acknowledges, with no fallback file, survives the power loss and is imported once | resend.FirstStartTests.test_a_first_authority_start_makes_the_state_tree_durable_before_any_ack (one missing level) | COVERED | Failing first at `fc29738`. |
+| W2 | The same with the state directory and its parent missing: each new entry synced before the acknowledgement | resend.FirstStartTests.test_a_first_authority_start_makes_the_state_tree_durable_before_any_ack (two missing levels) | COVERED | Failing first at `fc29738`. |
+| W3 | The same with the tree made, unsynced, by the bridge's `main()` before the authority starts | resend.FirstStartTests.test_a_first_authority_start_makes_the_state_tree_durable_before_any_ack (two levels, made by main) | COVERED | Failing first at `fc29738`. |
+| W4 | A start whose parent sync fails fails truthfully (nothing served or acknowledged); the next start makes the entry durable | resend.FirstStartTests.test_an_authority_start_whose_parent_sync_fails_is_retried | COVERED | Failing first at `fc29738`. |
+| W5 | A full flush (`F_FULLFSYNC`) that fails with EIO raises, and is never retried as a plain fsync that would report success | bridge.FullFlushTests.test_a_full_flush_io_error_is_a_failure_even_though_fsync_would_work | COVERED | Failing first at `fc29738`. |
+| W6 | An interrupt whose intent's full flush fails takes no action: no Escape, no Enter; it stays queued | bridge.FullFlushTests.test_an_intent_whose_full_flush_fails_takes_no_action | COVERED | Failing first at `fc29738`. |
+| W7 | A full flush the filesystem does not support (ENOTSUP or EOPNOTSUPP, EINVAL, ENOTTY) falls back to os.fsync | bridge.FullFlushTests.test_an_unsupported_full_flush_falls_back_to_fsync | COVERED | A control. |
+| W8 | A full flush that works is enough: no plain fsync after it | bridge.FullFlushTests.test_a_full_flush_that_works_is_enough | COVERED | A control. |
+
 ## Counts
 
 | Section | COVERED | PARTIAL | MISSING |
@@ -366,16 +385,17 @@ A line written to `acks.jsonl` whose sync failed is not evidence until it is syn
 | 17. Code review 6103285015 (slot 12) | 4 | 0 | 0 |
 | 18. Code review 6103685016 (CODE13) | 4 | 0 | 0 |
 | 19. Code review 6103950289 (CODE14) and the bounded recovery-input map | 30 | 0 | 0 |
-| **Total (196 rows)** | **196** | **0** | **0** |
+| 20. Code review 6104445458 (CODE16) | 8 | 0 | 0 |
+| **Total (204 rows)** | **204** | **0** | **0** |
 
 History: at `97db1bf`, before amendment 6's round, 104 of the then 130 rows
 were COVERED, 15 PARTIAL and 11 MISSING. That round closed them and added
 section 13. The final round added design tests 41–48 as their own rows in
-section 11, and section 14. The recovery rounds added sections 15 and 16, the durability round section 17, the acknowledgement-read round section 18, and the systematic round section 19 (V1 to V26; its follow-up added V27 to V30).
+section 11, and section 14. The recovery rounds added sections 15 and 16, the durability round section 17, the acknowledgement-read round section 18, and the systematic round section 19 (V1 to V26; its follow-up added V27 to V30), and the CODE16 round section 20.
 
 ## Appendix A. The test methods of every class named above
 
-Generated from the test tree at `fc29738`. A module named on its own (such as `rb` or `sil`) stands
+Generated from the test tree at `02be8f2`. A module named on its own (such as `rb` or `sil`) stands
 for all of its classes, listed here.
 
 ### `resend`: `packages/chat/scripts/tests/test_outbox_resend.py`
@@ -387,7 +407,7 @@ for all of its classes, listed here.
 - **CommittedThenTimeoutTests**: `test_pchat_queues_only_the_unconfirmed_part_and_never_writes_it_again`, `test_the_line_transport_behaves_the_same`, `test_an_uncertain_part_never_proves_absence_by_a_timeout`
 - **DirectPostDuringFlushTests**: `test_a_direct_posts_message_never_satisfies_an_older_part_too`
 - **FailureBeforeE1Tests**: `test_a_failed_login_queues_by_q0_with_no_fallback_file`, `test_with_the_authority_unavailable_the_fallback_file_carries_it`, `test_an_e1_commit_whose_reply_is_lost_is_handed_off_not_duplicated`, `test_a_q0_commit_whose_reply_is_lost_plus_its_fallback_file_is_one_entry`, `test_two_calls_with_identical_text_are_two_entries`
-- **FirstStartTests**: `test_a_first_post_and_acknowledgement_before_any_start`, `test_a_retry_after_a_failed_parent_sync_makes_every_entry_durable`, `test_a_publication_that_cannot_be_made_reports_nothing_queued`
+- **FirstStartTests**: `test_a_first_post_and_acknowledgement_before_any_start`, `test_a_retry_after_a_failed_parent_sync_makes_every_entry_durable`, `test_a_first_authority_start_makes_the_state_tree_durable_before_any_ack`, `test_an_authority_start_whose_parent_sync_fails_is_retried`, `test_a_publication_that_cannot_be_made_reports_nothing_queued`
 - **HostProbeTests**: `test_only_values_known_on_both_sides_are_compared`, `test_malformed_identities_prove_nothing_and_raise_nothing`, `test_a_socket_table_that_cannot_be_read_proves_nothing`, `test_a_start_time_is_read_from_one_source_per_platform`
 - **IndependentDeliveryTests**: `test_another_accounts_entry_flows_while_one_awaits_its_check`, `test_a_refused_and_a_failing_entry_never_stop_the_others`
 - **LateOutcomeTests**: `test_a_late_outcome_exports_a_superseding_version`
@@ -444,6 +464,7 @@ for all of its classes, listed here.
 - **DeliveryContainmentTests**: `test_a_dead_letter_that_cannot_be_written_blocks_nothing`, `test_an_item_that_fails_in_any_way_blocks_no_other`, `test_an_item_leaves_only_once_its_ledger_line_is_durable`
 - **FailedBindTests**: `test_a_failed_bind_is_retried_and_the_thread_started_at_the_next_pass`
 - **FlushContainmentTests**: `test_each_failing_step_leaves_the_others_running`, `test_one_failing_reconciliation_key_leaves_the_others_decided`, `test_a_writer_with_an_impossible_pid_never_stops_a_flush`, `test_an_export_that_cannot_be_written_stays_due_and_blocks_nothing`
+- **FullFlushTests**: `test_a_full_flush_io_error_is_a_failure_even_though_fsync_would_work`, `test_an_intent_whose_full_flush_fails_takes_no_action`, `test_an_unsupported_full_flush_falls_back_to_fsync`, `test_a_full_flush_that_works_is_enough`
 - **IndexTimeTests**: `test_server_fields_missing_or_malformed_are_never_replaced_by_local_ones`, `test_an_unreadable_time_is_a_failed_index`
 - **InterruptIntentTests**: `test_the_intent_is_durable_before_the_first_command`, `test_without_a_durable_intent_nothing_is_done`, `test_a_crash_at_any_boundary_after_the_intent_never_interrupts_again`, `test_a_crash_after_the_evidence_never_interrupts_again`, `test_a_crash_before_the_intent_is_retried_as_today`
 - **InterruptOutcomeTests**: `test_save_failures_after_delivery_never_interrupt_again`, `test_with_no_surviving_proof_it_is_held_alerted_once_and_settled_by_the_acknowledgement`, `test_an_acknowledgement_while_work_is_owed_then_a_restart`, `test_a_proved_no_action_is_retried_and_a_partial_step_is_held`, `test_proof_that_is_not_proof_leaves_it_held`
