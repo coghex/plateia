@@ -2397,6 +2397,75 @@ Rejected alternatives:
 - **Code-only rollback after new-format writes.** Old code cannot consume the
   new state; it would strand or replay work.
 
+**Amendment, 2026-10-11 (owner, 12:57 and 13:38 UTC): the designation
+bootstrap and its launch digest.** The owner approved one narrow addition to
+PLT-14's (#21's) scope. It gives the bridge a way to receive the activation's
+designation list that is bound to the activation plan. The amendment on #21
+is normative. In summary:
+
+- **One declared read input.** `designation-bootstrap/1`
+  (`$CHAT_STATE/designation-bootstrap.json`, kind `state`, embedded version)
+  is the one new format the shipped chat package reads; it never writes it.
+  - **Writer:** only the activation controller writes it, once, as a
+    private file created without replacing anything.
+  - **Content:** it is derived deterministically from the sealed, admitted
+    activation plan, and covers the version, the operation, the pinned
+    release, the private state root's identity, the sorted account list
+    (which may be explicitly empty), the plan's digest and the plan's
+    creation time.
+  - **Admission:** it is admitted beside #19's unchanged format delta.
+  - **Tests:** `packages/release/tests/test_build.py` gains only its
+    excluded-format name and one read marker. The pinned acceptance digest
+    of the unchanged declarations stays as it was.
+- **D-26 amended for one target.** The controller's binding of the
+  `chat-bridge` LaunchAgent sets its program path plus exactly one option,
+  `--activation-bootstrap sha256:<D>`. D is the sha256 of the exact
+  bootstrap-record bytes, so it commits to the whole record, list included.
+  The controller publishes the record, journals D, and only then binds the
+  LaunchAgent. The log-rotation LaunchAgent and the other six D-26 targets
+  are unchanged.
+- **Staging stays strict.** Staging's refusal of an extra LaunchAgent
+  argument still judges the pre-activation baseline. The activation's
+  read-only post-check verifies the bound invocation exactly. Recognizing an
+  activated LaunchAgent in a later plateia-to-plateia staging is a future
+  slice.
+- **The bridge validates before any mutation.** Before opening its database,
+  the bridge checks the record's exact bytes against the launch digest, the
+  schema, its own running release and the actual state root. It serves,
+  imports or recovers only in three states:
+  - no activation (no digest, no record, no committed bootstrap);
+  - a valid record with nothing committed: the designations and their
+    record are committed atomically first, with the effective time and
+    version;
+  - an exact, consistent replay of the committed operation and digest: a
+    no-op that keeps the original time, version and every later suspension.
+
+  **Any other state is unknown.** In it:
+  - the authority does not start, and nothing is deleted or rewritten;
+  - clients keep their durable fallback;
+  - the activation is not complete;
+  - nothing in that state counts as proof that rollback is safe.
+
+  A different operation needs a separately approved activation.
+- **Unchanged:**
+  - #19's formats and migration;
+  - the three first-write boundaries, because the bootstrap's commit is the
+    existing `outbox-db/1` boundary;
+  - default strict compatibility;
+  - the latest-state-preserving recovery.
+
+  A rollback before the first write leaves the bootstrap record in place.
+
+Rejected alternatives:
+
+- **Trusting the record's own operation, or a digest inside it.** Both are
+  self-asserted: a changed list would be accepted on the first commit.
+- **Anchoring only the operation in the launch.** A changed list with the
+  right operation would still pass.
+- **The bridge reading the controller's plan and journal, or staging writing
+  the binding into the release.** Each needs more read formats or a staging
+  layout change.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
