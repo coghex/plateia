@@ -5,7 +5,7 @@ item 20) requires. It maps every requirement, acceptance item, binding
 correction and spec addition of #19, design revision 9's tests 1–48
 ([`chat_outbox_state.md`](chat_outbox_state.md), section 9), owner
 amendment 6, and the code reviews' findings, to the named tests that assert
-them, with a status for each. It describes PR #20 at `ab79c93`.
+them, with a status for each. It describes PR #20 at `654b81e`.
 
 How to read it:
 - Each row's **Requirement** or **Item** column (for design tests, the
@@ -276,6 +276,17 @@ All failed first at `e4dc48a`.
 | M3 | An acknowledgement recorded before its instruction is replayed from history settles the interrupt once it is queued: never rung, no false dead letter, with a readable ledger and with an unreadable one (held) | bridge.AcknowledgementBeforeHistoryTests.test_an_acknowledgement_before_its_instruction_is_replayed | COVERED | |
 | M4 | An acknowledgement counts as recorded only once its line is written, so a failed append is written when the message is replayed | bridge.AcknowledgementDurabilityTests.test_a_failed_acknowledgement_append_is_written_on_replay | COVERED | Bounded check. |
 
+## 17. Code review 6103285015 (slot 12)
+
+All failed first at `ab79c93` except where the note says otherwise.
+
+| ID | Item | Tests | Status | Note |
+|---|---|---|---|---|
+| N1 | A pending state that cannot be read, or cannot be parsed, is never an empty queue: with a possibly acted intent saved and the exact instruction replayed, no agent is touched, the saved bytes are never replaced, the message is left for replay, and once the state can be read the original intent is held | bridge.UnreadablePendingTests.test_a_possibly_acted_intent_survives_an_unreadable_pending_state (a read error; a parse error) | COVERED | |
+| N2 | A missing pending file is an empty queue, and a new interrupt is delivered | bridge.UnreadablePendingTests.test_a_missing_pending_file_is_an_empty_queue | COVERED | A control. |
+| N3 | An acknowledgement is durable (file, then directory) before it counts as recorded: after its settling save fails and the storage loses everything unsynced, the restarted bridge settles the interrupt by it, with its owed work kept, never rung and never falsely dead-lettered | bridge.AcknowledgementPowerLossTests.test_an_acknowledgement_survives_a_failed_settling_save_and_a_power_loss (with and without an owed announcement) | COVERED | |
+| N4 | A failed acknowledgement append is retried by the replayed message (the durable append, on the live and replay path alike) | bridge.AcknowledgementDurabilityTests.test_a_failed_acknowledgement_append_is_written_on_replay | COVERED | From section 16 (M4); it now injects its failure at the durable append. Not failing-first evidence for this round. |
+
 ## Counts
 
 | Section | COVERED | PARTIAL | MISSING |
@@ -296,16 +307,17 @@ All failed first at `e4dc48a`.
 | 14. Code review 6102471519 (slot 9) and the final re-check | 8 | 0 | 0 |
 | 15. Code review 6102730761 (slot 10) | 5 | 0 | 0 |
 | 16. Code review 6103073520 (slot 11) and the bounded check | 4 | 0 | 0 |
-| **Total (158 rows)** | **158** | **0** | **0** |
+| 17. Code review 6103285015 (slot 12) | 4 | 0 | 0 |
+| **Total (162 rows)** | **162** | **0** | **0** |
 
 History: at `97db1bf`, before amendment 6's round, 104 of the then 130 rows
 were COVERED, 15 PARTIAL and 11 MISSING. That round closed them and added
 section 13. The final round added design tests 41–48 as their own rows in
-section 11, and section 14. The recovery rounds added sections 15 and 16.
+section 11, and section 14. The recovery rounds added sections 15 and 16, and the durability round section 17.
 
 ## Appendix A. The test methods of every class named above
 
-Generated from the test tree at `ab79c93`. A module named on its own (such as `rb` or `sil`) stands
+Generated from the test tree at `654b81e`. A module named on its own (such as `rb` or `sil`) stands
 for all of its classes, listed here.
 
 ### `resend`: `packages/chat/scripts/tests/test_outbox_resend.py`
@@ -360,6 +372,7 @@ for all of its classes, listed here.
 
 - **AcknowledgementBeforeHistoryTests**: `test_an_acknowledgement_before_its_instruction_is_replayed`
 - **AcknowledgementDurabilityTests**: `test_a_failed_acknowledgement_append_is_written_on_replay`
+- **AcknowledgementPowerLossTests**: `test_an_acknowledgement_survives_a_failed_settling_save_and_a_power_loss`
 - **AcknowledgementRecoveryTests**: `test_every_recipient_of_one_interrupt_is_recovered_after_a_failed_settling_save`, `test_a_failed_read_is_retried_at_a_later_pass_and_a_malformed_line_is_skipped`
 - **AlertIdentityTests**: `test_two_recipients_alerts_are_each_dead_lettered`
 - **AnnounceTests**: `test_with_its_requests_failing_it_publishes_a_fallback_file_without_outbox_lock`, `test_with_nothing_durable_the_flag_stays_unset_and_a_repeat_is_one_entry`, `test_deliveries_saves_held_announced_only_after_the_announcement_is_durable`, `test_a_crash_after_e1_and_before_a1_is_adopted_after_the_restart_and_sent_once`, `test_an_ordinary_post_killed_after_e1_is_still_abandoned`
@@ -381,6 +394,7 @@ for all of its classes, listed here.
 - **ReplayedInterruptTests**: `test_a_replayed_interrupt_keeps_one_obligation_whatever_its_outcome`, `test_another_recipient_of_the_same_message_stays_independent`, `test_an_ordinary_wake_up_keeps_its_baseline`, `test_a_replay_with_an_unreadable_ledger_is_never_rung`
 - **ServerEvidenceTests**: `test_a_late_message_without_server_time_never_proves_absence`, `test_a_failed_first_index_without_a_checkpoint_is_replayed_and_never_skipped`, `test_a_failed_index_mid_catch_up_never_restores_completeness_or_moves_the_checkpoint`, `test_a_successful_replay_restores_completeness_from_the_preserved_checkpoint`
 - **StartupCleanupTests**: `test_a_failed_sync_of_the_database_files_releases_everything`, `test_a_failed_bind_or_thread_start_releases_everything`, `test_a_dead_authority_thread_is_not_running_and_is_replaced`
+- **UnreadablePendingTests**: `test_a_possibly_acted_intent_survives_an_unreadable_pending_state`, `test_a_missing_pending_file_is_an_empty_queue`
 
 ### `store`: `packages/chat/scripts/tests/test_outbox_store.py`
 
