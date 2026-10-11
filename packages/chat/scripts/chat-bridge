@@ -480,7 +480,10 @@ class Deliveries:
     def _proof(self, item):
         """Surviving, exact-identity proof that this interrupt's submission was
         proved: a durable ledger line with its intent id, target, surface and
-        session. Anything missing, mismatched or unreadable is no proof."""
+        session. Anything missing, mismatched or unreadable is no proof (False).
+        A matching line counts only once the ledger and its directory are synced:
+        a line can be written while its sync fails. If that sync fails, the proof
+        is unknown (None), and the item is left as it is (code review CODE17)."""
         want = {"intent": item.get("intent_id"), "target": item.get("target"),
                 "surface": item.get("intent_surface"), "session": item.get("intent_session")}
         if not want["intent"]:
@@ -495,12 +498,27 @@ class Deliveries:
             except ValueError:
                 continue
             if isinstance(row, dict) and row.get("ok") is True and all(row.get(k) == v for k, v in want.items()):
+                try:
+                    delivery_store.FS_DEFAULT.durable(DELIVERIES)
+                except OSError as err:
+                    log(f"interrupt ({item['channel']}) to {item.get('target')}: its ledger proof is not yet"
+                        f" durable ({err!r:.80}); checked again next pass")
+                    return None
                 return True
         return False
 
     def _commit_intent(self, item, surface):
         """The interrupt's durable intent, before its first agent-affecting command.
-        True once saved; False (and the item as it was) if it cannot be."""
+        True once saved; False (and the item as it was) if it cannot be. The
+        state directory's ancestry is made durable first, whoever made it (the
+        bridge's main(), or an authority start whose sync failed): an intent is
+        durable only with it (code review CODE17)."""
+        try:
+            delivery_store._make_state_tree(delivery_store.FS_DEFAULT, PENDING.parent)
+        except OSError as err:
+            log(f"interrupt ({item['channel']}) to {item.get('target')}: the state directory is not yet durable"
+                f" ({err!r:.80}); nothing done")
+            return False
         before = dict(item)
         try:
             session = identities.read_registry().get("agents", {}).get(item.get("target"), {}).get("session_id")
@@ -535,7 +553,10 @@ class Deliveries:
         it is held. Durable accept and settled states are kept as they are."""
         changed = False
         for item in [i for i in self.items if i.get("phase") in ("intent", "held")]:
-            if self._proof(item):
+            proof = self._proof(item)
+            if proof is None:  # a matching line that could not be made durable: unknown, left as it is
+                continue
+            if proof:
                 item.update(phase="accept", next_at=time.time() + INTERRUPT_ACK_WAIT)
                 if item.get("delivered_announced") is not True:
                     item["delivered_announced"] = False  # owed, by the same entry id: never a second post

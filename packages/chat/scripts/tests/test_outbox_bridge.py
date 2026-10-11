@@ -1959,6 +1959,158 @@ class FullFlushTests(InterruptCase):
         self.assertEqual(calls["fsync"], 0)
 
 
+class IntentAncestryTests(InterruptCase):
+    """Code review CODE17, finding 1: the bridge's main() makes the state
+    directory unsynced, and the authority's start, which would make it durable,
+    may fail its parent sync (and is retried later). An interrupt's intent is
+    durable only with that ancestry: until every entry is synced, no command
+    (Escape, mode change, draft cleanup, Enter) runs and the item stays queued.
+    The power loss is modelled from the syncs that succeeded."""
+
+    def recording(self, failing_parent):
+        import os as _os
+        ds = self.bridge.delivery_store
+        real, synced, state = ds.FS.sync_dir, [], {"failing": True}
+
+        def sync_dir(fs, path):
+            if state["failing"] and Path(path) == failing_parent:
+                raise OSError(5, "input/output error (fake)")
+            real(fs, path)
+            synced.append((Path(path), set(_os.listdir(path))))
+        return mock.patch.object(ds.FS, "sync_dir", sync_dir), synced, state
+
+    def durable(self, synced):
+        sd = self.chatlib.STATE_DIR
+        return any(p == sd.parent and sd.name in names for p, names in synced)
+
+    def test_no_command_until_the_state_directory_entry_is_durable(self):
+        sd = self.chatlib.STATE_DIR  # made by main(), never synced in its parent
+        patch, synced, state = self.recording(sd.parent)
+        agent = self.FakeAgent()
+        at_first_key = []
+
+        def watching(*args):
+            if args[0] in ("send", "send-key") and not at_first_key:
+                at_first_key.append(self.durable(synced))
+            return agent(*args)
+        watching.keys = agent.keys
+        d = self.bridge.Deliveries()
+        d.items = [self.item()]
+        with patch:
+            with self.assertRaises(OSError):  # the authority's start fails its parent sync
+                self.bridge.delivery_store.Authority(sd).start()
+            self.passes(watching, deliveries=d)
+            self.assertEqual(agent.keys, [], "no Escape, mode change, cleanup or Enter")
+            self.assertNotEqual([i.get("phase") for i in d.items if i["kind"] == "ring"], ["intent"],
+                                "no intent committed")
+            state["failing"] = False  # the sync works again
+            for i in d.items:
+                i["next_at"] = 0
+            self.passes(watching, deliveries=d)
+        self.assertEqual(self.interrupts(agent), 1, "then delivered, once")
+        self.assertEqual(at_first_key, [True], "its ancestry was durable before the first command")
+
+    def test_with_every_sync_working_an_interrupt_is_delivered(self):
+        """A control: the ordinary path."""
+        d = self.bridge.Deliveries()
+        d.items = [self.item()]
+        agent = self.FakeAgent()
+        self.passes(agent, deliveries=d)
+        self.assertEqual(self.interrupts(agent), 1)
+
+
+class LedgerProofSyncTests(InterruptCase):
+    """Code review CODE17, finding 2: a ledger line can be written while its
+    sync fails. Recovery trusts a matching line only once it has synced the
+    ledger and its directory; until then the proof is unknown and the item is
+    left as it is (no accept, no hold, no action), so a later power loss can
+    never leave an accepted interrupt with no ledger record and nothing owed."""
+
+    def simfs(self):
+        from outbox_fakes import SimFS
+        fs = SimFS(self.chatlib.STATE_DIR)
+        p = mock.patch.object(self.bridge.delivery_store, "FS_DEFAULT", fs)
+        p.start()
+        self.addCleanup(p.stop)
+        return fs
+
+    def failing_ledger_sync(self, fs, state):
+        real = fs.durable
+
+        def durable(path):
+            if Path(path) == self.bridge.DELIVERIES and state["failing"]:
+                raise OSError(5, "input/output error (fake)")
+            return real(path)
+        return mock.patch.object(fs, "durable", durable)
+
+    def delivered_with_unsynced_proof(self, fs, agent):
+        """Delivered; its ledger line written but not synced; the save of accept failing too."""
+        d = self.bridge.Deliveries()
+        d.items = [self.item()]
+        d._save()
+        real_save = self.bridge.Deliveries._save
+
+        def save(dd):
+            if any(i.get("phase") == "accept" for i in dd.items):
+                raise OSError(28, "no space left on device (fake)")
+            return real_save(dd)
+        state = {"failing": True}
+        with self.failing_ledger_sync(fs, state), mock.patch.object(self.bridge.Deliveries, "_save", save):
+            self.passes(agent, deliveries=d)
+        self.assertEqual(self.interrupts(agent), 1)
+        self.assertEqual([i["phase"] for i in self.bridge.Deliveries().items if i["kind"] == "ring"], ["intent"])
+        return state
+
+    def proof_lines(self):
+        return [r for r in self.ledger() if r.get("intent") and r.get("ok") is True]
+
+    def test_recovery_syncs_the_ledger_before_it_accepts_the_proof(self):
+        fs = self.simfs()
+        agent = self.FakeAgent()
+        self.delivered_with_unsynced_proof(fs, agent)
+        after = self.bridge.Deliveries()  # a restart: the ledger line is readable, never synced
+        self.passes(agent, deliveries=after)
+        self.assertEqual([i["phase"] for i in after.items if i["kind"] == "ring"], ["accept"])
+        fs.power_loss()
+        final = self.bridge.Deliveries()
+        self.passes(agent, 2, deliveries=final)
+        self.assertEqual(len(self.proof_lines()), 1, "the accepted interrupt keeps its ledger record")
+        self.assertEqual(self.interrupts(agent), 1, "never rung again")
+
+    def test_while_the_ledger_cannot_be_synced_the_proof_is_unknown(self):
+        fs = self.simfs()
+        agent = self.FakeAgent()
+        state = self.delivered_with_unsynced_proof(fs, agent)
+        after = self.bridge.Deliveries()  # a restart
+        with self.failing_ledger_sync(fs, state):
+            self.passes(agent, 3, deliveries=after)
+            self.assertEqual([i["phase"] for i in after.items if i["kind"] == "ring"], ["intent"],
+                             "left as it is: neither accepted nor held")
+        state["failing"] = False
+        self.passes(agent, deliveries=after)
+        self.assertEqual([i["phase"] for i in after.items if i["kind"] == "ring"], ["accept"])
+        fs.power_loss()
+        self.passes(agent, 2, deliveries=self.bridge.Deliveries())
+        self.assertEqual(len(self.proof_lines()), 1)
+        self.assertEqual(self.interrupts(agent), 1, "never rung again")
+
+    def test_a_durable_proof_reconciles_as_before(self):
+        """A control: a ledger line that was synced when written."""
+        d = self.bridge.Deliveries()
+        d.items = [dict(self.item(), phase="intent", intent_id="i" * 32, intent_surface="S", intent_session=None,
+                        intent_at=0)]
+        d._save()
+        self.bridge.delivery_store.durable_append(
+            self.bridge.delivery_store.FS_DEFAULT, self.bridge.DELIVERIES,
+            json.dumps({"msgid": "m-int", "kind": "ring", "ok": True, "intent": "i" * 32, "target": "alp-solver-2",
+                        "surface": "S", "session": None}))
+        agent = self.FakeAgent()
+        after = self.bridge.Deliveries()
+        self.passes(agent, deliveries=after)
+        self.assertEqual([i["phase"] for i in after.items if i["kind"] == "ring"], ["accept"])
+        self.assertEqual(agent.keys, [])
+
+
 class LiveAcknowledgementRetryTests(InterruptCase):
     """Code review slot 10, finding 2: a live acknowledgement is durable in
     acks.jsonl, but settling it fails in the ledger. The SAME Deliveries instance
