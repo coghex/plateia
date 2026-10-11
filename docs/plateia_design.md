@@ -2465,6 +2465,23 @@ is normative. In summary:
   - The bridge checks the identity against its own; the controller's
     read-only post-check verifies the manifest hash against the plan.
   - No new file, format, read or launch option.
+- **2026-10-11, 16:52 UTC (owner): a guarded seal of the staged package.**
+  Real use writes bytecode into the staged environment, but its approved
+  verification allows none. So activation may seal exactly two directories
+  of the pinned staged release: the `plateia_chat` package directory and
+  its `scripts/` subdirectory.
+  - **The baseline is checked first.** Each directory must be exactly 0755,
+    owned by this user, with a readable identity and access metadata.
+    Anything stricter, different or ambiguous refuses.
+  - **Only the mode bits change,** to 0555, through pinned descriptors.
+    Ownership, ACLs and parent permissions are untouched. The original
+    modes and identities are journaled.
+  - **Rollback keeps the seal.** Restoring the recorded modes is a later,
+    separately authorized cleanup.
+  - **Strict verification is unchanged.** No bytecode or cache waiver is
+    approved.
+  - **A live seal needs the owner's confirmation** at the time of the
+    action, against the exact paths and verified baselines.
 
 Rejected alternatives:
 
@@ -3036,6 +3053,19 @@ the PR.
   activation/recovery plan needs separate explicit authorization; none is
   requested or implied here. **Stop before processing** until the design is
   ready.
+- **Implementation (#21, 2026-10-11; not merged, nothing run live):**
+  - **The controller:** `packages/release/activate_release.py` and
+    `activation.json`.
+  - **The bootstrap record:** derived from the sealed plan and published
+    without replacement. The `chat-bridge` LaunchAgent is bound with its
+    launch digest D.
+  - **The bridge's start:** S1, S2, S3 or UNKNOWN, judged before any
+    database commit
+    ([chat_outbox_state.md](chat_outbox_state.md#241-startup-and-the-exclusive-opener)).
+  - **Admission:** an explicit admission API in the stager
+    ([release_staging.md](release_staging.md#activation-plt-14-21)).
+    Default preflight stays strict, and the declaration pin is unchanged
+    ([release_contract.md](release_contract.md)).
 
 ### PLT-10. Expose one shared chat API with compatible non-web entry points
 

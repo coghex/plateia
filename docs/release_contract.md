@@ -131,7 +131,11 @@ they don't refresh the source's index.
   not yet merged or live), adds three more: the outbox store `outbox-db`
   (its `meta` schema-version row), the outbox authority protocol
   `outbox-authority` (each frame's `v`), and the `outbox/2` fallback file
-  (its `v`). The rest get documented baseline
+  (its `v`). PLT-14's activation (#21, owner amendment 1 of 2026-10-11)
+  declares one more, read only: `designation-bootstrap` (its `v`), the
+  record the activation controller writes once into `$CHAT_STATE` and the
+  bridge reads at its authority's start (`write` is null: the shipped code
+  never writes it). The rest get documented baseline
   identifiers such as `channel-log/1`. The chat
   config is written as well as read: `identities.register()` adds accounts,
   identity roles and assistants to it. The inventory also lists
@@ -144,6 +148,15 @@ they don't refresh the source's index.
   changes no serialized byte.
 
 The manifest has no API version; the shared API slice (PLT-10) adds one.
+
+**The declaration pin.** `test_build.py`'s digest of the declarations #19
+leaves unchanged stays `f2895cb0…`. PLT-14 (#21) adds only
+`designation-bootstrap` to the format names that digest excludes, and one
+marker row, `designation-bootstrap/1`, for a format the shipped code reads
+and never writes; the builder and its privacy scan are unchanged. Staging's
+default compatibility check still refuses the release; only an activation
+plan's admission admits its format delta
+([release_staging.md](release_staging.md#activation-plt-14-21)).
 
 ## What verification refuses
 
