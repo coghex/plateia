@@ -346,14 +346,41 @@ def capture_cited(entry):
 
 class Deliveries:
     def __init__(self):
-        try:
-            self.items = json.loads(PENDING.read_text())
-        except (OSError, ValueError):
-            self.items = []
+        self.items, self.load_error = [], None
+        self._load()
         self.unsaved = False  # a change whose save failed: saved again at every pass until it is
 
+    def _load(self):
+        """pending.json, read in full. Only a MISSING file is an empty queue. A
+        file that cannot be read or parsed leaves the state unloaded (code review
+        slot 12): nothing may replace it, nothing new is queued, no delivery is
+        tried, and every pass reads it again, so its saved intents survive."""
+        error = None
+        try:
+            items = json.loads(PENDING.read_text())
+        except FileNotFoundError:
+            items = []
+        except (OSError, ValueError) as err:
+            items, error = None, err
+        else:
+            if not (isinstance(items, list) and all(isinstance(i, dict) for i in items)):
+                error = ValueError("not a list of pending items")
+        if error is not None:
+            if self.load_error is None:
+                log(f"pending deliveries unreadable ({error!r:.100}); nothing is done until they can be read")
+            self.load_error = error
+            return False
+        if self.load_error is not None:
+            log("pending deliveries readable again")
+            self._acks_checked = False  # an acknowledgement recorded meanwhile is settled at this pass
+        self.items, self.load_error = items, None
+        return True
+
     def _save(self):
-        """A durable replace: an item leaves only after its ledger line is durable (section 3.6)."""
+        """A durable replace: an item leaves only after its ledger line is durable (section 3.6).
+        Never while the saved state could not be loaded: it would replace what is there."""
+        if self.load_error is not None:
+            raise OSError(f"pending deliveries unreadable ({self.load_error!r:.80}); not replaced")
         delivery_store.durable_replace(delivery_store.FS_DEFAULT, PENDING, json.dumps(self.items))
 
     def ledger_has(self, key):
@@ -379,6 +406,10 @@ class Deliveries:
         before the message is logged or checkpointed, so it is handled again.
         A new interrupt reopens acknowledgement recovery: its acknowledgement
         may already be recorded (code review slot 11)."""
+        if not new_items:
+            return
+        if self.load_error is not None and not self._load():  # unreadable: the message stays unlogged, for replay
+            raise OSError(f"pending deliveries unreadable ({self.load_error!r:.80}); nothing queued")
         before = list(self.items)
         new_items = [i for i in new_items if not self._earlier_interrupt(i)]
         if new_items or len(self.items) != len(before):
@@ -627,6 +658,8 @@ class Deliveries:
         return changed
 
     def process(self, cfg):
+        if self.load_error is not None and not self._load():
+            return  # nothing is delivered, recovered or saved until the saved state can be read
         changed = self.recover(cfg) | self.recovered_acknowledgements(cfg) | self.retry_owed(cfg)
         due = [i for i in self.items if i["next_at"] <= time.time() and i.get("phase") not in ("settled", "intent")]
         for item in due:
@@ -1455,8 +1488,10 @@ class Acks:
     def add(self, msgid, entry):
         if msgid and msgid in self.seen:
             return False
-        _append_jsonl(ACKS, entry)
-        self.seen.add(msgid)  # only once its line is written: a failed append is written again on replay
+        # durable, file then directory, before it counts as recorded and before recovery can rely on it
+        # (code review slot 12): a failed append raises, and the replayed message records it again
+        delivery_store.durable_append(delivery_store.FS_DEFAULT, ACKS, json.dumps(entry))
+        self.seen.add(msgid)
         return True
 
 

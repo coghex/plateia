@@ -1360,20 +1360,131 @@ class AcknowledgementDurabilityTests(ReplayCase):
         state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks())
         ack = privmsg("alp-solver-2", "[status] stopped as asked", "m-ack", channel="#alpha", reply_to="m-int",
                       t="2026-10-09T10:02:00.000Z")
-        real, calls = self.bridge._append_jsonl, []
+        real, calls = self.bridge.delivery_store.durable_append, []
 
-        def append(path, entry):
-            if path == self.bridge.ACKS and not calls:
+        def append(fs, path, line):
+            if Path(path) == self.bridge.ACKS and not calls:
                 calls.append(1)
                 raise OSError(28, "no space left on device (fake)")
-            return real(path, entry)
-        with mock.patch.object(self.bridge, "_append_jsonl", append):
+            return real(fs, path, line)
+        with mock.patch.object(self.bridge.delivery_store, "durable_append", append):
             with self.assertRaises(OSError):
                 self.bridge.handle(ack, CFG, *state)
             self.bridge.handle(ack, CFG, *state, replayed=True)  # the same bridge
             self.bridge.handle(ack, CFG, *state, replayed=True)  # and once more: a duplicate now
         lines = self.bridge.ACKS.read_text().splitlines() if self.bridge.ACKS.exists() else []
         self.assertEqual([json.loads(x)["msgid"] for x in lines], ["m-ack"], "recorded once, when written")
+
+
+class UnreadablePendingTests(ReplayCase):
+    """Code review slot 12, finding 1: only a MISSING pending.json means an empty
+    queue. A read or parse failure leaves the state unloaded: nothing replaces
+    the saved file, nothing new is queued (handle() raises before logging, so
+    the message is replayed later), no agent is touched, and each pass tries
+    the load again; once it succeeds the saved intent is recovered as held."""
+
+    def possibly_acted(self):
+        """The instruction queued but not yet logged (the crash window between the two), then
+        the bridge killed at its Enter: an intent on disk, and a message the restart replays."""
+        d = self.ingest_unlogged(self.message())
+        first = self.FakeAgent()
+        with self.assertRaises(Crash):
+            self.passes(CrashingAgent(first, 4), deliveries=d)
+        self.assertEqual([i["phase"] for i in self.rings(self.bridge.Deliveries())], ["intent"])
+        return first
+
+    def unreadable(self, how, original):
+        real = Path.read_text
+        pending = self.bridge.PENDING
+
+        def read_text(path, *a, **k):
+            if Path(path) == pending:
+                if how == "read error":
+                    raise OSError(5, "input/output error (fake)")
+                return original.decode()[: len(original) // 2]  # a torn read: not JSON
+            return real(path, *a, **k)
+        return mock.patch.object(Path, "read_text", read_text)
+
+    def test_a_possibly_acted_intent_survives_an_unreadable_pending_state(self):
+        for how in ("read error", "parse error"):
+            with self.subTest(how=how):
+                self.fresh()
+                first = self.possibly_acted()
+                original = self.bridge.PENDING.read_bytes()
+                second = self.FakeAgent()
+                with self.unreadable(how, original):
+                    d = self.bridge.Deliveries()  # a restart that cannot read its state
+                    state = (self.bridge.Record(), d, self.bridge.Acks())
+                    with self.assertRaises(Exception):
+                        self.bridge.handle(self.message(), CFG, *state, replayed=True)  # the exact instruction
+                    self.passes(second, 3, deliveries=d)
+                    self.assertEqual(self.bridge.PENDING.read_bytes(), original, "the saved state is intact")
+                logged = self.chatlib.channel_log("#alpha")
+                self.assertNotIn('"m-int"', logged.read_text() if logged.exists() else "", "left for replay")
+                self.passes(second, 2, deliveries=d)  # readable again: the same bridge loads it
+                self.bridge.handle(self.message(), CFG, *state, replayed=True)  # the replay, now handled
+                self.passes(second, 2, deliveries=d)
+                self.assertEqual(second.keys, [], "no new interrupt, no partial step")
+                self.assertEqual(self.interrupts(first, second), 0, "never submitted")
+                self.assertEqual([i["phase"] for i in self.rings(d)], ["held"], "the original intent, held")
+
+    def test_a_missing_pending_file_is_an_empty_queue(self):
+        """The baseline (a control): no file at all is an empty queue, and a new interrupt is delivered."""
+        self.assertFalse(self.bridge.PENDING.exists())
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks())
+        self.assertEqual(state[1].items, [])
+        self.bridge.handle(self.message(), CFG, *state)
+        agent = self.FakeAgent()
+        self.passes(agent, deliveries=state[1])
+        self.assertEqual(self.interrupts(agent), 1)
+
+
+class AcknowledgementPowerLossTests(InterruptCase):
+    """Code review slot 12, finding 2: an acknowledgement is durable (file, then
+    directory) before it counts as recorded. Its settling save fails, the
+    storage loses everything unsynced, the bridge restarts: the interrupt is
+    settled by that acknowledgement, with its owed work kept, and is never rung
+    or falsely dead-lettered."""
+
+    def test_an_acknowledgement_survives_a_failed_settling_save_and_a_power_loss(self):
+        from outbox_fakes import SimFS
+        for owed in (False, True):
+            with self.subTest(announcement_owed=owed):
+                self.fresh()
+                fs = SimFS(self.chatlib.STATE_DIR)
+                p = mock.patch.object(self.bridge.delivery_store, "FS_DEFAULT", fs)
+                p.start()
+                self.addCleanup(p.stop)
+                item = dict(self.item(), phase="accept", attempt=1, next_at=self.bridge.time.time() + 600,
+                            intent_id="i" * 32, intent_surface="S", intent_session=None, delivered_announced=True)
+                if owed:
+                    item.update(delivered_announced=False, delivered_text="interrupt → alp-solver-2: it was not "
+                                "working; instruction delivered; waiting for its acknowledgement")
+                d = self.bridge.Deliveries()
+                d.items = [item]
+                d._save()
+                agent = self.FakeAgent()
+                with mock.patch.object(self.bridge, "announce", lambda *a: False):
+                    self.passes(agent, deliveries=d)
+                acks = self.bridge.Acks()
+
+                def save(dd):
+                    raise OSError(28, "no space left on device (fake)")
+                with mock.patch.object(self.bridge.Deliveries, "_save", save):
+                    self.bridge.accepted(CFG, d, acks, msgid="m-ack", reply_to="m-int", sender="alp-solver-2",
+                                         channel="#alpha", at="2026-10-09T10:01:00Z", how="reply")
+                fs.power_loss()  # whatever was never synced is gone
+                p.stop()
+                after = self.bridge.Deliveries()  # the restart
+                self.passes(agent, 2, deliveries=after)
+                for i in after.items:
+                    i["next_at"] = 0
+                self.passes(agent, 2, deliveries=after)
+                self.assertEqual(agent.keys, [], "never rung")
+                self.assertEqual([i for i in after.items if i["kind"] == "ring"], [], "settled")
+                self.assertEqual([r for r in self.dead_letters() if r.get("kind") == "ring"], [],
+                                 "no false unacknowledged dead letter")
+                self.assertEqual(len(self.announcements()), 1 if owed else 0, "owed work kept and done")
 
 
 class LiveAcknowledgementRetryTests(InterruptCase):
