@@ -474,6 +474,54 @@ After step 3, and before the socket is bound, the bridge makes sure
 `outbox.d/` and `outbox.d/tmp/` exist, syncing the state directory if it
 creates them (section 2.1).
 
+**The activation's designation bootstrap (PLT-14, #21; D-74, D-26).** The
+bridge's start also applies the activation's designation list, bound to the
+activation plan (#21's owner amendments 1 and 2, and the review's spec
+additions):
+
+- **Before step 2** (before the database is opened or created), the bridge
+  judges two things:
+  - **E**, the launch digest: none, or the one option
+    `--activation-bootstrap sha256:<D>` its LaunchAgent carries after an
+    activation. Any other argument is malformed, and the bridge doesn't
+    start.
+  - **R**, the record `$CHAT_STATE/designation-bootstrap.json`
+    (`designation-bootstrap/1`). It is VALID only if all of these hold:
+    - it is a private regular file of this user, opened without following
+      links and read whole within 64 KiB;
+    - its bytes' sha256 is E;
+    - it is exactly the canonical record;
+    - its release identity is this bridge's own, from its resolved
+      `…/releases/<identity>/env/` path (the manifest hash reaches it only
+      inside the bytes D covers);
+    - its state root is the actual root's realpath, device and inode.
+- **Inside step 3**, the start transaction classifies **M**, the committed
+  `designation_bootstrap` meta row, before it writes `authority_epoch`:
+  - **S1:** no E, no record and no M. No activation is involved, and the
+    #19 baseline applies.
+  - **S2:** E, a VALID R and no M. In that same transaction, each listed
+    account not yet in the database is designated from now (none for an
+    explicit empty list), and M records the operation, D, the effective time
+    and the version.
+  - **S3:** E, a VALID R and a well-formed M with the same operation and D. A
+    replay: nothing is designated again, so the original effective time and
+    version and every later suspension stand.
+- **Every other state is UNKNOWN.** Examples: a record without E, E without a
+  valid record, M without either, M naming another operation or digest, or a
+  malformed M. In that state:
+  - the transaction rolls back, so nothing is committed, not even the epoch;
+  - no socket is bound, and nothing is imported or recovered;
+  - nothing is deleted or rewritten, and the status snapshot isn't replaced;
+  - the bridge logs one alert naming the state, and neither serves nor
+    recovers until the state is resolved, checking again each minute;
+  - clients keep their durable fallback.
+
+  A different operation needs a separately approved activation.
+
+The S2 commit is the existing `outbox-db/1` first write, not a fourth
+boundary. `chat-bridge` is the only place that designates (one call, in the
+start transaction); no client, request, option or config key does.
+
 #### 2.4.2 Requests
 
 **Framing.** A client opens a connection, sends one frame, reads one reply

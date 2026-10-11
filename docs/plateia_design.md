@@ -3036,6 +3036,19 @@ the PR.
   activation/recovery plan needs separate explicit authorization; none is
   requested or implied here. **Stop before processing** until the design is
   ready.
+- **Implementation (#21, 2026-10-11; not merged, nothing run live):**
+  - **The controller:** `packages/release/activate_release.py` and
+    `activation.json`.
+  - **The bootstrap record:** derived from the sealed plan and published
+    without replacement. The `chat-bridge` LaunchAgent is bound with its
+    launch digest D.
+  - **The bridge's start:** S1, S2, S3 or UNKNOWN, judged before any
+    database commit
+    ([chat_outbox_state.md](chat_outbox_state.md#241-startup-and-the-exclusive-opener)).
+  - **Admission:** an explicit admission API in the stager
+    ([release_staging.md](release_staging.md#activation-plt-14-21)).
+    Default preflight stays strict, and the declaration pin is unchanged
+    ([release_contract.md](release_contract.md)).
 
 ### PLT-10. Expose one shared chat API with compatible non-web entry points
 

@@ -4,7 +4,7 @@
 `build_release.py` built (PLT-11, [release_contract.md](release_contract.md))
 without changing the live chat tools. This is PLT-12 (#14) under D-26: plan,
 stage and preflight only. Selecting, activating and rolling back a release
-are PLT-14's.
+are PLT-14's (#21): see [Activation](#activation-plt-14-21) below.
 
 **Staging has never been run on the owner's machine.** Everything below was
 exercised on invented homes, provenance, state and service definitions, with
@@ -529,6 +529,172 @@ Staging never calls `install-identities` or any identity rollout, creates
 accounts, starts, restarts or loads a service, or starts the merge worker or
 the drainer. It doesn't change configuration, service definitions or
 schedules, and it posts nothing to chat.
+
+## Activation (PLT-14, #21)
+
+`packages/release/activate_release.py` carries #19's release through one
+guarded format cutover (D-74, D-26, D-27; #21 with its owner amendments 1
+and 2 of 2026-10-11). **It has never been run on the owner's machine.**
+Everything here was exercised on invented homes, state and service
+definitions, with fake service and process reads. Implementing or reviewing
+it authorizes no live step: that needs the owner's decision and a published
+operator plan (D-74).
+
+### The one admitted transition
+
+A plain preflight still refuses #19's release. `packages/release/activation.json`
+names the one transition an activation may admit, from the D-19 baseline
+formats (`live_versions` in `staging.json`, unchanged) to:
+
+- #19's delta: `outbox` and `delivery-records` write `/2` and still read
+  `/1`; `outbox-authority/1` and `outbox-db/1` are new; `boot-id/1` and
+  `tcp-sockets/1` are new read-only host interfaces;
+- one read input, `designation-bootstrap/1` (owner amendment 1).
+
+`stage_release.admission(plan, release)` returns an admission only for an
+activation plan (`plateia-activation-plan/1`) whose digest holds and which is
+bound to:
+
+- this release's manifest hash and identity;
+- the seven D-26 targets, each exactly as observed now;
+- the chat state's snapshot (its embedded versions and first-write evidence)
+  and its root's realpath, device and inode;
+- `activation.json`'s transition and file hash.
+
+`compatibility()` then checks exactly those formats against the transition
+and reports them "admitted"; every other format keeps the strict check, so a
+release with any other new format or changed write version is still
+refused. `stage(..., admission=...)` accepts only an admission from
+`admission()`, and the stage journal's binding records which plan admitted
+it. Without an admission, staging is unchanged.
+
+### Commands
+
+```
+activate_release plan --release <dir> --dest <dir> --root <private dir> --evidence <file>
+                      (--designate <account> ... | --no-designations) --out <plan file>
+activate_release stage --plan <plan file>
+activate_release activate --plan <plan file> --evidence <file>
+activate_release postcheck --plan <plan file> --evidence <file>
+activate_release rollback --plan <plan file> --evidence <file>
+activate_release operator-plan --plan <plan file>
+activate_release status --root <private dir>
+```
+
+- **`plan`** is read-only. It seals one new operation id, the release, the
+  targets, the state snapshot and root, the transition, the private root and
+  the designation list (an explicit empty list is allowed) under one digest.
+  It refuses a state that already holds a new-format write, or a bootstrap
+  record.
+- **`activate`** works under a fenced journal in the private root
+  (`plateia-activation-journal/1`; a second activation is refused, never
+  interleaved). In order:
+  1. **The old writers are quiet.** Every legacy writer (the old bridge, the
+     flusher, helpers, running or cached producers) is at an acknowledged
+     checkpoint, and every designated account's producers are tracked. A
+     delivered request is not an acknowledgement; unknown evidence blocks.
+     Nothing is interrupted, restarted or killed, and the list is never
+     changed.
+  2. **Every original is backed up** privately (mode 0600) before anything is
+     changed, after re-checking each target against the plan.
+  3. **The bootstrap record is published.** Its canonical bytes come from the
+     sealed plan: the format version, the operation, the pinned manifest hash
+     and release identity, the state root's realpath, device and inode, the
+     sorted accounts, the plan digest and the plan's time. It is written to a
+     journaled temporary file, linked to `$CHAT_STATE/designation-bootstrap.json`
+     (never replacing anything), and the directory is synced. It is then
+     reconciled as this operation's own: the journaled inode, the exact bytes,
+     the root identity, durability. Only then is D, its sha256, journaled. A
+     record this operation can't show it published is retained and stops the
+     activation for an owner decision.
+  4. **The seven targets are bound**, all checked before any is written: the
+     `pchat` and role-colors links to the release; `SKILL.md`; the
+     `chat/scripts` handoff layer (each module and command runs the release's
+     copy); the two LaunchAgents, whose effective executable is the release's
+     command, any `Program` key removed. The `chat-bridge` LaunchAgent gets
+     exactly one option, `--activation-bootstrap sha256:<D>`.
+- **`activate` starts, stops and restarts nothing.** The operator restarts
+  the bridge at an acknowledged checkpoint, as the published plan says. A
+  running bridge of this operation's release allows only a read-only
+  reconcile; any other running bridge, or an unknown state, blocks every
+  change.
+- **A resume** takes the original plan for its own journaled operation only:
+  changed inputs are refused, and every step reconciles from what is on disk.
+- **`postcheck`** is read-only and never opens the outbox database. It
+  recomputes the record and D from the sealed plan, checks the record, both
+  release fields against the staged release, every target, each
+  LaunchAgent's effective executable and exact arguments, the expected new
+  bridge and its authority's status snapshot. The activation is complete
+  only when it passes.
+- **`rollback`** works only before the first new-format write. It judges the
+  three first-write boundaries from the state directory itself, never from
+  the journal:
+  - `outbox-db/1`: `outbox.db` or any of its `-wal`, `-shm` or `-journal`
+    files exists;
+  - `outbox/2`: `outbox.d/` exists;
+  - `delivery-records/2`: `dead-letters.jsonl` holds a versioned record.
+
+  Anything unreadable counts as written. Before the first write, it restores
+  every recorded target exactly, which removes the launch option, and leaves
+  the bootstrap record in place, journaled. After it, it refuses: the
+  recovery is repair or roll-forward on the latest state, and every target,
+  backup and state file is kept.
+- **`operator-plan`** prints the private plan an operator publishes (A9): the
+  source commit, the release and artifact hashes, the private environment and
+  root, the targets, the affected helpers, the checkpoint owners, the
+  preserved state, the migration point, the designation list, D, the
+  post-checks, the permitted recovery and the skills-repository change.
+- **The skills-repository change** (D-27) is reported by `activate` as paths
+  under the skills root with their new hashes; the owner commits it.
+
+### Activation tests
+
+`test_activate.py` (39 tests) and `test_cutover.py` (1 end-to-end test), all
+on invented homes:
+
+- **Admission (A1):** a plain preflight still refuses #19; a bound plan admits
+  exactly the transition; any other format change is refused; altered,
+  mismatched, reused or stale plans admit nothing, and nothing is staged.
+- **Publication:** the record comes from the sealed plan and D is the launch
+  option; an explicit empty list; a crash after each publication step,
+  after the link and before the directory sync, or leaving an unrecorded
+  staged copy (kept as cleanup debt); a record someone else published or
+  replaced is retained and stops the activation.
+- **LaunchAgents (C1):** all four accepted baseline forms bind to the release
+  and restore byte for byte; a `Program` key that would override the bound
+  executable fails the post-check.
+- **Post-check and bridges:** complete only with the expected bridge serving;
+  record, digest, option and manifest mismatches fail it; an unexpected or
+  unknown bridge blocks; the expected bridge allows only a read-only
+  reconcile.
+- **Crashes and races (A6):** a crash after every journal record, and inside
+  a target write, resumes to the same bindings; a changed plan can't resume;
+  a concurrent upgrader is refused; a target changed or swapped for a symlink
+  mid-activation blocks; the staged release and the 0600 backups are kept.
+- **Quiet writers (A3):** a delivered but unacknowledged request, a cached
+  producer not yet quiet, an unknown checkpoint or kind, missing evidence or
+  an untracked producer each block before any change.
+- **Rollback (A7):** before a first write, the targets are restored exactly
+  and the record is left; after an `outbox.db`, a WAL alone, an `outbox.d/`
+  file, a versioned dead letter, or unreadable delivery records, it is
+  refused without opening the database, including after a crash before the
+  controller's acknowledgement.
+- **Targets, preservation and the plan (A2, A4, A9):** every target resolves
+  to the release, and a module imported by path loads from it with no source
+  checkout on the path; the chat state changes only by the new record, with
+  no config, credential or project state touched; the operator plan names
+  every required item.
+- **End to end (A8):** in the staged release's own interpreter, with #19's
+  invented chat server and in-process authority, the test covers:
+  - posting and a notice with the bridge down, each queued as one `outbox/2`
+    file;
+  - `pchat status`;
+  - the bridge's first start, committing the plan-bound designation;
+  - import and delivery, each item once, with an unsupported legacy row held;
+  - post, ack and notify with the bridge up;
+  - a long post whose last confirmation times out, never reposted;
+  - a restart that changes nothing;
+  - rollback refused afterwards, and the post-check passing.
 
 ## Evidence
 
