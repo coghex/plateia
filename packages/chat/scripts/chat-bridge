@@ -1990,38 +1990,70 @@ def canonical_bytes(record):
     return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
+class PinnedRoot:
+    """The state root as classification validated it: its descriptor, held open
+    through the authority's whole start, and its identity (code review slot 3,
+    finding 2)."""
+
+    def __init__(self, fd, real):
+        st = os.fstat(fd)
+        self.fd, self.real, self.identity = fd, real, (st.st_dev, st.st_ino)
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def check(self, paths, *names):
+        """The state path still names the validated root, and each named entry
+        reached through it is the one in that root: else BootstrapUnknown."""
+        try:
+            st = os.stat(paths.state)
+            ok = (st.st_dev, st.st_ino) == self.identity
+            for name in names if ok else ():
+                inside = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+                there = os.stat(Path(paths.state) / name, follow_symlinks=False)
+                ok = ok and (inside.st_dev, inside.st_ino) == (there.st_dev, there.st_ino)
+        except OSError:
+            ok = False
+        if not ok:
+            raise BootstrapUnknown("the state root was moved or replaced after it was validated")
+
+
 def classify_launch(state, expected):
     """E and R, judged before any database is opened or created, through one
-    pinned descriptor of the state root: None when no activation is involved
-    (S1 so far), the VALID record for an activated launch (S2 or S3, by M), or
-    BootstrapUnknown. Anything that can't be judged is UNKNOWN, never an
-    ordinary failure."""
+    pinned descriptor of the state root: (record, root), where record is None
+    when no activation is involved (S1 so far) or the VALID record for an
+    activated launch (S2 or S3, by M), and root is the PinnedRoot (None when
+    there is no state at all), which the caller closes; or BootstrapUnknown.
+    Anything that can't be judged is UNKNOWN, never an ordinary failure."""
     real = os.path.realpath(state)
     try:
         state_fd = os.open(real, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
         if expected is not None:
             raise BootstrapUnknown("this launch names a bootstrap digest, but the state root is missing") from None
-        return None  # no state at all: no record, no database, S1 so far
+        return None, None  # no state at all: no record, no database, S1 so far
     except OSError as err:
         raise BootstrapUnknown(f"the state root can't be opened ({err.strerror or err})") from None
+    root = PinnedRoot(state_fd, real)
     try:
         data, reason = read_bootstrap(state_fd)
         if expected is None:
             if data is not None:
                 raise BootstrapUnknown("a bootstrap record is present, but this launch names no digest")
-            return None
+            return None, root
         if data is None:
             raise BootstrapUnknown("this launch names a bootstrap digest, but there is no record")
         if reason:
             raise BootstrapUnknown(f"the bootstrap record {reason}")
-        return bootstrap_record(data, expected, real, os.fstat(state_fd))
+        return bootstrap_record(data, expected, real, os.fstat(state_fd)), root
     except BootstrapUnknown:
+        root.close()
         raise
     except Exception as err:  # a shape or type nobody foresaw: never the ordinary failure path
+        root.close()
         raise BootstrapUnknown(f"the bootstrap record can't be judged ({type(err).__name__})") from None
-    finally:
-        os.close(state_fd)
 
 
 def valid_meta(committed, record, expected):
@@ -2048,13 +2080,15 @@ class BootstrapStore(delivery_store.Store):
     committed; S2 commits its designations and M with that write, in that one
     transaction; S1 and S3 change nothing more."""
 
-    def __init__(self, paths, *, expected=None, record=None, **kw):
+    def __init__(self, paths, *, expected=None, record=None, root=None, **kw):
         super().__init__(paths, **kw)
-        self.expected, self.record = expected, record
+        self.expected, self.record, self.root = expected, record, root
         self.bootstrap = None  # what this open did: "none" (S1), "applied" (S2) or "replayed" (S3)
 
     def set_meta(self, name, value):
         if name == "authority_epoch" and self.bootstrap is None:
+            if self.root is not None:  # inside the opening transaction, before any commit
+                self.root.check(self.paths, "outbox.db")
             self.bootstrap = self.classify_meta()
         super().set_meta(name, value)
 
@@ -2104,19 +2138,31 @@ def start_authority(authority, expected=None):
     any bootstrap committed in the opening transaction, then the socket and
     the thread. All or nothing: any failure closes what was opened and raises;
     BootstrapUnknown before anything was opened or committed."""
-    record = classify_launch(authority.paths.state, expected)
-    authority.store = BootstrapStore(authority.paths, clock=authority.clock, fs=authority.fs,
-                                     expected=expected, record=record)
+    record, root = classify_launch(authority.paths.state, expected)
     try:
-        authority.start()
-        if authority.store.bootstrap in ("applied", "replayed"):
-            log(f"designation bootstrap {authority.store.bootstrap}: operation {record['operation']}, "
-                f"{len(record['accounts'])} account(s)")
-        authority.bridge_only = not authority.bind()
-        authority.run_in_thread()
-    except BaseException:
-        authority.close()
-        raise
+        if root is not None:
+            root.check(authority.paths)  # before anything opens
+        authority.store = BootstrapStore(authority.paths, clock=authority.clock, fs=authority.fs,
+                                         expected=expected, record=record, root=root)
+        try:
+            authority.start()
+            if root is not None:
+                root.check(authority.paths, "outbox.db")  # after the commit, before the socket
+            if authority.store.bootstrap in ("applied", "replayed"):
+                log(f"designation bootstrap {authority.store.bootstrap}: operation {record['operation']}, "
+                    f"{len(record['accounts'])} account(s)")
+            authority.bridge_only = not authority.bind()
+            if root is not None:
+                root.check(authority.paths, "outbox.db", *(() if authority.bridge_only else ("outbox.sock",)))
+            authority.run_in_thread()
+        except BaseException as err:
+            authority.close()
+            if root is not None and not isinstance(err, BootstrapUnknown):
+                root.check(authority.paths)  # a swap that surfaced as another failure is UNKNOWN too
+            raise
+    finally:
+        if root is not None:
+            root.close()
     return authority.epoch
 
 

@@ -550,6 +550,7 @@ def publish_bootstrap(journal, plan):
                 os.link(tmp, final, src_dir_fd=sfd, dst_dir_fd=sfd)  # never replaces a file
             fsync_dir(sfd)
             reconcile_bootstrap(sfd, data, inode)
+            root_still_there(plan, sfd)
             journal.append({"op": op, "kind": "bootstrap-published", "inode": list(inode)})
         debt = []
         staged_names = {r["tmp"]: tuple(r["inode"]) for r in journal.records
@@ -565,11 +566,18 @@ def publish_bootstrap(journal, plan):
                 debt.append(r["tmp"])  # never journaled as ours: kept, and reported
         fsync_dir(sfd)
         ctime_ns = reconcile_bootstrap(sfd, data, inode)
+        root_still_there(plan, sfd)  # D is journaled only while the path still names the root it was published in
         journal.append({"op": op, "kind": "bootstrap", "digest": d, "inode": list(inode), "ctime_ns": ctime_ns,
                         "cleanup_debt": debt})
         return d
     finally:
         os.close(sfd)
+
+
+def root_still_there(plan, sfd):
+    if not still_there(plan["state_root"]["path"], sfd):
+        raise Refused("blocked: the chat state root was moved or replaced during publication; the record is retained, "
+                      "and nothing more was changed")
 
 
 def reconcile_bootstrap(sfd, data, inode, ctime_ns=None):
@@ -910,12 +918,21 @@ def pinned_seal_dirs(plan):
     fds = []
     try:
         for rel in SEAL_DIRS:
-            fds.append((rel, subdir(site, rel.split("/"))))
+            fds.append((rel, subdir(site, rel.split("/")), sites[0] / rel))
         yield fds
     finally:
-        for _, fd in fds:
+        for _, fd, _ in fds:
             os.close(fd)
         os.close(site)
+
+
+def seal_paths_hold(dirs):
+    """The live staged paths still name the pinned seal directories (code review
+    slot 3, finding 4): Refused, naming the first that doesn't."""
+    for rel, fd, path in dirs:
+        if not still_there(path, fd):
+            raise Refused(f"blocked: the staged {rel} was moved or replaced during the seal (its path no longer names "
+                          "the pinned directory); the seal is not journaled, and nothing more was changed")
 
 
 def seal_problem(recorded, found):
@@ -948,7 +965,8 @@ def seal_release(journal, plan, read_only=False):
     sealed = next((r for r in reversed(mine) if r["kind"] == "release-sealed"), None)
     intent = next((r for r in reversed(mine) if r["kind"] == "release-seal-baseline"), None)
     with pinned_seal_dirs(plan) as dirs:
-        found = [dir_metadata(fd, rel) for rel, fd in dirs]
+        found = [dir_metadata(fd, rel) for rel, fd, _ in dirs]
+        seal_paths_hold(dirs)
         if sealed is not None:
             problem = seal_problem(sealed["dirs"], found)
             if problem:
@@ -975,12 +993,15 @@ def seal_release(journal, plan, read_only=False):
                     raise Refused(f"blocked: the staged {m['rel']} is owned by another user; nothing was changed")
             originals = found
             journal.append({"op": op, "kind": "release-seal-baseline", "dirs": originals})
-        for (rel, fd), m in zip(dirs, found):
+        for (rel, fd, _), m in zip(dirs, found):
             if m["mode"] != SEAL_MODE:
+                seal_paths_hold(dirs)  # around each fchmod: the live paths still name the pinned directories
                 os.fchmod(fd, SEAL_MODE)
-        problem = seal_problem(originals, [dir_metadata(fd, rel) for rel, fd in dirs])
+                seal_paths_hold(dirs)
+        problem = seal_problem(originals, [dir_metadata(fd, rel) for rel, fd, _ in dirs])
         if problem:
             raise Refused(f"blocked: the seal didn't take as recorded ({problem}); nothing more was changed")
+        seal_paths_hold(dirs)  # before the seal is declared complete, and the bootstrap and binding go on
         journal.append({"op": op, "kind": "release-sealed", "dirs": originals})
 
 
@@ -991,7 +1012,8 @@ def seal_report(plan, mine):
         return "not journaled by this operation"
     try:
         with pinned_seal_dirs(plan) as dirs:
-            problem = seal_problem(sealed["dirs"], [dir_metadata(fd, rel) for rel, fd in dirs])
+            seal_paths_hold(dirs)
+            problem = seal_problem(sealed["dirs"], [dir_metadata(fd, rel) for rel, fd, _ in dirs])
     except Refused as e:
         return f"unreadable: {e}"
     return f"drifted: {problem}" if problem else "matches"
@@ -1269,26 +1291,38 @@ def clear_own_temporaries(journal, plan, t, path, backup):
         os.close(fd)
 
 
-def apply_entries(journal, plan, t, path, backup, writes, kind):
+def apply_entries(journal, plan, t, path, backup, writes, kind, guard=None):
     """Write each (rel, before, after) entry of one target through its pinned
-    directory, journaled entry by entry (`kind` "binding" or "restoring"): each
-    entry is checked against what was judged just before it is replaced, and
-    the directory's path is checked after every write."""
+    directory, journaled entry by entry (`kind` "binding" or "restoring").
+    Each entry and its directory's path are checked against what was judged
+    before the durable intent is journaled, and again after it, immediately
+    before the write (code review slot 3, finding 3): a change in between
+    refuses, and is kept. `guard` (the producers fenced, and for a rollback
+    the current first-write evidence) runs immediately before every write.
+    The directory's path is checked again after every write."""
     op = plan["operation"]
+    follow = t["kind"] not in FOLDERS
+
+    def unchanged(fd, name, before, rel):
+        if not still_there(container_of(t, path), fd, follow=follow):
+            raise Refused(f"blocked: {t['name']}'s directory was moved or replaced; nothing more was changed")
+        if entry_digest(entry_at(fd, name, link=t["kind"] == "symlink")) != entry_digest(before):
+            raise Refused(f"blocked: {t['name']} ({rel or name}) changed just before it was written: the change is "
+                          "kept, and nothing more was changed")
     clear_own_temporaries(journal, plan, t, path, backup)
     fd = open_container(t, path, backup.get("container"))
     if not isinstance(fd, int):
         raise Refused(f"blocked: {t['name']}'s directory is missing; nothing more was changed")
-    follow = t["kind"] not in FOLDERS
     try:
         for rel, before, after in writes:
             name = entry_name(t, path, rel)
-            if entry_digest(entry_at(fd, name, link=t["kind"] == "symlink")) != entry_digest(before):
-                raise Refused(f"blocked: {t['name']} ({rel or name}) changed just before it was written; nothing more "
-                              "was changed")
+            unchanged(fd, name, before, rel)
             tmp = f".plateia-activation-{secrets.token_hex(6)}"
             journal.append({"op": op, "kind": f"entry-{kind}", "target": t["name"], "rel": rel, "tmp": tmp,
                             "from": entry_digest(before), "to": entry_digest(after)})
+            if guard is not None:
+                guard()
+            unchanged(fd, name, before, rel)  # after the durable intent and the guard, immediately before the write
             write_entry_at(fd, name, after, tmp)
             journal.append({"op": op, "kind": "entry-bound" if kind == "binding" else "entry-restored",
                             "target": t["name"], "rel": rel, "digest": entry_digest(after)})
@@ -1431,6 +1465,15 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
                           "bootstrap; nothing was changed")
         if not read_only:
             check_quiet(ops, plan)
+
+        def binding_guard():
+            """Before each write: producers still fenced (no bridge started,
+            every writer still quiet) and the release still sealed as journaled
+            (its paths, identities, modes and access metadata)."""
+            if bridge_verdict(ops, plan) != "stopped":
+                raise Refused("blocked: a bridge started during binding; nothing more was changed")
+            check_quiet(ops, plan)
+            seal_release(journal, plan, read_only=True)
         if not mine["admitted"]:
             journal.append({"op": plan["operation"], "kind": "admitted", "plan_sha256": plan["digest"],
                             "release": plan["release"], "targets": {t["name"]: t["digest"] for t in plan["targets"]}})
@@ -1477,13 +1520,14 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
                               "at an acknowledged checkpoint; nothing was changed")
             steps.append((t, path, backup, original, desired, writes))
         seal_release(journal, plan, read_only)  # before any target is written: verified, or guarded and journaled
+        seal_release(journal, plan, read_only=True)  # and verified again across that durable record
         if not read_only:
             publish_bootstrap(journal, plan)
         for t, path, backup, original, desired, writes in steps:
             if writes:
                 journal.append({"op": plan["operation"], "kind": "binding", "target": t["name"],
                                 "from": summary_of(original), "to": summary_of(desired)})
-                apply_entries(journal, plan, t, path, backup, writes, "binding")
+                apply_entries(journal, plan, t, path, backup, writes, "binding", guard=binding_guard)
             if t["kind"] == "launchagent":
                 bound, _ = observe_target(t, path, layout, backup.get("container"))
                 problem = invocation_problem(t, bound.get(""), layout, d)
@@ -1611,15 +1655,27 @@ def rollback(plan_path, ops, spec_path=None, crash=None):
         if bridge.get("running") is not False:
             raise Refused("rollback refused for now: a bridge is running, or its state is unknown; it must stop at an "
                           "acknowledged checkpoint first; nothing was changed")
-        evidence = first_write_evidence(plan["state_root"]["path"], plan["state_root"])
-        written = {k: v for k, v in evidence.items() if v != "absent"}
-        if written:
-            journal.append({"op": plan["operation"], "kind": "rollback-refused", "evidence": evidence})
-            raise Refused("rollback refused: " + "; ".join(f"{k}: {v}" for k, v in sorted(written.items()))
-                          + ". Old code can't read the new state, or nothing shows it wasn't written, so the "
-                            "recovery is repair or roll-forward: a reviewed repair, or a roll-forward that keeps the "
-                            "newer state (D-74). The recorded targets, backups and the state are kept, and nothing "
-                            "was changed")
+
+        def eligible():
+            """Rollback stays eligible all the way through (code review slot 3,
+            finding 1): checked before anything and again immediately before
+            every restoring write. No bridge has started, every writer is still
+            at its acknowledged checkpoint, and the plan's sealed state root
+            still shows no first write, judged now."""
+            if (ops.bridge_state() or {}).get("running") is not False:
+                raise Refused("blocked: a bridge started, or its state became unknown, during rollback; nothing "
+                              "more was changed")
+            check_quiet(ops, plan)
+            evidence = first_write_evidence(plan["state_root"]["path"], plan["state_root"])
+            written = {k: v for k, v in evidence.items() if v != "absent"}
+            if written:
+                journal.append({"op": plan["operation"], "kind": "rollback-refused", "evidence": evidence})
+                raise Refused("rollback refused: " + "; ".join(f"{k}: {v}" for k, v in sorted(written.items()))
+                              + ". Old code can't read the new state, or nothing shows it wasn't written, so the "
+                                "recovery is repair or roll-forward: a reviewed repair, or a roll-forward that keeps "
+                                "the newer state (D-74). The recorded targets, backups and the state are kept, and "
+                                "nothing more was changed")
+        eligible()
         layout = staged_layout(plan)
         paths = target_paths(stage_release.load_spec(spec_path)[0]["targets"], skills_root(spec_path))
         steps = []
@@ -1646,7 +1702,7 @@ def rollback(plan_path, ops, spec_path=None, crash=None):
         for t, path, backup, writes in steps:
             if writes:
                 journal.append({"op": plan["operation"], "kind": "restoring", "target": t["name"]})
-                apply_entries(journal, plan, t, path, backup, writes, "restoring")
+                apply_entries(journal, plan, t, path, backup, writes, "restoring", guard=eligible)
             journal.append({"op": plan["operation"], "kind": "restored", "target": t["name"]})
         try:
             sfd = open_state_root(plan)

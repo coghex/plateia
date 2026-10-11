@@ -1418,6 +1418,139 @@ class GuardedSealTests(ActivationCase):
         self.assertEqual(dict(report["checks"])["staged release"], "matches", "strict verification, unchanged")
 
 
+class CodeThreeTests(ActivationCase):
+    """Code review slot 3 on PR #22 (6112012412): the controller's three
+    findings, each reproduced at c229c83 before its fix."""
+
+    # 1. Rollback stays eligible all the way through: fenced producers, current first-write evidence.
+    def test_a_first_write_or_a_waking_producer_during_rollback_refuses_before_the_next_restore(self):
+        for name, when in (("a first write before the first restore", "restoring"),
+                           ("a first write between two restores", "entry-restored"),
+                           ("a producer leaving its checkpoint", "restoring")):
+            with self.subTest(case=name):
+                self.fresh()
+                plan, path = self.activated()
+                seen = []
+
+                def late(record):
+                    if record["kind"] == when and not seen:
+                        seen.append(record)
+                        if "producer" in name:
+                            self.ops.writer_list[1]["checkpoint"] = "requested"
+                        else:
+                            (self.state / "outbox.d").mkdir()
+                with self.assertRaisesRegex(Refused, "repair or roll-forward" if "write" in name else "blocked"):
+                    self.rollback(path, crash=late)
+                self.assertNotIn("rolled-back", self.kinds())
+                if "write" in name:
+                    self.assertTrue((self.state / "outbox.d").is_dir(), "the evidence is kept")
+                restored = [r for r in self.journal() if r["kind"] == "entry-restored"]
+                self.assertEqual(len(restored), 0 if when == "restoring" else 1, "nothing more was restored")
+
+    # 3. The entry and its directory are checked again after the durable intent, just before the write.
+    def test_an_edit_at_the_intent_boundary_refuses_and_is_kept(self):
+        edit = "# the owner's edit, made at the intent boundary\n"
+        for phase in ("binding", "restoring"):
+            with self.subTest(phase=phase):
+                self.fresh()
+                if phase == "binding":
+                    plan, path = self.prepared()
+                else:
+                    plan, path = self.activated()
+                target = self.skills / "chat/scripts/chatlib.py"
+
+                def at_intent(record):
+                    if record["kind"] == f"entry-{phase}" and record["rel"] == "chatlib.py":
+                        target.write_text(edit)
+                with self.assertRaisesRegex(Refused, "changed"):
+                    (self.activate if phase == "binding" else self.rollback)(path, crash=at_intent)
+                self.assertEqual(target.read_text(), edit, "the owner's edit is kept")
+
+    # 4. The live staged paths still name the pinned seal directories.
+    def test_a_seal_directory_swapped_mid_operation_refuses_and_is_not_journaled_sealed(self):
+        for when in ("after the journaled baseline", "between the two fchmods"):
+            with self.subTest(swap=when):
+                self.fresh()
+                plan, path = self.prepared()
+                site = next((Path(plan["staged_release"]) / "env").glob("lib/python*/site-packages"))
+                pkg, scripts = site / "plateia_chat", site / "plateia_chat/scripts"
+
+                def swap():
+                    mode = pkg.stat().st_mode & 0o777
+                    pkg.chmod(0o755)
+                    scripts.rename(pkg / "scripts-displaced")
+                    shutil.copytree(pkg / "scripts-displaced", scripts)  # identical contents, another directory
+                    scripts.chmod(0o755)
+                    pkg.chmod(mode)
+                crash, patches = None, []
+                if when == "after the journaled baseline":
+                    def crash(record):
+                        if record["kind"] == "release-seal-baseline":
+                            swap()
+                else:
+                    real, calls = os.fchmod, []
+
+                    def fchmod(fd, mode):
+                        real(fd, mode)
+                        if mode == 0o555:
+                            calls.append(fd)
+                            if len(calls) == 1:
+                                swap()
+                    patches.append(mock.patch.object(activate_release.os, "fchmod", fchmod))
+                with contextlib.ExitStack() as stack:
+                    for p in patches:
+                        stack.enter_context(p)
+                    with self.assertRaisesRegex(Refused, "blocked"):
+                        self.activate(path, crash=crash)
+                self.assertNotIn("release-sealed", self.kinds())
+                self.assertNotIn("binding", self.kinds())
+                self.assertEqual(scripts.stat().st_mode & 0o777, 0o755, "the live scripts/ was never sealed")
+
+
+class CodeThreeSweepTests(ActivationCase):
+    """The same classes as slot 3's findings, swept: a check that doesn't hold
+    across a durable step, and validation that doesn't reach the act."""
+
+    def test_a_seal_directory_swapped_just_after_release_sealed_stops_before_any_binding(self):
+        plan, path = self.prepared()
+        site = next((Path(plan["staged_release"]) / "env").glob("lib/python*/site-packages"))
+        pkg, scripts = site / "plateia_chat", site / "plateia_chat/scripts"
+
+        def swap(record):
+            if record["kind"] == "release-sealed":
+                pkg.chmod(0o755)
+                scripts.rename(pkg / "scripts-displaced")
+                shutil.copytree(pkg / "scripts-displaced", scripts)
+                pkg.chmod(0o555)
+        with self.assertRaisesRegex(Refused, "blocked"):
+            self.activate(path, crash=swap)
+        self.assertNotIn("bootstrap-intent", self.kinds())
+        self.assertNotIn("binding", self.kinds())
+
+    def test_a_producer_leaving_its_checkpoint_during_binding_stops_the_next_write(self):
+        plan, path = self.prepared()
+        seen = []
+
+        def wake(record):
+            if record["kind"] == "entry-bound" and not seen:
+                seen.append(record)
+                self.ops.writer_list[1]["checkpoint"] = "requested"
+        with self.assertRaisesRegex(Refused, "blocked"):
+            self.activate(path, crash=wake)
+        self.assertEqual(self.kinds().count("entry-bound"), 1, "nothing more was written")
+
+    def test_the_state_root_moved_during_publication_stops_before_d(self):
+        plan, path = self.prepared()
+
+        def move(record):
+            if record["kind"] == "bootstrap-staged":
+                self.state.rename(self.state.with_name("chat-moved"))
+                self.state.mkdir()
+        with self.assertRaisesRegex(Refused, "blocked"):
+            self.activate(path, crash=move)
+        self.assertNotIn("bootstrap", self.kinds(), "D is never journaled for a root that moved")
+
+
 class OperatorPlanTests(ActivationCase):
     """A9: the private operator plan names everything an operator publishes."""
 

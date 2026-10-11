@@ -7,6 +7,7 @@ import contextlib
 import fcntl
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import sys
@@ -727,6 +728,81 @@ class BootstrapTypeTests(BootstrapCase):
 
     def no_database_open(self):
         return mock.patch.object(self.ds.sqlite3, "connect", side_effect=AssertionError("the database was opened"))
+
+
+class BootstrapRootBindingTests(BootstrapCase):
+    """Code review slot 3 on PR #22 (6112012412), finding 2: the validated state
+    root stays the one the authority opens, commits into and binds in. A root
+    swapped after classification is UNKNOWN: no designation, no commit in the
+    replacement, no bind."""
+
+    def swap_root(self):
+        moved = self.state.with_name(f"{self.state.name}-validated-{__import__('secrets').token_hex(4)}")
+        self.state.rename(moved)
+        self.state.mkdir()
+        self.addCleanup(self.unswap, moved)
+        return moved
+
+    def unswap(self, moved):
+        if moved.exists():
+            shutil.rmtree(self.state)
+            moved.rename(self.state)
+
+    def committed(self, root):
+        db = root / "outbox.db"
+        if not db.exists():
+            return None
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            if con.execute("SELECT 1 FROM sqlite_master WHERE name = 'meta'").fetchone() is None:
+                return {}
+            return {"meta": dict(con.execute("SELECT name, value FROM meta").fetchall()),
+                    "designated": [r[0] for r in con.execute("SELECT account FROM accounts")]}
+        finally:
+            con.close()
+
+    def test_a_root_swapped_after_classification_is_unknown(self):
+        for moment in ("before the database opens", "right after the connection opens", "before the bind"):
+            with self.subTest(swap=moment):
+                self.stop()
+                for name in ("outbox.db", "outbox.db-wal", "outbox.db-shm"):
+                    with contextlib.suppress(FileNotFoundError):
+                        (self.state / name).unlink()
+                d = self.publish(self.record(["alp-solver-2"]))
+                moved, binds = [], []
+                real_start, real_connect = self.ds.Authority.start, self.ds.sqlite3.connect
+
+                def start(authority):
+                    if moment == "before the database opens":
+                        moved.append(self.swap_root())
+                    return real_start(authority)
+
+                def connect(*a, **k):
+                    con = real_connect(*a, **k)
+                    if moment == "right after the connection opens" and not moved:
+                        moved.append(self.swap_root())
+                    return con
+
+                def bind(authority):
+                    if moment == "before the bind" and not moved:
+                        moved.append(self.swap_root())
+                    binds.append(1)
+                    return False
+                with mock.patch.object(self.ds.Authority, "start", start), \
+                        mock.patch.object(self.ds.sqlite3, "connect", connect), \
+                        mock.patch.object(self.ds.Authority, "bind", bind):
+                    authority = self.launch(d)
+                self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, f"{moment}: {authority.unavailable}")
+                self.assertFalse(authority.running)
+                self.assertFalse(binds and moment != "before the bind", "nothing was bound")
+                replacement = self.committed(self.state)
+                self.assertIn(replacement, (None, {}), "nothing was committed in the replacement")
+                if moment != "before the bind":
+                    validated = self.committed(moved[0])
+                    self.assertTrue(validated in (None, {}) or "designation_bootstrap" not in validated["meta"],
+                                    "no designation was committed")
+                self.stop()
+                self.unswap(moved[0])
 
 
 class BootstrapCrashTests(BootstrapCase):
