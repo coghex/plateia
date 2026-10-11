@@ -2455,6 +2455,16 @@ is normative. In summary:
   - the latest-state-preserving recovery.
 
   A rollback before the first write leaves the bootstrap record in place.
+- **2026-10-11, 14:33 UTC (owner): the record also carries the release
+  identity.** The bridge knows its running release only by identity, from
+  its own path, so it can't compare a manifest hash without reading the
+  release manifest.
+  - The record keeps the pinned release manifest hash, and adds the pinned
+    release identity, both derived from the sealed plan. The launch digest
+    still covers the whole record.
+  - The bridge checks the identity against its own; the controller's
+    read-only post-check verifies the manifest hash against the plan.
+  - No new file, format, read or launch option.
 
 Rejected alternatives:
 
