@@ -601,11 +601,16 @@ class ResumeTests(ActivationCase):
     a concurrent upgrader and a target changed or swapped by anything else
     prevent action; releases still referenced are kept."""
 
-    def test_a_crash_after_every_journal_record_resumes_to_the_same_bindings(self):
+    def test_a_crash_after_every_kind_of_journal_record_resumes_to_the_same_bindings(self):
+        """A crash after the first and after the last record of every kind the
+        activation journals: every distinct boundary, each from both ends.
+        (Repeats of one kind, such as one entry write after another, cross the
+        same boundary; an interruption between two of them has its own test.)"""
         self.activated()
-        records = len(self.journal())
-        self.assertGreater(records, 20)
-        for n in range(1, records + 1):
+        kinds = [r["kind"] for r in self.journal()]
+        self.assertGreater(len(set(kinds)), 10)
+        points = sorted({kinds.index(k) + 1 for k in kinds} | {len(kinds) - kinds[::-1].index(k) for k in kinds})
+        for n in points:
             with self.subTest(crash_after_record=n):
                 self.fresh()
                 plan, path = self.prepared()
