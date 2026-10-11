@@ -486,9 +486,12 @@ additions):
     activation. Any other argument is malformed, and the bridge doesn't
     start.
   - **R**, the record `$CHAT_STATE/designation-bootstrap.json`
-    (`designation-bootstrap/1`). It is VALID only if all of these hold:
+    (`designation-bootstrap/1`). It is read through one descriptor of the
+    state root, and is VALID only if all of these hold:
     - it is a private regular file of this user, opened without following
       links and read whole within 64 KiB;
+    - every field has its exact type: each account is checked as a name
+      before anything compares, hashes or sorts them;
     - its bytes' sha256 is E;
     - it is exactly the canonical record;
     - its release identity is this bridge's own, from its resolved
@@ -505,10 +508,14 @@ additions):
     and the version.
   - **S3:** E, a VALID R and a well-formed M with the same operation and D. A
     replay: nothing is designated again, so the original effective time and
-    version and every later suspension stand.
+    version and every later suspension stand. Well formed means every field
+    has its exact type: `effective_at` is a real number (not a bool),
+    `already_present` is a sorted list of names drawn from the accounts.
 - **Every other state is UNKNOWN.** Examples: a record without E, E without a
   valid record, M without either, M naming another operation or digest, or a
-  malformed M. In that state:
+  malformed M. Anything that can't be judged, such as a value of an
+  unforeseen type in a digest-matching record, is UNKNOWN too, never an
+  ordinary failure. In that state:
   - the transaction rolls back, so nothing is committed, not even the epoch;
   - no socket is bound, and nothing is imported or recovered;
   - nothing is deleted or rewritten, and the status snapshot isn't replaced;

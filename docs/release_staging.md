@@ -587,17 +587,45 @@ activate_release status --root <private dir>
   It refuses a state that already holds a new-format write, or a bootstrap
   record.
 - **`activate`** works under a fenced journal in the private root
-  (`plateia-activation-journal/1`; a second activation is refused, never
-  interleaved). In order:
-  1. **The old writers are quiet.** Every legacy writer (the old bridge, the
-     flusher, helpers, running or cached producers) is at an acknowledged
-     checkpoint, and every designated account's producers are tracked. A
-     delivered request is not an acknowledgement; unknown evidence blocks.
-     Nothing is interrupted, restarted or killed, and the list is never
-     changed.
-  2. **Every original is backed up** privately (mode 0600) before anything is
-     changed, after re-checking each target against the plan.
-  3. **The bootstrap record is published.** Its canonical bytes come from the
+  (`plateia-activation-journal/1`). In order:
+  1. **The journal is fenced.**
+     - The root, the lock and the journal file are opened once, never
+       through a link, and kept as descriptors.
+     - Every append first checks that the root's path still names that
+       directory and those files. A renamed or replaced root stops the
+       operation, so one operation can't be split across two journals.
+     - A second activation is refused, never interleaved.
+     - A record cut short by a crash (a torn suffix) is kept privately as
+       `journal-torn-<offset>.bin`, then truncated and synced, before
+       anything is appended.
+     - Every decoded record, and the plan itself, is checked for its shape.
+  2. **The staged release is verified** as the stager verifies a completed
+     operation, against its recorded inventory and trusted binding: the
+     artifacts, the environment, the interpreter and the import check. This
+     happens before every activation and resume, and in the post-check; any
+     change blocks.
+     - The release's two package directories are then made read-only
+       (0555), so running its commands never writes bytecode into it, and
+       it stays exactly as staged. Directory modes aren't part of the
+       inventory.
+     - The skill and the status client the controller uses are read from
+       the hash-verified artifacts.
+  3. **The old writers are quiet.**
+     - Every writer the sealed plan names, and every legacy writer the
+       current evidence lists (the old bridge, the flusher, helpers, running
+       or cached producers), must be at an acknowledged checkpoint or
+       verifiably retired. A named writer the evidence omits is unknown.
+     - Every designated account's producers must be tracked.
+     - The evidence must be current: `observed_at` within 15 minutes.
+     - A delivered request is not an acknowledgement, and unknown evidence
+       blocks.
+     - Nothing is interrupted, restarted or killed, and the list is never
+       changed.
+  4. **Every original is backed up** privately (mode 0600, through the
+     pinned root) before anything is changed, after re-checking each target
+     against the plan. Each target's directory identity (device and inode)
+     is recorded with it.
+  5. **The bootstrap record is published.** Its canonical bytes come from the
      sealed plan: the format version, the operation, the pinned manifest hash
      and release identity, the state root's realpath, device and inode, the
      sorted accounts, the plan digest and the plan's time. It is written to a
@@ -610,12 +638,25 @@ activate_release status --root <private dir>
      checks both. A
      record this operation can't show it published is retained and stops the
      activation for an owner decision.
-  4. **The seven targets are bound**, all checked before any is written: the
-     `pchat` and role-colors links to the release; `SKILL.md`; the
-     `chat/scripts` handoff layer (each module and command runs the release's
-     copy); the two LaunchAgents, whose effective executable is the release's
-     command, any `Program` key removed. The `chat-bridge` LaunchAgent gets
-     exactly one option, `--activation-bootstrap sha256:<D>`.
+  6. **The seven targets are bound**, all checked before any is written:
+     - the `pchat` and role-colors links point to the release;
+     - `SKILL.md` is the release's;
+     - the `chat/scripts` handoff layer runs the release's copy of each
+       module and command;
+     - the two LaunchAgents' effective executable is the release's command,
+       with any `Program` key removed. The `chat-bridge` LaunchAgent gets
+       exactly one option, `--activation-bootstrap sha256:<D>`.
+
+     How each write happens:
+     - It goes through the target's directory, pinned by descriptor and
+       matched to its recorded identity, and never follows a link.
+     - Each entry is checked against what was judged just before it is
+       replaced, and the directory's path is checked after every write.
+     - Each entry's write is journaled before and after it, so a folder
+       interrupted between two entries resumes, or rolls back, entry by
+       entry. That journal is the ownership evidence.
+     - A temporary that a crash leaves behind is removed on resume, but only
+       if this operation journaled it.
 - **`activate` starts, stops and restarts nothing.** The operator restarts
   the bridge at an acknowledged checkpoint, as the published plan says. A
   running bridge of this operation's release allows only a read-only
@@ -624,22 +665,35 @@ activate_release status --root <private dir>
 - **A resume** takes the original plan for its own journaled operation only:
   changed inputs are refused, and every step reconciles from what is on disk.
 - **`postcheck`** is read-only and never opens the outbox database. It
-  recomputes the record and D from the sealed plan, checks the record, both
-  release fields against the staged release, every target, each
-  LaunchAgent's effective executable and exact arguments, the expected new
-  bridge and its authority's status snapshot. The activation is complete
-  only when it passes.
+  recomputes the record and D from the sealed plan, then checks:
+  - the staged release (verified);
+  - the record, and both release fields against the staged release;
+  - every target, through its pinned directory;
+  - each LaunchAgent's effective executable and exact arguments;
+  - the expected new bridge;
+  - a live answer from its authority to the existing read-only status
+    request over its socket. This uses the release's own client, within its
+    bounded deadline, and reports the authority's epoch.
+
+  An old status snapshot proves nothing. The live answer ties the evidence
+  to this activation: once the record exists, a bridge launched without its
+  exact digest is UNKNOWN and never binds its socket. The activation is
+  complete only when every check passes.
 - **`rollback`** works only before the first new-format write. It judges the
   three first-write boundaries from the state directory itself, never from
-  the journal:
+  the journal, through one descriptor of the root the plan sealed. A root
+  that is missing, replaced (another device or inode) or unreadable makes
+  every boundary unknown, and refuses:
   - `outbox-db/1`: `outbox.db` or any of its `-wal`, `-shm` or `-journal`
     files exists;
   - `outbox/2`: `outbox.d/` exists;
   - `delivery-records/2`: `dead-letters.jsonl` holds a versioned record.
 
   Anything unreadable counts as written. Before the first write, it restores
-  every recorded target exactly, which removes the launch option, and leaves
-  the bootstrap record in place, journaled. After it, it refuses: the
+  every recorded target exactly, entry by entry through its pinned
+  directory, which removes the launch option. An entry may be as backed up
+  or as this operation journaled writing it, and anything else blocks. It
+  leaves the bootstrap record in place, journaled. After it, it refuses: the
   recovery is repair or roll-forward on the latest state, and every target,
   backup and state file is kept.
 - **`operator-plan`** prints the private plan an operator publishes (A9): the
@@ -652,8 +706,27 @@ activate_release status --root <private dir>
 
 ### Activation tests
 
-`test_activate.py` (39 tests) and `test_cutover.py` (1 end-to-end test), all
-on invented homes:
+`test_activate.py` (54 tests) and `test_cutover.py` (1 end-to-end test), all
+on invented homes. The slot-2 review of PR #22 added its nine findings, each
+reproduced before its fix, and a sweep of the same classes:
+
+- the state root moved, removed or unreadable;
+- a folder or parent swapped for a link mid-binding;
+- the journal's root renamed or replaced, and a link put in place of its
+  root, lock or file;
+- a changed staged release;
+- a named writer omitted from the evidence;
+- an interruption between two script replacements, then resume or
+  rollback;
+- an old status snapshot;
+- a torn journal suffix, and a crash during a journal write;
+- a crash between a temporary and its rename;
+- stale or undated evidence;
+- a failed service query;
+- the status client coming from the verified wheel;
+- malformed plans and journals.
+
+The earlier tests cover:
 
 - **Admission (A1):** a plain preflight still refuses #19; a bound plan admits
   exactly the transition; any other format change is refused; altered,
