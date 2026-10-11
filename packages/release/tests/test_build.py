@@ -108,6 +108,7 @@ class BuildTests(BuildCase):
             r"\"supersedes\"": ("delivery-records", True, True),
             r"kern\.bootsessionuuid|random/boot_id": ("boot-id", True, False),
             r"-iTCP": ("tcp-sockets", True, False),
+            r"designation-bootstrap/1": ("designation-bootstrap", True, False),
         }
         manifest = build_release.verify(self.build()[0])
         formats = {f["name"]: f for f in manifest["formats"]}
@@ -442,7 +443,8 @@ class RefusalTests(BuildCase):
 # delivery-records, outbox-db, outbox-authority, boot-id and tcp-sockets
 # format entries (the second to fifth amendments of #19, acceptance 11).
 UNCHANGED_DECLARATIVE = "f2895cb0c6145ded6b845e214ab21cc06ae5f68426d73cb71bfecadb66602f81"
-CHANGED_BY_19 = {"outbox", "delivery-records", "outbox-db", "outbox-authority", "boot-id", "tcp-sockets"}
+CHANGED_BY_19 = {"outbox", "delivery-records", "outbox-db", "outbox-authority", "boot-id", "tcp-sockets",
+                 "designation-bootstrap"}
 GENERATED = ("release", "source", "builder", "build_interpreter", "artifacts")
 
 
