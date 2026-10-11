@@ -567,6 +567,8 @@ class Deliveries:
             elif item["phase"] == "intent":
                 self._hold(item, "its outcome is unknown after a restart")
                 changed = True
+        if changed:  # newly accepted or held: an acknowledgement already saved settles it (code review CODE19)
+            self._acks_checked = False
         return changed
 
     def _dead(self, item, detail, cfg, reason=None):

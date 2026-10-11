@@ -204,6 +204,9 @@ class Connection:
         self.sock.close()
 
     def send(self, line: str) -> None:
+        left = self._left()  # an active absolute deadline bounds each write too (code review CODE19)
+        if left is not None:
+            self.sock.settimeout(left)
         self.sock.sendall(line.encode() + b"\r\n")
 
     def _left(self) -> float | None:

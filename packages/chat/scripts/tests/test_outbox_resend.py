@@ -1059,6 +1059,152 @@ class ConfirmationDeadlineTests(OutboxCase):
         self.assertEqual(len(conn.sock.sent), 2, "both PINGs answered")
 
 
+class SetupWriteDeadlineTests(OutboxCase):
+    """Code review CODE19, finding 2: login (LOGIN_WAIT, 30 s) and channel
+    setup (CHANNEL_WAIT, 15 s) each have one absolute deadline, and it bounds
+    every write as well as every read: a write gets only the time left. On a
+    fake clock and socket."""
+
+    class Sock:
+        def __init__(self, now, cost, replies=b""):
+            self.now, self.cost, self.timeout, self.replies, self.sent = now, cost, None, replies, []
+
+        def settimeout(self, t):
+            self.timeout = t
+
+        def sendall(self, data):
+            if self.timeout is not None and self.cost > self.timeout:
+                self.now[0] += self.timeout
+                raise TimeoutError("timed out")
+            self.now[0] += self.cost
+            self.sent.append(data)
+
+        def recv(self, n):
+            if self.replies:
+                data, self.replies = self.replies, b""
+                return data
+            self.now[0] += self.timeout or 0
+            raise TimeoutError("timed out")
+
+        def close(self):
+            pass
+
+    def fake_clock(self):
+        import types
+        now = [1000.0]
+        return now, mock.patch.object(self.chatlib, "time", types.SimpleNamespace(monotonic=lambda: now[0],
+                                                                                    time=lambda: now[0]))
+
+    def login(self, connect_cost, write_cost, replies=b""):
+        now, patched = self.fake_clock()
+        sock = self.Sock(now, write_cost, replies)
+
+        def create_connection(address, timeout):
+            now[0] += connect_cost
+            sock.settimeout(timeout)
+            return sock
+        with patched, mock.patch.object(self.chatlib.socket, "create_connection", create_connection):
+            try:
+                conn = self.chatlib.Connection(None, None, cfg={}, caps=("message-tags",),
+                                               wait=self.ds.LOGIN_WAIT)
+            except (TimeoutError, self.chatlib.ChatError) as err:
+                conn = err
+        return conn, now[0] - 1000.0, sock
+
+    def channel(self, write_cost, replies=b""):
+        now, patched = self.fake_clock()
+        conn = object.__new__(self.chatlib.Connection)
+        conn.sock, conn.buf, conn.deadline = self.Sock(now, write_cost, replies), b"", None
+        with patched:
+            try:
+                self.chatlib.ensure_channel(conn, "#alpha", wait=self.ds.CHANNEL_WAIT)
+                outcome = None
+            except (TimeoutError, self.chatlib.ChatError) as err:
+                outcome = err
+        return outcome, now[0] - 1000.0
+
+    def test_a_slow_connect_and_slow_login_writes_stay_within_login_wait(self):
+        outcome, elapsed, sock = self.login(connect_cost=25.0, write_cost=10.0)
+        self.assertIsInstance(outcome, TimeoutError, "the login failed: nothing is assumed")
+        self.assertLessEqual(elapsed, self.ds.LOGIN_WAIT)
+
+    def test_slow_channel_setup_writes_stay_within_channel_wait(self):
+        outcome, elapsed = self.channel(write_cost=10.0)
+        self.assertIsInstance(outcome, TimeoutError)
+        self.assertLessEqual(elapsed, self.ds.CHANNEL_WAIT)
+
+    def test_a_timely_login_and_channel_setup(self):
+        """A control: quick writes, and the server's answers."""
+        conn, elapsed, sock = self.login(connect_cost=0.1, write_cost=0.1, replies=b":srv CAP * LS :message-tags\r\n"
+                                         b":srv CAP * ACK :message-tags\r\n:srv 001 guest :welcome\r\n")
+        self.assertIsInstance(conn, self.chatlib.Connection)
+        self.assertIsNone(conn.deadline)
+        outcome, elapsed = self.channel(write_cost=0.1,
+                                        replies=b":srv 353 g = #alpha :guest chatbridge\r\n:srv 366 g #alpha :end\r\n")
+        self.assertIsNone(outcome)
+
+
+class IpcDeadlineTests(OutboxCase):
+    """Code review CODE19, finding 3: one request over outbox.sock shares one
+    absolute deadline (IPC_WAIT, 5 s) across connect, write and read: the write
+    gets only the time left after connecting. A timeout is no reply, never an
+    acceptance. On a fake clock and socket."""
+
+    def exchange(self, connect_cost, write_cost, reply=None):
+        now = [1000.0]
+        ds = self.ds
+
+        class Sock:
+            def __init__(self, *a):
+                self.timeout, self.reply = None, reply
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def settimeout(self, t):
+                self.timeout = t
+
+            def connect(self, path):
+                if connect_cost > (self.timeout or 0):
+                    now[0] += self.timeout
+                    raise TimeoutError("timed out")
+                now[0] += connect_cost
+
+            def sendall(self, data):
+                if write_cost > (self.timeout or 0):
+                    now[0] += self.timeout
+                    raise TimeoutError("timed out")
+                now[0] += write_cost
+
+            def recv(self, n):
+                if self.reply is not None:
+                    data, self.reply = self.reply, None
+                    return data
+                now[0] += self.timeout or 0
+                raise TimeoutError("timed out")
+        transport = ds.UnixTransport("/tmp/x.sock", mono=lambda: now[0])
+        with mock.patch.object(ds.socket, "socket", Sock):
+            try:
+                result = transport.exchange({"op": "query"})
+            except OSError as err:
+                result = err
+        return result, now[0] - 1000.0
+
+    def test_a_slow_connect_then_a_blocked_write_stays_within_ipc_wait(self):
+        result, elapsed = self.exchange(connect_cost=4.0, write_cost=60.0)
+        self.assertNotIsInstance(result, dict, "no reply, never an acceptance")
+        self.assertLessEqual(elapsed, self.ds.IPC_WAIT)
+
+    def test_a_timely_exchange(self):
+        """A control."""
+        reply = self.ds.encode_frame({"ok": True, "accepted": "fake"}, self.ds.REPLY_MAX)
+        result, elapsed = self.exchange(connect_cost=0.1, write_cost=0.1, reply=reply)
+        self.assertEqual(result, {"ok": True, "accepted": "fake"})
+
+
 class LateOutcomeTests(OutboxCase):
     """Test 10 (F6): a paused writer resumes after E7's export: version 2 supersedes version 1."""
 

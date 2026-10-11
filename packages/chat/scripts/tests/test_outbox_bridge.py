@@ -2112,6 +2112,69 @@ class LedgerProofSyncTests(InterruptCase):
         self.assertEqual(agent.keys, [])
 
 
+class ProofThenAcknowledgementTests(InterruptCase):
+    """Code review CODE19, finding 1: an interrupt left in intent while its
+    ledger proof could not be synced is not one an acknowledgement settles, so
+    the acknowledgement scan may close meanwhile. When recovery later accepts
+    it (the proof now durable), the scan reopens, and an acknowledgement saved
+    before then settles it, in the same process: no false dead letter."""
+
+    simfs = LedgerProofSyncTests.simfs
+    failing_ledger_sync = LedgerProofSyncTests.failing_ledger_sync
+
+    def intent_with_saved_ack(self):
+        fs = self.simfs()
+        d = self.bridge.Deliveries()
+        d.items = [dict(self.item(), phase="intent", intent_id="i" * 32, intent_surface="S", intent_session=None,
+                        intent_at=0)]
+        d._save()
+        self.bridge.Acks().add("m-ack", {"at": "2026-10-09T10:02:00Z", "msgid": "m-ack", "reply_to": "m-int",
+                                         "by": "alp-solver-2", "channel": "#alpha", "project": "alpha",
+                                         "how": "reply"})
+        return fs
+
+    def write_proof(self, durable):
+        line = json.dumps({"msgid": "m-int", "kind": "ring", "ok": True, "intent": "i" * 32,
+                           "target": "alp-solver-2", "surface": "S", "session": None})
+        if durable:
+            self.bridge.delivery_store.durable_append(self.bridge.delivery_store.FS_DEFAULT,
+                                                      self.bridge.DELIVERIES, line)
+        else:
+            with self.bridge.DELIVERIES.open("a") as f:
+                f.write(line + "\n")
+
+    def expire(self, d, agent):
+        self.passes(agent, deliveries=d)
+        for i in d.items:
+            i["next_at"] = 0
+        self.passes(agent, 2, deliveries=d)
+
+    def test_a_saved_acknowledgement_settles_once_the_proof_becomes_durable(self):
+        fs = self.intent_with_saved_ack()
+        self.write_proof(durable=False)
+        d = self.bridge.Deliveries()
+        agent = self.FakeAgent()
+        state = {"failing": True}
+        with self.failing_ledger_sync(fs, state):
+            self.passes(agent, 2, deliveries=d)  # the proof is unknown: the item stays in intent
+        self.assertEqual([i["phase"] for i in d.items if i["kind"] == "ring"], ["intent"])
+        state["failing"] = False
+        self.expire(d, agent)  # the same process: the proof is synced, then its deadline passes
+        self.assertEqual([r for r in self.dead_letters() if r.get("kind") == "ring"], [], "no false dead letter")
+        self.assertEqual([i for i in d.items if i["kind"] == "ring"], [], "settled by its saved acknowledgement")
+        self.assertEqual(agent.keys, [])
+
+    def test_a_proof_synced_the_first_time_settles_by_its_acknowledgement(self):
+        """A control: no sync failure."""
+        self.intent_with_saved_ack()
+        self.write_proof(durable=True)
+        d = self.bridge.Deliveries()
+        agent = self.FakeAgent()
+        self.expire(d, agent)
+        self.assertEqual([r for r in self.dead_letters() if r.get("kind") == "ring"], [])
+        self.assertEqual([i for i in d.items if i["kind"] == "ring"], [])
+
+
 class LiveAcknowledgementRetryTests(InterruptCase):
     """Code review slot 10, finding 2: a live acknowledgement is durable in
     acks.jsonl, but settling it fails in the ledger. The SAME Deliveries instance

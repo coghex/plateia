@@ -2122,6 +2122,10 @@ class UnixTransport:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(max(0.01, deadline - self.mono()))
             sock.connect(self.path)
+            left = deadline - self.mono()  # connect and write share the one deadline (code review CODE19)
+            if left <= 0:
+                return None
+            sock.settimeout(left)
             sock.sendall(encode_frame(request, FRAME_MAX))
             buf = b""
             while True:
