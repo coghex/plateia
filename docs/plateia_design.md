@@ -2465,6 +2465,23 @@ is normative. In summary:
   - The bridge checks the identity against its own; the controller's
     read-only post-check verifies the manifest hash against the plan.
   - No new file, format, read or launch option.
+- **2026-10-11, 16:52 UTC (owner): a guarded seal of the staged package.**
+  Real use writes bytecode into the staged environment, but its approved
+  verification allows none. So activation may seal exactly two directories
+  of the pinned staged release: the `plateia_chat` package directory and
+  its `scripts/` subdirectory.
+  - **The baseline is checked first.** Each directory must be exactly 0755,
+    owned by this user, with a readable identity and access metadata.
+    Anything stricter, different or ambiguous refuses.
+  - **Only the mode bits change,** to 0555, through pinned descriptors.
+    Ownership, ACLs and parent permissions are untouched. The original
+    modes and identities are journaled.
+  - **Rollback keeps the seal.** Restoring the recorded modes is a later,
+    separately authorized cleanup.
+  - **Strict verification is unchanged.** No bytecode or cache waiver is
+    approved.
+  - **A live seal needs the owner's confirmation** at the time of the
+    action, against the exact paths and verified baselines.
 
 Rejected alternatives:
 

@@ -604,10 +604,32 @@ activate_release status --root <private dir>
      artifacts, the environment, the interpreter and the import check. This
      happens before every activation and resume, and in the post-check; any
      change blocks.
-     - The release's two package directories are then made read-only
-       (0555), so running its commands never writes bytecode into it, and
-       it stays exactly as staged. Directory modes aren't part of the
-       inventory.
+     - **The guarded seal** (owner amendment 3, 2026-10-11). Exactly two
+       directories are sealed: the staged environment's
+       `site-packages/plateia_chat` package directory and its `scripts/`
+       subdirectory. Each is opened through pinned descriptors.
+       - **Before sealing,** each directory's baseline must be verified:
+         mode exactly 0755, owned by this user, and its identity (device and
+         inode) and access metadata (ACL and flags) readable. A stricter,
+         different or unknown mode, or any ambiguity about identity or
+         access, refuses, and nothing changes.
+       - **The originals are recorded.** The controller records each
+         directory's original mode, owner and identity, then sets that
+         directory's mode bits to 0555 and nothing else: ownership, ACLs,
+         flags and every parent's permissions are unchanged. It journals
+         `release-sealed` with the recorded originals.
+       - **Resume** accepts an existing 0555 only for this operation's
+         journaled seal, with matching identities. Otherwise the state is
+         unknown, and the activation stops.
+       - **Rollback keeps the seal,** because the release is retained (A6). A
+         later cleanup, which needs its own authorization, restores the
+         recorded modes before removing anything.
+       - **Why:** running the release's commands then never writes bytecode
+         into it, so it stays exactly as staged. Verification of the
+         environment stays strict: bytecode is never waived.
+       - **The operator plan** names the exact staged paths and their
+         verified baselines. A live seal is a permission change, and needs
+         the owner's confirmation at the time of the action.
      - The skill and the status client the controller uses are read from
        the hash-verified artifacts.
   3. **The old writers are quiet.**
