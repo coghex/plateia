@@ -2525,11 +2525,45 @@ named, discovered and newly started writers all stay inside the guarantee.
   rollback choice, D-74's "rollback only before the first new-format write"
   stands.
 
+**Owner decision, 2026-10-12: implement the design (#24).** The owner decided to
+implement the design; #24 implements the chat package's side. #24's canonical review
+(APPROVE, 2026-10-12) made these rulings, recorded here:
+
+- **Scope.** #24 implements the chat package's side on `master`: the record
+  reader, the admission sections, per-transaction admission and the
+  `maintenance` reply, the refusal sink and its import, the bridge's hold,
+  exit 5, and the owning operation's primitives. The activation controller's
+  side (`activate_release.py`, `activation.json`, `stage_release.py`, and the
+  bridge's start bound by a `full` record) stays #21's rework against PR #22.
+  Live activation, #21's cutover and its rollback decision (G-9) stay
+  separately gated.
+- **Placement.** The protocol primitives (create the lock, link `draining`, a
+  non-blocking exclusive drain, write `partial` and `full` holding the lock,
+  release by unlink, a read-only reconcile) live in `delivery_store.py`, not in
+  `activate_release.py`, each under a caller-supplied journal or fence, because
+  `activate_release.py` exists only on PR #22's unmerged head. That is
+  consistent with the design and needs no additional owner decision, provided
+  the format is declared as it is: `maintenance` is **read and written**
+  `maintenance/1`, replacing the design's `write: null`, and
+  [writer_admission.md](writer_admission.md) (sections 3.2, 10.1 and 10.2) says
+  so. Ordinary writers still only read the record. G-3 is not waived.
+- **Contract changes.** The eight changes to #19's contract in the design's
+  section 11 are implemented (G-4 is closed). With the chat package's part of
+  G-5 done, the design's other gates still block #21's cutover.
+- **Refusal.** A refused post or notice carries the delayed marker when posted;
+  a refused acknowledgement keeps its original reply/react TAGMSG and gains
+  no text. "Once" means an idempotent import plus delivery in a successful
+  fixture; recovery stays at-least-once.
+- **Documents.** The documentation lands through `docs-push`, linked from the
+  pull request; `SKILL.md` and its guidance test go with the code.
+
 The design is [writer_admission.md](writer_admission.md). It proposes
 changes to #19's and #21's contracts, enumerated there (its sections 9.2, 10
 and 11) and summarized in [chat_outbox_state.md](chat_outbox_state.md)
 section 2.4.6 and [release_staging.md](release_staging.md#writer-admission-23-proposed-changes).
-None of them is in force until the owner approves the implementation. Its
+#19's changes (its section 11) are implemented by #24, as above. #21's
+(its sections 9.2, 10 and 12) are not in force until #21's rework is approved
+(G-3). Its
 blocking gates (its section 14) include two owner decisions the design does
 not make: retiring legacy writers by a reboot after binding (G-1), and an
 owner-authorized inventory and inhibition of launchers outside the managed

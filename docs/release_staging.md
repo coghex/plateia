@@ -874,10 +874,11 @@ write is refused: `status` writes nothing and is answered in every state. The
 bridge's status snapshot is deferred while maintenance is held, which the
 post-check never relies on.
 
-**The maintenance format's admission.** The chat package would read
-`maintenance/1` and never write it. Default staging refuses it, so it would
-join the one admitted transition's `added` formats beside
-`designation-bootstrap/1`. It holds no work and is not a first-write boundary.
+**The maintenance format's admission.** The chat package reads
+`maintenance/1`, and (since #24) ships the owning operation's primitives, which
+alone write it, so the format is declared both read and written; ordinary
+writers only read it. Default staging refuses it, so it would join the one
+admitted transition's `added` formats beside `designation-bootstrap/1`. It holds no work and is not a first-write boundary.
 The design's refusal sink, `refused.d/` (`outbox/2` files), would be one:
 `outbox/2`'s first write becomes "`outbox.d/` or `refused.d/` exists".
 `plan` would refuse a state that already holds either. Rollback (report-only

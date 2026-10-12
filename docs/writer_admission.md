@@ -16,6 +16,16 @@ changing anything live, and nothing in it changes #19's or #21's contract until
 the owner approves the implementation. Where it proposes a change to those
 contracts, it says so and enumerates it.
 
+**Implementation (#24; owner decision 2026-10-12, D-75).** The chat package's
+side of this protocol is implemented by #24 (pull request #25): the record reader, the
+`L_adm` sections, per-transaction admission and the `maintenance` reply, the
+refusal sink and its import, the bridge's hold, exit 5, and the owning
+operation's primitives (`delivery_store.Owner`). The primitives live in the chat
+package, not in the controller: see section 10.2, "Placement". What stays
+pending is #21's rework against PR #22, under G-3: the controller's own
+decisions, the `full`-plus-binding admitted bridge start, and the activation
+and cutover themselves. Nothing here waives a gate or activates anything.
+
 Every example uses invented data: projects `alpha` and `beta`, the owner
 `pat`, the assistant `sam`, the agent `alp-solver-2`, the activation operation
 `activate-0a1b2c3d4e5f6071`, and the boots `boot-A` and `boot-B`.
@@ -130,7 +140,7 @@ permanent.
 | `evidence/`, `evidence.jsonl` (`evidence/1`) | `capture_cited` (`chat-bridge:333-363`), inside message handling (`:1672`) | None | **Inside**: bridge (written in the message section). |
 | `bridge.log` (`bridge-log/1`) | `log()` (`chat-bridge:130-142`) | None | **Outside.** It is diagnostic and write-only: nothing in the package reads it (`release.json:100-101`, `read: []`), no decision depends on it, its format is unchanged, and it rotates itself. It must stay writable so that a held bridge can say why. |
 | `designation-bootstrap.json` (`designation-bootstrap/1`) | Only the activation controller, once (`docs/release_staging.md:668-680`; `activate_release.py@e2cd9cef:479-575`) | The controller's fenced journal | **Inside** (rules 1, 2). An operation-owned write (section 6). |
-| `maintenance.json`, `admission.lock` (`maintenance/1`, new) | Only the owning operation writes the record; any writer may create the empty lock file (section 4) | This protocol | The protocol's own state (section 4.3). |
+| `maintenance.json`, `admission.lock` (`maintenance/1`, new) | Only the owning operation writes the record, through `delivery_store.Owner` (shipped in the chat package, section 10.2), under that operation's fence; ordinary writers only read it, and any writer may create the empty lock file (section 4) | This protocol | The protocol's own state (section 4.3). |
 | `refused.d/`, `refused.d/tmp/` (the refusal sink, new; `outbox/2` files) | Only refusals, only while maintenance is held (section 5) | None needed: immutable files, published like fallback files | **Inside** (rule 2, once section 12's boundary is adopted). Written only on the refusal path; imported only after release. |
 | `identities.json`, `identities.lock` (identity registry, version 1) | `identities.register`, `update` and `sync` (`identities.py:165`, `:193`, `:422`) through `atomic_json` (`:43-60`) | Its own blocking flock (`identities.py:63-71`) | **Outside.** The legacy and new code are byte-identical (`identities.py` is unchanged from `9542466` to `a8ce42bc`), so both write one format under one lock (rule 4 does not hold). The cutover neither reads nor writes it, and the authority never reads it. The bridge reads it only inside its delivery sections, which are held. |
 | The chat config `$CHAT_CONFIG` (`chat-config/1`) | `identities.register` (`identities.py:169`, `:183`) | The registry's flock | **Outside.** It is not in `$CHAT_STATE`, its format is unchanged, the cutover reads no configuration (`docs/release_staging.md:147-150`), and the authority never reads it. |
@@ -909,7 +919,7 @@ evidence (section 12).
 
 | Format | Change | Compatibility | Activation-transition effect |
 |---|---|---|---|
-| **`maintenance/1`** (new; `$CHAT_STATE/maintenance.json`, `admission.lock`) | New state format, embedded version `v`. The chat package **reads** the record and never writes it (`write: null`); it may only create the empty `admission.lock`. Only the operation's controller writes the record. | Legacy tools neither read nor take it, which is why section 8 exists. | Default staging refuses it as a declared format the live tools don't use (`stage_release.py:879-881`). **It is admitted beside #19's delta**, as one more `added` entry in #21's one admitted transition (`activation.json@e2cd9cef:12-18`), as `designation-bootstrap/1` was (`docs/release_staging.md:543-569`). That widens the transition: a #21 contract change. It is **not** a first-write boundary: it holds no work, and a rollback releases it. |
+| **`maintenance/1`** (new; `$CHAT_STATE/maintenance.json`, `admission.lock`) | New state format, embedded version `v`. The chat package declares **`read: ["maintenance/1"]` and `write: "maintenance/1"`** (#24's review): it ships `delivery_store.Owner`, the owning operation's primitives, which are the only code that writes the record (it links `draining`, replaces for `partial` and `full`, and unlinks to release, for the fenced operation the record names, under that operation's own journal). **Ordinary writers only read it**; they may only create the empty `admission.lock`. `docs/release_contract.md` defines a format as everything shipped code reads or writes, so the shipped primitives are why `write` is not `null`. The controller (#21) calls the primitives and keeps its own decisions. | Legacy tools neither read nor take it, which is why section 8 exists. | Default staging refuses it as a declared format the live tools don't use (`stage_release.py:879-881`). **It is admitted beside #19's delta**, as one more `added` entry in #21's one admitted transition (`activation.json@e2cd9cef:12-18`), as `designation-bootstrap/1` was (`docs/release_staging.md:543-569`). That widens the transition: a #21 contract change. It is **not** a first-write boundary: it holds no work, and a rollback releases it. |
 | `outbox` (`outbox/2`, unchanged version) | Its path list gains `refused.d/` and `refused.d/tmp/`. File content is unchanged. | Unchanged reads and writes. | First-write evidence for `outbox/2` becomes "`outbox.d/` **or `refused.d/`** exists" (`activation.json@e2cd9cef:20-24`; section 12): a #21 contract change. |
 | `outbox-authority/1` | A new reply result, `maintenance`, and a `maintenance` object in the `status` reply. | No `outbox-authority/1` peer has ever been deployed, and client and authority ship together in one pinned release, so the version stays `/1`. If any `/1` peer were deployed before the implementation, the version would have to become `/2`; both are within the same admitted transition, because the format is `added`, not live. | None beyond its existing `added` entry. |
 | `outbox-db/1` | Unchanged schema. The record is not in the database. | — | None. |
@@ -922,7 +932,7 @@ Confirmed or refuted against the issue's expected list:
 
 | Path | Change |
 |---|---|
-| `packages/chat/scripts/delivery_store.py` | `Paths` gains the record, `admission.lock` and `refused.d/`; the record reader; section helpers for `L_adm`; per-transaction admission and the `maintenance` result in `Authority.handle` and `_run_job`; read-only ops outside sections; the start's admission gate; `status` gains the record; sink publication reusing `publish_fallback`; the `Importer` imports the sink after release. |
+| `packages/chat/scripts/delivery_store.py` | `Paths` gains the record, `admission.lock` and `refused.d/`; the record reader; section helpers for `L_adm`; per-transaction admission and the `maintenance` result in `Authority.handle`, `_run_job` and `run_tx`'s synchronous path; read-only ops outside sections; the start's admission gate; `status` gains the record and the sink's count; sink publication reusing `publish_fallback`; the `Importer` imports the sink after release. **#24 adds the owning operation's primitives (`Owner`)**: create the lock, link `draining`, drain to `partial`, write `partial` and `full` holding the lock, release by unlink and a read-only reconcile, each under a caller-supplied journal or fence (see "Placement" below). |
 | `packages/chat/scripts/chatlib.py` | Call sections in `post`, `ack` and `deliver_entry`; the `Held` exception; refusal into the sink; the `maintenance` reply. |
 | `packages/chat/scripts/chat-bridge` | The hold; sections around message handling, delivery passes and flush steps; the deferred status snapshot; the start's `full` binding check. |
 | `packages/chat/scripts/pchat` | Exit 5; `status` shows the record and the sink. (Not in the issue's list; needed.) |
@@ -932,13 +942,41 @@ Confirmed or refuted against the issue's expected list:
 | `packages/chat/scripts/rotate-logs` | **Refuted: no change.** Outside. |
 | `packages/chat/SKILL.md`, `packages/chat/scripts/tests/test_skill_guidance.py` | Exit 5's guidance (section 5.4). |
 | `packages/chat/provenance.json` | The reasons for every changed captured file. |
-| `packages/release/release.json` | The `maintenance` format; the `outbox` path list; the `outbox-authority` note. |
-| `packages/release/tests/test_build.py` | `maintenance` joins the names the unchanged-declarations digest excludes (`test_build.py:441-445`), with one read marker, `maintenance/1`, as `designation-bootstrap` did. |
-| `packages/release/activate_release.py` | Acquisition, `full`, `release`, reconcile in `status`; `check_quiet` replaced (section 9.2); the record fence in the binding guard; boot verification; `plan` refusing a record or sink; rollback's sink boundary and release. |
+| `packages/release/release.json` | The `maintenance` format, **read `maintenance/1` and write `maintenance/1`**; the `outbox` path list; the `outbox-authority` note. |
+| `packages/release/tests/test_build.py` | `maintenance` joins the names the unchanged-declarations digest excludes (`test_build.py:441-445`), with a marker that asserts **both** read and write of `maintenance/1` (the primitives ship in the package). |
+| `packages/release/activate_release.py` | **Calls the primitives in `delivery_store.py`** for acquisition, `full`, `release` and the reconcile in `status`, under its own fenced journal; `check_quiet` replaced (section 9.2); the record fence in the binding guard; boot verification; `plan` refusing a record or sink; rollback's sink boundary and release. It keeps its own decisions: verifying retirement, inhibition and targets before `full`, the operation's journal, the `release` command and its post-check. |
 | `packages/release/activation.json` | `added.maintenance`; the `outbox/2` first-write text. |
 | `packages/release/stage_release.py` | Only if its admission does not already accept every `added` entry generically, and so that the plan's first-write evidence includes the sink. To be confirmed in the implementation. |
 | `packages/release/staging.json` | No change: `live_versions` stay the D-19 baseline. |
 | Tests under `packages/chat/scripts/tests/` and `packages/release/tests/` | Section 15. |
+
+**Placement (#24's review; implemented 2026-10-12).** This section first
+placed acquisition, `full`, release and reconcile in `activate_release.py`.
+That file exists only on PR #22's unmerged head, so the drain and its crash cases
+(tests 3, 7 and 8) could not be implemented or tested on `master`. #24 moves
+the **protocol primitives** into `delivery_store.py`. #24's canonical review
+ruled that the placement is consistent with the design provided the design and
+the format declaration say so accurately (this section, 3.2 and 10.1 are that
+amendment), and that it needs no additional owner decision. It stands on three
+conditions, which hold:
+
+- **No new authority.** `Owner` writes the record only for the operation the
+  record names, only under that operation's caller-supplied journal or fence
+  (verification of ownership, a durable intent before each mutation and a
+  durable outcome after it), and only on evidence that matches the operation,
+  plan, generation, exact bytes, inode and change time of its own last
+  journaled write. A failed or unknown fence permits nothing further, and a
+  record that is not provably the operation's own is never adopted, repaired or
+  released. Ordinary writers still only read the record (section 3.2).
+- **The format is declared as it is.** Because the shipped code writes the
+  record, `maintenance` is declared `read` and `write` `maintenance/1`, replacing
+  this design's earlier `write: null`, and `test_build.py` asserts both.
+- **G-3 is not waived.** Default staging still refuses the declared
+  `maintenance` format, and admitting it in the one admitted transition, the
+  controller's changes, and the cutover remain #21's rework and the owner's
+  decision. The controller keeps what the primitives do not decide: verifying
+  retirement, inhibition and targets before `full`, the operation's journal, the
+  `release` command and its post-check.
 
 ## 11. Changes to #19's contract
 
