@@ -135,6 +135,40 @@ class GuidanceTests(unittest.TestCase):
         self.assertIn("only the bridge is down, even if the chat server answers", down)
         self.assertIn("checked against the channel record before any resend", down)
 
+    def test_the_held_guidance_describes_exit_5(self):
+        """#24 (docs/writer_admission.md 5.4): "No lost posts" and "When chat is down" say that a call refused for
+        maintenance is held (exit 5, not 3; a notice prints a line), is posted marked delayed after the
+        maintenance is released, and must not be posted again."""
+        lost = SKILL.split("- **No lost posts.**", 1)[1].split("\n- **", 1)[0]
+        down = SKILL.split("## When chat is down", 1)[1].split("\n## ", 1)[0]
+        flat = lambda text: " ".join(text.split())  # noqa: E731
+        lost, down = flat(lost), flat(down)
+        self.assertIn("exit code 5 (not 3)", lost)
+        self.assertIn("a `notice held` line on stderr", lost)
+        self.assertIn("once the maintenance is released", lost)
+        self.assertIn("Don't post it again", lost)
+        self.assertIn("`pchat status` names the holder", lost)
+        self.assertIn("Exit code 5 is not chat being down", down)
+        self.assertIn("don't post it again", down)
+
+    def test_exit_5_is_what_pchat_returns_for_a_held_call_and_exit_3_for_a_queued_one(self):
+        cfg = {"owner": "pat", "assistants": [], "accounts": {}, "projects": {}}
+        for argv, name in ((["post", "#alpha", "[status] x"], "post"), (["ack", "#alpha", "msg-1"], "ack")):
+            for error, code in ((chatlib.Held("held for maintenance by activate-0a1b2c3d4e5f6071", None,
+                                              "activate-0a1b2c3d4e5f6071", "partial"), 5),
+                                (chatlib.Queued("queued", None), 3)):
+                with self.subTest(command=name, error=type(error).__name__), \
+                        mock.patch.object(chatlib, "load_config", lambda: cfg), \
+                        mock.patch.object(chatlib, name, side_effect=error), \
+                        mock.patch.object(pchat, "who", lambda args, cfg, required=True: "alp-solver-2"), \
+                        mock.patch.object(pchat.identities, "remember", lambda *a, **k: None), \
+                        mock.patch.object(pchat.runstore, "silent_refusal", lambda *a: None), \
+                        mock.patch("sys.stderr"):
+                    self.assertEqual(pchat.main(argv), code)
+
+    def test_a_held_error_is_a_kind_of_queued_so_callers_that_keep_queued_work_keep_held_work(self):
+        self.assertTrue(issubclass(chatlib.Held, chatlib.Queued))
+
     def test_the_check_catches_a_missing_option(self):
         self.assertNotIn("--no-such-option", PCHAT["post"])
         self.assertIsNone(resolve(["agent", "no-such-subcommand"])[1])

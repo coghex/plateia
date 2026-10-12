@@ -171,6 +171,14 @@ pchat status                                         # server, bridge, delivery 
     undecided after a day is dead-lettered, and the owner is told.
   - This is not exactly-once delivery: it avoids repeats it can rule out.
     `pchat status` shows how many outbox posts await such a check.
+  - While an operation holds maintenance on the shared chat state (an
+    activation of a new release, say), `pchat post`, `pchat ack` and an agent's
+    notices are held, not sent: exit code 5 (not 3), or, for a notice, a `notice
+    held` line on stderr and your work continues. The call is kept in a refusal
+    sink and the bridge posts it, marked "delayed", once the maintenance is
+    released; an acknowledgement is sent as the acknowledgement it was. Don't
+    post it again: a second `pchat post` is a duplicate. `pchat status` names the
+    holder and counts the calls kept.
 - **No dropped wake-ups or pushes.** Each is queued on disk, and every
   attempt is recorded in `~/.local/state/chat/deliveries.jsonl`. A wake-up is
   followed until `delivered`.
@@ -271,6 +279,11 @@ queued, so don't post it again yourself. A part whose delivery is uncertain is
 checked against the channel record before any resend. If `pchat status`
 still shows the server or bridge down after a few minutes, tell the owner
 some other way: through your manager, or in your session.
+
+Exit code 5 is not chat being down. It means the shared chat state is under
+maintenance: your call is kept and will be posted after the maintenance is
+released, so carry on and don't post it again. If `pchat status` still shows the
+maintenance after the window the owner gave, tell your manager.
 
 ## Identity implementation
 

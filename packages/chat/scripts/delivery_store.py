@@ -26,6 +26,7 @@ import secrets
 import selectors
 import socket
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -56,14 +57,21 @@ AUTH_WAIT = 5.0          # a bridge thread's deadline for its in-process request
 IMPORT_MAX = 256         # fallback files imported per flush, oldest name first
 LINES_MAX = 1000         # legacy lines one import request reads from one claim file
 COLLECT_MAX = 1000       # rows one collection request deletes
+ADMIT_WAIT = 2.0         # a shared L_adm acquisition that misses this long is held maintenance (writer admission 4.2)
+ADMIT_POLL = 0.05        # between non-blocking tries of L_adm
+DRAIN_MAX = 300.0        # the owning operation's bound on one drain: longer than any bounded section (4.4)
+HOLD_RECHECK = 10.0      # how often a held bridge reads the maintenance record again (4.6)
+MAINT_MAX = 64 << 10     # largest maintenance record
 
 PROTOCOL = "outbox-authority/1"
 DB_FORMAT = "outbox-db/1"
 FALLBACK_FORMAT = "outbox/2"
+MAINT_FORMAT = "maintenance/1"
 WRITER_MODEL = "bridge-exclusive/1"
 SOCKET_LIMIT = 103 if sys.platform == "darwin" else 107  # bytes of an AF_UNIX path
-RESULTS = ("ok", "replay", "conflict", "refused", "busy", "error")
+RESULTS = ("ok", "replay", "conflict", "refused", "busy", "error", "maintenance")
 CLIENT_OPS = ("create", "queue", "attempt", "outcome", "retire", "void", "handoff", "done", "query", "status")
+READ_OPS = ("query", "status")  # answered in every maintenance state, and never inside a section (writer admission 6.4)
 OUTCOMES = {"confirmed": "confirmed", "refused": "refused", "rejected": "rejected", "closed": "ended"}
 
 
@@ -113,6 +121,10 @@ class Paths:
         self.staging = state / "outbox.d" / "tmp"
         self.legacy = state / "outbox.jsonl"
         self.dead_letters = state / "dead-letters.jsonl"
+        self.maintenance = state / "maintenance.json"          # maintenance/1: the record (writer admission 4.3)
+        self.admission_lock = state / "admission.lock"         # L_adm, content-free (4.2)
+        self.refused = state / "refused.d"                     # the refusal sink: outbox/2 files (5)
+        self.refused_staging = state / "refused.d" / "tmp"
 
 
 # --- durable files (section 2.1) -------------------------------------------------
@@ -652,37 +664,629 @@ def _make_state_tree(fs, path):
         fs.sync_dir(level.parent)
 
 
-def publish_fallback(fs, paths, row, *, clock=time.time):
+def publish_fallback(fs, paths, row, *, clock=time.time, sink=False):
     """Publish one complete, immutable fallback file for row["id"]: exclusive
     creation under tmp/, the whole content synced, a link() that never replaces
     a file, then outbox.d/ and the state directory synced. Returns its name.
     An OSError up to those syncs means nothing was reported queued (the caller
     fails as today); after them the call is queued, and removing the tmp/
-    copy is cleanup only (clean_staging removes it later, once linked)."""
+    copy is cleanup only (clean_staging removes it later, once linked).
+    With `sink`, the same file goes to the refusal sink refused.d/ instead
+    (writer admission 5): only the directory differs."""
+    target, staging = (paths.refused, paths.refused_staging) if sink else (paths.fallback, paths.staging)
     _make_state_tree(fs, paths.state)
-    fs.mkdir(paths.fallback)
-    fs.mkdir(paths.staging)
+    fs.mkdir(target)
+    fs.mkdir(staging)
     writer = row.get("writer") or {}
     data = (json.dumps({"v": FALLBACK_FORMAT, **row}, sort_keys=True) + "\n").encode()
     tag = f"{writer.get('boot', 'x')}.{writer.get('pid', os.getpid())}.{writer.get('start', 'x')}"
-    tmp = paths.staging / (tag.replace("/", "_").replace(" ", "_") + f".{secrets.token_hex(6)}.tmp")
+    tmp = staging / (tag.replace("/", "_").replace(" ", "_") + f".{secrets.token_hex(6)}.tmp")
     fs.create_excl(tmp, data)
     for _ in range(8):
         name = fallback_name(clock(), row["id"])
         try:
-            fs.link(tmp, paths.fallback / name)
+            fs.link(tmp, target / name)
             break
         except FileExistsError:
             continue
     else:
         raise OSError(errno.EEXIST, "no free fallback name")
-    fs.sync_dir(paths.fallback)
+    fs.sync_dir(target)
     fs.sync_dir(paths.state)
     try:
         fs.unlink(tmp)  # cleanup only: published and durable already
     except OSError:
         pass
     return name
+
+
+# --- writer admission (#24; docs/writer_admission.md) -------------------------------------
+# Every new-release writer of $CHAT_STATE holds L_adm (a flock on admission.lock) SHARED for
+# each section and reads the maintenance record while holding it. The owning operation
+# alone writes the record, through Owner below, under a caller-supplied journal or fence.
+# Nothing here ever blocks on L_adm: every acquisition is LOCK_NB, retried to a deadline
+# by callers that may wait, and tried once by the authority's selector thread.
+
+MAINT_STATES = ("draining", "partial", "full")
+MAINT_LEGACY = ("unverified", "retired-and-inhibited")
+MAINT_REQUIRED = ("v", "operation", "kind", "plan_sha256", "state", "generation", "acquired_boot", "boot",
+                  "bound_boot", "legacy", "binding")
+MAINT_INFO = ("pid", "pid_start")  # informational fields (4.3): displayed, never decided from
+
+
+class Maintenance:
+    """What a reader decides from the record (section 4.3): no file means admitted;
+    a valid record means held, in its state; anything else (unreadable, not a
+    private regular file of this user, not canonical, an unknown version, state or
+    field type) is unknown, and unknown means held. A reader never writes it."""
+
+    def __init__(self, present=False, fields=None, raw=None, stat_result=None, why=None):
+        self.present, self.fields, self.raw, self.why = present, fields, raw, why
+        self.ino = stat_result.st_ino if stat_result is not None else None
+        self.dev = stat_result.st_dev if stat_result is not None else None
+        self.ctime_ns = stat_result.st_ctime_ns if stat_result is not None else None
+
+    @property
+    def valid(self):
+        return self.present and self.fields is not None
+
+    @property
+    def state(self):
+        """none, draining, partial, full, or unknown."""
+        if not self.present:
+            return "none"
+        return self.fields["state"] if self.fields is not None else "unknown"
+
+    def describe(self):
+        """The record as a reply or a status shows it: no more than operation, kind, state and generation."""
+        if not self.present:
+            return None
+        if self.fields is None:
+            return {"state": "unknown", "why": self.why}
+        f = self.fields
+        return {"operation": f["operation"], "kind": f["kind"], "state": f["state"], "generation": f["generation"]}
+
+    def evidence(self):
+        """The generation, exact bytes (as a digest), inode and change time of the record on disk, for the
+        owning operation to journal after each write (4.3)."""
+        if self.fields is None:
+            return None
+        return {"generation": self.fields["generation"], "sha256": hashlib.sha256(self.raw).hexdigest(),
+                "ino": self.ino, "dev": self.dev, "ctime_ns": self.ctime_ns}
+
+
+def _unknown(why, raw=None, stat_result=None):
+    return Maintenance(True, None, raw, stat_result, why)
+
+
+EVIDENCE_KEYS = ("generation", "sha256", "ino", "ctime_ns")  # what a journaled write must match; dev too, when journaled
+
+
+def same_evidence(journaled, actual):
+    """Whether a journaled write's evidence is exactly the record on disk: generation, exact bytes (digest), inode and
+    change time, and the device when the journal kept it."""
+    if not isinstance(journaled, dict) or not isinstance(actual, dict):
+        return False
+    keys = EVIDENCE_KEYS + (("dev",) if "dev" in journaled else ())
+    return all(journaled.get(k) == actual.get(k) for k in keys)
+
+
+def _record_problem(rec, raw):
+    """Why a parsed record is not a valid maintenance/1 record, or None (section 4.3)."""
+    if not isinstance(rec, dict):
+        return "not an object"
+    keys = set(rec)
+    if not set(MAINT_REQUIRED) <= keys:
+        return "a field is missing"
+    if keys - set(MAINT_REQUIRED) - set(MAINT_INFO):
+        return "an unknown field"
+    if rec["v"] != MAINT_FORMAT:
+        return "an unknown version"
+    if not valid_id(rec["operation"]):
+        return "invalid operation"
+    if not all(isinstance(rec[k], str) and 0 < len(rec[k]) <= 200 for k in ("kind", "plan_sha256", "acquired_boot", "boot")):
+        return "a field is not a string"
+    if rec["state"] not in MAINT_STATES:
+        return "an unknown state"
+    if not _count(rec["generation"], 1):
+        return "invalid generation"
+    if rec["bound_boot"] is not None and not (isinstance(rec["bound_boot"], str) and 0 < len(rec["bound_boot"]) <= 200):
+        return "invalid bound_boot"
+    if rec["legacy"] not in MAINT_LEGACY:
+        return "invalid legacy coverage"
+    binding = rec["binding"]
+    if not (isinstance(binding, dict) and set(binding) == {"release_id", "bootstrap_digest", "permits"}
+            and isinstance(binding["release_id"], str) and _optional_str(binding["bootstrap_digest"])
+            and isinstance(binding["permits"], list) and all(isinstance(x, str) for x in binding["permits"])):
+        return "invalid binding"
+    if "pid" in rec and not valid_pid(rec["pid"]):
+        return "invalid pid"
+    if "pid_start" in rec and not _optional_str(rec["pid_start"]):
+        return "invalid pid_start"
+    canonical = jdump(rec).encode()
+    if raw not in (canonical, canonical + b"\n"):
+        return "not canonical JSON"
+    return None
+
+
+def read_maintenance(paths, *, uid=None):
+    """The record, read whole within 64 KiB, opened without following links (4.3).
+    Never writes, removes or repairs anything."""
+    try:
+        fd = os.open(paths.maintenance, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return Maintenance()
+    except OSError as err:
+        return _unknown(f"cannot be opened ({err.strerror or type(err).__name__})")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return _unknown("not a regular file", None, st)
+        if st.st_uid != (os.getuid() if uid is None else uid):
+            return _unknown("another user's file", None, st)
+        if st.st_mode & 0o077:
+            return _unknown("not private to its owner", None, st)
+        if st.st_size > MAINT_MAX:
+            return _unknown("over 64 KiB", None, st)
+        raw = b""
+        while len(raw) <= MAINT_MAX:
+            chunk = os.read(fd, MAINT_MAX + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError as err:
+        return _unknown(f"cannot be read ({err.strerror or type(err).__name__})")
+    finally:
+        os.close(fd)
+    if len(raw) > MAINT_MAX:
+        return _unknown("over 64 KiB", None, st)
+    try:
+        rec = json.loads(raw.decode())
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return _unknown("not JSON", raw, st)
+    problem = _record_problem(rec, raw)
+    if problem:
+        return _unknown(problem, raw, st)
+    return Maintenance(True, rec, raw, st)
+
+
+def sink_count(paths, fs=None):
+    """How many refused calls wait in refused.d/: counted by file name, never read. None when the
+    directory cannot be listed, which is not zero (5.3)."""
+    try:
+        names = (fs or FS_DEFAULT).listdir(paths.refused)
+    except OSError:
+        return None
+    return sum(1 for n in names if is_published_name(n))
+
+
+class StorageError(OSError):
+    """The admission lock does not exist and could not be created: the state directory cannot be written. That is
+    not held maintenance (the owner creates the lock before it writes the record); the call fails as an unwritable
+    outbox does today."""
+
+
+def _open_admission_lock(paths, fs=None):
+    """L_adm's file descriptor. The file is content-free; a writer that finds it missing creates it, empty:
+    the only path of this format the chat package ever creates (4.2). A lock that exists and cannot be opened
+    raises OSError (the caller reads that as held); one that cannot be created raises StorageError."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        try:
+            return os.open(paths.admission_lock, flags, 0o600)
+        except FileNotFoundError:  # a first call before the bridge ever made the state directory
+            _make_state_tree(fs or FS_DEFAULT, paths.state)
+            return os.open(paths.admission_lock, flags, 0o600)
+    except OSError as err:
+        if os.path.lexists(paths.admission_lock):
+            raise  # it exists and is unusable (a link, no permission): fail closed
+        raise StorageError(err.errno, f"the admission lock cannot be created ({err.strerror or err})") from err
+
+
+class Admission:
+    """What entering a section found. `locked` says L_adm was held shared; `record` was read while holding it.
+    Admitted means locked with no record. A lock that could not be had is held maintenance: refuse."""
+
+    def __init__(self, locked, record):
+        self.locked, self.record = locked, record
+
+    @property
+    def admitted(self):
+        return self.locked and not self.record.present
+
+
+@contextlib.contextmanager
+def section(paths, *, fs=None, wait=None, clock=time.monotonic, sleep=time.sleep):
+    """One section of a new-release writer (4.2): L_adm shared, taken without blocking and retried to an
+    absolute deadline of `wait` (ADMIT_WAIT), then the record read while holding it. Yields an Admission.
+    A miss, or a lock that cannot be opened, reads as held maintenance. wait=0 tries exactly once and never
+    sleeps: what the authority's selector thread does."""
+    wait = ADMIT_WAIT if wait is None else wait
+    fd, locked, why = None, False, "the admission lock is busy"
+    try:
+        try:
+            fd = _open_admission_lock(paths, fs)
+        except StorageError:
+            raise
+        except OSError as err:
+            why = f"the admission lock cannot be opened ({err.strerror or type(err).__name__})"
+        if fd is not None:
+            deadline = clock() + wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if clock() >= deadline:
+                        break
+                    sleep(min(ADMIT_POLL, max(0.0, deadline - clock())))
+        yield Admission(locked, read_maintenance(paths) if locked else _unknown(why))
+    finally:
+        if fd is not None:
+            os.close(fd)  # closing the description releases its flock
+
+
+class OwnerError(Exception):
+    """The owning operation's primitive refused or could not finish."""
+
+
+class NotOwner(OwnerError):
+    """The record is absent, unknown, another operation's, or not the operation's own last journaled write."""
+
+
+class FenceFailed(OwnerError):
+    """The caller's journal or fence did not permit a step, or failed. It permits nothing further."""
+
+
+class OutcomeNotRecorded(OwnerError):
+    """The effect happened, and the caller's journal did not record its outcome. `result` is what to journal
+    on resume; the pending intent stays, and the next primitive settles it from what is on disk."""
+
+    def __init__(self, message, result):
+        super().__init__(message)
+        self.result = result
+
+
+class Owner:
+    """The owning operation's side of writer admission: acquire, drain, advance, release and a read-only
+    reconcile (4.3, 4.4, 4.7, 4.8). It is the only code that writes the record, and it writes it only for
+    the fenced operation. Ordinary writers only read it.
+
+    `fence` is the caller's journal and ownership check (for #21, its fenced journal):
+      verify(step) -> True     the caller still owns the operation; anything else (False, None, an error) is
+                               a failed or unknown fence, and permits no further mutation
+      intent(step)             durably journal the step BEFORE its effect; an error stops it
+      outcome(step, result)    durably journal the result AFTER it; an error leaves the intent pending
+      evidence() -> dict|None  the generation, sha256, ino, dev and ctime_ns of the record at the caller's
+                               last journaled write, or None when it journaled none
+      pending() -> dict|None   the step journaled as an intent that has no outcome, if any
+
+    A step names the operation, the plan, the evidence of the record it replaces and the generation and exact
+    bytes (as a digest) it writes. Verifying that legacy writers are retired and inhibited, and that targets
+    are bound, stays with the caller: it does so in its own `verify` before it permits `full`."""
+
+    def __init__(self, paths, *, operation, kind, plan_sha256, fence, fs=None, probes=None, clock=time.time,
+                 mono=time.monotonic, sleep=time.sleep):
+        self.paths, self.operation, self.kind, self.plan = paths, operation, kind, plan_sha256
+        self.fence, self.fs = fence, fs or FS_DEFAULT
+        self.probes = probes
+        self.clock, self.mono, self.sleep = clock, mono, sleep
+        self.failed = None  # why the fence failed: nothing further is mutated
+
+    def point(self, name):
+        """A named place between steps. It does nothing; the crash tests override it."""
+
+    def _probes(self):
+        return self.probes or PROBES
+
+    # --- the fence ---
+
+    def _fail(self, why, err=None):
+        self.failed = why
+        raise FenceFailed(why) from err
+
+    def _live(self):
+        if self.failed:
+            raise FenceFailed(f"an earlier fence failure permits nothing further ({self.failed})")
+
+    def _fenced(self, step, effect):
+        """verify, journal the intent, run the effect, journal the outcome. Any failure of the fence is final."""
+        self._live()
+        self._verify(step)
+        try:
+            self.fence.intent(step)
+        except Exception as err:
+            self._fail(f"the intent was not journaled ({err!r:.80})", err)
+        self.point("intent")
+        result = effect()
+        self.point("effect")
+        try:
+            self.fence.outcome(step, result)
+        except Exception as err:
+            self.failed = f"the outcome was not journaled ({err!r:.80})"
+            raise OutcomeNotRecorded(self.failed, result) from err
+        return result
+
+    def _verify(self, step):
+        self._live()
+        try:
+            ok = self.fence.verify(step)
+        except Exception as err:
+            self._fail(f"ownership was not verified ({err!r:.80})", err)
+        if ok is not True:
+            self._fail("ownership was not verified")
+
+    def _step(self, name, **more):
+        return {"step": name, "operation": self.operation, "kind": self.kind, "plan_sha256": self.plan, **more}
+
+    # --- reading and evidence ---
+
+    def _expect_own(self, rec):
+        """The record must be this operation's, and exactly its last journaled write (4.3)."""
+        if not rec.present:
+            raise NotOwner("there is no maintenance record")
+        if not rec.valid:
+            raise NotOwner(f"the maintenance record is unknown ({rec.why}); it is never repaired or adopted")
+        f = rec.fields
+        if (f["operation"], f["kind"], f["plan_sha256"]) != (self.operation, self.kind, self.plan):
+            raise NotOwner("the maintenance record belongs to another operation or plan")
+        try:
+            journaled = self.fence.evidence()
+        except Exception as err:
+            self._fail(f"the journal's evidence could not be read ({err!r:.80})", err)
+        if not journaled:
+            raise NotOwner("the journal holds no write of this record")
+        actual = rec.evidence()
+        for key in EVIDENCE_KEYS + (("dev",) if "dev" in journaled else ()):
+            if journaled.get(key) != actual[key]:
+                raise NotOwner(f"the record's {key} differs from the operation's last journaled write")
+        return rec
+
+    def _record_bytes(self, base, **changes):
+        fields = dict(base)
+        fields.update(changes)
+        who = self._probes().identity()
+        fields.update(pid=who.get("pid"), pid_start=who.get("start"))
+        if fields["pid_start"] is not None and not isinstance(fields["pid_start"], str):
+            fields["pid_start"] = str(fields["pid_start"])
+        if not valid_pid(fields["pid"]):
+            fields.pop("pid"), fields.pop("pid_start")
+        problem = _record_problem(fields, jdump(fields).encode())
+        if problem:
+            raise OwnerError(f"the record would be invalid ({problem})")
+        return fields, (jdump(fields) + "\n").encode()
+
+    def _fresh_tmp(self):
+        return f".maintenance.json.{secrets.token_hex(6)}.tmp"
+
+    # --- settling a pending intent: a crash between an effect and its outcome (4.8) ---
+
+    def _settle(self):
+        """Close a journaled intent that has no outcome, from what is on disk, before anything else. A landed write
+        is adopted only if its bytes are exactly the journaled ones; a record that is neither the journaled
+        prior nor the journaled write is a replacement, and is never adopted. Writes and removes nothing but a
+        temporary file the operation journaled."""
+        self._live()
+        try:
+            pending = self.fence.pending()
+        except Exception as err:
+            self._fail(f"the journal's pending step could not be read ({err!r:.80})", err)
+        if not pending:
+            return None
+        if pending.get("operation") != self.operation or pending.get("plan_sha256") != self.plan:
+            raise NotOwner("the journal's pending step is another operation's")
+        rec = read_maintenance(self.paths)
+        name = pending.get("step")
+        if name == "create-lock":
+            landed = self.paths.admission_lock.exists()
+        elif name in ("write-draining", "write-record"):
+            want = pending["to"]
+            actual = rec.evidence()
+            landed = bool(actual and actual["sha256"] == want["sha256"] and actual["generation"] == want["generation"])
+            prior = pending.get("from")
+            unchanged = (not rec.present) if prior is None else same_evidence(prior, actual)
+            if not landed and not unchanged:
+                raise NotOwner("the record is neither the journaled prior nor the journaled write; a replacement is "
+                               "never adopted")
+        elif name == "release":
+            landed = not rec.present
+            prior = pending.get("from")
+            actual = rec.evidence()
+            if not landed and not same_evidence(prior, actual):
+                raise NotOwner("the record is neither the journaled prior nor absent; it is not the operation's own")
+        else:
+            raise NotOwner(f"the journal's pending step {name!r} is unknown")
+        self._verify(pending)
+        tmp = pending.get("tmp")
+        if tmp and "/" not in tmp:
+            with contextlib.suppress(OSError):
+                self.fs.unlink(self.paths.state / tmp)  # a temporary file the operation journaled
+        result = {"landed": landed, "resumed": True}
+        if landed and name in ("write-draining", "write-record"):
+            result["evidence"] = read_maintenance(self.paths).evidence()
+        try:
+            self.fence.outcome(pending, result)
+        except Exception as err:
+            self.failed = f"the outcome was not journaled ({err!r:.80})"
+            raise OutcomeNotRecorded(self.failed, result) from err
+        return result
+
+    # --- acquiring ---
+
+    def create_lock(self):
+        """Create admission.lock if it is missing, empty (4.4 step 2)."""
+        self._settle()
+
+        def effect():
+            fd = _open_admission_lock(self.paths, self.fs)
+            os.close(fd)
+            return {"landed": True}
+        return self._fenced(self._step("create-lock"), effect)
+
+    def acquire(self):
+        """Steps 1 and 2 of acquiring: read the record; if it is present and names another operation, or is
+        unknown, stop; if it names this operation, return it to resume from its state (verified as the
+        operation's own); otherwise create the lock and link a `draining` record, never replacing a file."""
+        self._settle()
+        rec = read_maintenance(self.paths)
+        if rec.present:
+            return self._expect_own(rec)
+        self.create_lock()
+        boot = self._probes().boot()
+        fields, data = self._record_bytes(
+            {"v": MAINT_FORMAT, "operation": self.operation, "kind": self.kind, "plan_sha256": self.plan,
+             "state": "draining", "generation": 1, "acquired_boot": boot, "boot": boot, "bound_boot": None,
+             "legacy": "unverified", "binding": {"release_id": "", "bootstrap_digest": None, "permits": []}})
+        tmp = self._fresh_tmp()
+        step = self._step("write-draining", **{"from": None, "tmp": tmp,
+                                               "to": {"state": "draining", "generation": 1,
+                                                      "sha256": hashlib.sha256(data).hexdigest()}})
+
+        def effect():
+            self.fs.create_excl(self.paths.state / tmp, data)
+            self.point("tmp-created")
+            self.fs.link(self.paths.state / tmp, self.paths.maintenance)  # never replaces a file
+            self.point("linked")
+            self.fs.sync_dir(self.paths.state)
+            with contextlib.suppress(OSError):
+                self.fs.unlink(self.paths.state / tmp)
+            return {"landed": True, "evidence": read_maintenance(self.paths).evidence()}
+        self._fenced(step, effect)
+        return read_maintenance(self.paths)
+
+    # --- the exclusive drain, and every later record write (4.4) ---
+
+    @contextlib.contextmanager
+    def _exclusive(self, wait):
+        """L_adm exclusive, without blocking, every ADMIT_POLL until `wait`. Yields (held, tries)."""
+        fd = _open_admission_lock(self.paths, self.fs)
+        try:
+            end, tries, held = self.mono() + wait, 0, False
+            while True:
+                tries += 1
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held = True
+                    break
+                except BlockingIOError:
+                    if self.mono() >= end:
+                        break
+                    self.sleep(min(ADMIT_POLL, max(0.0, end - self.mono())))
+            if held:
+                self.point("locked")
+            yield held, tries
+        finally:
+            os.close(fd)
+
+    def advance(self, state, *, wait=DRAIN_MAX, boot=None, bound_boot=None, set_bound_boot=False, legacy=None,
+                binding=None):
+        """Write the next record while holding L_adm exclusive: `partial` (the drain, from `draining`, or again
+        from `partial` in a new boot), `full`, or back to `partial`. The exclusive lock is tried without blocking
+        until `wait`; the step is journaled first, so the lock is held only for one durable write. Returns
+        a result with drained False, and writes nothing, if the lock could not be had: the record stays as it is
+        and the drain is reported incomplete. Retirement, inhibition and targets are the caller's to verify,
+        in its `verify`, before it asks for `full`."""
+        self._settle()
+        rec = self._expect_own(read_maintenance(self.paths))
+        cur = rec.fields
+        if (cur["state"], state) not in (("draining", "partial"), ("partial", "partial"), ("partial", "full"),
+                                         ("full", "partial")):
+            raise OwnerError(f"the record cannot go from {cur['state']} to {state}")
+        boot = boot if boot is not None else self._probes().boot()
+        if state == "full" and known(boot) is None:
+            raise OwnerError("the boot cannot be read; full is refused as unknown")
+        changes = {"state": state, "generation": cur["generation"] + 1, "boot": boot}
+        if set_bound_boot:
+            changes["bound_boot"] = bound_boot
+        if state == "partial" and cur["state"] == "full":
+            changes.update(legacy="unverified")
+        if legacy is not None:
+            changes["legacy"] = legacy
+        if binding is not None:
+            changes["binding"] = binding
+        fields, data = self._record_bytes(cur, **changes)
+        tmp = self._fresh_tmp()
+        step = self._step("write-record", **{"from": rec.evidence(), "tmp": tmp, "wait": wait,
+                                             "to": {"state": state, "generation": fields["generation"],
+                                                    "sha256": hashlib.sha256(data).hexdigest()}})
+
+        def effect():
+            with self._exclusive(wait) as (held, tries):
+                if not held:  # hold nothing, leave the record as it is: the drain is incomplete (4.4)
+                    return {"landed": False, "drained": False, "attempts": tries}
+                self._expect_own(read_maintenance(self.paths))  # still exactly the journaled record, under the lock
+                self.fs.create_excl(self.paths.state / tmp, data)
+                self.point("tmp-created")
+                self.fs.replace(self.paths.state / tmp, self.paths.maintenance)
+                self.point("renamed")
+                self.fs.sync_dir(self.paths.state)
+                self.point("written")
+            return {"landed": True, "drained": True, "attempts": tries,
+                    "evidence": read_maintenance(self.paths).evidence()}
+        return self._fenced(step, effect)
+
+    def drain(self, *, wait=DRAIN_MAX, boot=None):
+        """Drain to `partial`: no section of any new-release writer is open, and none can open."""
+        return self.advance("partial", wait=wait, boot=boot)
+
+    # --- release (4.7) ---
+
+    def release(self):
+        """Unlink the record. The unlink is the moment of release: the next section of every writer is
+        admitted, whether or not the outcome is journaled."""
+        settled = self._settle()
+        rec = read_maintenance(self.paths)
+        if settled is not None and settled.get("landed") and not rec.present:
+            return settled  # a completed release, found on resume
+        self._expect_own(rec)
+        step = self._step("release", **{"from": rec.evidence()})
+
+        def effect():
+            self.fs.unlink(self.paths.maintenance)
+            self.point("unlinked")
+            self.fs.sync_dir(self.paths.state)
+            return {"landed": True}
+        return self._fenced(step, effect)
+
+    # --- reconcile (4.8): read-only ---
+
+    def reconcile(self):
+        """Report; write and clean nothing. The record, whether it is exactly the operation's last journaled write,
+        whether the acting process is gone, the sink's count, temporary files (which of them the operation
+        journaled), a step pending in the journal, and the next permitted step."""
+        rec = read_maintenance(self.paths)
+        pending = self.fence.pending()
+        journaled = self.fence.evidence()
+        matches = None
+        if rec.valid and journaled:
+            actual = rec.evidence()
+            matches = same_evidence(journaled, actual)
+        gone = None
+        if rec.valid and "pid" in rec.fields:
+            gone = self._probes().gone({"boot": rec.fields["boot"], "pid": rec.fields["pid"],
+                                        "start": rec.fields.get("pid_start")})
+        try:
+            temps = sorted(n for n in os.listdir(self.paths.state) if n.startswith(".maintenance.json.")
+                           and n.endswith(".tmp"))
+        except OSError:
+            temps = None
+        mine = {pending.get("tmp")} if pending and pending.get("tmp") else set()
+        if not rec.present:
+            nxt = "release-completed" if pending and pending.get("step") == "release" else "acquire"
+        elif not rec.valid:
+            nxt = "none: the record is unknown; repair is an owner decision"
+        elif not rec.fields["operation"] == self.operation:
+            nxt = "none: another operation's record"
+        else:
+            nxt = {"draining": "drain", "partial": "advance to full or release",
+                   "full": "post-check, then release"}[rec.fields["state"]]
+        if pending:
+            nxt = f"settle the pending {pending.get('step')} step"
+        return {"record": rec.describe(), "fields": dict(rec.fields) if rec.valid else None,
+                "matches_journal": matches, "acting_process_gone": gone, "refused_files": sink_count(self.paths, self.fs),
+                "pending": pending, "journaled_temp_files": sorted(set(temps or []) & mine),
+                "unjournaled_temp_files": sorted(set(temps or []) - mine), "next": nxt}
 
 
 # --- the database (sections 2.1 and 2.2) -------------------------------------------
@@ -836,6 +1440,17 @@ class Store:
         except BaseException:
             self._rollback()
             raise
+
+    @contextlib.contextmanager
+    def read_tx(self):
+        """A read-only transaction (a deferred BEGIN, never committed): it takes no write lock and
+        changes no database or WAL file, for `query` and `status` in every maintenance state (writer
+        admission 6.4)."""
+        self.con.execute("BEGIN")
+        try:
+            yield self.con
+        finally:
+            self._rollback()
 
     def _rollback(self):
         """Never leave the connection inside a transaction: a failed statement or
@@ -1677,8 +2292,9 @@ def peer_credentials(sock):
 class _Job:
     """An in-process request: queued, then running, then done; or cancelled while still queued."""
 
-    def __init__(self, fn):
+    def __init__(self, fn, readonly=False):
         self.fn, self.state, self.result, self.error = fn, "queued", None, None
+        self.readonly = readonly
         self.cond = threading.Condition()
 
 
@@ -1729,17 +2345,35 @@ class Authority:
     def start(self):
         """Steps 1-4 of section 2.4.1, all or nothing; requests then run at once,
         in this thread (the tests). Raises, having opened and bound nothing."""
-        self._open()
+        with self._start_section():
+            self._open()
         self.ready = True
         return self.epoch
+
+    @contextlib.contextmanager
+    def _start_section(self):
+        """The start is one section (writer admission 4.2, 6.3): L_adm shared, the record read while holding it,
+        and the start refused while any record exists. The start of an authority bound by a `full` record is
+        #21's rework."""
+        _make_state_tree(self.fs, self.paths.state)  # as _open does, and failing as it does (code review CODE16)
+        with section(self.paths, fs=self.fs) as adm:
+            if not adm.admitted:
+                info = adm.record.describe() or {"state": "unknown"}
+                who = f"held by {info['operation']} ({info['state']})" if "operation" in info else \
+                    f"unknown ({adm.record.why})"
+                self.unavailable = (f"maintenance is {who}: the authority does not start",
+                                    self.unavailable[1] if self.unavailable else self.clock())
+                raise Unavailable(self.unavailable[0])
+            yield
 
     def launch(self):
         """The bridge's whole start: steps 1-4, the socket (step 5) and the
         authority thread. All or nothing: any failure closes what was opened,
         releases the lock and raises; running only once every step is done."""
         try:
-            self._open()
-            self.bridge_only = not self.bind()
+            with self._start_section():
+                self._open()
+                self.bridge_only = not self.bind()
             self.run_in_thread()
         except BaseException:
             self.close()
@@ -1859,14 +2493,40 @@ class Authority:
         if not self.running:
             return reply("error", detail="authority not running")
         try:
-            with self.store.tx():
-                result, data = self._dispatch(request, bridge)
+            if request["op"] in READ_OPS:  # answered in every state, in no section and with no write (6.4)
+                with self.store.read_tx():
+                    result, data = self._dispatch(request, bridge)
+            else:
+                with section(self.paths, fs=self.fs, wait=0) as adm:  # one try: this may be the selector thread
+                    refusal = self._refusal(adm, request, bridge)
+                    if refusal is not None:  # committed nothing, begun nothing
+                        return reply("maintenance", maintenance=refusal, detail="held for maintenance")
+                    with self.store.tx():
+                        result, data = self._dispatch(request, bridge)
         except Conflict as err:
             return reply("conflict", detail=str(err))
         except Exception as err:  # rolled back; this request fails alone
             self.log(f"authority: request {request.get('op')} failed: {err!r:.120}")
             return reply("error")
         return reply(result, **data)
+
+    def _refusal(self, adm, request, bridge):
+        """The admission table of writer admission 4.5, for a request that mutates: None to run it, else what
+        to answer `maintenance`. In `draining` only a request that would create a new entry is refused (any
+        other continues an open call); in `partial`, `full` or an unknown record every one is. An in-process
+        bridge request runs in `draining`. A lock that cannot be had at once is held maintenance."""
+        if not adm.locked:
+            return {"state": "unknown", "why": adm.record.why}
+        record = adm.record
+        if not record.present:
+            return None
+        if record.state == "draining":
+            if bridge:
+                return None
+            if request["op"] in ("create", "queue") and self.store.entry(request["id"]) is None:
+                return record.describe()
+            return None
+        return record.describe()
 
     def _dispatch(self, r, bridge):
         s, op, writer = self.store, r["op"], r.get("writer")
@@ -1900,19 +2560,36 @@ class Authority:
             return s.done(r["id"], writer, bridge=bridge), {}
         if op == "query":
             return "ok", {"entry": s.entry_view(r["id"], writer)}
-        return "ok", {"status": s.status()}
+        status = s.status()
+        # the record and the sink's count (5.3): read, never written; an unreadable count is None, not zero
+        status.update(maintenance=read_maintenance(self.paths).describe(), refused=sink_count(self.paths, self.fs))
+        return "ok", {"status": status}
 
-    def run_tx(self, fn):
+    def _exec_tx(self, fn, readonly=False):
+        """`fn(store)` in one transaction, by the in-process rule of writer admission 4.5: it begins only holding
+        L_adm shared (one non-blocking try: this may be the selector thread, which never waits), and only with no
+        record or in `draining`, where the bridge's requests come from a section already open. Otherwise
+        CANCELLED, having begun nothing. A read-only request takes no section and writes nothing."""
+        if readonly:
+            with self.store.read_tx():
+                return fn(self.store)
+        with section(self.paths, fs=self.fs, wait=0) as adm:
+            if not (adm.locked and (not adm.record.present or adm.record.state == "draining")):
+                return CANCELLED
+            with self.store.tx():
+                return fn(self.store)
+
+    def run_tx(self, fn, readonly=False):
         """An in-process request: `fn(store)` in one transaction on the authority
         thread. Cancelled, having committed nothing, if it has not begun within
-        AUTH_WAIT; then CANCELLED is returned and the caller treats it as a
-        failed TX. A guard that fails raises Conflict, after the rollback."""
+        AUTH_WAIT, or if maintenance does not admit it; then CANCELLED is returned
+        and the caller treats it as a failed TX. A guard that fails raises
+        Conflict, after the rollback."""
         if not self.running:
             return CANCELLED
         if self.thread is None or threading.current_thread() is self.thread:
-            with self.store.tx():
-                return fn(self.store)
-        job = _Job(fn)
+            return self._exec_tx(fn, readonly)
+        job = _Job(fn, readonly)
         with self.mutex:
             self.jobs.append(job)
         self._wake()
@@ -1939,8 +2616,7 @@ class Authority:
                 return
             job.state = "running"
         try:
-            with self.store.tx():
-                job.result = job.fn(self.store)
+            job.result = self._exec_tx(job.fn, job.readonly)
         except BaseException as err:  # reported to the waiting thread
             job.error = err
         with job.cond:
@@ -2158,7 +2834,8 @@ class LocalTransport:
                     or request_error(request)):
                 return dict(base, result="refused", authority_epoch=self.authority.epoch)
             try:
-                done = self.authority.run_tx(lambda store: self.authority._dispatch(request, True))
+                done = self.authority.run_tx(lambda store: self.authority._dispatch(request, True),
+                                             readonly=request.get("op") in READ_OPS)
             except Conflict as err:
                 done = ("conflict", {"detail": str(err)})
             except Exception:  # rolled back: this request fails alone
@@ -2175,7 +2852,8 @@ class LocalTransport:
 
 class Client:
     """A caller's view of the authority. `call` returns the reply when it is
-    ok, replay or conflict, and None when there is no usable reply: no socket,
+    ok, replay, conflict or maintenance (which committed nothing, and is not an
+    unavailable authority), and None when there is no usable reply: no socket,
     refused, busy, error (commit unknown), timed out, or an older epoch's."""
 
     def __init__(self, transport, *, clock=time.time):
@@ -2196,7 +2874,7 @@ class Client:
             return None
         if not isinstance(reply, dict) or reply.get("v") != PROTOCOL or reply.get("request_id") != request["request_id"]:
             return None
-        if reply.get("result") not in ("ok", "replay", "conflict"):
+        if reply.get("result") not in ("ok", "replay", "conflict", "maintenance"):
             return None
         epoch = reply.get("authority_epoch") or 0
         if epoch < self.epoch:
@@ -2209,18 +2887,36 @@ class Client:
 
 # --- the bridge's file-side import (sections 6.3 and 6.4) ------------------------------
 
+SINK_PREFIX = "refused.d/"  # a refusal-sink file's key (its imports row, held row and alert): its name cannot clash
+
+
 class Importer:
-    """IF (fallback files) and I1-I3 (the legacy outbox), run on the bridge's
-    flush. Holds only L_flush; never takes outbox.lock to import. File work is
+    """IF (fallback files, from outbox.d/ and from the refusal sink refused.d/) and I1-I3 (the legacy outbox),
+    run on the bridge's flush. Holds only L_flush; never takes outbox.lock to import. File work is
     done here; each file or batch of lines is one in-process request. A file
-    or claim that fails is kept, with an alert, and every other one proceeds."""
+    or claim that fails is kept, with an alert, and every other one proceeds.
+
+    A fallback file is known by its key: its bare name in outbox.d/ (as before), and "refused.d/" plus its name in
+    the sink, so two files of one name in the two directories are two files, each with its own receipt. Each is
+    applied by its entry id, so two files for one entry are one obligation."""
 
     def __init__(self, authority, *, log=lambda m: None):
         self.authority, self.fs, self.paths = authority, authority.fs, authority.paths
         self.log = log
-        self.pass_names = None  # the names the current import pass listed when it began
-        self.kept = []  # fallback files kept after a failure, least recently tried first
-        self.staging_after = None  # the last tmp/ name the previous cleanup examined
+        self.pass_names = None  # the keys the current import pass listed when it began
+        self.kept = []  # fallback files (keys) kept after a failure, least recently tried first
+        self.staging_after = {}  # per tmp/ directory, the last name the previous cleanup examined
+
+    def _sources(self):
+        """(key prefix, directory, staging directory) of each place fallback files are imported from."""
+        return (("", self.paths.fallback, self.paths.staging),
+                (SINK_PREFIX, self.paths.refused, self.paths.refused_staging))
+
+    def _where(self, key):
+        """(directory, file name) of a key."""
+        if key.startswith(SINK_PREFIX):
+            return self.paths.refused, key[len(SINK_PREFIX):]
+        return self.paths.fallback, key
 
     def _sha(self, data):
         return hashlib.sha256(data).hexdigest()
@@ -2257,15 +2953,26 @@ class Importer:
         take = [n for n in names if n not in kept][:IMPORT_MAX - reserve]
         return take + self.kept[:IMPORT_MAX - len(take)]
 
+    def _keys(self):
+        """The published files of every source, oldest name first, and whether every listing was read. A
+        listing that fails is never read as an empty directory: its files are not listed, and the result is
+        incomplete."""
+        keys, whole = [], True
+        for prefix, directory, _staging in self._sources():
+            listed = self._listdir(directory)
+            if listed is None:
+                whole = False
+                continue
+            keys += [prefix + n for n in listed if is_published_name(n)]
+        return sorted(keys, key=lambda k: (self._where(k)[1], k)), whole
+
     def import_fallback_files(self):
-        """At most IMPORT_MAX published files, oldest name first. Returns how many
-        were imported. A listing that fails completes no pass: the pass in
-        progress stays unfinished and import_epoch where it is (section 6.3)."""
-        listed = self._listdir(self.paths.fallback)
-        if listed is None:
-            return 0
-        names = sorted(n for n in listed if is_published_name(n))
-        if self.pass_names is None:
+        """At most IMPORT_MAX published files, oldest name first, from both sources. Returns how many
+        were imported. A listing that fails completes no pass, and starts none: the pass in progress stays
+        unfinished and import_epoch where it is, so a retained handoff stays valid (section 6.3). The
+        sources that could be listed are imported meanwhile."""
+        names, whole = self._keys()
+        if self.pass_names is None and whole:
             self.pass_names = set(names)
         count = 0
         for name in self._budget(names):
@@ -2283,16 +2990,17 @@ class Importer:
                 self.kept.remove(name)
             if outcome is not None:
                 count += 1
-        remaining = self._listdir(self.paths.fallback)
-        if remaining is not None and not (self.pass_names & set(remaining)):
+        remaining, whole = self._keys()
+        if whole and self.pass_names is not None and not (self.pass_names & set(remaining)):
             self.authority.run_tx(lambda s: s.complete_pass())
             self.pass_names = None
         return count
 
-    def _import_file(self, name):
+    def _import_file(self, key):
         """IF for one file: its durable sync, one TX, then its removal. Returns
         the outcome; None if it is gone; CANCELLED if the TX never began."""
-        path = self.paths.fallback / name
+        directory, name = self._where(key)
+        path = directory / name
         try:
             self.fs.durable(path)
             data = self.fs.read(path)
@@ -2303,11 +3011,11 @@ class Importer:
             row = json.loads(data.decode())
         except (ValueError, UnicodeDecodeError, RecursionError):
             row = data.decode(errors="replace")
-        outcome = self.authority.run_tx(lambda s: s.import_fallback(name, sha, row))
+        outcome = self.authority.run_tx(lambda s: s.import_fallback(key, sha, row))
         if outcome is CANCELLED:
             return CANCELLED
         if outcome == "changed":  # its exact bytes are held first; a hold that fails or never runs keeps the file
-            if self.authority.run_tx(lambda s: s.hold_changed(name, sha, data)) is CANCELLED:
+            if self.authority.run_tx(lambda s: s.hold_changed(key, sha, data)) is CANCELLED:
                 return CANCELLED
         try:
             if self.fs.read(path) != data:  # rewritten since it was read: kept, and held by its bytes at the next pass
@@ -2315,29 +3023,32 @@ class Importer:
         except FileNotFoundError:
             return outcome
         self.fs.unlink(path)  # a failure keeps it: the next try finds its imports row and removes it
-        self.fs.sync_dir(self.paths.fallback)
-        self.pass_names.discard(name)
+        self.fs.sync_dir(directory)
+        if self.pass_names is not None:
+            self.pass_names.discard(key)
         if outcome not in ("imported", "noop"):
-            self.log(f"outbox: fallback file {name}: {outcome}")
+            self.log(f"outbox: fallback file {key}: {outcome}")
         return outcome
 
     def clean_staging(self):
-        """A tmp/ file is removed only once its writer is gone, or once published.
-        A writer identity its name does not fully carry is unknown, never gone.
-        At most IMPORT_MAX files per flush, in rotation, so every one is reached."""
-        names = sorted(self._listdir(self.paths.staging) or [])
-        if self.staging_after is not None:
-            names = [n for n in names if n > self.staging_after] + [n for n in names if n <= self.staging_after]
-        batch = names[:IMPORT_MAX]
-        self.staging_after = batch[-1] if len(names) > IMPORT_MAX else None
-        for name in batch:
-            try:
-                self._clean_one(name)
-            except Exception as err:  # cleanup only: tried again at the next flush
-                self.log(f"outbox: staging file {name}: {err!r:.80}")
+        """A tmp/ file (outbox.d/tmp/ and the sink's) is removed only once its writer is gone, or once
+        published. A writer identity its name does not fully carry is unknown, never gone.
+        At most IMPORT_MAX files per directory per flush, in rotation, so every one is reached."""
+        for _prefix, _directory, staging in self._sources():
+            names = sorted(self._listdir(staging) or [])
+            after = self.staging_after.get(staging)
+            if after is not None:
+                names = [n for n in names if n > after] + [n for n in names if n <= after]
+            batch = names[:IMPORT_MAX]
+            self.staging_after[staging] = batch[-1] if len(names) > IMPORT_MAX else None
+            for name in batch:
+                try:
+                    self._clean_one(staging, name)
+                except Exception as err:  # cleanup only: tried again at the next flush
+                    self.log(f"outbox: staging file {name}: {err!r:.80}")
 
-    def _clean_one(self, name):
-        path = self.paths.staging / name
+    def _clean_one(self, staging, name):
+        path = staging / name
         try:
             if self.fs.nlink(path) > 1:
                 self.fs.unlink(path)

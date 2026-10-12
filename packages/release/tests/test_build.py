@@ -108,6 +108,9 @@ class BuildTests(BuildCase):
             r"\"supersedes\"": ("delivery-records", True, True),
             r"kern\.bootsessionuuid|random/boot_id": ("boot-id", True, False),
             r"-iTCP": ("tcp-sockets", True, False),
+            # #24: the maintenance record is read by every writer and written by the owning operation's
+            # primitives, which ship in this package, so it is declared both read and written
+            r"maintenance\.json": ("maintenance", True, True),
         }
         manifest = build_release.verify(self.build()[0])
         formats = {f["name"]: f for f in manifest["formats"]}
@@ -128,7 +131,8 @@ class BuildTests(BuildCase):
         code = (_support.CHECKOUT / "packages/chat/scripts/delivery_store.py").read_text()
         for name, constant, field in (("outbox", 'FALLBACK_FORMAT = "outbox/2"', "v"),
                                       ("outbox-authority", 'PROTOCOL = "outbox-authority/1"', "v"),
-                                      ("outbox-db", 'DB_FORMAT = "outbox-db/1"', "meta.schema")):
+                                      ("outbox-db", 'DB_FORMAT = "outbox-db/1"', "meta.schema"),
+                                      ("maintenance", 'MAINT_FORMAT = "maintenance/1"', "v")):
             with self.subTest(format=name):
                 self.assertIn(constant, code)
                 self.assertTrue(formats[name]["embedded_version"])
@@ -437,12 +441,14 @@ class RefusalTests(BuildCase):
         self.assertEqual([p.name for p in self.out.iterdir() if p.name.startswith(".")], [])
 
 
-# The declarative content of release.json that #19 leaves exactly as it was:
+# The declarative content of release.json that #19 and #24 leave exactly as it was:
 # everything but package.files, the interpreter note and the outbox,
 # delivery-records, outbox-db, outbox-authority, boot-id and tcp-sockets
-# format entries (the second to fifth amendments of #19, acceptance 11).
+# format entries (the second to fifth amendments of #19, acceptance 11), and
+# the maintenance format (#24: writer admission, read and written, maintenance/1).
 UNCHANGED_DECLARATIVE = "f2895cb0c6145ded6b845e214ab21cc06ae5f68426d73cb71bfecadb66602f81"
-CHANGED_BY_19 = {"outbox", "delivery-records", "outbox-db", "outbox-authority", "boot-id", "tcp-sockets"}
+CHANGED_BY_19 = {"outbox", "delivery-records", "outbox-db", "outbox-authority", "boot-id", "tcp-sockets",
+                 "maintenance"}
 GENERATED = ("release", "source", "builder", "build_interpreter", "artifacts")
 
 

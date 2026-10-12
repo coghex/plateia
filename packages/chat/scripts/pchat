@@ -177,6 +177,21 @@ def outbox_status():
         lines.append(f"   suspended sender designations: {', '.join(map(str, st['suspended']))}")
     for what, since in (st.get("deferred") if isinstance(st.get("deferred"), dict) else {}).items():
         lines.append(f"   deferred ({str(what).replace('_', ' ')}): outbox.lock busy since {since}")
+    # maintenance (writer admission 5.3): from the authority's reply, else read here, read-only
+    answered = bool(reply and isinstance(reply.get("status"), dict))
+    held = st.get("maintenance") if answered else chatlib.delivery_store.read_maintenance(paths).describe()
+    refused = st.get("refused") if answered else chatlib.delivery_store.sink_count(paths)
+    if held:
+        if held.get("operation"):
+            lines.append(f"   MAINTENANCE: held by {held['operation']} ({held.get('kind')}), state {held['state']},"
+                         f" generation {held.get('generation')}: new posts are kept, not sent, until it is released")
+        else:
+            lines.append("   MAINTENANCE: a maintenance record exists but cannot be read; it is held, and new posts"
+                         " are kept, not sent, until it is released")
+    if refused is None:
+        lines.append("   held for maintenance: the refusal sink (refused.d/) could not be read")
+    elif refused or held:
+        lines.append(f"   held for maintenance: {refused} refused call(s) kept in refused.d/, posted after the release")
     unreadable = 0
     try:
         files = [n for n in (os.listdir(paths.fallback) if paths.fallback.exists() else [])
@@ -291,6 +306,11 @@ def main(argv=None):
                     return 2
                 print(f"pchat: {err}; not queued", file=sys.stderr)
                 return 2
+            except chatlib.Held as err:  # refused for maintenance and kept: the bridge posts it after the release
+                counts = chatlib.part_counts(err.parts or [])
+                print(f"pchat: {err}" + (f" ({counts['confirmed']} of {len(err.parts)} parts were already posted; "
+                                          "only the rest is kept)" if counts["confirmed"] else ""), file=sys.stderr)
+                return 5
             except chatlib.Queued as err:
                 # Never lose a post: it is durably queued, or its unposted rest handed off, and the bridge
                 # posts it. A part the server confirmed is never queued again; one whose delivery is
@@ -312,6 +332,9 @@ def main(argv=None):
             try:
                 chatlib.ack(args.channel, args.msgid, account, cfg)
                 print(f"acknowledged {args.msgid} in {args.channel} as {account}")
+            except chatlib.Held as err:  # refused for maintenance and kept: the bridge sends it after the release
+                print(f"pchat: {err}", file=sys.stderr)
+                return 5
             except chatlib.Queued as err:  # durably queued: the bridge sends it
                 print(f"pchat: {err}", file=sys.stderr)
                 return 3
