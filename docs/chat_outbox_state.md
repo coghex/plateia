@@ -779,6 +779,41 @@ holds:
 
 The snapshot is diagnostic, and nothing decides from it.
 
+#### 2.4.6 Maintenance ownership (#23; proposed)
+
+[writer_admission.md](writer_admission.md) designs a serialized
+writer-admission protocol for the chat state, which #21's activation needs.
+It changes this contract only when the owner approves its implementation.
+Until then everything above stands unchanged. The proposed changes, each
+specified there (its section 11):
+
+1. **Refusal keeps the work.** While maintenance is held, or its record
+   (`maintenance.json`, `maintenance/1`) is unknown, a post, an
+   acknowledgement or a notice that would start a new entry is refused before
+   any byte. Its row is published, exactly as an `outbox/2` fallback file,
+   into the refusal sink `refused.d/` instead of `outbox.d/`, and `pchat`
+   exits **5** (`Held`, a kind of `Queued`), naming the maintenance. The
+   bridge imports the sink after the explicit release, by *X*, as it imports
+   fallback files. Maintenance refusal is distinct from section 2.4.4: other
+   trigger, other place, other exit, and delivery only after release.
+2. **Sections.** A client holds the admission lock `admission.lock` shared
+   for each call, from its first state-changing request to its end, and
+   reads the record while holding it. The owning operation drains by taking
+   it exclusive, without blocking, after its record is durable.
+3. **The authority's transactions.** Each mutating transaction takes the
+   admission lock shared, without blocking, and checks the record first.
+   While a record is in `draining`, continuations of an existing entry run
+   and new entries are refused; in every later state, and when it is
+   unknown, every mutation is answered with a new result, `maintenance`,
+   committing nothing. `query` and `status` are answered in every state.
+4. **The authority's start** is gated by the record: only the owning
+   operation's bound start (the designation bootstrap under `full`) runs
+   while maintenance is held.
+5. **The bridge's hold.** While a record exists, the bridge writes nothing
+   but its log: no chat connection, checkpoint, delivery, import, flush or
+   status snapshot. After release it catches up from its checkpoints.
+6. **I-11 and I-12** are amended as their notes below say.
+
 ## 3. State and transition tables
 
 Every transition is a conditional update inside one `TX`:
@@ -1405,6 +1440,15 @@ any design depends on. It is not caused by any client, entry or lock holder.
 
 Section 5.6, case 11, gives a schedule.
 
+**Proposed amendment (#23; [writer_admission.md](writer_admission.md),
+section 7.3).** The claim is unchanged. A client also holds the admission
+lock shared for its call; the authority never needs it exclusive and never
+waits for it (I-11a). A paused client inside its call can delay maintenance
+acquisition, never the authority; each acquisition attempt is bounded and
+reported, and the paused client's own continuations are not refused (I-11b).
+While maintenance is held, a mutating request is answered `maintenance`
+without a transaction (I-11c).
+
 ### I-12. A queued obligation never waits for another writer
 
 An obligation that is already durable, whether a published fallback file or
@@ -1447,6 +1491,13 @@ unfinished publication.
 design.
 
 Section 5.6, case 9, gives a schedule.
+
+**Proposed amendment (#23; [writer_admission.md](writer_admission.md),
+section 7.3).** I-12 holds whenever no maintenance record exists, and then
+also covers the refusal sink's files. While a record exists, or is unknown,
+no obligation is imported or attempted: every durable obligation waits for
+the owning operation's explicit release, not for another writer, and
+`pchat status` shows the wait. Nothing is lost meanwhile.
 
 ### How each round-5 finding is closed
 
@@ -3526,3 +3577,7 @@ review. Merging and activation are not approved by any of them.
   - **Unchanged:** everything revision 8 adopted, every ordinary wake-up's
     baseline, and #19's IRC delivery rules. No resolved finding is reopened,
     and no test is relaxed.
+- **Proposed, not yet a revision** (#23's design, 2026-10-12): section
+  2.4.6 and the amendment notes on I-11 and I-12 summarize the changes
+  [writer_admission.md](writer_admission.md) proposes. They become a
+  revision only with the owner's implementation decision.

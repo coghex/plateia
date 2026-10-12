@@ -158,6 +158,18 @@ default compatibility check still refuses the release; only an activation
 plan's admission admits its format delta
 ([release_staging.md](release_staging.md#activation-plt-14-21)).
 
+**Proposed by #23 (design only; not implemented).**
+[writer_admission.md](writer_admission.md) would add one state format,
+`maintenance` (`$CHAT_STATE/maintenance.json` and `admission.lock`, embedded
+`v`, `maintenance/1`). The shipped code reads the record and never writes
+it; it may only create the empty lock file. Only an operation's controller
+writes the record. Like `designation-bootstrap`, it would join
+the names the declaration pin excludes, with one read marker, and be admitted
+only through an activation plan's transition. The `outbox` entry's path list
+would gain `refused.d/` and `refused.d/tmp/`, holding unchanged `outbox/2`
+files, and `outbox-authority/1` would gain a `maintenance` reply result. No
+version that is live today changes.
+
 ## What verification refuses
 
 `verify` reads a release directory and never writes to it. It refuses, naming

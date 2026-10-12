@@ -2376,6 +2376,8 @@ entry and D-27 as follows. Everything else they say stands.
   These still stop for an owner decision:
   - any material risk or action beyond this guarded transition;
   - a protected owner workflow that cannot be shown to be quiet at the window.
+
+  (2026-10-11: quietness is not the guarantee; see D-75 and #23.)
 - **Unchanged:**
   - D-15's pinned, staged and guarded releases;
   - D-26's seven managed targets;
@@ -2492,6 +2494,46 @@ Rejected alternatives:
 - **The bridge reading the controller's plan and journal, or staging writing
   the binding into the release.** Each needs more read formats or a staging
   layout change.
+
+### D-75. Writer admission is its own design (#23); quiet windows are not the guarantee
+
+**Owner decision, 2026-10-11.** #21's code reviews kept finding the same
+class of problem: the activation controller observes that writers are quiet
+and then acts, and an ordinary writer can start or wake in between. So
+writer admission is split into its own design issue, #23, and #21's rollout
+stays executable with its original safety: old and new, active and cached,
+named, discovered and newly started writers all stay inside the guarantee.
+
+- **Rejected as the guarantee:** a quiet window based on timestamps, rechecks
+  or attestation. D-74's stop condition about a protected owner workflow that
+  "cannot be shown to be quiet" is to be read with this decision; #23's
+  design proposes its amendment.
+- **#23 is design only.** Implementation, and its budget, are a later owner
+  decision.
+
+**Owner decision, 2026-10-12** (with the owner-approved amendment of #23):
+
+- **Delivery and closure.** #23 is one documentation-only delivery unit. Its
+  design documents land on `master` through one `docs-push` landing, and #23
+  is closed once its acceptance is satisfied and the landing is verified on
+  the remote. Runtime implementation, service activation, #21's cutover,
+  configuration or trust changes, and merging PR #22 are not part of it.
+- **Rollback stays an explicit owner gate.** Whether #21's rollback is
+  report-only or automatic may remain unresolved. That decision blocks #21's
+  live cutover but not #23's design, and it is neither inferred nor waived.
+- **Never back to legacy code after a new-format write.** Whatever the
+  rollback choice, D-74's "rollback only before the first new-format write"
+  stands.
+
+The design is [writer_admission.md](writer_admission.md). It proposes
+changes to #19's and #21's contracts, enumerated there (its sections 9.2, 10
+and 11) and summarized in [chat_outbox_state.md](chat_outbox_state.md)
+section 2.4.6 and [release_staging.md](release_staging.md#writer-admission-23-proposed-changes).
+None of them is in force until the owner approves the implementation. Its
+blocking gates (its section 14) include two owner decisions the design does
+not make: retiring legacy writers by a reboot after binding (G-1), and an
+owner-authorized inventory and inhibition of launchers outside the managed
+targets (G-2). Until both close, #21's cutover stays blocked.
 
 ## Open questions
 
@@ -3036,7 +3078,8 @@ the PR.
 - **Ordering:** critical path for activation; independent of offline board work.
 - **Relevant decisions:** D-2, D-6, D-7, D-10, D-12, D-15, D-16, D-17, D-23,
   D-26, D-27, D-72, D-74 (one guarded #19 format cutover; rollback only before
-  the first new-format write).
+  the first new-format write), D-75 (writer admission is designed in #23; its
+  gates block the cutover).
 - **Acceptance signals:** unknown/modified installed files block replacement;
   concurrent upgraders cannot interleave; binding/journal crash outcomes
   reconcile reality. Latest identity counters, settings, requests, accepted

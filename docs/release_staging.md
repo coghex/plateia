@@ -836,6 +836,53 @@ The earlier tests cover:
   - a restart that changes nothing;
   - rollback refused afterwards, and the post-check passing.
 
+### Writer admission (#23): proposed changes
+
+[writer_admission.md](writer_admission.md) designs the write-admission barrier
+this activation needs, in place of observing that writers are quiet (the
+owner's decision of 2026-10-11; D-75 in [plateia_design.md](plateia_design.md)).
+Nothing in this section is in force: it lists what the design would change in
+this contract, which applies only once the owner approves the implementation.
+The contract above stands as written until then.
+
+**The order is kept.** Seal, then the writer step, then publish the bootstrap
+record, journal D, and only then bind (steps 2, 3, 5 and 6 above). The writer
+step becomes **maintenance acquisition**: the controller writes a durable
+maintenance record (`$CHAT_STATE/maintenance.json`, `maintenance/1`) naming
+this operation and the boot, drains every new-release writer through the
+admission lock, and reaches the intermediate state `partial`. Publishing the
+bootstrap record, journaling D and binding are operation-owned writes
+admitted in `partial`. After binding, the owner reboots (the proposed
+retirement step, an owner decision: the design's gate G-1); the resumed
+`activate` verifies the boot changed since binding (retirement) and that no
+legacy writer can start (inhibition), and only then writes `full`. Only under
+`full` may the bound bridge make its bootstrap commit, the first
+`outbox-db/1` write. A new `release` command repeats the post-check's checks
+and ends maintenance. The design's section 9.1 gives the whole sequence.
+
+**Each quiet-writer clause** (the design's section 9.2):
+
+| Clause | Disposition |
+| --- | --- |
+| Step 3, "The old writers are quiet" | **Replaced** by acquisition (new-release writers) and by retirement and inhibition before `full` (legacy writers). The 15-minute `observed_at` evidence is no longer a gate. "Every designated account's producers must be tracked" is **kept** as an extra precondition. "Nothing is interrupted, restarted or killed" is **kept** for `activate`; the owner's reboot is the retirement step. |
+| The A3 test row (quiet writers) | **Replaced** by the design's tests 1, 10, 11, 12 and 13; its untracked-producer case is **kept**. |
+| "`activate` starts, stops and restarts nothing. The operator restarts the bridge at an acknowledged checkpoint" | **Amended.** The first sentence is kept. The owner stops the legacy bridge before binding and reboots after it; launchd then starts the bound bridge, which waits for `full`. The running-bridge rules are kept. |
+| D-74's stop condition, a protected workflow "that cannot be shown to be quiet" | **Amended** to a protected workflow that cannot tolerate its chat writes being held for the window, or a reboot. It still stops for an owner decision. |
+
+**The post-check's status request** stays answerable while every ordinary
+write is refused: `status` writes nothing and is answered in every state. The
+bridge's status snapshot is deferred while maintenance is held, which the
+post-check never relies on.
+
+**The maintenance format's admission.** The chat package would read
+`maintenance/1` and never write it. Default staging refuses it, so it would
+join the one admitted transition's `added` formats beside
+`designation-bootstrap/1`. It holds no work and is not a first-write boundary.
+The design's refusal sink, `refused.d/` (`outbox/2` files), would be one:
+`outbox/2`'s first write becomes "`outbox.d/` or `refused.d/` exists".
+`plan` would refuse a state that already holds either. Rollback (report-only
+or automatic) remains the owner's open gate, and blocks the cutover.
+
 ## Evidence
 
 ### Tests
