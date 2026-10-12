@@ -826,7 +826,9 @@ each specified in the design (its section 11):
    `draining`, continuations of an existing entry run and a request that would
    create an entry is refused; in every later state, and when the record is
    unknown, every mutation is answered with a new result, `maintenance`,
-   committing nothing and surviving the client's validation. `query` and
+   committing nothing and surviving the client's validation. An in-process
+   request in `draining` runs only for a caller holding an admitted section
+   open. `query` and
    `status` are answered in every state, in a read-only transaction that
    changes no database or WAL file, and `status` reports the record and the
    refusal sink's count.
@@ -844,8 +846,10 @@ each specified in the design (its section 11):
    creates the lock, links the `draining` record (never replacing a file),
    drains and writes `partial` and `full` while holding the admission lock
    exclusive, releases by unlinking the record, and reconciles read-only.
-   Each takes a caller-supplied journal or fence covering a durable intent,
-   ownership verification and a durable outcome; it mutates only on evidence
+   Each takes a caller-supplied journal or fence covering a durable intent
+   and the facts that identify the file it publishes, ownership verification
+   and a durable outcome; an effect recovered after a crash is made durable
+   before its outcome is recorded; it mutates only on evidence
    that matches the operation, plan, generation, exact bytes, inode and change
    time of its own last journaled write; and a failed or unknown fence permits
    nothing further. **Pending #21:** the controller that calls them, and its
