@@ -16,7 +16,7 @@
       "files": [
         "chat/SKILL.md"
       ],
-      "summary": "workflow: bound machine quiet to timing measurements \u2014 adds the 7-line \"Timing reservations\" paragraph to chat/SKILL.md",
+      "summary": "workflow: bound machine quiet to timing measurements — adds the 7-line \"Timing reservations\" paragraph to chat/SKILL.md",
       "carried_in": "PLT-15 (#12)"
     }
   ],
@@ -55,7 +55,7 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "262d42bf09af99eac65e19ef4e50ec6fea7d7072969c8308d3ff58848c94e272",
       "capture": "changed",
-      "sha256": "dbe730f9ae1b0a94033380f448cadfb7d359bf30993d38dba1e25fda14779cd0",
+      "sha256": "c1ae287b0d1cbbc1f3d65d7afe82aa03388096dc01c66c1f8b97d9d6fb33bc44",
       "changes": [
         {
           "change": "`pchat agent who`'s 'outside cmux use --as ... explicitly' hint names the chat config's assistant identity (the identity whose role is assistant), or ACCOUNT if none, instead of a fixed account name.",
@@ -64,6 +64,10 @@
         {
           "change": "notify() posts through the outbox authority like pchat post (origin notify): a notice that cannot be recorded is queued durably, its unposted remainder handed off, and a refusal reported; nothing is queued for a silent run.",
           "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
+        },
+        {
+          "change": "notify() reports a notice that was refused for maintenance and kept in the refusal sink (chatlib.Held) as a line on stderr, where a queued notice stays silent; the notice is posted, marked delayed, after the maintenance is released.",
+          "reason": "Deliberate deviation from c572bad, by the owner's decision of 2026-10-12 to implement docs/writer_admission.md (issue #24: the chat package's side of serialized writer admission; recorded in D-75 of docs/plateia_design.md, whose design (issue #23) the decision approved). The running tools keep the baseline behavior until activation (D-23); activation of this release stays separately gated (#21)."
         }
       ]
     },
@@ -99,7 +103,7 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "d5fd3bca06e139c3f61dfb6d34ef56947255c0b723fb9778c6da3afea874e8d0",
       "capture": "changed",
-      "sha256": "c60452e892693918669f3b7316dd6753649ae588100965ade6d830b7af3ca22e",
+      "sha256": "b1eb31c2a3c1a71fe382653184ea36c2113c032d6b00082caf99dd3df8ad13c5",
       "changes": [
         {
           "change": "The config example in the module docstring shows placeholder owner and assistant names.",
@@ -108,6 +112,10 @@
         {
           "change": "post() and ack() commit each part's attempt with the bridge's outbox authority (delivery_store) before any of its bytes, record each part's outcome (confirmed, refused, rejected, or ended without or with finality after an absolute wait and a bounded drain), and on a failure hand off the unconfirmed remainder or queue the whole call (a connection a failed record closed is never used again); with no committed answer they publish one immutable fallback file per call instead, and raise Queued only once it is durable. Login and channel creation have absolute deadlines, and a part's confirmation deadline also bounds each buffered line and each PONG written for a buffered PING; an active deadline bounds every write, login and channel setup included. A silent run's post is refused and never queued in any form. outbox_append(), outbox_claim(), outbox_summary(), reserve() and queued_entry() are removed: this release writes no outbox.jsonl row.",
           "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
+        },
+        {
+          "change": "post(), ack() and deliver_entry() are each one section of writer admission: admission.lock held shared (taken without blocking, a miss read as held maintenance) from before the first create, queue or fallback publication to the end of the call, with the maintenance record read while holding it. A held or unreadable record, or a `maintenance` reply to any request, keeps the call whole as one immutable file in the refusal sink refused.d/ (with any attestation of an outcome or void the authority did not record) and raises Held, a kind of Queued; a lock that cannot be created fails as an unwritable outbox does; the bridge's own entry delivery starts nothing under maintenance.",
+          "reason": "Deliberate deviation from c572bad, by the owner's decision of 2026-10-12 to implement docs/writer_admission.md (issue #24: the chat package's side of serialized writer admission; recorded in D-75 of docs/plateia_design.md, whose design (issue #23) the decision approved). The running tools keep the baseline behavior until activation (D-23); activation of this release stays separately gated (#21)."
         }
       ]
     },
@@ -138,11 +146,15 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "edf4615c95b572c9b677994bfb65da9d2158513dca4d2ec943ed11d86a558227",
       "capture": "changed",
-      "sha256": "8b5e3bf99c30af6d8393e4431d40fcbb2fde4f2ec2c60d913e1dd988f5184d64",
+      "sha256": "640a16c410d34d3c205a8be491b75f72d0b2913fb5f168bffadb6cfd9d5d6eca",
       "changes": [
         {
           "change": "pchat post and pchat ack exit 3 only once the call is durably queued or handed off (by an acknowledged request, or a fallback file); a refusal after some parts were published is reported, and the bridge dead-letters it with its parts; pchat status reads the outbox authority's status, or its dated snapshot while the authority is unavailable, and counts fallback files and legacy rows waiting for it, reporting any it cannot read; it counts and shows each dead-lettered post by its highest version.",
           "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
+        },
+        {
+          "change": "pchat post and pchat ack exit 5 when the call was refused for maintenance and kept in the refusal sink (Held), distinct from exit 3, with a message that names the holder and says not to post it again; pchat status shows the maintenance record (from the authority's status reply, or read here without writing) and the count of calls kept in refused.d/, reporting a sink it cannot read as unreadable, not empty.",
+          "reason": "Deliberate deviation from c572bad, by the owner's decision of 2026-10-12 to implement docs/writer_admission.md (issue #24: the chat package's side of serialized writer admission; recorded in D-75 of docs/plateia_design.md, whose design (issue #23) the decision approved). The running tools keep the baseline behavior until activation (D-23); activation of this release stays separately gated (#21)."
         }
       ]
     },
@@ -295,7 +307,7 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
       "capture": "changed",
-      "sha256": "59293532b4ea12eca7c77f555d7dc92fa9069889d80f146041fcb4bc96a6c1f8",
+      "sha256": "86a3da4b31b11730ec7937d1cc779d9c9cc05485033da83fa14175b6f06b35c7",
       "changes": [
         {
           "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
@@ -304,6 +316,10 @@
         {
           "change": "The bridge runs the outbox authority (delivery_store.Authority: the only opener of outbox.db, on its own thread, serving outbox.sock; started all or nothing, and started again whole at the next pass after any failure or a dead thread) and its flush, in which one step's or one item's failure never stops another: it imports fallback files and the legacy outbox without outbox.lock, ends gone writers' attempts, abandons (E8) or, for its own announcements, adopts (E9) their entries, reconciles from current state (R1, R2), dead-letters after 24 hours with a content-free alert row, gives every eligible entry its attempt, and retires claims and writes dead letters under a bounded outbox.lock. It indexes every verified message (V1) before its checkpoint moves, with the server's own time, msgid and account only (one without them is a failed index, never given a local substitute); a new channel gets a durable replay boundary when joined, from the server's join time only (without one: no coverage from that join, and a boundary before all of its history); a failed index invalidates any catch-up of that channel, which completes nothing until a replay from the preserved checkpoint indexes it; keeps record coverage in the authority, writes the pending queue, ledger and dead letters durably (a delivery leaves only once its ledger line is durable, and one that cannot be written blocks no other), and announces with a derived entry id, saving held_announced only once the announcement is durable; an interrupt records its durable intent before its first agent-affecting command, and takes none without it; one that may have acted without a proved submission, or is found in intent after a restart, is held, never rung again, settled only by exact-identity proof in the ledger or by its acknowledgement, and otherwise dead-lettered truthfully; a delivered interrupt's ledger line, announcement and the save of its state are each done again until durable, across its acknowledgement or dead letter; an acknowledgement already recorded settles each recipient's interrupt after a restart, read again until it succeeds, including after a live settling fails in the ledger; a replayed message adds no second interrupt for the same recipient, an interrupt counts as queued only once saved, and a new one reopens acknowledgement recovery; an acknowledgement counts as recorded only once durable (delivery_store.durable_append), and while acks.jsonl cannot be read the interrupts it could settle are neither rung nor dead-lettered; for the pending, acknowledgement and ledger files only a missing file is absence, and any other failure to inspect or read one is unknown, never empty; a line read from acks.jsonl, or a ledger line taken as an interrupt's proof, counts only once the file and its directory are synced; an interrupt's intent is committed only once the state directory's ancestry is durable, and acknowledgement recovery reopens when recovery accepts or holds an interrupt; only a missing pending.json is an empty queue, and one that cannot be read or parsed is never replaced, nothing new is queued and nothing delivered until it can be read; and each owner alert's dead letter is its own (#19 owner amendment 6, 2026-10-10). The file-based claimed-outbox, reservation and attribution state is removed.",
           "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
+        },
+        {
+          "change": "The bridge holds while a maintenance record exists or cannot be read: each message, join, catch-up completion, acknowledgement, coverage update at a PONG, delivery pass, flush lock, flush step and entry delivery is one section of writer admission, and a section that finds the record held starts nothing, closes the connection and puts the bridge in a hold that reads the record every HOLD_RECHECK seconds. It starts no authority, writes no status snapshot (the unavailable one included), and logs the holder once per change. After the release it catches up from its checkpoints and imports the refusal sink with outbox.d/. An authority whose close was deferred by maintenance is kept, not dropped with its database open, and closed at a later pass.",
+          "reason": "Deliberate deviation from c572bad, by the owner's decision of 2026-10-12 to implement docs/writer_admission.md (issue #24: the chat package's side of serialized writer admission; recorded in D-75 of docs/plateia_design.md, whose design (issue #23) the decision approved). The running tools keep the baseline behavior until activation (D-23); activation of this release stays separately gated (#21)."
         }
       ]
     },
@@ -408,7 +424,7 @@
       "source_commit": "8ff325ee307b92e53157594e570235bc9f2f5229",
       "effective_sha256": "e5eda84d2d8b8773ef5b4660b40f1dee0e2545d2db764d5d0e1b20929d7fe438",
       "capture": "changed",
-      "sha256": "1b240b32ed4d9806cfae9f976dfbfa81aa1b4c49f74ae3946c46ad95fb910698",
+      "sha256": "b48348e07ddf2013b234c1d3e4088f7b4a342a68754d9243bbffbc54c3af7aff",
       "changes": [
         {
           "change": "Where the guidance named the owner's or the global assistant's account, it now says where that account is configured (`owner` and `assistants` in the chat config); examples that used the owner's or assistant's account use `<assistant>` / `@<owner>`.",
@@ -421,6 +437,10 @@
         {
           "change": "\"No lost posts\" and \"When chat is down\" describe partial posts (only the unposted remainder is queued, an uncertain part is checked against the record before any resend, not exactly-once) and that posts, acks and notices queue while the bridge cannot answer, even when the chat server is reachable.",
           "reason": "The guidance must match the behavior agents see from pchat (#19 requirement 11, and its fourth amendment's D5(b)). Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
+        },
+        {
+          "change": "\"No lost posts\" and \"When chat is down\" describe exit code 5: a call refused for maintenance is held in a refusal sink, posted marked delayed after the maintenance is released, and not to be posted again.",
+          "reason": "Deliberate deviation from c572bad, by the owner's decision of 2026-10-12 to implement docs/writer_admission.md (issue #24: the chat package's side of serialized writer admission; recorded in D-75 of docs/plateia_design.md, whose design (issue #23) the decision approved). The running tools keep the baseline behavior until activation (D-23); activation of this release stays separately gated (#21)."
         }
       ],
       "external_references": [
@@ -477,7 +497,7 @@
     },
     {
       "path": "packages/chat/scripts/tests/test_skill_guidance.py",
-      "purpose": "Every pchat subcommand and option SKILL.md mentions exists in the captured pchat (PLT-15)."
+      "purpose": "Every pchat subcommand and option SKILL.md mentions exists in the captured pchat (PLT-15); the held-call guidance describes exit 5 (#24)."
     },
     {
       "path": "packages/chat/scripts/tests/test_replay_dedup.py",
@@ -485,7 +505,7 @@
     },
     {
       "path": "packages/chat/scripts/delivery_store.py",
-      "purpose": "The outbox's one SQLite authority (#19): the store and its transitions, reconciliation, the bridge-only authority server and its request protocol, clients, fallback files and the lock-free import (design revision 8)."
+      "purpose": "The outbox's one SQLite authority (#19): the store and its transitions, reconciliation, the bridge-only authority server and its request protocol, clients, fallback files and the lock-free import (design revision 8); and writer admission (#24, docs/writer_admission.md): the maintenance record reader, the admission-lock sections, per-transaction admission and the `maintenance` reply, the refusal sink and its import, the authority's start and its failure cleanup as one section, a close that waits for a section or the release, and the owning operation's fenced primitives (Owner), whose recovery adopts only the file it published and makes what it recovers durable before it journals it."
     },
     {
       "path": "packages/chat/scripts/tests/outbox_fakes.py",
@@ -518,6 +538,34 @@
     {
       "path": "packages/chat/scripts/tests/test_outbox_crashes.py",
       "purpose": "A crash at every boundary of design revision 8's section 5.5, one case per row (#19)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/admission_fakes.py",
+      "purpose": "Shared fakes for the writer-admission tests (#24): an invented journal for the owning operation, byte snapshots of a state directory, a guard against any blocking flock, and a base case that holds invented maintenance on the sandboxed state."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_admission_record.py",
+      "purpose": "The maintenance record's reader and the admission-lock sections: no file admitted, a valid record held, anything else unknown and held, and a reader that never writes (#24; writer admission 4.2, 4.3)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_admission_owner.py",
+      "purpose": "The owning operation's primitives under a caller-supplied journal or fence: acquire, drain, advance, release and a read-only reconcile, with crash, resume, pending-effect, evidence and fence-failure cases (#24; design tests 3, 5-8, reduced)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_admission_clients.py",
+      "purpose": "Clients under maintenance: a refusal keeps exactly one sink file and changes nothing else in the boundary; exit 5 and the notice line; delayed marker for posts and notices and none for acknowledgements; the admission table on every execution path; read-only status and query (#24; design tests 2, 5, 13; A3, A5)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_admission_concurrency.py",
+      "purpose": "Draining, a paused client and lock ordering with real threads: a call in progress finishes while new ones are refused, the authority's selector thread never sleeps, and no acquisition blocks (#24; design tests 1 and 10, A2, the ordering and deadlock schedule)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_admission_bridge.py",
+      "purpose": "The bridge under maintenance: the hold, the authority start refused under any record, no database, WAL or socket created, flush steps and the status snapshot held, and resumption after the release (#24; design test 9, reduced)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_admission_import.py",
+      "purpose": "The two import sources: the refusal sink beside outbox.d/ with source identity, entry-id deduplication, basename collisions, bounded fairness, listing failures and the import pass's accounting (#24; A4)."
     }
   ]
 }

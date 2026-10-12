@@ -16,6 +16,7 @@ Agents' own accounts are allocated by identities.py; see the chat skill.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import secrets
@@ -53,6 +54,18 @@ class Queued(ChatError):
     def __init__(self, message: str, parts: list | None = None, fallback: bool = False):
         super().__init__(message)
         self.parts, self.fallback = parts, fallback
+
+
+class Held(Queued):
+    """The call was refused for maintenance and kept (pchat exit 5): one file in the refusal sink,
+    refused.d/, which the bridge posts after the owning operation releases the maintenance
+    (docs/writer_admission.md 5). A kind of Queued, so every caller that keeps queued work keeps held work.
+    `operation` and `state` name the holder when the record or the authority said."""
+
+    def __init__(self, message: str, parts: list | None = None, operation: str | None = None,
+                 state: str | None = None):
+        super().__init__(message, parts, fallback=True)
+        self.operation, self.state = operation, state
 
 
 def _wallclock() -> float:
@@ -515,10 +528,53 @@ class _Call:
         _close(self.conn, self.joined)
         self.conn = None
 
+    # --- maintenance (docs/writer_admission.md sections 4.2, 4.5 and 5) ---
+
+    @contextlib.contextmanager
+    def section(self):
+        """This call is one section: L_adm shared from before its first create, queue or fallback publication
+        to its end (taken without blocking, a miss read as held maintenance), the record read while holding it.
+        A held or unknown record refuses the call into the refusal sink, raising Held."""
+        try:
+            with delivery_store.section(delivery_store.Paths(STATE_DIR), clock=_mono, sleep=_sleep) as adm:
+                if not adm.admitted:
+                    self.refuse(adm.record.describe() or {}, "held for maintenance")
+                yield adm
+        except delivery_store.StorageError as err:  # nothing to admit against, and nothing can be kept: as today
+            raise ChatError(f"the outbox cannot be written ({err})") from None
+
+    def maintenance(self, reply):
+        """A `maintenance` reply committed nothing: the call goes to the refusal sink, as a call refused at
+        its start does. Any other reply passes through."""
+        if reply is not None and reply.get("result") == "maintenance":
+            self.refuse(reply.get("maintenance") or {}, reply.get("detail") or "held for maintenance")
+        return reply
+
+    def refuse(self, info, why):
+        """Keep the call, whole, as one immutable file in the refusal sink (the same file as a fallback file, in
+        refused.d/), and raise Held (pchat exit 5). Its entry id X and its writer travel in the file, and so does
+        any attestation of an outcome or void the authority did not record: the import applies it under H1
+        exactly as for a fallback file. Confirmed parts are never resent. Nothing is reported held until the
+        file is durable; when it cannot be written the call fails as an unwritable outbox does."""
+        self._stop()
+        row = dict(self.row, id=self.id, writer=self.writer, origin=self.origin, epoch_seen=self.client.epoch,
+                   attestation=self.attestation)
+        state = info.get("state")
+        try:
+            delivery_store.publish_fallback(delivery_store.FS_DEFAULT, delivery_store.Paths(STATE_DIR), row,
+                                            clock=_wallclock, sink=True)
+        except OSError as err:
+            raise ChatError(f"{why}; and the refusal sink cannot be written ({err}); not kept") from None
+        by = (f" by {info['operation']}" if info.get("operation") else
+              " (the maintenance record cannot be read)" if state == "unknown" else "")
+        raise Held(f"held for maintenance{by}: kept in the refusal sink and posted, marked delayed, after the "
+                   f"maintenance is released; do not post it again", self.parts, info.get("operation"), state)
+
     def queue(self, why):
         """Q0 before any byte; if unanswered, the fallback file (section 6.4)."""
         self._stop()
-        reply = self.client.call("queue", self.writer, id=self.id, entry=self.row, origin=self.origin)
+        reply = self.maintenance(self.client.call("queue", self.writer, id=self.id, entry=self.row,
+                                                  origin=self.origin))
         if self._ok(reply):
             raise Queued(f"{why}; queued in the outbox for the bridge to post", None)
         self.fallback(why)
@@ -526,7 +582,8 @@ class _Call:
     def handoff(self, why):
         """E3 after some bytes, with at most one attestation; if unanswered, the fallback file."""
         self._stop()
-        reply = self.client.call("handoff", self.writer, id=self.id, attestation=self.attestation)
+        reply = self.maintenance(self.client.call("handoff", self.writer, id=self.id,
+                                                  attestation=self.attestation))
         if self._ok(reply):
             raise Queued(f"{why}; the rest is queued for the bridge", self.parts)
         self.fallback(why)
@@ -549,6 +606,11 @@ class _Call:
         for tries in range(50):
             reply = self.client.call("outcome", self.writer, id=self.id, n=n, generation=generation,
                                      a1_nonce=nonce, outcome=outcome, final_at=final_at, detail=detail)
+            if reply is not None and reply.get("result") == "maintenance":
+                # not recorded, and so carried as an attested outcome in the sink file, as when unanswered
+                self.attestation = {"kind": "outcome", "n": n, "generation": generation, "a1_nonce": nonce,
+                                    "outcome": outcome, "final_at": final_at, "detail": detail}
+                self.maintenance(reply)
             if reply is not None:
                 return reply
             if tries == 0:
@@ -589,8 +651,8 @@ class _Call:
                         self.handoff("the outbox authority restarted mid-part")
                     generation = known["generation"]
                 nonce = secrets.token_hex(16)
-                reply = self.client.call("attempt", self.writer, id=self.id, n=n, generation=generation,
-                                         a1_nonce=nonce)
+                reply = self.maintenance(self.client.call("attempt", self.writer, id=self.id, n=n,
+                                                          generation=generation, a1_nonce=nonce))
                 if reply is None:  # we may own an attempt we never learned of: send nothing for it (A12)
                     self.attestation = {"kind": "void", "n": n, "generation": generation + 1, "a1_nonce": nonce}
                     self.handoff(f"the outbox authority did not answer before part {n + 1}")
@@ -651,24 +713,29 @@ def post(channel: str, text: str, account: str, cfg: dict | None = None, cont: s
     row = {"kind": "post", "channel": channel, "as": account, "text": text, "cont": cont, "reply_to": reply_to,
            "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(_wallclock()))}
     call = _Call(client or client_factory(), entry_id or uuid.uuid4().hex, row, origin)
+    failure = None
     try:
         call.conn = login(account, cfg, caps=("message-tags", "batch", "draft/multiline"),
                           wait=delivery_store.LOGIN_WAIT)
     except (OSError, ChatError) as err:
-        call.queue(f"post failed ({err})")
+        failure = err
     try:
-        call.writer = delivery_store.PROBES.identity(_conn_id(call.conn))
-        call.parts = fix_parts(text, cont, call.conn)
-        reply = call.client.call("create", call.writer, id=call.id, entry=row, origin=origin,
-                                 parts=[{"kind": p["kind"], "lines": p["lines"], "text": p["text"]}
-                                        for p in call.parts])
-        if reply is None:  # E1 may have landed: Q0 by the same X hands it off instead
-            call.queue("the bridge's outbox authority did not answer")
-        if reply["result"] == "conflict":
-            call.queue(f"the outbox authority refused the entry ({reply.get('detail')})")
-        sent = call.send_parts(channel, reply_to)
-        call.client.call("done", call.writer, id=call.id)  # E5; the bridge sets it too
-        return sent
+        with call.section():  # login writes nothing; everything from here to the end of the call is one section
+            if failure is not None:
+                call.queue(f"post failed ({failure})")
+            call.writer = delivery_store.PROBES.identity(_conn_id(call.conn))
+            call.parts = fix_parts(text, cont, call.conn)
+            reply = call.client.call("create", call.writer, id=call.id, entry=row, origin=origin,
+                                     parts=[{"kind": p["kind"], "lines": p["lines"], "text": p["text"]}
+                                            for p in call.parts])
+            call.maintenance(reply)  # committed nothing: nothing of this call was sent, so it is kept in the sink
+            if reply is None:  # E1 may have landed: Q0 by the same X hands it off instead
+                call.queue("the bridge's outbox authority did not answer")
+            if reply["result"] == "conflict":
+                call.queue(f"the outbox authority refused the entry ({reply.get('detail')})")
+            sent = call.send_parts(channel, reply_to)
+            call.client.call("done", call.writer, id=call.id)  # E5; the bridge sets it too
+            return sent
     finally:
         call._stop()
 
@@ -689,22 +756,27 @@ def ack(channel: str, msgid: str, account: str, cfg: dict | None = None, *, entr
     row = {"kind": "ack", "channel": channel, "as": account, "ack": msgid, "text": None,
            "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(_wallclock()))}
     call = _Call(client or client_factory(), entry_id or uuid.uuid4().hex, row, "ack")
+    failure = None
     try:
         call.conn = login(account, cfg, caps=("message-tags",), wait=delivery_store.LOGIN_WAIT)
     except (OSError, ChatError) as err:
-        call.queue(f"ack failed ({err})")
+        failure = err
     try:
-        call.writer = delivery_store.PROBES.identity(_conn_id(call.conn))
-        line = f"@+draft/reply={msgid};+draft/react=ack TAGMSG {channel}"
-        call.parts = [{"kind": "ack", "lines": [[line, False]], "text": line, "state": "unsent"}]
-        reply = call.client.call("create", call.writer, id=call.id, entry=row, origin="ack",
-                                 parts=[{"kind": "ack", "lines": [[line, False]], "text": line}])
-        if reply is None:
-            call.queue("the bridge's outbox authority did not answer")
-        if reply["result"] == "conflict":
-            call.queue(f"the outbox authority refused the entry ({reply.get('detail')})")
-        call.send_parts(channel, None, pre_lines=lambda part: [part["lines"][0][0]])
-        call.client.call("done", call.writer, id=call.id)
+        with call.section():  # as for a post: one section
+            if failure is not None:
+                call.queue(f"ack failed ({failure})")
+            call.writer = delivery_store.PROBES.identity(_conn_id(call.conn))
+            line = f"@+draft/reply={msgid};+draft/react=ack TAGMSG {channel}"
+            call.parts = [{"kind": "ack", "lines": [[line, False]], "text": line, "state": "unsent"}]
+            reply = call.client.call("create", call.writer, id=call.id, entry=row, origin="ack",
+                                     parts=[{"kind": "ack", "lines": [[line, False]], "text": line}])
+            call.maintenance(reply)
+            if reply is None:
+                call.queue("the bridge's outbox authority did not answer")
+            if reply["result"] == "conflict":
+                call.queue(f"the outbox authority refused the entry ({reply.get('detail')})")
+            call.send_parts(channel, None, pre_lines=lambda part: [part["lines"][0][0]])
+            call.client.call("done", call.writer, id=call.id)
     finally:
         call._stop()
 
@@ -718,17 +790,25 @@ def deliver_entry(entry: dict, cfg: dict | None, client, writer_identity, fix) -
     parts fixed once (E4, through `fix(parts) -> bool`), then each part not yet
     confirmed as one attempt. Returns (outcome, attestation): 'done', 'refused',
     or 'waiting' (stopped, still owed; with the attestation the bridge must
-    still make durable, if any)."""
+    still make durable, if any). One entry's delivery is one section (writer
+    admission 4.2): held or unknown maintenance starts nothing, and it stays owed."""
+    with delivery_store.section(delivery_store.Paths(STATE_DIR), clock=_mono, sleep=_sleep) as adm:
+        if not adm.admitted:
+            return "waiting", None
+        return _deliver_entry(entry, cfg, client, writer_identity, fix)
+
+
+def _deliver_entry(entry, cfg, client, writer_identity, fix):
     account, channel = entry["account"], entry["channel"]
     conn = login(account, cfg, caps=("message-tags", "batch", "draft/multiline"), wait=delivery_store.LOGIN_WAIT)
     row = {"channel": channel, "as": account, "text": entry.get("text"), "cont": entry.get("cont") or ""}
     call = _Call(client, entry["id"], row, entry.get("origin") or "post", writer=writer_identity(_conn_id(conn)))
     call.conn = conn
 
-    def stop(why=None):
+    def stop(why=None, *_):  # refuse(info, why) takes two arguments; the bridge's own call keeps nothing in the sink
         call._stop()
         raise _Stopped(why)
-    call.handoff = call.queue = call.fallback = stop
+    call.handoff = call.queue = call.fallback = call.refuse = stop
     try:
         parts = entry.get("parts") or []
         ack_line = f"@+draft/reply={entry['ack']};+draft/react=ack TAGMSG {channel}" if entry.get("ack") else None
