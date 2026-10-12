@@ -33,6 +33,7 @@ class Journal:
         self.verifies = True       # True; False; None (unknown); or an Exception to raise
         self.fail_intent = None
         self.fail_outcome = None
+        self.fail_progress = None
         self.verified = []
 
     def verify(self, step):
@@ -46,6 +47,13 @@ class Journal:
             raise self.fail_intent
         self.records.append(("intent", dict(step), None))
         self.open = dict(step)
+
+    def progress(self, step, facts):
+        if self.fail_progress is not None:
+            raise self.fail_progress
+        self.records.append(("progress", dict(step), dict(facts)))
+        if self.open is not None:
+            self.open.setdefault("progress", {}).update(facts)
 
     def outcome(self, step, result):
         if self.fail_outcome is not None:
@@ -66,15 +74,24 @@ class Journal:
     def intents(self, name=None):
         return [s for kind, s, _ in self.records if kind == "intent" and (name is None or s["step"] == name)]
 
+    def progresses(self, name=None):
+        return [r for kind, s, r in self.records if kind == "progress" and (name is None or s["step"] == name)]
+
     def outcomes(self, name=None):
         return [r for kind, s, r in self.records if kind == "outcome" and (name is None or s["step"] == name)]
 
 
-def crash_at(owner, point):
-    """Make `owner` die (a BaseException no except clause catches) at the named point between its steps."""
+def crash_at(owner, point, nth=1):
+    """Make `owner` die (a BaseException no except clause catches) at the named point between its steps, the `nth`
+    time it is reached (acquisition journals two steps, the lock and the record, so its second "intent" is the
+    record's)."""
+    seen = []
+
     def hit(name):
         if name == point:
-            raise Crash(point)
+            seen.append(name)
+            if len(seen) == nth:
+                raise Crash(point)
     owner.point = hit
 
 
@@ -176,6 +193,11 @@ class HeldCase(OutboxCase):
         self.paths = self.ds.Paths(self.chatlib.STATE_DIR)
         self.journal = Journal()
         self.mclock = Clock()  # the owner's clock: its sleep advances it, so a drain never sleeps for real
+
+    def tearDown(self):
+        # release first: closing the authority while maintenance is held is deferred, by design
+        self.paths.maintenance.unlink(missing_ok=True)
+        super().tearDown()
 
     def owner(self, journal=None, operation=OPERATION, plan=PLAN, boot="boot-A", probes=None, **kw):
         return self.ds.Owner(self.paths, operation=operation, kind=KIND, plan_sha256=plan,

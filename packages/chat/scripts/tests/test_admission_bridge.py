@@ -198,6 +198,102 @@ class AuthorityStartTests(BridgeHoldCase):
         self.assertEqual(calls, ["slept", "authority", "connected"])
 
 
+class StartupRaceTests(BridgeHoldCase):
+    """The authority's start, and the cleanup of a start that fails, are one section (writer admission 4.2, 6.3): an
+    owner cannot complete its drain while either still touches the database, its WAL or the socket. And closing a
+    running authority is a mutation of the same files, so it too waits for a section, or for the release."""
+
+    def fresh_authority(self):
+        self.authority.close()
+        self.no_database()
+        return self.ds.Authority(self.chatlib.STATE_DIR, clock=self.clock, mono=self.clock.mono, probes=self.probes)
+
+    def test_a_start_that_fails_cleans_up_before_a_drain_can_complete(self):
+        authority = self.fresh_authority()
+        owner = self.owner()
+        events = []
+        real_close = self.ds.Store.close
+
+        def run_in_thread():
+            owner.acquire()  # maintenance begins while the start is in progress: no lock is needed to publish it
+            events.append(("drain during the start", owner.drain(wait=0)["drained"]))
+            raise RuntimeError("the thread cannot start")
+
+        def store_close(store):
+            events.append(("cleanup", self.record().state, owner.drain(wait=0)["drained"]))
+            return real_close(store)
+        authority.run_in_thread = run_in_thread
+        with mock.patch.object(self.ds.Store, "close", store_close), self.assertRaises(RuntimeError):
+            authority.launch()
+        self.assertEqual(events, [("drain during the start", False), ("cleanup", "draining", False)],
+                         "the cleanup ran while the start's section was still open, so the drain could not land")
+        self.assertFalse(authority.running)
+        self.assertTrue(authority.released)
+        for name in ("outbox.db-wal", "outbox.sock"):
+            self.assertFalse((self.chatlib.STATE_DIR / name).exists(), name)
+        before = snapshot(self.chatlib.STATE_DIR)
+        self.assertTrue(owner.drain(wait=0)["drained"], "once the start is over, the drain lands")
+        self.assertEqual(self.record().state, "partial")
+        after = snapshot(self.chatlib.STATE_DIR)
+        self.assertEqual([k for k in after if before.get(k) != after[k]], ["maintenance.json"],
+                         "and it is the only file that changed: no cleanup follows the drain")
+
+    def test_a_start_whose_socket_bind_fails_is_cleaned_up_inside_the_section_too(self):
+        authority = self.fresh_authority()
+        owner = self.owner()
+        seen = []
+
+        def bind():
+            owner.acquire()
+            seen.append(owner.drain(wait=0)["drained"])
+            raise OSError(98, "address in use (fake)")
+        authority.bind = bind
+        with self.assertRaises(OSError):
+            authority.launch()
+        self.assertEqual(seen, [False])
+        self.assertTrue(authority.released)
+
+    def test_closing_while_maintenance_is_held_is_deferred_and_touches_nothing(self):
+        owner = self.hold("partial")
+        db, wal = self.chatlib.STATE_DIR / "outbox.db", self.chatlib.STATE_DIR / "outbox.db-wal"
+        before = (db.read_bytes(), wal.exists() and wal.read_bytes(), (db.stat().st_mtime_ns))
+        self.authority.close()
+        self.assertFalse(self.authority.released, "the connection and the lock are kept")
+        self.assertFalse(self.authority.running)
+        self.assertEqual((db.read_bytes(), wal.exists() and wal.read_bytes(), db.stat().st_mtime_ns), before,
+                         "no checkpoint, no WAL removal while maintenance is held")
+        owner.release()
+        self.authority.close()
+        self.assertTrue(self.authority.released)
+
+    def test_closing_in_draining_with_no_open_section_is_deferred_but_inside_one_it_proceeds(self):
+        self.hold("draining")
+        self.authority.close()
+        self.assertFalse(self.authority.released, "a new section does not start in draining")
+        self.paths.maintenance.unlink()
+        self.authority.close()
+        self.assertTrue(self.authority.released)
+        self.authority = self.new_authority()
+        with self.ds.section(self.paths) as section:  # a section open before the record
+            self.assertTrue(section.admitted)
+            self.hold("draining")
+            self.authority.close()
+            self.assertTrue(self.authority.released, "it continues work already begun, under the section's lock")
+
+    def test_ensure_authority_keeps_an_authority_whose_close_was_deferred_and_finishes_after_the_release(self):
+        owner = self.hold("partial")
+        self.authority.thread = None
+        with mock.patch.object(self.bridge, "OUTBOX_AUTHORITY", self.authority):
+            self.authority.ready = False  # not running: the bridge would replace it
+            self.assertIs(self.bridge.ensure_authority(), self.authority, "kept, not dropped with its connection open")
+            self.assertFalse(self.authority.released)
+            owner.release()
+            started = self.bridge.ensure_authority()
+            self.assertIsNot(started, self.authority)
+            self.assertTrue(self.authority.released)
+            started.close()
+
+
 class ScriptedConnection:
     """One scripted chat-server connection: its lines, then the connection drops. `during` runs between lines."""
 
@@ -288,6 +384,83 @@ class RunLoopTests(BridgeHoldCase):
         with mock.patch.object(self.bridge.Deliveries, "process", lambda self_, cfg: ran.append(1)):
             self.run_script([TimeoutError("idle")], self.chatlib.ChatError)
         self.assertEqual(ran, [1])
+
+
+class PingTests(BridgeHoldCase):
+    """The outbox PING and its PONG: the coverage update the PONG causes is a write to the authority, so it is one
+    section of the bridge. Maintenance beginning while a PING is outstanding holds the bridge there."""
+
+    class Script(ScriptedConnection):
+        def __init__(self, case, record_appears):
+            super().__init__([])
+            self.case, self.phase, self.record_appears = case, 0, record_appears
+
+        def lines(self, timeout=None):
+            self.phase += 1
+            if self.phase == 1:
+                joined = join("#alpha")
+                joined["tags"]["time"] = "2026-10-02T09:59:00.000Z"  # the server's time: coverage begins
+                yield joined
+                raise TimeoutError("idle")  # the loop's pass, and then its PING
+            if self.phase == 2:
+                self.record_appears()
+                ping = next(x for x in reversed(self.sent) if x.startswith("PING :outbox-sync-"))
+                yield {"tags": {}, "prefix": "irc", "command": "PONG", "params": ["irc", ping.split(":", 1)[1]]}
+            from chatlib import ChatError
+            raise ChatError("connection dropped")
+
+    def run_with(self, record_appears, expect):
+        cfgfile = self.chatlib.STATE_DIR / "config.json"
+        cfgfile.write_text("{}")
+        state = (self.bridge.Record(), self.bridge.Deliveries(), self.bridge.Acks(), self.bridge.Checkpoints())
+        self.conn = self.Script(self, record_appears)
+        ticks = iter(range(10 ** 6))
+        with mock.patch.object(self.chatlib, "CONFIG_PATH", cfgfile), \
+                mock.patch.object(self.chatlib, "login", lambda *a, **k: self.conn), \
+                mock.patch.object(self.bridge, "_cmux", lambda *a: (0, "{}", "")), \
+                mock.patch.object(self.bridge, "OUTBOX_AUTHORITY", self.authority), \
+                mock.patch.object(self.bridge.time, "time", lambda: 1.8e9 + 10 * next(ticks)), \
+                self.assertRaises(expect):
+            self.bridge.run(CFG, *state, coverage=self.bridge.Coverage(self.authority))
+
+    def through(self):
+        return self.rows("SELECT through FROM coverage WHERE channel = '#alpha'")[0]["through"]
+
+    def test_without_maintenance_the_pong_extends_coverage(self):
+        self.run_with(lambda: None, self.chatlib.ChatError)
+        self.assertIsNotNone(self.through())
+
+    def test_maintenance_beginning_while_a_ping_is_outstanding_holds_the_bridge_at_its_pong(self):
+        records = []
+
+        def appears():
+            records.append(self.hold("draining"))
+        passes = []
+        real_process = self.bridge.Deliveries.process
+
+        def process(deliveries, cfg):
+            passes.append(self.record().state if self.record().present else "none")
+            return real_process(deliveries, cfg)
+        with mock.patch.object(self.bridge.Coverage, "sync", side_effect=AssertionError("coverage.sync started")), \
+                mock.patch.object(self.bridge.Deliveries, "process", process):
+            self.run_with(appears, self.bridge.Hold)
+        self.assertEqual(passes, ["none"], "the only delivery pass ran before the record: the hold came at the PONG")
+        self.assertIsNone(self.through(), "no coverage update was made after the record began")
+        self.assertTrue(self.conn.closed)
+        self.assertEqual(self.record().state, "draining", "and the owner was not delayed: the bridge held at once")
+
+    def test_a_coverage_update_outside_any_section_is_cancelled_in_draining_whatever_calls_it(self):
+        """The authority's rule, not the call site's: in draining an in-process request runs only for a caller that
+        holds a section open, so no bridge write can slip in between the PING and the pass that holds."""
+        coverage = self.bridge.Coverage(self.authority)
+        coverage.begin("#alpha", None, "msgid=m0")
+        self.hold("draining")
+        coverage.sync(self.clock())
+        self.assertIsNone(self.through())
+        index = self.bridge.index_message({"verified": True, "msgid": "m9", "channel": "#alpha", "from": "pat",
+                                           "text": "hello", "at": "2026-10-02T10:00:00+00:00"}, self.authority)
+        self.assertFalse(index, "an index outside a section fails too")
+        self.assertEqual(self.rows("SELECT msgid FROM messages"), [])
 
 
 class FlushTests(BridgeHoldCase):

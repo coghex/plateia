@@ -307,7 +307,7 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
       "capture": "changed",
-      "sha256": "ec661d445abd605313aa5c71eed0c4e8963e2e4f78f6e0a939268f1c6bcf397b",
+      "sha256": "86a3da4b31b11730ec7937d1cc779d9c9cc05485033da83fa14175b6f06b35c7",
       "changes": [
         {
           "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
@@ -318,7 +318,7 @@
           "reason": "Deliberate deviation from c572bad, by the owner's authorization on 2026-10-09 to repair this transport defect (issue #19; recorded in docs/plateia_design.md alongside D-70), as the owner's decisions recorded in D-73 (2026-10-09 and 2026-10-10) shaped it: one SQLite outbox authority opened only by the bridge. The running tools keep the baseline behavior until activation (D-23)."
         },
         {
-          "change": "The bridge holds while a maintenance record exists or cannot be read: each message, join, catch-up completion, acknowledgement, delivery pass, flush lock, flush step and entry delivery is one section of writer admission, and a section that finds the record held starts nothing, closes the connection and puts the bridge in a hold that reads the record every HOLD_RECHECK seconds. It starts no authority, writes no status snapshot (the unavailable one included), and logs the holder once per change. After the release it catches up from its checkpoints and imports the refusal sink with outbox.d/.",
+          "change": "The bridge holds while a maintenance record exists or cannot be read: each message, join, catch-up completion, acknowledgement, coverage update at a PONG, delivery pass, flush lock, flush step and entry delivery is one section of writer admission, and a section that finds the record held starts nothing, closes the connection and puts the bridge in a hold that reads the record every HOLD_RECHECK seconds. It starts no authority, writes no status snapshot (the unavailable one included), and logs the holder once per change. After the release it catches up from its checkpoints and imports the refusal sink with outbox.d/. An authority whose close was deferred by maintenance is kept, not dropped with its database open, and closed at a later pass.",
           "reason": "Deliberate deviation from c572bad, by the owner's decision of 2026-10-12 to implement docs/writer_admission.md (issue #24: the chat package's side of serialized writer admission; recorded in D-75 of docs/plateia_design.md, whose design (issue #23) the decision approved). The running tools keep the baseline behavior until activation (D-23); activation of this release stays separately gated (#21)."
         }
       ]
@@ -505,7 +505,7 @@
     },
     {
       "path": "packages/chat/scripts/delivery_store.py",
-      "purpose": "The outbox's one SQLite authority (#19): the store and its transitions, reconciliation, the bridge-only authority server and its request protocol, clients, fallback files and the lock-free import (design revision 8); and writer admission (#24, docs/writer_admission.md): the maintenance record reader, the admission-lock sections, per-transaction admission and the `maintenance` reply, the refusal sink and its import, and the owning operation's fenced primitives (Owner)."
+      "purpose": "The outbox's one SQLite authority (#19): the store and its transitions, reconciliation, the bridge-only authority server and its request protocol, clients, fallback files and the lock-free import (design revision 8); and writer admission (#24, docs/writer_admission.md): the maintenance record reader, the admission-lock sections, per-transaction admission and the `maintenance` reply, the refusal sink and its import, the authority's start and its failure cleanup as one section, a close that waits for a section or the release, and the owning operation's fenced primitives (Owner), whose recovery adopts only the file it published and makes what it recovers durable before it journals it."
     },
     {
       "path": "packages/chat/scripts/tests/outbox_fakes.py",

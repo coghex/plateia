@@ -883,6 +883,17 @@ def _open_admission_lock(paths, fs=None):
         raise StorageError(err.errno, f"the admission lock cannot be created ({err.strerror or err})") from err
 
 
+_OPEN = threading.local()  # per thread: how many admitted sections it holds open
+
+
+def in_admitted_section():
+    """Whether the calling thread holds an admitted section open: one that began with no maintenance record and is
+    still protected by its shared L_adm. In `draining` this is what separates an in-process request that continues
+    work already begun from one that would start new work (writer admission 4.5): the table lets only the former
+    run."""
+    return getattr(_OPEN, "depth", 0) > 0
+
+
 class Admission:
     """What entering a section found. `locked` says L_adm was held shared; `record` was read while holding it.
     Admitted means locked with no record. A lock that could not be had is held maintenance: refuse."""
@@ -921,7 +932,14 @@ def section(paths, *, fs=None, wait=None, clock=time.monotonic, sleep=time.sleep
                     if clock() >= deadline:
                         break
                     sleep(min(ADMIT_POLL, max(0.0, deadline - clock())))
-        yield Admission(locked, read_maintenance(paths) if locked else _unknown(why))
+        adm = Admission(locked, read_maintenance(paths) if locked else _unknown(why))
+        if adm.admitted:
+            _OPEN.depth = getattr(_OPEN, "depth", 0) + 1
+        try:
+            yield adm
+        finally:
+            if adm.admitted:
+                _OPEN.depth -= 1
     finally:
         if fd is not None:
             os.close(fd)  # closing the description releases its flock
@@ -957,10 +975,14 @@ class Owner:
       verify(step) -> True     the caller still owns the operation; anything else (False, None, an error) is
                                a failed or unknown fence, and permits no further mutation
       intent(step)             durably journal the step BEFORE its effect; an error stops it
+      progress(step, facts)    durably journal facts about the pending step as its effect advances: the
+                               identity (inode, device) of the temporary file before it is published, and the
+                               evidence of the published record after; an error is a failed fence
       outcome(step, result)    durably journal the result AFTER it; an error leaves the intent pending
       evidence() -> dict|None  the generation, sha256, ino, dev and ctime_ns of the record at the caller's
                                last journaled write, or None when it journaled none
-      pending() -> dict|None   the step journaled as an intent that has no outcome, if any
+      pending() -> dict|None   the step journaled as an intent that has no outcome, if any, with the facts
+                               journaled as its `progress`
 
     A step names the operation, the plan, the evidence of the record it replaces and the generation and exact
     bytes (as a digest) it writes. Verifying that legacy writers are retired and inhibited, and that targets
@@ -999,7 +1021,13 @@ class Owner:
         except Exception as err:
             self._fail(f"the intent was not journaled ({err!r:.80})", err)
         self.point("intent")
-        result = effect()
+
+        def progress(facts):
+            try:
+                self.fence.progress(step, facts)
+            except Exception as err:
+                self._fail(f"progress was not journaled ({err!r:.80})", err)
+        result = effect(progress)
         self.point("effect")
         try:
             self.fence.outcome(step, result)
@@ -1057,15 +1085,35 @@ class Owner:
             raise OwnerError(f"the record would be invalid ({problem})")
         return fields, (jdump(fields) + "\n").encode()
 
+    @staticmethod
+    def _identity(path):
+        """The inode and device of a file: what a link or a rename keeps, and so what identifies the published record."""
+        st = os.stat(path)
+        return {"ino": st.st_ino, "dev": st.st_dev}
+
     def _fresh_tmp(self):
         return f".maintenance.json.{secrets.token_hex(6)}.tmp"
 
     # --- settling a pending intent: a crash between an effect and its outcome (4.8) ---
 
+    def _same_publication(self, facts, actual):
+        """The record on disk, whose bytes are the journaled ones, must also be the file this step published: the
+        temporary file's identity (inode and device, which a link or a rename keeps), journaled before it was
+        published, and, once the step journaled it, the published record's evidence including its change time.
+        Identical bytes in another file, or a changed change time, are a replacement, never adopted."""
+        tmp, published = facts.get("tmp"), facts.get("published")
+        if not isinstance(tmp, dict) or (tmp.get("ino"), tmp.get("dev")) != (actual["ino"], actual["dev"]):
+            raise NotOwner("the record has the journaled bytes, but is not the file the operation published; a "
+                           "replacement is never adopted")
+        if published is not None and not same_evidence(published, actual):
+            raise NotOwner("the record changed after the operation published it; it is not adopted")
+
     def _settle(self):
         """Close a journaled intent that has no outcome, from what is on disk, before anything else. A landed write
-        is adopted only if its bytes are exactly the journaled ones; a record that is neither the journaled
-        prior nor the journaled write is a replacement, and is never adopted. Writes and removes nothing but a
+        is adopted only if it is the file the operation published (its journaled identity, and its exact bytes
+        and generation); a record that is neither the journaled prior nor that write is a replacement, and is never
+        adopted. What the recovery decides is made durable (the file and the state directory) before its outcome is
+        journaled, so a power loss cannot undo an effect already recorded as complete. Removes nothing but a
         temporary file the operation journaled."""
         self._live()
         try:
@@ -1078,15 +1126,22 @@ class Owner:
             raise NotOwner("the journal's pending step is another operation's")
         rec = read_maintenance(self.paths)
         name = pending.get("step")
+        facts = pending.get("progress") or {}
         if name == "create-lock":
             landed = self.paths.admission_lock.exists()
         elif name in ("write-draining", "write-record"):
             want = pending["to"]
             actual = rec.evidence()
-            landed = bool(actual and actual["sha256"] == want["sha256"] and actual["generation"] == want["generation"])
+            candidate = bool(actual and actual["sha256"] == want["sha256"]
+                             and actual["generation"] == want["generation"])
             prior = pending.get("from")
             unchanged = (not rec.present) if prior is None else same_evidence(prior, actual)
-            if not landed and not unchanged:
+            if candidate:
+                self._same_publication(facts, actual)
+                landed = True
+            elif unchanged:
+                landed = False
+            else:
                 raise NotOwner("the record is neither the journaled prior nor the journaled write; a replacement is "
                                "never adopted")
         elif name == "release":
@@ -1102,6 +1157,12 @@ class Owner:
         if tmp and "/" not in tmp:
             with contextlib.suppress(OSError):
                 self.fs.unlink(self.paths.state / tmp)  # a temporary file the operation journaled
+        # durable before the outcome: the record's content, then the state directory (the link or rename, the
+        # temporary file's removal, or the release's unlink). A failure leaves the intent pending, to settle again.
+        with contextlib.suppress(FileNotFoundError):
+            if landed and name in ("write-draining", "write-record"):
+                self.fs.sync_file(self.paths.maintenance)
+            self.fs.sync_dir(self.paths.state)
         result = {"landed": landed, "resumed": True}
         if landed and name in ("write-draining", "write-record"):
             result["evidence"] = read_maintenance(self.paths).evidence()
@@ -1118,7 +1179,7 @@ class Owner:
         """Create admission.lock if it is missing, empty (4.4 step 2)."""
         self._settle()
 
-        def effect():
+        def effect(progress):
             fd = _open_admission_lock(self.paths, self.fs)
             os.close(fd)
             return {"landed": True}
@@ -1143,15 +1204,22 @@ class Owner:
                                                "to": {"state": "draining", "generation": 1,
                                                       "sha256": hashlib.sha256(data).hexdigest()}})
 
-        def effect():
-            self.fs.create_excl(self.paths.state / tmp, data)
+        def effect(progress):
+            path = self.paths.state / tmp
+            self.fs.create_excl(path, data)
             self.point("tmp-created")
-            self.fs.link(self.paths.state / tmp, self.paths.maintenance)  # never replaces a file
+            progress({"tmp": self._identity(path)})  # before it is published, so a recovery can tell it from another
+            self.point("tmp-journaled")
+            self.fs.link(path, self.paths.maintenance)  # never replaces a file
             self.point("linked")
             self.fs.sync_dir(self.paths.state)
             with contextlib.suppress(OSError):
-                self.fs.unlink(self.paths.state / tmp)
-            return {"landed": True, "evidence": read_maintenance(self.paths).evidence()}
+                self.fs.unlink(path)
+            self.fs.sync_dir(self.paths.state)
+            evidence = read_maintenance(self.paths).evidence()
+            self.point("published")
+            progress({"published": evidence})
+            return {"landed": True, "evidence": evidence}
         self._fenced(step, effect)
         return read_maintenance(self.paths)
 
@@ -1211,19 +1279,27 @@ class Owner:
                                              "to": {"state": state, "generation": fields["generation"],
                                                     "sha256": hashlib.sha256(data).hexdigest()}})
 
-        def effect():
+        def effect(progress):
+            path = self.paths.state / tmp
+            self.fs.create_excl(path, data)  # before the lock: it is held only for the rename and its sync
+            self.point("tmp-created")
+            progress({"tmp": self._identity(path)})
+            self.point("tmp-journaled")
             with self._exclusive(wait) as (held, tries):
                 if not held:  # hold nothing, leave the record as it is: the drain is incomplete (4.4)
+                    with contextlib.suppress(OSError):
+                        self.fs.unlink(path)
+                    self.fs.sync_dir(self.paths.state)
                     return {"landed": False, "drained": False, "attempts": tries}
                 self._expect_own(read_maintenance(self.paths))  # still exactly the journaled record, under the lock
-                self.fs.create_excl(self.paths.state / tmp, data)
-                self.point("tmp-created")
-                self.fs.replace(self.paths.state / tmp, self.paths.maintenance)
+                self.fs.replace(path, self.paths.maintenance)
                 self.point("renamed")
                 self.fs.sync_dir(self.paths.state)
                 self.point("written")
-            return {"landed": True, "drained": True, "attempts": tries,
-                    "evidence": read_maintenance(self.paths).evidence()}
+            evidence = read_maintenance(self.paths).evidence()
+            self.point("published")
+            progress({"published": evidence})
+            return {"landed": True, "drained": True, "attempts": tries, "evidence": evidence}
         return self._fenced(step, effect)
 
     def drain(self, *, wait=DRAIN_MAX, boot=None):
@@ -1242,7 +1318,7 @@ class Owner:
         self._expect_own(rec)
         step = self._step("release", **{"from": rec.evidence()})
 
-        def effect():
+        def effect(progress):
             self.fs.unlink(self.paths.maintenance)
             self.point("unlinked")
             self.fs.sync_dir(self.paths.state)
@@ -2292,9 +2368,9 @@ def peer_credentials(sock):
 class _Job:
     """An in-process request: queued, then running, then done; or cancelled while still queued."""
 
-    def __init__(self, fn, readonly=False):
+    def __init__(self, fn, readonly=False, sectioned=False):
         self.fn, self.state, self.result, self.error = fn, "queued", None, None
-        self.readonly = readonly
+        self.readonly, self.sectioned = readonly, sectioned  # sectioned: its caller held an admitted section
         self.cond = threading.Condition()
 
 
@@ -2331,6 +2407,7 @@ class Authority:
         self.unavailable = None  # (reason, since) while the authority cannot run
         self.ready = False  # set only once a start has completed; cleared by close()
         self.bridge_only = False  # no socket: its path is over the platform's limit
+        self._bound = False  # outbox.sock was bound by this authority, and is still to be removed
 
     @property
     def epoch(self):
@@ -2372,11 +2449,18 @@ class Authority:
         releases the lock and raises; running only once every step is done."""
         try:
             with self._start_section():
-                self._open()
-                self.bridge_only = not self.bind()
-            self.run_in_thread()
+                try:
+                    self._open()
+                    self.bridge_only = not self.bind()
+                    self.run_in_thread()
+                except BaseException:
+                    # the failure's cleanup (the database's checkpoint, the socket, the locks) is a mutation of the
+                    # protected files: it happens while this start still holds L_adm shared, so an owner's drain
+                    # cannot complete until it has
+                    self.close()
+                    raise
         except BaseException:
-            self.close()
+            self.close()  # a start that was refused opened nothing; after the cleanup above, nothing is left
             raise
         return self.epoch
 
@@ -2438,11 +2522,17 @@ class Authority:
                 os.unlink(path)
             raise
         self.listener = listener
+        self._bound = True
         return True
 
     def close(self):
         """Stop serving and release everything a start opened, whatever step it
-        reached: the thread, the connections, the socket, the database, the lock."""
+        reached: the thread, the connections, the socket, the database, the lock.
+        What touches the protected files (the database's close and checkpoint, the
+        socket's removal) is a mutation: it runs inside a section, or in the one
+        its caller holds. While maintenance is held and no section is open it is
+        deferred, with the connection and the lock kept, until a later close()
+        finds no record (writer admission 3.1, rule 1)."""
         self.ready = False
         self.stopping = True
         thread, self.thread = self.thread, None
@@ -2455,8 +2545,6 @@ class Authority:
         if self.listener is not None:
             self.listener.close()
             self.listener = None
-            with contextlib.suppress(OSError):
-                os.unlink(self.paths.sock)
         if self.sel is not None:
             with contextlib.suppress(Exception):
                 self.sel.close()
@@ -2466,6 +2554,30 @@ class Authority:
                 with contextlib.suppress(OSError):
                     os.close(fd)
         self.wake_r = self.wake_w = None
+        if self.released:
+            return
+        if in_admitted_section():
+            self._release_files()
+            return
+        try:
+            with section(self.paths, fs=self.fs) as adm:
+                if adm.admitted:
+                    self._release_files()
+                else:
+                    self.log("authority: closing is deferred while maintenance is held")
+        except StorageError:  # no lock file can exist here, so no maintenance can be held
+            self._release_files()
+
+    @property
+    def released(self):
+        """Whether every file this authority opened is released: false after a close() deferred by maintenance."""
+        return not (self._bound or self.store.con is not None or self.lock_file is not None)
+
+    def _release_files(self):
+        if self._bound:
+            self._bound = False
+            with contextlib.suppress(OSError):
+                os.unlink(self.paths.sock)
         self.store.close()
         if self.lock_file is not None:
             fcntl.flock(self.lock_file, fcntl.LOCK_UN)
@@ -2522,7 +2634,7 @@ class Authority:
             return None
         if record.state == "draining":
             if bridge:
-                return None
+                return None if in_admitted_section() else record.describe()
             if request["op"] in ("create", "queue") and self.store.entry(request["id"]) is None:
                 return record.describe()
             return None
@@ -2565,16 +2677,17 @@ class Authority:
         status.update(maintenance=read_maintenance(self.paths).describe(), refused=sink_count(self.paths, self.fs))
         return "ok", {"status": status}
 
-    def _exec_tx(self, fn, readonly=False):
+    def _exec_tx(self, fn, readonly=False, sectioned=False):
         """`fn(store)` in one transaction, by the in-process rule of writer admission 4.5: it begins only holding
         L_adm shared (one non-blocking try: this may be the selector thread, which never waits), and only with no
-        record or in `draining`, where the bridge's requests come from a section already open. Otherwise
+        record, or in `draining` when its caller holds an admitted section open (`sectioned`): the bridge's requests
+        continue a section already begun, and a request made outside one would start new work. Otherwise
         CANCELLED, having begun nothing. A read-only request takes no section and writes nothing."""
         if readonly:
             with self.store.read_tx():
                 return fn(self.store)
         with section(self.paths, fs=self.fs, wait=0) as adm:
-            if not (adm.locked and (not adm.record.present or adm.record.state == "draining")):
+            if not (adm.locked and (not adm.record.present or (adm.record.state == "draining" and sectioned))):
                 return CANCELLED
             with self.store.tx():
                 return fn(self.store)
@@ -2588,8 +2701,8 @@ class Authority:
         if not self.running:
             return CANCELLED
         if self.thread is None or threading.current_thread() is self.thread:
-            return self._exec_tx(fn, readonly)
-        job = _Job(fn, readonly)
+            return self._exec_tx(fn, readonly, in_admitted_section())
+        job = _Job(fn, readonly, in_admitted_section())
         with self.mutex:
             self.jobs.append(job)
         self._wake()
@@ -2616,7 +2729,7 @@ class Authority:
                 return
             job.state = "running"
         try:
-            job.result = self._exec_tx(job.fn, job.readonly)
+            job.result = self._exec_tx(job.fn, job.readonly, job.sectioned)
         except BaseException as err:  # reported to the waiting thread
             job.error = err
         with job.cond:

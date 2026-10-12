@@ -1920,7 +1920,8 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
                           and msg["params"][:1] and not batch):
                         lost(msg["params"][0])
                     elif cmd == "PONG" and sync and msg["params"][-1:] == [sync[0]]:
-                        coverage.sync(sync[1])  # everything published before the PING is logged
+                        with admitted("coverage sync"):  # a write to the authority: maintenance may have begun meanwhile
+                            coverage.sync(sync[1])  # everything published before the PING is logged
                         flush_due = True
                         break
                     if time.time() > next_list:
@@ -1979,6 +1980,10 @@ def ensure_authority():
     since = old.unavailable[1] if old is not None and old.unavailable else None
     if old is not None:
         old.close()  # whatever it still holds is released before the next start takes the lock
+        if not old.released:
+            # maintenance deferred the close: its connection and lock stay as they are (not dropped, which would
+            # close the database outside any section), and the close is tried again at the next pass
+            return old
     authority = delivery_store.Authority(chatlib.STATE_DIR, log=log)
     try:
         authority.launch()

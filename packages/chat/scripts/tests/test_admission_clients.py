@@ -343,8 +343,11 @@ class AdmissionTableTests(HeldCase):
                     self.assertIsNone(self.authority.thread)
                 run = lambda: self.authority.run_tx(lambda s: s.status()["waiting"])  # noqa: E731
                 self.assertEqual(run(), 0, "no record")
-                owner = self.hold("draining")
-                self.assertEqual(run(), 0, "draining: the bridge's requests come from a section already open")
+                with self.ds.section(self.paths) as section:  # a bridge section, open before the record begins
+                    self.assertTrue(section.admitted)
+                    owner = self.hold("draining")
+                    self.assertEqual(run(), 0, "draining: a request of a section already open continues it")
+                self.assertIs(run(), self.ds.CANCELLED, "draining, outside a section: it would start new work")
                 owner.drain()
                 self.assertIs(run(), self.ds.CANCELLED, "partial: not run, nothing begun")
                 self.assertEqual(self.authority.run_tx(lambda s: s.status()["waiting"], readonly=True), 0,
@@ -356,11 +359,14 @@ class AdmissionTableTests(HeldCase):
                 os.unlink(self.paths.maintenance)
 
     def test_the_bridges_in_process_client_gets_no_answer_where_it_is_not_run(self):
-        owner = self.hold("draining")
         bridge_client = self.bridge.bridge_client(self.authority)
         me = self.probes.identity()
-        self.assertIsNotNone(bridge_client.call("create", me, **self.create_args("a" * 32)),
-                             "draining: the bridge's own request runs")
+        with self.ds.section(self.paths):  # open before the record begins
+            owner = self.hold("draining")
+            self.assertIsNotNone(bridge_client.call("create", me, **self.create_args("a" * 32)),
+                                 "draining: the bridge's own request, from a section already open, runs")
+        self.assertIsNone(bridge_client.call("create", me, **self.create_args("c" * 32)),
+                          "draining, from no open section: it would start new work")
         owner.drain()
         self.assertIsNone(bridge_client.call("create", me, **self.create_args("b" * 32)))
         self.assertEqual(bridge_client.call("status", None)["result"], "ok")

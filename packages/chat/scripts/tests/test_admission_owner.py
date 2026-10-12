@@ -19,7 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 import delivery_store as ds  # noqa: E402
 from admission_fakes import (OPERATION, OTHER_OPERATION, PLAN, Journal, crash_at,  # noqa: E402
                              only_nonblocking_flocks, put_record, record_fields, shared_lock, snapshot)
-from outbox_fakes import Clock, Crash  # noqa: E402
+from outbox_fakes import Clock, Crash, SimFS  # noqa: E402
 
 
 class OwnerCase(unittest.TestCase):
@@ -30,10 +30,10 @@ class OwnerCase(unittest.TestCase):
         self.journal = Journal()
         self.clock = Clock()
 
-    def owner(self, journal=None, operation=OPERATION, plan=PLAN, boot="boot-A", pid=7001, probes=None):
+    def owner(self, journal=None, operation=OPERATION, plan=PLAN, boot="boot-A", pid=7001, probes=None, fs=None):
         return ds.Owner(self.paths, operation=operation, kind="plateia-activation", plan_sha256=plan,
                         fence=journal or self.journal, probes=probes or ds.FakeProbes(boot=boot, pid=pid),
-                        mono=self.clock.mono, sleep=self.clock.advance)
+                        mono=self.clock.mono, sleep=self.clock.advance, fs=fs)
 
     def record(self):
         return ds.read_maintenance(self.paths)
@@ -83,7 +83,12 @@ class LifecycleTests(OwnerCase):
         self.assertTrue(self.paths.admission_lock.exists(), "release is the record's unlink; the lock file stays")
         self.assertTrue(self.admitted())
         # every step: verified, then an intent, then its effect, then an outcome; nothing is left pending
-        self.assertEqual([k for k, _, _ in self.journal.records], ["intent", "outcome"] * 5)
+        self.assertEqual([k for k, _, _ in self.journal.records if k != "progress"], ["intent", "outcome"] * 5)
+        # a record write journals the file it will publish before it publishes, and the published record after
+        self.assertEqual([[k for k in r] for r in self.journal.progresses("write-record")],
+                         [["tmp"], ["published"]] * 2)
+        self.assertEqual(self.journal.progresses("write-draining")[1]["published"],
+                         self.journal.outcomes("write-draining")[0]["evidence"])
         self.assertEqual([s["step"] for s in self.journal.intents()],
                          ["create-lock", "write-draining", "write-record", "write-record", "release"])
         self.assertEqual(self.journal.verified, [s["step"] for s in self.journal.intents()])
@@ -532,6 +537,213 @@ class CrashTests(OwnerCase):
         self.assertTrue(stray.exists(), "kept")
         self.assertFalse((self.paths.state / journaled).exists(), "the journaled one is removed on resume")
         self.assertEqual(self.owner().reconcile()["unjournaled_temp_files"], [stray.name], "and still reported")
+
+
+class RecoveryIdentityTests(OwnerCase):
+    """Recovery adopts a landed write only if it is the file the operation published: the identity of its temporary
+    file, journaled before it was published, and, once journaled, the published record's evidence with its change
+    time. Identical bytes in another file are a replacement, never adopted."""
+
+    def crashed(self, how, point):
+        """A run that dies at `point` of acquisition (`how` == "acquire") or of the drain; returns the pending step."""
+        owner = self.owner()
+        if how == "drain":
+            owner.acquire()
+        crash_at(owner, point, nth=2 if how == "acquire" and point in ("intent", "effect") else 1)
+        with self.assertRaises(Crash):
+            owner.acquire() if how == "acquire" else owner.drain()
+        return self.journal.pending()
+
+    def replace_with_identical_bytes(self):
+        raw = self.paths.maintenance.read_bytes()
+        other = self.paths.state / "elsewhere"
+        other.write_bytes(raw)
+        os.chmod(other, 0o600)
+        os.replace(other, self.paths.maintenance)
+        self.assertEqual(self.paths.maintenance.read_bytes(), raw)
+        return raw
+
+    PLAN_POINTS = (("acquire", "linked"), ("acquire", "published"), ("acquire", "effect"),
+                   ("drain", "renamed"), ("drain", "written"), ("drain", "published"), ("drain", "effect"))
+
+    def test_identical_bytes_in_a_new_inode_are_a_replacement_at_every_point_after_the_write(self):
+        for how, point in self.PLAN_POINTS:
+            with self.subTest(how=how, point=point):
+                shutil.rmtree(self.paths.state, ignore_errors=True)
+                self.journal = Journal()
+                self.crashed(how, point)
+                raw = self.replace_with_identical_bytes()
+                ino, evidence = os.stat(self.paths.maintenance).st_ino, self.journal.evidence()
+                resumed = self.owner()
+                for attempt in (resumed.acquire, self.owner().release, self.owner().drain):
+                    with self.assertRaises(ds.NotOwner):
+                        attempt()
+                self.assertEqual(self.paths.maintenance.read_bytes(), raw, "not rewritten, adopted or removed")
+                self.assertEqual(os.stat(self.paths.maintenance).st_ino, ino)
+                self.assertIsNotNone(self.journal.pending(), "the intent stays pending: no outcome was journaled")
+                self.assertEqual(self.journal.evidence(), evidence, "the replacement's inode and change time were "
+                                 "never journaled as the operation's own")
+                self.assertFalse(self.admitted(), "and every writer keeps refusing")
+
+    def test_the_operations_own_file_is_adopted_at_every_point(self):
+        for how, point in self.PLAN_POINTS:
+            with self.subTest(how=how, point=point):
+                shutil.rmtree(self.paths.state, ignore_errors=True)
+                self.journal = Journal()
+                self.crashed(how, point)
+                ino = os.stat(self.paths.maintenance).st_ino
+                rec = self.owner().acquire()
+                self.assertEqual(os.stat(self.paths.maintenance).st_ino, ino, "not rewritten")
+                self.assertEqual(self.journal.evidence(), rec.evidence())
+                self.assertIsNone(self.journal.pending())
+
+    def test_a_changed_change_time_after_publication_was_journaled_is_not_adopted(self):
+        for how in ("acquire", "drain"):
+            with self.subTest(how=how):
+                shutil.rmtree(self.paths.state, ignore_errors=True)
+                self.journal = Journal()
+                step = self.crashed(how, "effect")  # published and journaled; the outcome is not
+                self.assertIn("published", step["progress"])
+                self.quiet_period()
+                os.chmod(self.paths.maintenance, 0o600)  # same bytes, same inode, a later change time
+                os.utime(self.paths.maintenance)
+                before = snapshot(self.paths.state)
+                with self.assertRaises(ds.NotOwner):
+                    self.owner().acquire()
+                self.assertEqual(snapshot(self.paths.state), before)
+                self.assertIsNotNone(self.journal.pending())
+
+    def test_a_record_with_the_journaled_bytes_is_refused_when_no_temporary_file_was_journaled(self):
+        owner = self.owner()
+        crash_at(owner, "intent", nth=2)  # the record's intent is journaled; nothing was created or published
+        with self.assertRaises(Crash):
+            owner.acquire()
+        step = self.journal.pending()
+        self.assertNotIn("progress", step)
+        put_record(self.paths, record_fields(state="draining", generation=1, boot="boot-A"))  # anything at the name
+        with self.assertRaises(ds.NotOwner):
+            self.owner().acquire()
+
+    def test_the_temporary_files_identity_is_journaled_before_it_is_published(self):
+        owner = self.owner()
+        crash_at(owner, "tmp-journaled")
+        with self.assertRaises(Crash):
+            owner.acquire()
+        step = self.journal.pending()
+        st = os.stat(self.paths.state / step["tmp"])
+        self.assertEqual(step["progress"], {"tmp": {"ino": st.st_ino, "dev": st.st_dev}})
+        self.assertFalse(self.paths.maintenance.exists(), "journaled first, published after")
+
+    def test_progress_that_cannot_be_journaled_publishes_nothing(self):
+        owner = self.owner()
+        self.journal.fail_progress = OSError(5, "input/output error (fake)")
+        with self.assertRaises(ds.FenceFailed):
+            owner.acquire()
+        self.assertFalse(self.paths.maintenance.exists(), "an unjournaled identity is never published")
+        with self.assertRaises(ds.FenceFailed):
+            owner.acquire()
+
+
+class RecordingFS(SimFS):
+    """The filesystem model that drops what was never synced, noting each sync in a shared list of events."""
+
+    def __init__(self, root, events=None):
+        if events is not None:
+            self.events = events  # kept across the power loss, which builds the model again
+        super().__init__(root)
+
+    def sync_dir(self, path):
+        self.events.append("sync_dir")
+        super().sync_dir(path)
+
+    def sync_file(self, path):
+        self.events.append("sync_file")
+        super().sync_file(path)
+
+
+class DurableRecoveryTests(OwnerCase):
+    """A recovery makes its decision durable, the file and the state directory, before it journals the outcome, so a
+    power loss cannot undo an effect already recorded as complete. The original crash comes before the normal sync."""
+
+    def setUp(self):
+        super().setUp()
+        self.paths.state.mkdir()
+        self.events = []
+        self.fs = RecordingFS(self.paths.state, self.events)
+        real = self.journal.outcome
+
+        def outcome(step, result):
+            self.events.append("outcome")
+            return real(step, result)
+        self.journal.outcome = outcome
+
+    def resume(self, how):
+        del self.events[:]
+        owner = self.owner(fs=self.fs)
+        {"acquire": owner.acquire, "release": owner.release}[how]()
+        self.assertIn("outcome", self.events)
+        first = self.events.index("outcome")
+        self.assertIn("sync_dir", self.events[:first], "the state directory is synced before the outcome is journaled")
+
+    def test_a_recovered_link_is_durable_before_its_outcome(self):
+        owner = self.owner(fs=self.fs)
+        crash_at(owner, "linked")
+        with self.assertRaises(Crash):
+            owner.acquire()
+        self.resume("acquire")
+        self.fs.power_loss()
+        self.assertEqual(self.record().state, "draining", "the recovered record survives a power loss")
+        self.assertEqual(self.record().evidence()["generation"], 1)
+
+    def test_a_recovered_rename_is_durable_before_its_outcome(self):
+        owner = self.owner(fs=self.fs)
+        owner.acquire()
+        crash_at(owner, "renamed")
+        with self.assertRaises(Crash):
+            owner.drain()
+        self.resume("acquire")
+        self.fs.power_loss()
+        self.assertEqual((self.record().state, self.fields()["generation"]), ("partial", 2))
+
+    def test_a_recovered_release_is_durable_before_its_outcome(self):
+        owner = self.whole(self.owner(fs=self.fs))
+        crash_at(owner, "unlinked")
+        with self.assertRaises(Crash):
+            owner.release()
+        self.resume("release")
+        self.fs.power_loss()
+        self.assertFalse(self.paths.maintenance.exists(), "the release is not undone by a power loss")
+        self.assertTrue(self.admitted())
+
+    def test_a_recovered_temporary_files_removal_is_durable_before_its_outcome(self):
+        owner = self.owner(fs=self.fs)
+        crash_at(owner, "tmp-journaled")
+        with self.assertRaises(Crash):
+            owner.acquire()
+        tmp = self.journal.pending()["tmp"]
+        self.fs.sync_dir(self.paths.state)  # it is a name the model saw durably
+        self.resume("acquire")
+        self.fs.power_loss()
+        self.assertFalse((self.paths.state / tmp).exists())
+        self.assertEqual(self.record().state, "draining", "and the retry then wrote the record")
+
+    def test_a_sync_that_fails_keeps_the_intent_pending_and_journals_no_outcome(self):
+        owner = self.owner(fs=self.fs)
+        crash_at(owner, "linked")
+        with self.assertRaises(Crash):
+            owner.acquire()
+        real = self.fs.sync_dir
+
+        def broken(path):
+            raise OSError(5, "input/output error (fake)")
+        self.fs.sync_dir = broken
+        with self.assertRaises(OSError):
+            self.owner(fs=self.fs).acquire()
+        self.assertIsNotNone(self.journal.pending(), "not durable, so not recorded as done")
+        self.assertEqual(self.journal.outcomes("write-draining"), [])
+        self.fs.sync_dir = real
+        self.assertEqual(self.owner(fs=self.fs).acquire().state, "draining")
+        self.assertIsNone(self.journal.pending())
 
 
 class RebootTests(OwnerCase):
