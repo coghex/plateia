@@ -46,8 +46,9 @@ class Bench:
                                                  text=f'[question {request}] Which approved default?'))
         return self.box.poll()['items']
 
-    def reply(self, mid, account, part=1, parts=1, request='job-17', reply_to='q1', key='resolution', **more):
-        return self.record(mid, account, key, part, parts, f'[decision {request}] The owner settled this',
+    def reply(self, mid, account, part=1, parts=1, request='job-17', reply_to='q1', key='resolution', text=None,
+              **more):
+        return self.record(mid, account, key, part, parts, text or f'[decision {request}] The owner settled this',
                            reply_to, **more)
 
     def query(self, sql, args=()):
@@ -84,8 +85,10 @@ class OwnerAccountTests(unittest.TestCase):
                     b.adapter.messages.append(b.reply('r2', second, nick=f'{second}-phone'))
                     self.assertEqual(b.box.poll()['items'], [])
                     self.assertEqual(b.status(), 'resolved')
-                    expected = {'selected': {'account': first, 'messages': [{'msgid': 'r1', 'nick': f'{first}-laptop'}]},
-                                'replay': {'account': second, 'messages': [{'msgid': 'r2', 'nick': f'{second}-phone'}]}}
+                    expected = {'selected': {'account': first, 'messages': [
+                                    {'msgid': 'r1', 'nick': f'{first}-laptop', 'attested_account': first}]},
+                                'replay': {'account': second, 'messages': [
+                                    {'msgid': 'r2', 'nick': f'{second}-phone', 'attested_account': second}]}}
                     self.assertEqual(b.replays(), [expected])
                     # a repeated read, and a restart, record nothing more and send nothing
                     b.box.poll()
@@ -96,6 +99,49 @@ class OwnerAccountTests(unittest.TestCase):
                     self.assertEqual(b.query("SELECT msgid, account FROM messages WHERE msgid IN ('r1','r2') "
                                              "ORDER BY msgid"),
                                      [{'msgid': 'r1', 'account': first}, {'msgid': 'r2', 'account': second}])
+        with self.subTest(case='a late conflicting copy and a later reply cannot change what was selected'):
+            b = self.bench('late', owner_accounts=['quill'])
+            b.ask()
+            b.adapter.messages += [b.reply('r1', 'pat'), b.reply('r2', 'quill')]
+            b.box.poll()
+            [recorded] = b.replays()
+            self.assertEqual(recorded['selected']['account'], 'pat')
+            # pat's group now conflicts (same key, other text), then pat answers again under another key
+            b.adapter.messages.append(b.reply('r3', 'pat', text='[decision job-17] A different conclusion'))
+            b.box.poll()
+            b.adapter.messages.append(b.reply('r4', 'pat', key='resolution-later'))
+            b.box.poll()
+            b.open(owner_accounts=['quill'])
+            b.box.poll()
+            self.assertEqual((b.status(), b.replays(), b.adapter.sends), ('resolved', [recorded], []))
+        with self.subTest(case='the attested spelling is kept beside the comparison form'):
+            b = self.bench('mixed', owner_accounts=['quill'])
+            b.ask()
+            b.adapter.messages += [b.reply('r1', 'PAT', nick='Pat'), b.reply('r2', 'Quill')]
+            b.box.poll()
+            self.assertEqual(b.status(), 'resolved')
+            self.assertEqual(b.replays(), [{
+                'selected': {'account': 'pat', 'messages': [{'msgid': 'r1', 'nick': 'Pat', 'attested_account': 'PAT'}]},
+                'replay': {'account': 'quill', 'messages': [
+                    {'msgid': 'r2', 'nick': None, 'attested_account': 'Quill'}]}}])
+            stored = {r['msgid']: r for r in b.query("SELECT msgid, account, payload FROM messages")}
+            self.assertEqual((stored['r1']['account'], json.loads(stored['r1']['payload'])['attested_account']),
+                             ('pat', 'PAT'))
+            # an already lowercase account has the payload it always had
+            self.assertNotIn('attested_account', json.loads(stored['q1']['payload']))
+        with self.subTest(case='a message stored without the attested spelling is still the same message'):
+            b = self.bench('stored-before', owner_accounts=['quill'])
+            b.ask()
+            b.adapter.messages.append(b.reply('r1', 'Quill'))
+            b.box.poll()
+            with contextlib.closing(sqlite3.connect(b.state / 'inbox.sqlite3')) as db:
+                before = json.loads(db.execute("SELECT payload FROM messages WHERE msgid='r1'").fetchone()[0])
+                del before['attested_account']
+                db.execute("UPDATE messages SET payload=? WHERE msgid='r1'", (json.dumps(before, sort_keys=True),))
+                db.execute('DELETE FROM cursors')  # every record is read again
+                db.commit()
+            b.box.poll()
+            self.assertEqual(b.status(), 'resolved')
         with self.subTest(case='a repeat from the same account is not a second owner'):
             b = self.bench('same-account', owner_accounts=['quill'])
             b.ask()

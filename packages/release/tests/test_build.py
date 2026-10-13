@@ -448,8 +448,10 @@ class RefusalTests(BuildCase):
 # delivery-records, outbox-db, outbox-authority, boot-id and tcp-sockets
 # format entries (the second to fifth amendments of #19, acceptance 11), the
 # maintenance format (#24: writer admission, read and written, maintenance/1)
-# and the request-line format (#27: request/v1, read and written).
-UNCHANGED_DECLARATIVE = "f2895cb0c6145ded6b845e214ab21cc06ae5f68426d73cb71bfecadb66602f81"
+# and the request-line format (#27: request/v1, read and written). The digest also
+# covers the one declared text change of #29: the chat-config entry's `covers` now names the
+# optional `owner_accounts` key, with its read and write identifiers unchanged.
+UNCHANGED_DECLARATIVE = "d58c3a44135efadd8664821ae384a7eee024afbf886ad75a666f3a479281bbae"
 CHANGED_BY_19 = {"outbox", "delivery-records", "outbox-db", "outbox-authority", "boot-id", "tcp-sockets",
                  "maintenance", "request-line"}
 GENERATED = ("release", "source", "builder", "build_interpreter", "artifacts")

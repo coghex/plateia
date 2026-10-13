@@ -113,7 +113,11 @@ def decode(record):
         raise AdapterError("invalid attested account")
     if record.get("reply_to") is not None and not isinstance(record["reply_to"], str):
         raise AdapterError("invalid reply correlation")
-    return {**record, "account": account.lower() if account and TOKEN.fullmatch(account) else account,
+    # The comparison form is lowercase (IRC accounts are case-insensitive). The attested spelling is kept beside it,
+    # only when it differs, so a message with an already lowercase account has the payload it always had.
+    normalized = account.lower() if account and TOKEN.fullmatch(account) else account
+    kept = {"attested_account": account} if account is not None and normalized != account else {}
+    return {**{k: v for k, v in record.items() if k != "attested_account"}, "account": normalized, **kept,
             "routing": routing, "routing_error": routing_error, "kind": kind, "request": request, "body": body,
             "continued": continued}
 
@@ -279,7 +283,9 @@ class Inbox:
         payload = json.dumps(e, sort_keys=True)
         previous = self.db.execute("SELECT payload FROM messages WHERE msgid=?", (mid,)).fetchone()
         if previous:
-            if previous[0] != payload:
+            # A message stored before the attested spelling was kept has the payload without it.
+            legacy = json.dumps({k: v for k, v in e.items() if k != "attested_account"}, sort_keys=True)
+            if previous[0] not in (payload, legacy):
                 raise AdapterError("stable message identity has conflicting contents")
             return
         raw_key = e.get("tags", {}).get("+plateia/key")
@@ -390,41 +396,63 @@ class Inbox:
 
     @staticmethod
     def reply_evidence(found):
-        """One complete reply as retained: the attested account, and each fragment's nickname and message ID."""
+        """One complete reply as retained: the account compared, and each fragment's message ID, nickname and the
+        server-attested spelling of the account."""
         return {"account": found[1], "messages": [
-            {"msgid": m["msgid"], "nick": m["nick"] if isinstance(m.get("nick"), str) else None} for m in found[2]]}
+            {"msgid": m["msgid"], "nick": m["nick"] if isinstance(m.get("nick"), str) else None,
+             "attested_account": m.get("attested_account", m["account"])} for m in found[2]]}
 
-    def record_replays(self, messages):
+    def complete_resolutions(self, row, messages, position):
+        """Every complete, valid, correlated resolution by the manager or an owner account, in server order."""
+        references, found = self.references(row), []
+        for (account, _), group in self.resolution_groups(row, messages)[1].items():
+            if any(references(m) for m in group):
+                copies, conflict = complete_copies(group, references)
+                if not conflict:
+                    found += [(max(position[m["msgid"]] for m in copy), account, copy) for copy in copies]
+        return sorted(found, key=lambda one: one[0])
+
+    def selection(self, ident):
+        found = self.db.execute("SELECT reason FROM audit WHERE item=? AND operation='owner_selection'",
+                                (ident,)).fetchone()
+        return json.loads(found[0]) if found else None
+
+    def retain_selection(self, row, messages, position):
+        """Keep, when a question resolves, which resolution resolved it (only where owner accounts are listed).
+
+        Later evidence is judged against this record and never against groups that can still change, so a late
+        conflicting copy or a reply from the other account cannot change what was selected."""
+        if "owner_accounts" not in json.loads(row["context"]) or self.selection(row["id"]):
+            return
+        found = self.complete_resolutions(row, messages, position)
+        if found:
+            self.db.execute("INSERT INTO audit VALUES(?,?,?,?)", (self.clock(), row["id"], "owner_selection",
+                                                                  json.dumps(self.reply_evidence(found[0]), sort_keys=True)))
+
+    def record_replays(self, messages, position):
         """Retain, once, a later complete owner reply from another owner account to a resolved question.
 
-        The first complete, valid, correlated resolution in server order resolved it. A later one from a different
-        owner account changes nothing: it is audit evidence naming each reply's attested account, nickname and
-        message ID, and a repeated read or a restart finds it already recorded."""
-        position = {m["msgid"]: i for i, m in enumerate(messages)}
+        The resolution retained when the question resolved stays selected. A later complete reply from a different
+        owner account changes nothing: it is audit evidence naming each reply's account, nickname, message ID and
+        attested spelling, and a repeated read or a restart finds it already recorded."""
         resolved = self.db.execute("SELECT i.id FROM items i JOIN groups g USING(gid) WHERE i.status='resolved' "
                                    "AND instr(g.context,'\"owner_accounts\"')>0 ORDER BY i.rowid").fetchall()
         for (ident,) in resolved:
+            selected = self.selection(ident)
             row = self.row(ident)
-            owners, references = owner_accounts(json.loads(row["context"])), self.references(row)
-            complete = []
-            for (account, _), group in self.resolution_groups(row, messages)[1].items():
-                if any(references(m) for m in group):
-                    copies, conflict = complete_copies(group, references)
-                    if not conflict:
-                        complete += [(max(position[m["msgid"]] for m in copy), account, copy) for copy in copies]
-            complete.sort(key=lambda found: found[0])
-            if not complete or complete[0][1] not in owners:
+            owners = owner_accounts(json.loads(row["context"]))
+            if not selected or selected["account"] not in owners:
                 continue
-            for later in complete[1:]:
-                if later[1] in owners and later[1] != complete[0][1]:
-                    reason = json.dumps({"selected": self.reply_evidence(complete[0]), "replay": self.reply_evidence(later)},
-                                        sort_keys=True)
+            for later in self.complete_resolutions(row, messages, position):
+                if later[1] in owners and later[1] != selected["account"]:
+                    reason = json.dumps({"selected": selected, "replay": self.reply_evidence(later)}, sort_keys=True)
                     if not self.db.execute("SELECT 1 FROM audit WHERE item=? AND operation='owner_replay' AND reason=?",
                                            (ident, reason)).fetchone():
                         self.db.execute("INSERT INTO audit VALUES(?,?,?,?)", (self.clock(), ident, "owner_replay", reason))
 
     def reconcile(self):
         messages = [json.loads(r[0]) for r in self.db.execute("SELECT payload FROM messages ORDER BY rowid")]
+        position = {m["msgid"]: i for i, m in enumerate(messages)}
         acks = [json.loads(r[0]) for r in self.db.execute("SELECT payload FROM acks")]
         for ident in [r[0] for r in self.db.execute("SELECT id FROM items WHERE status NOT IN ('resolved','quarantined')")]:
             row = self.row(ident)
@@ -436,6 +464,7 @@ class Inbox:
             if resolved:
                 self.db.execute("DELETE FROM problems WHERE identity IN (?,?)", (ident, ident + ':resolution'))
                 self.db.execute("UPDATE items SET status='resolved' WHERE id=?", (ident,))
+                self.retain_selection(row, messages, position)
                 continue
             if pending_resolution:
                 self.problem(ident + ':resolution', 'incomplete or unframed resolution; automatic handling suspended')
@@ -466,7 +495,7 @@ class Inbox:
             if any({m["msgid"] for m in copy} <= accepted for copy in copies):
                 status = "waiting_owner" if decision["kind"] == "escalate" else "accepted"
             self.db.execute("UPDATE items SET status=? WHERE id=?", (status, ident))
-        self.record_replays(messages)
+        self.record_replays(messages, position)
 
     def refresh(self):
         self.read()
