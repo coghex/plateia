@@ -238,7 +238,7 @@ class AdmissionTests(ActivationCase):
         self.assertEqual(summary["state"], "staged")
         self.assertEqual(report["refused"], [])
         admitted = sorted(r[1] for r in report["results"] if r[0] == "admitted")
-        self.assertEqual(admitted, ["boot-id", "delivery-records", "designation-bootstrap", "outbox",
+        self.assertEqual(admitted, ["boot-id", "delivery-records", "designation-bootstrap", "maintenance", "outbox",
                                     "outbox-authority", "outbox-db", "tcp-sockets"])
         self.assertEqual(_staging.snapshot_tree(self.home), self.before)
 

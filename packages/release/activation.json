@@ -3,7 +3,7 @@
   "note": "What activate_release.py may do (PLT-14, #21; D-74, D-26, D-27). Exactly one format transition is admitted, from the D-19 baseline formats (staging.json's live_versions) to #19's formats, and only through an activation plan bound to one release, these targets, one state snapshot and this transition. A normal preflight still refuses it. No wildcard compatibility: every other format keeps the strict check. The targets are D-26's seven managed targets, by name, and no others.",
   "transition": {
     "name": "d19-baseline-to-19",
-    "covers": "#19's declared format delta: two write versions raised (old versions still read), its new authority interface and state, its two read-only host interfaces, and the bootstrap record PLT-14 hands the bridge",
+    "covers": "#19's declared format delta: two write versions raised (old versions still read), its new authority interface and state, its two read-only host interfaces, the bootstrap record PLT-14 hands the bridge, and writer admission's maintenance record (#23, #24; #21 amendment 4, G-3), which only the activation's fenced operation writes",
     "changed": {
       "outbox": {"live": "outbox/1", "read": ["outbox/1", "outbox/2"], "write": "outbox/2"},
       "delivery-records": {"live": "delivery-records/1", "read": ["delivery-records/1", "delivery-records/2"],
@@ -14,7 +14,8 @@
       "outbox-db": {"kind": "state", "read": ["outbox-db/1"], "write": "outbox-db/1"},
       "boot-id": {"kind": "wire", "read": ["boot-id/1"], "write": null},
       "tcp-sockets": {"kind": "wire", "read": ["tcp-sockets/1"], "write": null},
-      "designation-bootstrap": {"kind": "state", "read": ["designation-bootstrap/1"], "write": null}
+      "designation-bootstrap": {"kind": "state", "read": ["designation-bootstrap/1"], "write": null},
+      "maintenance": {"kind": "state", "read": ["maintenance/1"], "write": "maintenance/1"}
     }
   },
   "first_writes": {

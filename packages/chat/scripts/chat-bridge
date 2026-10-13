@@ -2305,9 +2305,11 @@ def ensure_authority():
 
 
 def main(argv=None):
+    """The bridge. `argv` is this launch's arguments (the command line passes its own); none means a launch with
+    no arguments."""
     global ACTIVATION, BOOTSTRAP_UNKNOWN
     try:
-        ACTIVATION = activation_digest(sys.argv[1:] if argv is None else argv)
+        ACTIVATION = activation_digest(argv or [])
     except BootstrapUnknown as err:  # nothing starts: not the authority, not the bridge's recovery
         log(f"ALERT designation bootstrap UNKNOWN: {err}; the bridge does not start")
         return 2
@@ -2332,4 +2334,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
