@@ -153,7 +153,9 @@ The manifest has no API version; the shared API slice (PLT-10) adds one.
 leaves unchanged stays `f2895cb0…`. PLT-14 (#21) adds only
 `designation-bootstrap` to the format names that digest excludes, and one
 marker row, `designation-bootstrap/1`, for a format the shipped code reads
-and never writes; the builder and its privacy scan are unchanged. Staging's
+and never writes; with #24's `maintenance` (below) the excluded names cover
+both, and the pin is unchanged. The builder and its privacy scan are
+unchanged. Staging's
 default compatibility check still refuses the release; only an activation
 plan's admission admits its format delta
 ([release_staging.md](release_staging.md#activation-plt-14-21)).
@@ -170,8 +172,13 @@ everything the shipped code reads or writes, so the shipped primitives are why
 `write` is not `null`. Like `designation-bootstrap`, `maintenance` joins the
 names the declaration pin excludes, with a marker row that asserts both
 capabilities (`maintenance.json`), and stays unadmitted by default staging: it
-is admitted only through an activation plan's transition, which is #21's
-rework and the owner's decision (the design's G-3). The `outbox` entry's path
+is admitted only through an activation plan's transition. #21's owner
+amendment 4 (2026-10-13; the design's G-3) adds it to that transition's
+`added` formats beside `designation-bootstrap/1`
+([release_staging.md](release_staging.md#the-one-admitted-transition)); it
+holds no work and is not a first-write boundary. The refusal sink is one:
+`outbox/2`'s first-write evidence becomes "`outbox.d/` or `refused.d/`
+exists". The `outbox` entry's path
 list gains `refused.d/` and `refused.d/tmp/`, holding unchanged `outbox/2`
 files, and `outbox-authority/1` gains a `maintenance` reply result and a
 `maintenance` object in the status reply. No version that is live today

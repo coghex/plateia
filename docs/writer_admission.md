@@ -21,10 +21,21 @@ side of this protocol is implemented by #24 (pull request #25): the record reade
 `L_adm` sections, per-transaction admission and the `maintenance` reply, the
 refusal sink and its import, the bridge's hold, exit 5, and the owning
 operation's primitives (`delivery_store.Owner`). The primitives live in the chat
-package, not in the controller: see section 10.2, "Placement". What stays
-pending is #21's rework against PR #22, under G-3: the controller's own
-decisions, the `full`-plus-binding admitted bridge start, and the activation
-and cutover themselves. Nothing here waives a gate or activates anything.
+package, not in the controller: see section 10.2, "Placement".
+
+**#21's side (owner amendment 4, 2026-10-13; APPROVE 6151464851).** The owner
+approved #21's contract changes (G-3), and PR #22 implements them: the
+controller drives `Owner` under its fenced journal (acquisition, the binding's
+boot, `full`, the release and the reconcile in `status`), keeps its own
+decisions (retirement, inhibition, targets and the bootstrap before `full`,
+the `release` command and its post-check, rollback's record check and its
+release after a boot change), and the bridge's `full`-plus-binding start is
+one operation-owned section (`delivery_store.Authority.start_section`). The
+APPROVE's four clarifications (K1 to K4) are part of that contract; see
+[release_staging.md](release_staging.md#activation-plt-14-21). Merge,
+deployment, the activation and the cutover stay separately gated, and G-1,
+G-2 and G-9 stay the owner's undecided gates. Nothing here waives a gate or
+activates anything.
 
 Every example uses invented data: projects `alpha` and `beta`, the owner
 `pat`, the assistant `sam`, the agent `alp-solver-2`, the activation operation
@@ -1067,6 +1078,12 @@ These block #21's live cutover. None blocks this design's completion.
 | **G-7. The protected-workflow stop condition** | At the window, the owner decides whether each protected workflow can tolerate its writes being held and a reboot (section 9.2). | **Yes**, at the window |
 | **G-8. Source recheck** | Before the cutover, the inventory and citations are rechecked against PR #22's final head and master's chat package, if either moved (section 1). | No |
 | **G-9. Rollback mode** | The owner chooses report-only or automatic rollback (section 12). | **Yes** |
+
+**Gate status, 2026-10-13.** G-3 is approved (#21's owner amendment 4 and its
+APPROVE; D-75) and implemented in PR #22, which is not yet merged. G-4 is
+closed (#24). G-5: the chat package's part is merged (#24, pull request #25);
+#21's part is PR #22, pending its review and merge. G-1, G-2, G-6, G-7, G-8 and
+G-9 stay open, and #21's live cutover stays blocked until they close.
 
 ## 15. Test designs (invented fixtures)
 

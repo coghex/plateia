@@ -2560,14 +2560,67 @@ implement the design; #24 implements the chat package's side. #24's canonical re
 The design is [writer_admission.md](writer_admission.md). It proposes
 changes to #19's and #21's contracts, enumerated there (its sections 9.2, 10
 and 11) and summarized in [chat_outbox_state.md](chat_outbox_state.md)
-section 2.4.6 and [release_staging.md](release_staging.md#writer-admission-23-proposed-changes).
+section 2.4.6 and [release_staging.md](release_staging.md#writer-admission-23-24-integrated-by-amendment-4).
 #19's changes (its section 11) are implemented by #24, as above. #21's
-(its sections 9.2, 10 and 12) are not in force until #21's rework is approved
-(G-3). Its
+(its sections 9.2, 10 and 12) are approved by the owner's decision of
+2026-10-13 below (G-3), and take effect with PR #22's merge. Its
 blocking gates (its section 14) include two owner decisions the design does
 not make: retiring legacy writers by a reboot after binding (G-1), and an
 owner-authorized inventory and inhibition of launchers outside the managed
 targets (G-2). Until both close, #21's cutover stays blocked.
+
+**Owner decision, 2026-10-13: integrate writer admission into #21 (#21's owner
+amendment 4; its APPROVE, 2026-10-13).** The owner approved a bounded rework of
+PR #22 that integrates writer admission into #21's activation controller, and
+with it #21's contract changes the design lists as G-3:
+
+- `maintenance/1` joins the one admitted transition's `added` formats, and
+  `outbox/2`'s first-write evidence becomes "`outbox.d/` or `refused.d/`
+  exists";
+- `activate`'s quiet-writer step is replaced by acquisition (`draining`, the
+  drain, `partial`) and, after the owner's reboot, by retirement and
+  inhibition before `full`; "every designated account's producers must be
+  tracked" is kept as a precondition, and the A3 test row is replaced (its
+  untracked-producer case kept);
+- rollback's eligibility check reads "the record is this operation's and
+  still held" in place of the quiet-writer check, beside the unchanged
+  first-write evidence; rollback keeps the record until the boot has changed
+  since the restore, then releases it, and a refused write meanwhile is a
+  first write, kept for the owner;
+- a new `release` command; `postcheck` adds the record's checks, `status`
+  reports the record and the reconcile, and `plan` refuses a state holding a
+  record or a refusal sink;
+- "`activate` starts, stops and restarts nothing" is kept: the owner stops the
+  legacy bridge before binding and reboots after it, and the bound bridge
+  waits for `full`;
+- D-74's stop condition becomes "a protected owner workflow that cannot
+  tolerate its chat writes being held for the maintenance window, or a
+  reboot".
+
+Its APPROVE adds four binding clarifications. **K1:** while the operation's own
+bridge holds or serves read-only status, the maintenance transitions and
+`release` are permitted, target rebinding and the pre-migration reversal keep
+their running-bridge restrictions, and unexpected or ambiguous bridge
+ownership still blocks mutation. **K2:** a release after a successful
+activation repeats the post-checks; a release after a completed pre-write
+rollback verifies the exact restored targets, the retained record's
+ownership, a known boot change since the restore and the continued absence of
+first-write evidence, and a refusal-sink write blocks it and stays for the
+owner. **K3:** the bridge's matching-`full` start is one operation-owned
+section, holding the admission lock shared through admission, the bootstrap's
+classification, the start, the socket's binding and a failed start's cleanup,
+admitting no ordinary mutation, chat connection, import or flush. **K4:** the
+controller's fence for `Owner` keeps intent, progress, outcome, the pending
+step and the latest record evidence durably across commands, and crash
+settlement verifies the published file's identity and durability, never
+adopting matching bytes or a matching operation alone.
+
+The amendment adds no automatic rollback and changes no rollback trigger.
+Merge, deployment, the live activation and the cutover stay separately gated;
+retirement by reboot (G-1), the unmanaged-launcher inventory (G-2) and the
+rollback mode (G-9) stay the owner's undecided gates. The rework also fixes
+PR #22's four remaining review blockers (code review 6112483129). The
+contract is [release_staging.md](release_staging.md#activation-plt-14-21).
 
 ## Open questions
 
