@@ -198,8 +198,14 @@ request elsewhere are pointers to it, not new requests.
 - **The chain.** The envelope carries the original scoped grant, the chain
   of provenance (owner, then assistant, then manager), and exactly one
   intended decision-maker.
-- **Proof.** Each link is a verified post, checked as `cited_authority`
-  checks today. A sender's nick or label is never proof.
+- **Proof.** The verification anchors are the owner's existing written
+  policy grant and the server-verified assistant's relay post. That relay
+  is checked as `cited_authority` checks today.
+  - Later hops, such as a manager handing work to a worker, cite that relay
+    and keep its exact scope.
+  - The owner's original instruction may be in a client outside chat. Its
+    reference is audit context, not an IRC-verifiable link.
+  - A sender's nick or label is never proof.
 - **Revocation and supersession.** A later verified post from the same
   authority can revoke or supersede the grant. Gates attached to the
   original grant, such as a merge or live-action gate, travel with it.
@@ -517,8 +523,11 @@ The design fixes enforcement, not amounts. It affects COLLAB-4.
   - fixture round-trips, and a refusal for each invalid form;
   - existing `card-move/v1` examples parse unchanged;
   - an out-of-scope request is refused;
-  - a request relayed by a verified assistant is accepted exactly like one
-    the owner posted directly;
+  - a request relayed by a verified assistant gets the same validation
+    outcome regardless of the owner's device, within the existing grant,
+    the request's bounds and the owner-only gates. This is device
+    neutrality, not identity substitution: the relay remains the
+    assistant's post;
   - a trace reference alone never authorizes anything.
 - **Out of scope:** persistence, routing, skills.
 - **Open questions:** Q-5, Q-6
