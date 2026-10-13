@@ -555,7 +555,10 @@ formats (`live_versions` in `staging.json`, unchanged) to:
 - writer admission's record, `maintenance/1`, read and written (amendment 4,
   gate G-3). Only the activation's fenced operation writes it, through the
   chat package's `delivery_store.Owner`; it holds no work and is not a
-  first-write boundary.
+  first-write boundary;
+- #27's request line, `request-line` (`request/v1`), read and written (owner
+  amendment 6, 2026-10-13). It is a library format that no running tool
+  uses yet; it holds no state and is not a first-write boundary.
 
 `stage_release.admission(plan, release)` returns an admission only for an
 activation plan (`plateia-activation-plan/1`) whose digest holds and which is
