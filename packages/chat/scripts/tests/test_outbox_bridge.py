@@ -885,6 +885,54 @@ class BootstrapRootBindingTests(BootstrapCase):
         self.stop()
         self.unswap(moved[0])
 
+    def test_a_database_replaced_before_its_identity_is_captured_is_unknown(self):
+        """PR #22 review 2 (6154707381), finding 3: the database is bound to the file SQLite opened. Swapping
+        outbox.db (and its sidecars) for another database while startup reads the authority epoch, before any
+        identity is captured, is UNKNOWN and commits nothing into either file."""
+        d = self.publish(self.record(["alp-solver-2"]))
+        other = self.state.parent / "other-invented.db"
+        con = sqlite3.connect(other)
+        con.execute("CREATE TABLE invented (x)")
+        con.commit()
+        con.close()
+        real_meta, swapped = self.ds.Store.meta, []
+
+        def meta(store, name):
+            if name == "authority_epoch" and not swapped:
+                swapped.append(1)
+                for suffix in ("", "-wal", "-shm"):
+                    path = self.state / f"outbox.db{suffix}"
+                    if path.exists():
+                        path.rename(self.state / f"displaced.db{suffix}")
+                other.rename(self.state / "outbox.db")
+            return real_meta(store, name)
+        with mock.patch.object(self.ds.Store, "meta", meta):
+            authority = self.launch(d)
+        self.assertTrue(swapped)
+        self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+        self.assertFalse(authority.running)
+        self.stop()
+        named = sqlite3.connect(f"file:{self.state / 'outbox.db'}?mode=ro", uri=True)
+        try:
+            tables = {r[0] for r in named.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            named.close()
+        self.assertEqual(tables, {"invented"}, "nothing committed into the database at the path")
+        displaced = self.committed_in(self.state / "displaced.db")
+        self.assertTrue(displaced in (None, {}) or "designation_bootstrap" not in displaced,
+                        f"nothing committed into the displaced database: {displaced}")
+
+    def committed_in(self, db):
+        if not db.exists():
+            return None
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            if con.execute("SELECT 1 FROM sqlite_master WHERE name = 'meta'").fetchone() is None:
+                return {}
+            return dict(con.execute("SELECT name, value FROM meta").fetchall())
+        finally:
+            con.close()
+
 
 class BootstrapUnreadableMetaTests(BootstrapCase):
     """Code review 6112483129, finding 3: with a valid record and launch digest, a database whose bootstrap

@@ -14,6 +14,8 @@ import shutil
 import sys
 import threading
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import _staging
 import _support
@@ -664,6 +666,111 @@ class ReviewOneTests(AdmissionCase):
             self.do_release(path, crash=replace)
         self.assertEqual((self.state / "maintenance.json").read_text(), foreign, "the foreign record is kept")
         self.assertNotIn("released", self.kinds())
+
+
+
+class ReviewTwoTests(AdmissionCase):
+    """PR #22 review 2 (6154707381), the controller's three findings, each reproduced at 604aaba first."""
+
+    def at_temporary(self, match, act):
+        """Patch write_fd: once the temporary of the entry whose bytes `match` has been written, `act` runs: the
+        window between preparing the temporary and the rename."""
+        real, done = activate_release.write_fd, []
+
+        def write_fd(fd, data):
+            real(fd, data)
+            if not done and match(data):
+                done.append(1)
+                act()
+        return mock.patch.object(activate_release, "write_fd", write_fd), done
+
+    def chatlib(self):
+        return self.skills / "chat/scripts/chatlib.py"
+
+    # 1. The final mutation boundary: after the temporary is prepared, immediately before the replacement.
+    def test_an_edit_while_the_temporary_is_prepared_is_kept_when_binding_and_restoring(self):
+        edit = b"# the owner's edit, made while the temporary was prepared\n"
+        for phase in ("binding", "restoring"):
+            with self.subTest(phase=phase):
+                self.fresh()
+                original = self.chatlib().read_bytes()
+                if phase == "binding":
+                    plan, path = self.prepared()
+                    match = lambda data: b"plateia handoff layer" in data and b"chatlib.py" in data  # noqa: E731
+                else:
+                    plan, path = self.bound()
+                    match = lambda data: data == original  # noqa: E731
+                patch, done = self.at_temporary(match, lambda: open(self.chatlib(), "ab").write(edit))
+                with patch, self.assertRaisesRegex(Refused, "changed just before it was written"):
+                    self.run_activate(path) if phase == "binding" else self.rollback(path)
+                self.assertTrue(done)
+                self.assertTrue(self.chatlib().read_bytes().endswith(edit), "the edit is kept")
+
+    def test_a_refused_write_while_a_restore_is_prepared_stops_that_restore(self):
+        original = self.chatlib().read_bytes()
+        plan, path = self.bound()
+        bound = self.chatlib().read_bytes()
+        patch, done = self.at_temporary(lambda data: data == original, lambda: _staging.write(
+            self.state / "refused.d/1-invented.json", "{}\n", 0o600))
+        with patch, self.assertRaisesRegex(Refused, "repair or roll-forward"):
+            self.rollback(path)
+        self.assertTrue(done)
+        self.assertEqual(self.chatlib().read_bytes(), bound, "not restored after the first write")
+
+    # 2. Release eligibility, checked again after the durable intent, immediately before the unlink.
+    def test_a_target_changed_at_the_release_intent_keeps_maintenance(self):
+        plan, path = self.activated()
+        self.serve(plan)
+        skill = self.skills / "chat/SKILL.md"
+
+        def edit(record):
+            if record["kind"] == "maint-intent" and record["step"].get("step") == "release":
+                skill.write_text(skill.read_text() + "\nan edit at the intent\n")
+        with self.assertRaisesRegex(Refused, "release refused"):
+            self.do_release(path, crash=edit)
+        self.assertEqual(self.maintenance()["state"], "full", "maintenance is kept")
+        self.assertNotIn("released", self.kinds())
+
+    def test_a_sink_write_at_the_rollback_release_intent_keeps_maintenance(self):
+        plan, path = self.bound()
+        self.rollback(path)
+        self.ops.reboot()
+
+        def sink(record):
+            if record["kind"] == "maint-intent" and record["step"].get("step") == "release":
+                _staging.write(self.state / "refused.d/1-invented.json", "{}\n", 0o600)
+        with self.assertRaisesRegex(Refused, "release refused"):
+            self.do_release(path, crash=sink)
+        self.assertEqual(self.maintenance()["state"], "partial", "maintenance is kept")
+        self.assertTrue((self.state / "refused.d/1-invented.json").exists(), "kept, never deleted")
+
+    def test_a_target_changed_at_the_full_intent_never_reaches_full(self):
+        """The same class, for full: its checks run again after the durable intent, before the replacement."""
+        plan, path = self.bound()
+        self.ops.reboot()
+        skill = self.skills / "chat/SKILL.md"
+
+        def edit(record):
+            if record["kind"] == "maint-intent" and (record["step"].get("to") or {}).get("state") == "full":
+                skill.write_text(skill.read_text() + "\nan edit at the full intent\n")
+        refused = self.run_activate(path, crash=edit)["maintenance"]
+        self.assertIn("full is refused", refused["refused"])
+        self.assertEqual(self.maintenance()["state"], "partial")
+        self.assertNotIn("full", self.kinds())
+
+    # 4. The journaled seal is verified before a selected operation advances to full.
+    def test_seal_drift_after_binding_refuses_full_and_is_never_resealed(self):
+        plan, path = self.bound()
+        site = next((Path(plan["staged_release"]) / "env").glob("lib/python*/site-packages"))
+        scripts = site / "plateia_chat/scripts"
+        scripts.chmod(0o755)
+        self.addCleanup(scripts.chmod, 0o755)
+        self.ops.reboot()
+        refused = self.run_activate(path)["maintenance"]
+        self.assertIn("seal", refused["refused"])
+        self.assertEqual(self.maintenance()["state"], "partial")
+        self.assertNotIn("full", self.kinds())
+        self.assertEqual(scripts.stat().st_mode & 0o777, 0o755, "never resealed")
 
 
 if __name__ == "__main__":

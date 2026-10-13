@@ -51,6 +51,7 @@ the published plan (D-74).
 """
 import argparse
 import contextlib
+import contextvars
 import datetime
 import errno
 import fcntl
@@ -905,6 +906,8 @@ class SealedRootFS:
 
     def __init__(self, base, plan, fence, store):
         self.base, self.plan, self.fence, self.store = base, plan, fence, store
+        self.before_release = None  # the release's eligibility, run again immediately before its unlink
+        self.before_full = None  # full's checks, run again immediately before full replaces the record
 
     def __getattr__(self, name):
         return getattr(self.base, name)
@@ -954,11 +957,17 @@ class SealedRootFS:
     def replace(self, src, dst):
         with self._root() as root:
             self._expected(root, self._name(dst))
+            if self._name(dst) == MAINT_FILE and self.before_full is not None \
+                    and ((self.fence.pending() or {}).get("to") or {}).get("state") == "full":
+                self.before_full()
             os.replace(self._name(src), self._name(dst), src_dir_fd=root, dst_dir_fd=root)
 
     def unlink(self, path):
         with self._root() as root:
             self._expected(root, self._name(path))
+            if self._name(path) == MAINT_FILE and self.before_release is not None \
+                    and (self.fence.pending() or {}).get("step") == "release":
+                self.before_release()
             os.unlink(self._name(path), dir_fd=root)
 
     def sync_dir(self, path):
@@ -1089,6 +1098,16 @@ def targets_problems(journal_root_fd, mine, paths, layout, d):
     return problems
 
 
+def seal_problems(journal, plan):
+    """The journaled seal, verified read-only (identities, modes, owners and access metadata), never resealed
+    (PR #22 review 2, finding 4)."""
+    try:
+        seal_release(journal, plan, read_only=True)
+    except Refused as e:
+        return [f"the release seal: {e}"]
+    return []
+
+
 RETIREMENT = "retirement unverified"
 
 
@@ -1109,6 +1128,7 @@ def full_problems(journal, plan, ops, store, probes, layout, paths, d):
     problems += inhibition_problems(ops.inhibition() if hasattr(ops, "inhibition") else None)
     mine = operation_state(journal.records, plan["operation"])
     problems += targets_problems(journal.root_fd, mine, paths, layout, d)
+    problems += seal_problems(journal, plan)
     if mine["digest"] != d:
         problems.append("the bootstrap digest is not journaled as this plan's")
     else:
@@ -1149,7 +1169,7 @@ def take_full(journal, plan, ops, layout, paths, d):
     boot = probes.boot()
     if rec.state == "full":
         changed = targets_problems(journal.root_fd, operation_state(journal.records, plan["operation"]), paths,
-                                   layout, d)
+                                   layout, d) + seal_problems(journal, plan)
         if not changed:
             return {"state": "full", "next": "postcheck, then release"}
         with owner_step(store, "writing the record back to partial"):
@@ -1168,8 +1188,12 @@ def take_full(journal, plan, ops, layout, paths, d):
         only_retirement = all(p.startswith(RETIREMENT) for p in found)
         return {"state": rec.state, "refused": "full is refused: " + "; ".join(found),
                 "next": "reboot" if only_retirement else "resolve these, then activate again"}
-    with owner_step(store, "writing full"):
-        done = owner.advance("full", boot=boot, legacy="retired-and-inhibited", binding=full_binding(plan, d))
+    owner.fs.before_full = check  # and once more after the durable intent, immediately before the replacement
+    try:
+        with owner_step(store, "writing full"):
+            done = owner.advance("full", boot=boot, legacy="retired-and-inhibited", binding=full_binding(plan, d))
+    except Refused as e:
+        return {"state": "partial", "refused": f"full is refused: {e}", "next": "resolve this, then activate again"}
     if not landed(done):
         return {"state": "partial", "refused": "full is refused: writing full did not complete within its deadline "
                                                "(a writer's section is still open)", "next": "activate again"}
@@ -1683,15 +1707,36 @@ def summary_of(state):
                    for k, v in sorted(state.items())})
 
 
+FINAL_CHECK = contextvars.ContextVar("activate_release_final_check", default=None)
+
+
 def write_entry_at(fd, name, entry, tmp):
     """One entry made `entry` relative to its pinned directory, atomically: a
     temporary created exclusively, synced, renamed into place; then the
-    directory synced. Never follows a link."""
+    directory synced. Never follows a link. The caller's final check
+    (FINAL_CHECK) runs at the final mutation boundary, after the temporary is
+    prepared and immediately before the rename or removal (PR #22 review 2,
+    finding 1); if it raises, the temporary is removed and nothing is
+    replaced."""
+    ready = FINAL_CHECK.get()
+
+    def final():
+        if ready is None:
+            return
+        try:
+            ready()
+        except BaseException:
+            if entry is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp, dir_fd=fd)
+            raise
     if entry is None:
+        final()
         with contextlib.suppress(FileNotFoundError):
             os.unlink(name, dir_fd=fd)
     elif "link" in entry:
         os.symlink(entry["link"], tmp, dir_fd=fd)
+        final()
         os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
     else:
         efd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, entry["mode"], dir_fd=fd)
@@ -1701,6 +1746,7 @@ def write_entry_at(fd, name, entry, tmp):
             os.fsync(efd)
         finally:
             os.close(efd)
+        final()
         os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
     os.fsync(fd)
 
@@ -1757,8 +1803,19 @@ def apply_entries(journal, plan, t, path, backup, writes, kind, guard=None):
                             "from": entry_digest(before), "to": entry_digest(after)})
             if guard is not None:
                 guard()
-            unchanged(fd, name, before, rel)  # after the durable intent and the guard, immediately before the write
-            write_entry_at(fd, name, after, tmp)
+            unchanged(fd, name, before, rel)  # after the durable intent and the guard, before the temporary
+
+            def ready(name=name, before=before, rel=rel):
+                """At the final boundary, with the temporary prepared: the guard (the binding's, or rollback's
+                eligibility with its first-write evidence) and the entry and its directory, again."""
+                if guard is not None:
+                    guard()
+                unchanged(fd, name, before, rel)
+            token = FINAL_CHECK.set(ready)
+            try:
+                write_entry_at(fd, name, after, tmp)
+            finally:
+                FINAL_CHECK.reset(token)
             journal.append({"op": op, "kind": "entry-bound" if kind == "binding" else "entry-restored",
                             "target": t["name"], "rel": rel, "digest": entry_digest(after)})
             if not still_there(container_of(t, path), fd, follow=follow):
@@ -2289,6 +2346,20 @@ def rollback_release_problems(journal, plan, ops, store, fence, spec_path):
     return problems
 
 
+def release_problems(report):
+    """What a post-check report says blocks a release after an activation."""
+    problems = [f"{name}: {value}" for name, value in report["checks"] if value not in ("bound", "matches")]
+    if report["bridge"] != "expected":
+        problems.append(f"the bridge: {report['bridge']}")
+    elif not report["authority_serving"]:
+        problems.append("no live answer from the bridge's authority")
+    if report["maintenance"]["problem"]:
+        problems.append(report["maintenance"]["problem"])
+    if not report["ok"] and not problems:
+        problems.append("the post-check does not pass")
+    return problems
+
+
 def release(plan_path, ops, spec_path=None, crash=None):
     """End maintenance: unlink the record, the moment every writer is admitted
     again (writer admission 4.7). After a completed activation it is refused
@@ -2312,28 +2383,23 @@ def release(plan_path, ops, spec_path=None, crash=None):
         if pending is not None and pending.get("step") != "release":
             raise Refused("release refused for now: a maintenance step is pending in the journal; activate settles "
                           "it first; nothing was changed")
-        # A pending release whose unlink already landed only records its completion; one whose record is still
-        # there repeats every check first (PR #22 review 1, finding 2).
-        if pending is None or store.read_maintenance(owner.paths).present:
-            if mine["rolled_back"]:
-                problems = rollback_release_problems(journal, plan, ops, store, fence, spec_path)
-            elif mine["selected"]:
-                report = postcheck(plan_path, ops, spec_path)
-                problems = [f"{name}: {value}" for name, value in report["checks"] if value not in ("bound", "matches")]
-                if report["bridge"] != "expected":
-                    problems.append(f"the bridge: {report['bridge']}")
-                elif not report["authority_serving"]:
-                    problems.append("no live answer from the bridge's authority")
-                if report["maintenance"]["problem"]:
-                    problems.append(report["maintenance"]["problem"])
-                if not report["ok"] and not problems:
-                    problems.append("the post-check does not pass")
-            else:
-                raise Refused("release refused: the activation is not complete; finish it, or roll it back first; "
-                              "nothing was changed")
+        if not (mine["rolled_back"] or mine["selected"]):
+            raise Refused("release refused: the activation is not complete; finish it, or roll it back first; "
+                          "nothing was changed")
+
+        def eligible():
+            """The post-check after an activation, or K2's checks after a rollback; refused with the record kept."""
+            problems = rollback_release_problems(journal, plan, ops, store, fence, spec_path) if mine["rolled_back"] \
+                else release_problems(postcheck(plan_path, ops, spec_path))
             if problems:
                 raise Refused("release refused: " + "; ".join(problems) + ". The record stays and keeps every "
-                              "writer refused; nothing was changed")
+                              "writer refused; nothing more was changed")
+        # A pending release whose unlink already landed only records its completion; one whose record is still
+        # there repeats every check first (PR #22 review 1, finding 2). And the checks run once more after the
+        # durable intent, immediately before the unlink (PR #22 review 2, finding 2).
+        if pending is None or store.read_maintenance(owner.paths).present:
+            eligible()
+        owner.fs.before_release = eligible
         with owner_step(store, "releasing maintenance"):
             owner.release()
         journal.append({"op": plan["operation"], "kind": "released"})

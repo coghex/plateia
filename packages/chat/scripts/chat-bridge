@@ -2112,6 +2112,24 @@ class PinnedRoot:
                 from None
         return st.st_dev, st.st_ino
 
+    def opened(self, name):
+        """The (device, inode) of `name` in the pinned root, only if this process has that very file open: the
+        database SQLite opened, not one put at its name since (PR #22 review 2, finding 3). The open descriptors
+        are listed from /dev/fd; anything that can't be shown is BootstrapUnknown."""
+        ident = self.identity_of(name)
+        try:
+            fds = os.listdir("/dev/fd")
+        except OSError as err:
+            raise BootstrapUnknown(f"this process's open files can't be listed ({err.strerror or err})") from None
+        for entry in fds:
+            try:
+                st = os.fstat(int(entry))
+            except (OSError, ValueError):
+                continue
+            if stat.S_ISREG(st.st_mode) and (st.st_dev, st.st_ino) == ident:
+                return ident
+        raise BootstrapUnknown(f"{name} at the validated state root is not the database this start opened")
+
     def check(self, paths, *names):
         """The state path still resolves to the validated realpath, that
         realpath is still the pinned directory itself (not a link to it), and
@@ -2219,7 +2237,7 @@ class BootstrapStore(delivery_store.Store):
         if name == "authority_epoch" and self.bootstrap is None:
             if self.root is not None:  # inside the opening transaction, before any commit
                 self.root.check(self.paths, "outbox.db")
-                self.database = self.root.identity_of("outbox.db")
+                self.database = self.root.opened("outbox.db")
             self.bootstrap = self.classify_meta()
             super().set_meta(name, value)
             if self.root is not None:
@@ -2227,7 +2245,7 @@ class BootstrapStore(delivery_store.Store):
                 # more, after the bootstrap's designations and M, immediately before COMMIT. Drift raises, and
                 # the transaction rolls back (PR #22 review 1, finding 5).
                 self.root.check(self.paths, "outbox.db")
-                if self.root.identity_of("outbox.db") != self.database:
+                if self.root.opened("outbox.db") != self.database:
                     raise BootstrapUnknown("the database was replaced during the bootstrap's application")
             return
         super().set_meta(name, value)
