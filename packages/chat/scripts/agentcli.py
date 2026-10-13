@@ -30,6 +30,8 @@ def notify(record, text, kind='status'):
         chatlib.post(channel, message, record['name'], cfg, cont=tag, origin='notify')
     except chatlib.Refused as err:  # the server refused it: retrying can't help; the bridge dead-letters it
         print(f'pchat agent: notice refused: {err}', file=sys.stderr)
+    except chatlib.Held as err:  # refused for maintenance and kept in the sink: never silent (writer admission 5.1)
+        print(f'pchat agent: notice held: {err}', file=sys.stderr)
     except chatlib.Queued:  # durably queued, or its rest handed off: the bridge posts it
         pass
     except (OSError, chatlib.ChatError) as err:  # nothing could be queued: say so, as before

@@ -608,19 +608,37 @@ activate_release status --root <private dir>
        directories are sealed: the staged environment's
        `site-packages/plateia_chat` package directory and its `scripts/`
        subdirectory. Each is opened through pinned descriptors.
-       - **Before sealing,** each directory's baseline must be verified:
-         mode exactly 0755, owned by this user, and its identity (device and
-         inode) and access metadata (ACL and flags) readable. A stricter,
-         different or unknown mode, or any ambiguity about identity or
-         access, refuses, and nothing changes.
-       - **The originals are recorded.** The controller records each
-         directory's original mode, owner and identity, then sets that
-         directory's mode bits to 0555 and nothing else: ownership, ACLs,
-         flags and every parent's permissions are unchanged. It journals
+       - **Before sealing,** both directories' baselines are verified before
+         either changes:
+         - mode exactly 0755, and owned by this user;
+         - a definite identity (device and inode);
+         - access metadata that is readable and can't defeat the seal.
+
+         Any extended ACL refuses: it could grant writes a 0555 mode doesn't,
+         and on Linux the mode change would rewrite its mask. On macOS any
+         file flag refuses; on Linux an immutable or append-only flag does.
+         A stricter, different or unknown mode, an unjournaled 0555, another
+         owner, or any ambiguity about identity or access refuses, and
+         nothing changes.
+       - **The originals are recorded.** The controller journals each
+         directory's original mode, owner, identity and access metadata
+         (`release-seal-baseline`) before the first change. It then sets
+         each directory's mode bits to 0555 with `fchmod` on its pinned
+         descriptor, and nothing else: ownership, ACLs, flags and every
+         parent's permissions are unchanged. Finally it journals
          `release-sealed` with the recorded originals.
        - **Resume** accepts an existing 0555 only for this operation's
-         journaled seal, with matching identities. Otherwise the state is
-         unknown, and the activation stops.
+         journaled seal, with matching identities. A crash between the
+         baseline and `release-sealed` resumes from the journaled originals.
+         Otherwise the state is unknown, the activation stops, and no mode
+         is restored.
+       - **A sealed release that drifted blocks.** Resume, reconciliation and
+         every post-check compare both directories with the journaled seal:
+         the identities, the 0555 modes, the owners, the ACLs and the flags.
+         A mode put back, or a directory replaced even by one with identical
+         contents, blocks completion, and is never sealed again silently. The
+         stager's inventory records directories only as `["dir"]`, so it
+         can't see this.
        - **Rollback keeps the seal,** because the release is retained (A6). A
          later cleanup, which needs its own authorization, restores the
          recorded modes before removing anything.
@@ -728,8 +746,31 @@ activate_release status --root <private dir>
 
 ### Activation tests
 
-`test_activate.py` (54 tests) and `test_cutover.py` (1 end-to-end test), all
-on invented homes. The slot-2 review of PR #22 added its nine findings, each
+`test_activate.py` (63 tests) and `test_cutover.py` (1 end-to-end test), all
+on invented homes. The guarded seal has its own tests (`GuardedSealTests`):
+
+- a seal from 0755, with the originals journaled and owners, ACLs, flags and
+  parents unchanged;
+- each refused baseline, with the first directory left unchanged when the
+  second is invalid: 0700, an unjournaled 0555, 0775, 0750, another owner,
+  an ACL that could grant writes, an unreadable ACL, and an ambiguous
+  identity. On macOS this includes a real ACL, shown first to let a write
+  through a 0555 directory;
+- resume after the seal, and an unjournaled 0555 (unknown, nothing
+  restored);
+- a crash before and after each `fchmod` and after `release-sealed`, which
+  resumes from the journaled originals, and a directory replaced mid-seal
+  (unknown);
+- drift that blocks and is never resealed: a mode put back, and a directory
+  replaced with identical contents;
+- rollback keeping the seal;
+- real use with bytecode deliberately enabled: no `-B`, no
+  `PYTHONDONTWRITEBYTECODE`, no cache prefix. Imports try to write caches
+  in both sealed directories, none appears, and the strict post-check
+  passes. An unsealed control does get `__pycache__`, and then fails
+  verification.
+
+The slot-2 review of PR #22 added its nine findings, each
 reproduced before its fix, and a sweep of the same classes:
 
 - the state root moved, removed or unreadable;
@@ -765,7 +806,8 @@ The earlier tests cover:
   record, digest, option and manifest mismatches fail it; an unexpected or
   unknown bridge blocks; the expected bridge allows only a read-only
   reconcile.
-- **Crashes and races (A6):** a crash after every journal record, and inside
+- **Crashes and races (A6):** a crash after the first and the last record of
+  every kind the activation journals, and inside
   a target write, resumes to the same bindings; a changed plan can't resume;
   a concurrent upgrader is refused; a target changed or swapped for a symlink
   mid-activation blocks; the staged release and the 0600 backups are kept.
@@ -793,6 +835,54 @@ The earlier tests cover:
   - a long post whose last confirmation times out, never reposted;
   - a restart that changes nothing;
   - rollback refused afterwards, and the post-check passing.
+
+### Writer admission (#23): proposed changes
+
+[writer_admission.md](writer_admission.md) designs the write-admission barrier
+this activation needs, in place of observing that writers are quiet (the
+owner's decision of 2026-10-11; D-75 in [plateia_design.md](plateia_design.md)).
+Nothing in this section is in force: it lists what the design would change in
+this contract, which applies only once the owner approves the implementation.
+The contract above stands as written until then.
+
+**The order is kept.** Seal, then the writer step, then publish the bootstrap
+record, journal D, and only then bind (steps 2, 3, 5 and 6 above). The writer
+step becomes **maintenance acquisition**: the controller writes a durable
+maintenance record (`$CHAT_STATE/maintenance.json`, `maintenance/1`) naming
+this operation and the boot, drains every new-release writer through the
+admission lock, and reaches the intermediate state `partial`. Publishing the
+bootstrap record, journaling D and binding are operation-owned writes
+admitted in `partial`. After binding, the owner reboots (the proposed
+retirement step, an owner decision: the design's gate G-1); the resumed
+`activate` verifies the boot changed since binding (retirement) and that no
+legacy writer can start (inhibition), and only then writes `full`. Only under
+`full` may the bound bridge make its bootstrap commit, the first
+`outbox-db/1` write. A new `release` command repeats the post-check's checks
+and ends maintenance. The design's section 9.1 gives the whole sequence.
+
+**Each quiet-writer clause** (the design's section 9.2):
+
+| Clause | Disposition |
+| --- | --- |
+| Step 3, "The old writers are quiet" | **Replaced** by acquisition (new-release writers) and by retirement and inhibition before `full` (legacy writers). The 15-minute `observed_at` evidence is no longer a gate. "Every designated account's producers must be tracked" is **kept** as an extra precondition. "Nothing is interrupted, restarted or killed" is **kept** for `activate`; the owner's reboot is the retirement step. |
+| The A3 test row (quiet writers) | **Replaced** by the design's tests 1, 10, 11, 12 and 13; its untracked-producer case is **kept**. |
+| "`activate` starts, stops and restarts nothing. The operator restarts the bridge at an acknowledged checkpoint" | **Amended.** The first sentence is kept. The owner stops the legacy bridge before binding and reboots after it; launchd then starts the bound bridge, which waits for `full`. The running-bridge rules are kept. |
+| D-74's stop condition, a protected workflow "that cannot be shown to be quiet" | **Amended** to a protected workflow that cannot tolerate its chat writes being held for the window, or a reboot. It still stops for an owner decision. |
+
+**The post-check's status request** stays answerable while every ordinary
+write is refused: `status` writes nothing and is answered in every state. The
+bridge's status snapshot is deferred while maintenance is held, which the
+post-check never relies on.
+
+**The maintenance format's admission.** The chat package reads
+`maintenance/1`, and (since #24) ships the owning operation's primitives, which
+alone write it, so the format is declared both read and written; ordinary
+writers only read it. Default staging refuses it, so it would join the one
+admitted transition's `added` formats beside `designation-bootstrap/1`. It holds no work and is not a first-write boundary.
+The design's refusal sink, `refused.d/` (`outbox/2` files), would be one:
+`outbox/2`'s first write becomes "`outbox.d/` or `refused.d/` exists".
+`plan` would refuse a state that already holds either. Rollback (report-only
+or automatic) remains the owner's open gate, and blocks the cutover.
 
 ## Evidence
 

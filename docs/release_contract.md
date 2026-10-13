@@ -158,6 +158,25 @@ default compatibility check still refuses the release; only an activation
 plan's admission admits its format delta
 ([release_staging.md](release_staging.md#activation-plt-14-21)).
 
+**Writer admission (#23 designed it; #24 implements the chat package's side).**
+[writer_admission.md](writer_admission.md) adds one state format,
+`maintenance` (`$CHAT_STATE/maintenance.json` and `admission.lock`, embedded
+`v`, `maintenance/1`), declared **read and written**: `read: ["maintenance/1"]`
+and `write: "maintenance/1"`. Ordinary writers only read the record, and may
+only create the empty lock file; the package also ships the owning operation's
+primitives (`delivery_store.Owner`), which alone write it, for the fenced
+operation it names and under that operation's own journal. A format is
+everything the shipped code reads or writes, so the shipped primitives are why
+`write` is not `null`. Like `designation-bootstrap`, `maintenance` joins the
+names the declaration pin excludes, with a marker row that asserts both
+capabilities (`maintenance.json`), and stays unadmitted by default staging: it
+is admitted only through an activation plan's transition, which is #21's
+rework and the owner's decision (the design's G-3). The `outbox` entry's path
+list gains `refused.d/` and `refused.d/tmp/`, holding unchanged `outbox/2`
+files, and `outbox-authority/1` gains a `maintenance` reply result and a
+`maintenance` object in the status reply. No version that is live today
+changes.
+
 ## What verification refuses
 
 `verify` reads a release directory and never writes to it. It refuses, naming

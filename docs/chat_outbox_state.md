@@ -7,7 +7,7 @@ the callers section 2.4 names. Merging, installing and activating it each
 need their own owner decision. Until activation, the running tools keep
 their old behaviour.
 
-This is revision 9. Revision 3 answered design review round 2. Revision 4
+This is revision 10. Revision 3 answered design review round 2. Revision 4
 aligned the note with the owner's second amendment to #19:
 
 - the release-packaging scope;
@@ -85,6 +85,15 @@ It is narrow and specific to interrupts:
     (section 6.3);
   - the required negative-reconciliation and same-account tests (section 9,
     tests 41–48).
+
+Revision 10 records #24's implementation of writer admission, on the owner's
+decision of 2026-10-12 (D-75 in [plateia_design.md](plateia_design.md)). Section
+2.4.6 and the notes on I-11 and I-12 describe behaviour the chat package now
+implements: refusal into a sink with exit 5, sections under an admission lock,
+admission by the authority on every execution path, the bridge's hold, and the
+owning operation's primitives. **What stays pending is #21's work, which is
+separately gated:** the authority's start bound by a `full` record, the
+controller's own decisions and the activation. Section 12 lists the revision.
 
 Section 12 lists what changed and why. The owner's decisions of 2026-10-09 and
 2026-10-10 are recorded in section 11, and in D-73 of
@@ -779,6 +788,74 @@ holds:
 
 The snapshot is diagnostic, and nothing decides from it.
 
+#### 2.4.6 Maintenance ownership (#23, #24)
+
+[writer_admission.md](writer_admission.md) designs a serialized
+writer-admission protocol for the chat state, which #21's activation needs.
+**#24 implements the chat package's side of it** (the owner's decision of
+2026-10-12; D-75). As for the rest of this note, the running tools keep their
+old behaviour until an activation, which stays separately gated. With no
+maintenance record present, everything above stands unchanged. The changes,
+each specified in the design (its section 11):
+
+1. **Refusal keeps the work. Implemented.** While maintenance is held, or its
+   record (`maintenance.json`, `maintenance/1`) is unknown, a post, an
+   acknowledgement or a notice is refused before any byte of it is sent.
+   Its row is published, exactly as an `outbox/2` fallback file, into the
+   refusal sink `refused.d/` instead of `outbox.d/`, and `pchat` exits **5**
+   (`Held`, a kind of `Queued`), naming the maintenance; a notice prints a
+   visible line instead. The bridge imports the sink after the explicit
+   release, by *X* under H1, as it imports fallback files, through its own
+   source identity (a file is known by its directory and name), and bounded
+   fairness across both directories. A posted or notified entry carries the
+   delayed marker; an acknowledgement is sent as the original reply/react
+   TAGMSG, with no text. Maintenance refusal is distinct from section 2.4.4:
+   other trigger, other place, other exit, and delivery only after release.
+   "Once" means an idempotent import plus delivery in a successful fixture;
+   recovery is at-least-once, as ever.
+2. **Sections. Implemented.** A client holds the admission lock
+   `admission.lock` shared for each call, from its first state-changing
+   request to its end, and reads the record while holding it. The owning
+   operation drains by taking it exclusive, without blocking, after its
+   record is durable. No acquisition ever blocks.
+3. **The authority's transactions. Implemented.** Each mutating transaction
+   takes the admission lock shared, with one non-blocking try (the authority's
+   selector thread never sleeps or spins), and checks the record first, on
+   every execution path: a client request, a job on the authority thread and
+   an in-process request on the synchronous path. While a record is in
+   `draining`, continuations of an existing entry run and a request that would
+   create an entry is refused; in every later state, and when the record is
+   unknown, every mutation is answered with a new result, `maintenance`,
+   committing nothing and surviving the client's validation. An in-process
+   request in `draining` runs only for a caller holding an admitted section
+   open. `query` and
+   `status` are answered in every state, in a read-only transaction that
+   changes no database or WAL file, and `status` reports the record and the
+   refusal sink's count.
+4. **The authority's start. Implemented in part.** Every start is refused
+   while any record exists, before the database or the socket is touched.
+   **Pending #21:** the start bound by a matching `full` record (the
+   designation bootstrap under `full`), which is #21's rework against PR #22.
+5. **The bridge's hold. Implemented.** While a record exists, the bridge
+   writes nothing but its log: no chat connection, message, checkpoint,
+   delivery, import, flush or status snapshot, and it starts no authority. A
+   running authority keeps answering read-only requests. After release it
+   catches up from its checkpoints.
+6. **I-11 and I-12** are amended as their notes below say.
+7. **The owning operation's primitives. Implemented.** `delivery_store.Owner`
+   creates the lock, links the `draining` record (never replacing a file),
+   drains and writes `partial` and `full` while holding the admission lock
+   exclusive, releases by unlinking the record, and reconciles read-only.
+   Each takes a caller-supplied journal or fence covering a durable intent
+   and the facts that identify the file it publishes, ownership verification
+   and a durable outcome; an effect recovered after a crash is made durable
+   before its outcome is recorded; it mutates only on evidence
+   that matches the operation, plan, generation, exact bytes, inode and change
+   time of its own last journaled write; and a failed or unknown fence permits
+   nothing further. **Pending #21:** the controller that calls them, and its
+   own decisions (verifying retirement, inhibition and targets before `full`,
+   the operation's journal, the `release` command and its post-check).
+
 ## 3. State and transition tables
 
 Every transition is a conditional update inside one `TX`:
@@ -1405,6 +1482,15 @@ any design depends on. It is not caused by any client, entry or lock holder.
 
 Section 5.6, case 11, gives a schedule.
 
+**Amendment (#23, implemented by #24; [writer_admission.md](writer_admission.md),
+section 7.3).** The claim is unchanged. A client also holds the admission
+lock shared for its call; the authority never needs it exclusive and never
+waits for it (I-11a). A paused client inside its call can delay maintenance
+acquisition, never the authority; each acquisition attempt is bounded and
+reported, and the paused client's own continuations are not refused (I-11b).
+While maintenance is held, a mutating request is answered `maintenance`
+without a transaction (I-11c).
+
 ### I-12. A queued obligation never waits for another writer
 
 An obligation that is already durable, whether a published fallback file or
@@ -1447,6 +1533,13 @@ unfinished publication.
 design.
 
 Section 5.6, case 9, gives a schedule.
+
+**Amendment (#23, implemented by #24; [writer_admission.md](writer_admission.md),
+section 7.3).** I-12 holds whenever no maintenance record exists, and then
+also covers the refusal sink's files. While a record exists, or is unknown,
+no obligation is imported or attempted: every durable obligation waits for
+the owning operation's explicit release, not for another writer, and
+`pchat status` shows the wait. Nothing is lost meanwhile.
 
 ### How each round-5 finding is closed
 
@@ -3526,3 +3619,26 @@ review. Merging and activation are not approved by any of them.
   - **Unchanged:** everything revision 8 adopted, every ordinary wake-up's
     baseline, and #19's IRC delivery rules. No resolved finding is reopened,
     and no test is relaxed.
+- **Revision 10** (this revision) records #24's implementation of
+  [writer_admission.md](writer_admission.md), on the owner's decision of
+  2026-10-12 (D-75), whose design #23 landed. It changes the contract only in
+  the chat package, as section 2.4.6 and the notes on I-11 and I-12 say:
+  - **Refusal and exit 5.** Posts, acknowledgements and notices refused for
+    maintenance are kept in `refused.d/`, imported after the release by
+    entry id under H1; delayed text for posts and notices, none for
+    acknowledgements.
+  - **Admission.** Sections under `admission.lock`; the `maintenance` reply on
+    every execution path; read-only `query` and `status`; the authority's
+    start refused under any record; the bridge's hold and deferred status
+    snapshot; two import sources with source identity.
+  - **The owning operation's primitives** in `delivery_store.py`, under a
+    caller-supplied fence, so that the drain and its crash cases are testable
+    on `master`.
+  - **Unchanged:** I-1 to I-10, every transition's guard, `outbox-authority/1`
+    and the other formats, at-least-once delivery with the absence check, and
+    the unavailable-authority behaviour of section 2.4.4 when no maintenance is
+    held.
+  - **Pending #21, separately gated:** the authority's start bound by a `full`
+    record, the controller's changes, the admitted `maintenance` format in
+    the activation transition, and the cutover. Nothing here waives a gate
+    (G-3 of the design).

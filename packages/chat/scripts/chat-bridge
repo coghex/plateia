@@ -48,6 +48,12 @@ Runs as a service (launchd). Logged in as the `chatbridge` account, it:
   authority (`owner`/`assistants` in the config), types the post into the
   manager's empty prompt, pressing Enter only when the whole draft matches,
   and counts it delivered only on evidence that it was submitted;
+- holds while the owning operation of a maintenance record (maintenance.json) holds the shared
+  state: it finishes the section it is in, closes its chat connection and does nothing that
+  writes (no message handling, checkpoint, delivery, import, flush or status snapshot) until the
+  record is released, reading it again every few seconds. It starts nothing while a record exists
+  and keeps a running authority answering read-only requests only; after the release it catches
+  up from its checkpoints (docs/writer_admission.md);
 - flushes the outbox (posts that failed earlier) about every minute. A post
   that failed partway keeps the state of each of its parts: a part the server
   confirmed is never sent again, and a part written but never confirmed is
@@ -67,6 +73,7 @@ Runs as a service (launchd). Logged in as the `chatbridge` account, it:
   which cmux agent messages can't wake, get the post typed into their empty
   prompt, which a busy Codex takes after its next tool call.
 """
+import contextlib
 import datetime
 import hashlib
 import json
@@ -1189,6 +1196,62 @@ def _now():
 OUTBOX_AUTHORITY = None  # this bridge's authority, once it runs (main())
 
 
+# --- writer admission (#24; docs/writer_admission.md 4.2, 4.6) ---------------------------------
+# Every unit of work that writes shared state is one section: L_adm shared, the maintenance record
+# read while holding it. A held or unknown record starts nothing: the bridge goes into its hold.
+
+class Hold(Exception):
+    """Maintenance is held (or its record is unknown, which is held): nothing that writes may start."""
+
+    def __init__(self, record):
+        super().__init__("maintenance is held")
+        self.record = record
+
+
+_HOLD_LOGGED = [None]  # the record state last logged, so a hold is logged once per change
+
+
+def note_hold(record):
+    """Log the holder and its state, once per change (4.6)."""
+    info = record.describe() or {"state": "unknown"}
+    key = (info.get("operation"), info.get("state"), info.get("generation"))
+    if _HOLD_LOGGED[0] != key:
+        _HOLD_LOGGED[0] = key
+        if "operation" in info:
+            log(f"hold: maintenance held by {info['operation']} ({info['kind']}), state {info['state']},"
+                f" generation {info['generation']}: nothing is written until it is released")
+        else:
+            log(f"hold: the maintenance record cannot be read ({record.why}); held as unknown")
+
+
+def note_released():
+    if _HOLD_LOGGED[0] is not None:
+        _HOLD_LOGGED[0] = None
+        log("hold: no maintenance record; resuming from the checkpoints")
+
+
+@contextlib.contextmanager
+def admitted(what=None):
+    """One section of this bridge (4.2). Raises Hold, having started nothing, if maintenance is held."""
+    with delivery_store.section(delivery_store.Paths(chatlib.STATE_DIR)) as adm:
+        if not adm.admitted:
+            note_hold(adm.record)
+            raise Hold(adm.record)
+        note_released()
+        yield adm
+
+
+def held_record():
+    """The record, if maintenance is held, else None: what the main loop reads before it starts its authority
+    or connects (4.6). It never writes anything."""
+    record = delivery_store.read_maintenance(delivery_store.Paths(chatlib.STATE_DIR))
+    if record.present:
+        note_hold(record)
+        return record
+    note_released()
+    return None
+
+
 def bridge_client(authority=None):
     """The bridge's own client of its authority: in-process requests, as B."""
     authority = authority or OUTBOX_AUTHORITY
@@ -1285,11 +1348,15 @@ class Flusher:
         return self.probes.identity(conn_id)
 
     @staticmethod
-    def step(name, fn, *args, default=None):
+    def step(name, fn, *args, default=None, section=True):
         """One step of the flush. Its failure is logged, and never stops the steps
-        after it: each serves obligations of its own (R6)."""
+        after it: each serves obligations of its own (R6). Each step is one section
+        (writer admission 4.2); delivery is the exception, taking one per entry."""
         try:
-            return fn(*args)
+            with admitted(name) if section else contextlib.nullcontext():
+                return fn(*args)
+        except Hold:
+            raise  # held maintenance stops the flush: no step after it starts either
         except Exception as err:
             log(f"outbox: {name} failed ({err!r:.120}); the rest of the flush goes on")
             return default
@@ -1307,7 +1374,7 @@ class Flusher:
         expired = step("expiry", self.tx, lambda s: s.expire(), default=[]) or []    # E7
         for entry_id in expired:
             log(f"outbox: DEAD-LETTERED entry {entry_id}: delivery undecided for {int(delivery_store.UNDECIDED_MAX // 3600)} h")
-        step("delivery", self.deliver, cfg)                                          # every eligible entry's attempts
+        step("delivery", self.deliver, cfg, section=False)                           # every eligible entry's attempts
         step("retirement and export", self.retire_and_export)                        # I3, X1
         step("alert export", self.export_alerts, deliveries)                         # X2
         step("collection", self.tx, lambda s: s.collect())                           # G1
@@ -1395,9 +1462,12 @@ class Flusher:
         client = bridge_client(self.authority)
         for entry_id in ids:
             try:
-                e = self.tx(lambda s, i=entry_id: s.entry_view(i))
-                if e:
-                    self._deliver_one(cfg, client, e)
+                with admitted("delivery"):  # one entry's delivery is one section (4.2)
+                    e = self.tx(lambda s, i=entry_id: s.entry_view(i))
+                    if e:
+                        self._deliver_one(cfg, client, e)
+            except Hold:
+                raise
             except Exception as err:  # still failing: it stays owed, as recorded; the next entry gets its turn
                 log(f"outbox: still failing ({err!r:.100})")
 
@@ -1484,7 +1554,13 @@ class Flusher:
                                         " WHERE alert_key = ?", (_now(), key)))
 
     def write_status(self):
-        """X3: the dated snapshot pchat status reads while the authority is unavailable."""
+        """X3: the dated snapshot pchat status reads while the authority is unavailable. Deferred while any
+        maintenance record exists or it is unknown (writer admission 6.4): the step is a section, and this
+        checks again, so it cannot be written between the check and the write."""
+        with admitted("status snapshot"):
+            self._write_status()
+
+    def _write_status(self):
         summary = self.tx(lambda s: s.status(), {}) or {}
         summary.update(written_at=_now(), epoch=self.authority.epoch,
                        deferred={k: iso_of(v) for k, v in self.deferred.items()}, unavailable=None)
@@ -1512,7 +1588,9 @@ def flush_outbox(cfg, authority=None, deliveries=None, coverage=None, probes=Non
     flusher = _FLUSHERS.get(id(authority))
     if flusher is None or flusher.authority is not authority:
         flusher = _FLUSHERS[id(authority)] = Flusher(authority, probes)
-    with delivery_store.flock(authority.paths.flush_lock) as mine:
+    with contextlib.ExitStack() as stack:
+        with admitted("flush lock"):  # creating the flush lock is a write: a held bridge makes none
+            mine = stack.enter_context(delivery_store.flock(authority.paths.flush_lock))
         if not mine:
             log("outbox: another flush is running; skipped")
             return
@@ -1520,7 +1598,16 @@ def flush_outbox(cfg, authority=None, deliveries=None, coverage=None, probes=Non
 
 
 def write_unavailable_status(paths, reason, since):
-    """The snapshot, when the authority cannot run: why, and since when."""
+    """The snapshot, when the authority cannot run: why, and since when. Never written while any maintenance
+    record exists or it is unknown (writer admission 6.4): the next pass after the release writes it."""
+    try:
+        with admitted("status snapshot"):
+            _write_unavailable_status(paths, reason, since)
+    except Hold:
+        pass
+
+
+def _write_unavailable_status(paths, reason, since):
     try:
         old = json.loads(Path(paths.status).read_text())
     except (OSError, ValueError):
@@ -1736,14 +1823,15 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
         started.pop(k, None)
 
     def privmsg(m, history):
-        indexed = handle(m, cfg, record, deliveries, acks, replayed=history)
-        ch, mid = m["params"][0], m["tags"].get("msgid")
-        if indexed is False:  # V4: a failed index stops coverage; the checkpoint stays before it
-            invalidate(ch)
-            return
-        if not history and mid and ch.lower() in complete:
-            checkpoints.set(ch, f"msgid={mid}")
-            coverage.mark(ch, f"msgid={mid}")
+        with admitted("message"):  # one message is one section, to its checkpoint move (writer admission 4.2)
+            indexed = handle(m, cfg, record, deliveries, acks, replayed=history)
+            ch, mid = m["params"][0], m["tags"].get("msgid")
+            if indexed is False:  # V4: a failed index stops coverage; the checkpoint stays before it
+                invalidate(ch)
+                return
+            if not history and mid and ch.lower() in complete:
+                checkpoints.set(ch, f"msgid={mid}")
+                coverage.mark(ch, f"msgid={mid}")
 
     for p in cfg.get("projects", {}).values():
         conn.send(f"JOIN {p['channel']}")
@@ -1752,109 +1840,118 @@ def run(cfg, record, deliveries, acks, checkpoints, coverage=None):
     conn.send("LIST")
     next_list, next_outbox = time.time() + 10, time.time() + 5
     config_stamp = chatlib.CONFIG_PATH.stat().st_mtime_ns
-    while True:
-        try:
-            for msg in conn.lines(timeout=5):
-                stamp = chatlib.CONFIG_PATH.stat().st_mtime_ns
-                if stamp != config_stamp:
-                    cfg.update(chatlib.load_config())
-                    config_stamp = stamp
-                cmd, batch = msg["command"], msg["tags"].get("batch")
-                if batch:
-                    pager.item(batch, msg)
-                if cmd == "322":
-                    if msg["params"][1].lower() not in joined:
-                        conn.send(f"JOIN {msg['params'][1]}")
-                elif cmd == "INVITE":
-                    conn.send(f"JOIN {msg['params'][-1]}")
-                elif (cmd == "JOIN" and msg["prefix"].split("!")[0].lower() == "chatbridge"
-                      and not batch):  # a live join, not a replayed one
-                    ch = msg["params"][0]
-                    joined.add(ch.lower())
-                    if ch.lower() not in caught_up:  # catch up once per channel per connection
-                        caught_up.add(ch.lower())
-                        cur = checkpoints.get(ch)
-                        if cur:
-                            started[ch.lower()] = cur
-                            ask(ch, f"CHATHISTORY AFTER {ch} {cur} {HISTORY_PAGE}")
-                        else:
-                            complete.add(ch.lower())  # a new channel: nothing to catch up
-                            # its durable replay boundary, from just before this join: a failed
-                            # index is replayed from here, never from after the message it missed
-                            mark = boundary_mark(msg["tags"].get("time"))
-                            checkpoints.set(ch, mark)
-                            if mark == EPOCH_MARK:  # no server time: no coverage from this join (V2)
-                                log(f"joined {ch} without a server time; no coverage from this join")
-                            else:
-                                coverage.begin(ch, None, mark)
-                        log(f"joined {ch}" + (f" (catching up after {cur[:30]})" if cur else ""))
-                elif cmd == "BATCH":
-                    ref = msg["params"][0]
-                    if ref.startswith("+") and msg["params"][1:2] == ["chathistory"]:
-                        pager.start(ref[1:], msg["params"][2])
-                        if answered(msg["params"][2]):  # asked before the bridge lost the channel
-                            pager.abandon_ref(ref[1:])
-                    elif ref.startswith("+") and msg["params"][1:2] == ["draft/multiline"]:
-                        multiline[ref[1:]] = (msg, [])
-                    elif ref.startswith("-") and ref[1:] in multiline:
-                        opener, lines = multiline.pop(ref[1:])
-                        if opener["params"][2].startswith("#") and lines:
-                            # replayed when the batch itself sits inside a history batch
-                            privmsg(join_multiline(opener, lines), pager.is_history(opener["tags"].get("batch")))
-                    elif ref.startswith("-"):
-                        target = pager.target(ref[1:])
-                        nxt = pager.end(ref[1:])
-                        if nxt:
-                            ask(target, nxt)
-                            log(f"catch-up page full; next: {nxt[:60]}")
-                        elif target:  # the last page: the log is complete through its newest message
-                            complete.add(target.lower())
-                            invalid.pop(target.lower(), None)
-                            mark = Record.cursor(target)
-                            checkpoints.set(target, mark)
-                            coverage.begin(target, started.get(target.lower()), mark)
-                elif cmd == "PRIVMSG" and batch in multiline:
-                    multiline[batch][1].append(msg)
-                elif cmd == "PRIVMSG" and msg["params"][0].startswith("#"):
-                    privmsg(msg, pager.is_history(batch))
-                elif cmd == "TAGMSG" and msg["params"][0].startswith("#"):
-                    handle_tagmsg(msg, cfg, deliveries, acks)
-                elif cmd == "FAIL" and msg["params"][:1] == ["CHATHISTORY"]:  # a request answered without a batch
-                    for p in msg["params"][1:]:
-                        if p.startswith("#"):
-                            answered(p)
-                            break
-                elif cmd == "KICK" and msg["params"][1:2] and msg["params"][1].lower() == "chatbridge":
-                    lost(msg["params"][0])
-                elif (cmd == "PART" and msg["prefix"].split("!")[0].lower() == "chatbridge"
-                      and msg["params"][:1] and not batch):
-                    lost(msg["params"][0])
-                elif cmd == "PONG" and sync and msg["params"][-1:] == [sync[0]]:
-                    coverage.sync(sync[1])  # everything published before the PING is logged
-                    flush_due = True
-                    break
-                if time.time() > next_list:
-                    break
-        except TimeoutError:
-            pass
-        except OSError as e:
-            if "timed out" not in str(e):
-                raise
-        deliveries.process(cfg)
-        if flush_due or (sync and _now() - sync[1] > 60):  # synced, or the answer never came: flush anyway
-            ensure_authority()
-            flush_outbox(cfg, deliveries=deliveries)
-            next_outbox, sync, flush_due = time.time() + 60, None, False
-        elif time.time() > next_outbox and sync is None:
-            sync = (f"outbox-sync-{time.time_ns()}", _now())
-            conn.send(f"PING :{sync[0]}")
-        if time.time() > next_list:
-            conn.send("LIST")
-            next_list = time.time() + 10
-            for k, mark in list(invalid.items()):  # replay an invalidated catch-up, one request at a time
-                if k in joined and not asked.get(k) and mark:
-                    started[k] = mark
-                    ask(k, f"CHATHISTORY AFTER {k} {mark} {HISTORY_PAGE}")
+    try:  # a hold closes the connection: the section in progress has finished, and nothing else starts
+        while True:
+            try:
+                for msg in conn.lines(timeout=5):
+                    stamp = chatlib.CONFIG_PATH.stat().st_mtime_ns
+                    if stamp != config_stamp:
+                        cfg.update(chatlib.load_config())
+                        config_stamp = stamp
+                    cmd, batch = msg["command"], msg["tags"].get("batch")
+                    if batch:
+                        pager.item(batch, msg)
+                    if cmd == "322":
+                        if msg["params"][1].lower() not in joined:
+                            conn.send(f"JOIN {msg['params'][1]}")
+                    elif cmd == "INVITE":
+                        conn.send(f"JOIN {msg['params'][-1]}")
+                    elif (cmd == "JOIN" and msg["prefix"].split("!")[0].lower() == "chatbridge"
+                          and not batch):  # a live join, not a replayed one
+                        ch = msg["params"][0]
+                        joined.add(ch.lower())
+                        with admitted("join"):  # its checkpoint seed and mark are writes: one section
+                            if ch.lower() not in caught_up:  # catch up once per channel per connection
+                                caught_up.add(ch.lower())
+                                cur = checkpoints.get(ch)
+                                if cur:
+                                    started[ch.lower()] = cur
+                                    ask(ch, f"CHATHISTORY AFTER {ch} {cur} {HISTORY_PAGE}")
+                                else:
+                                    complete.add(ch.lower())  # a new channel: nothing to catch up
+                                    # its durable replay boundary, from just before this join: a failed
+                                    # index is replayed from here, never from after the message it missed
+                                    mark = boundary_mark(msg["tags"].get("time"))
+                                    checkpoints.set(ch, mark)
+                                    if mark == EPOCH_MARK:  # no server time: no coverage from this join (V2)
+                                        log(f"joined {ch} without a server time; no coverage from this join")
+                                    else:
+                                        coverage.begin(ch, None, mark)
+                                log(f"joined {ch}" + (f" (catching up after {cur[:30]})" if cur else ""))
+                    elif cmd == "BATCH":
+                        ref = msg["params"][0]
+                        if ref.startswith("+") and msg["params"][1:2] == ["chathistory"]:
+                            pager.start(ref[1:], msg["params"][2])
+                            if answered(msg["params"][2]):  # asked before the bridge lost the channel
+                                pager.abandon_ref(ref[1:])
+                        elif ref.startswith("+") and msg["params"][1:2] == ["draft/multiline"]:
+                            multiline[ref[1:]] = (msg, [])
+                        elif ref.startswith("-") and ref[1:] in multiline:
+                            opener, lines = multiline.pop(ref[1:])
+                            if opener["params"][2].startswith("#") and lines:
+                                # replayed when the batch itself sits inside a history batch
+                                privmsg(join_multiline(opener, lines), pager.is_history(opener["tags"].get("batch")))
+                        elif ref.startswith("-"):
+                            target = pager.target(ref[1:])
+                            nxt = pager.end(ref[1:])
+                            if nxt:
+                                ask(target, nxt)
+                                log(f"catch-up page full; next: {nxt[:60]}")
+                            elif target:  # the last page: the log is complete through its newest message
+                                with admitted("catch-up"):  # its checkpoint move is a write
+                                    complete.add(target.lower())
+                                    invalid.pop(target.lower(), None)
+                                    mark = Record.cursor(target)
+                                    checkpoints.set(target, mark)
+                                    coverage.begin(target, started.get(target.lower()), mark)
+                    elif cmd == "PRIVMSG" and batch in multiline:
+                        multiline[batch][1].append(msg)
+                    elif cmd == "PRIVMSG" and msg["params"][0].startswith("#"):
+                        privmsg(msg, pager.is_history(batch))
+                    elif cmd == "TAGMSG" and msg["params"][0].startswith("#"):
+                        with admitted("acknowledgement"):
+                            handle_tagmsg(msg, cfg, deliveries, acks)
+                    elif cmd == "FAIL" and msg["params"][:1] == ["CHATHISTORY"]:  # a request answered without a batch
+                        for p in msg["params"][1:]:
+                            if p.startswith("#"):
+                                answered(p)
+                                break
+                    elif cmd == "KICK" and msg["params"][1:2] and msg["params"][1].lower() == "chatbridge":
+                        lost(msg["params"][0])
+                    elif (cmd == "PART" and msg["prefix"].split("!")[0].lower() == "chatbridge"
+                          and msg["params"][:1] and not batch):
+                        lost(msg["params"][0])
+                    elif cmd == "PONG" and sync and msg["params"][-1:] == [sync[0]]:
+                        with admitted("coverage sync"):  # a write to the authority: maintenance may have begun meanwhile
+                            coverage.sync(sync[1])  # everything published before the PING is logged
+                        flush_due = True
+                        break
+                    if time.time() > next_list:
+                        break
+            except TimeoutError:
+                pass
+            except OSError as e:
+                if "timed out" not in str(e):
+                    raise
+            with admitted("delivery pass"):
+                deliveries.process(cfg)
+            if flush_due or (sync and _now() - sync[1] > 60):  # synced, or the answer never came: flush anyway
+                ensure_authority()
+                flush_outbox(cfg, deliveries=deliveries)
+                next_outbox, sync, flush_due = time.time() + 60, None, False
+            elif time.time() > next_outbox and sync is None:
+                sync = (f"outbox-sync-{time.time_ns()}", _now())
+                conn.send(f"PING :{sync[0]}")
+            if time.time() > next_list:
+                conn.send("LIST")
+                next_list = time.time() + 10
+                for k, mark in list(invalid.items()):  # replay an invalidated catch-up, one request at a time
+                    if k in joined and not asked.get(k) and mark:
+                        started[k] = mark
+                        ask(k, f"CHATHISTORY AFTER {k} {mark} {HISTORY_PAGE}")
+    except Hold:
+        chatlib._close(conn)
+        raise
 
 
 EPOCH_MARK = "timestamp=1970-01-01T00:00:00.000Z"  # before anything a channel can hold
@@ -2181,6 +2278,10 @@ def ensure_authority():
     since = old.unavailable[1] if old is not None and old.unavailable else None
     if old is not None:
         old.close()  # whatever it still holds is released before the next start takes the lock
+        if not old.released:
+            # maintenance deferred the close: its connection and lock stay as they are (not dropped, which would
+            # close the database outside any section), and the close is tried again at the next pass
+            return old
     authority = delivery_store.Authority(chatlib.STATE_DIR, log=log)
     try:
         start_authority(authority, ACTIVATION)
@@ -2215,11 +2316,16 @@ def main(argv=None):
     coverage = Coverage()
     while True:
         try:
+            if held_record() is not None:  # the hold (4.6): no authority start, no connection, nothing written
+                time.sleep(delivery_store.HOLD_RECHECK)
+                continue
             ensure_authority()  # before the first index, coverage change or flush of this connection
             if BOOTSTRAP_UNKNOWN is not None:  # no serving, import or recovery: checked again later
                 time.sleep(UNKNOWN_RECHECK)
                 continue
             run(chatlib.load_config(), record, deliveries, acks, checkpoints, coverage)
+        except Hold:  # a section found maintenance held; run() has closed its connection. Read the record again.
+            continue
         except Exception as e:  # reconnect on anything; the service must stay up
             log(f"disconnected: {e!r}; reconnecting in 5s")
             time.sleep(5)
