@@ -37,6 +37,20 @@ def config(value):
         data[k] = data[k].lower()
     if data["assistant"] == data["owner"]:
         raise Blocked("assistant and owner accounts must differ")
+    if "owner_accounts" in data:
+        # Optional; supplements `owner`. Read whole or refused, never coerced or partly accepted. The canonical form
+        # is a sorted list without the owner or duplicates, and none at all when nothing is added, so a
+        # configuration that adds nothing keeps today's digest and pinned context.
+        extra = data["owner_accounts"]
+        if not isinstance(extra, list) or any(not isinstance(a, str) or not TOKEN.fullmatch(a) for a in extra):
+            raise Blocked("owner_accounts must be a list of account names")
+        extra = sorted({a.lower() for a in extra} - {data["owner"]})
+        if data["assistant"] in extra:
+            raise Blocked("assistant and owner accounts must differ")
+        if extra:
+            data["owner_accounts"] = extra
+        else:
+            del data["owner_accounts"]
     if type(data["claim_seconds"]) is not int or not 1 <= data["claim_seconds"] <= 86400:
         raise Blocked("claim_seconds must be an integer from 1 through 86400")
     if not isinstance(data["projects"], dict) or not data["projects"]:
@@ -64,6 +78,16 @@ def config(value):
                     or right["request_prefix"].startswith(left["request_prefix"])):
                 raise Blocked("ambiguous target or request-prefix mapping")
     return data
+
+
+def owner_accounts(source):
+    """Every attested account with the owner's authority in a configuration or a question's pinned context.
+
+    A legacy context has no `owner_accounts` and keeps its single owner; anything but a list of names adds nothing."""
+    extra = source.get("owner_accounts", ())
+    if not isinstance(extra, (list, tuple)) or any(type(a) is not str for a in extra):
+        extra = ()
+    return {source["owner"], *extra}
 
 
 def decode(record):
@@ -287,8 +311,11 @@ class Inbox:
         problem = None if route and e["request"] and e["kind"] == "question" else "legacy or blocked question requires manager reconciliation"
         framing = json.dumps({"kind": e["kind"], "to": route["to"] if route else None,
                               "auto": route.get("auto") if route else None}, sort_keys=True)
-        context = json.dumps({"assistant": self.cfg["assistant"], "owner": self.cfg["owner"],
-                              "alias": self.cfg["alias"], "manager": p["manager"], "recipient": p["recipient"]})
+        pinned = {"assistant": self.cfg["assistant"], "owner": self.cfg["owner"],
+                  "alias": self.cfg["alias"], "manager": p["manager"], "recipient": p["recipient"]}
+        if "owner_accounts" in self.cfg:  # only when set: a question pinned without it keeps its single owner
+            pinned["owner_accounts"] = self.cfg["owner_accounts"]
+        context = json.dumps(pinned)
         if route:
             for raw in self.db.execute("SELECT payload FROM messages WHERE account=? AND target=? AND message_key=?",
                                        (e["account"], e["target"], raw_key)):
@@ -328,17 +355,30 @@ class Inbox:
                             (self.clock(), row["id"], "evidence_conflict", row["status"] + ": " + detail))
         self.db.execute("UPDATE items SET status='evidence_conflict' WHERE id=?", (row["id"],))
 
-    def resolution_evidence(self, row, messages):
+    @staticmethod
+    def resolution_groups(row, messages):
+        """The manager's and the owner accounts' posts about one question, grouped by attested sender and key.
+
+        A multipart reply is judged per sender before the canonical owner identity applies, so fragments from two
+        owner accounts are never spliced into one reply."""
         context = json.loads(row["context"])
-        related = [m for m in messages if m["account"] in (context["manager"], context["owner"])
-                   and m["target"] == row["target"]]
-        def references(m):
-            return m.get("reply_to") == row["id"] and m["request"] == row["request"] and m["kind"] in ("answer", "decision")
+        senders = {context["manager"], *owner_accounts(context)}
+        related = [m for m in messages if m["account"] in senders and m["target"] == row["target"]]
         groups = {}
         for m in related:
             key = m.get("tags", {}).get("+plateia/key")
             if isinstance(key, str):
                 groups.setdefault((m["account"], key), []).append(m)
+        return related, groups
+
+    @staticmethod
+    def references(row):
+        return lambda m: (m.get("reply_to") == row["id"] and m["request"] == row["request"]
+                          and m["kind"] in ("answer", "decision"))
+
+    def resolution_evidence(self, row, messages):
+        references = self.references(row)
+        related, groups = self.resolution_groups(row, messages)
         complete = False
         for group in groups.values():
             if any(references(m) for m in group):
@@ -347,6 +387,41 @@ class Inbox:
                     return False, True, conflict
                 complete |= bool(copies)
         return complete, any(references(m) for m in related), None
+
+    @staticmethod
+    def reply_evidence(found):
+        """One complete reply as retained: the attested account, and each fragment's nickname and message ID."""
+        return {"account": found[1], "messages": [
+            {"msgid": m["msgid"], "nick": m["nick"] if isinstance(m.get("nick"), str) else None} for m in found[2]]}
+
+    def record_replays(self, messages):
+        """Retain, once, a later complete owner reply from another owner account to a resolved question.
+
+        The first complete, valid, correlated resolution in server order resolved it. A later one from a different
+        owner account changes nothing: it is audit evidence naming each reply's attested account, nickname and
+        message ID, and a repeated read or a restart finds it already recorded."""
+        position = {m["msgid"]: i for i, m in enumerate(messages)}
+        resolved = self.db.execute("SELECT i.id FROM items i JOIN groups g USING(gid) WHERE i.status='resolved' "
+                                   "AND instr(g.context,'\"owner_accounts\"')>0 ORDER BY i.rowid").fetchall()
+        for (ident,) in resolved:
+            row = self.row(ident)
+            owners, references = owner_accounts(json.loads(row["context"])), self.references(row)
+            complete = []
+            for (account, _), group in self.resolution_groups(row, messages)[1].items():
+                if any(references(m) for m in group):
+                    copies, conflict = complete_copies(group, references)
+                    if not conflict:
+                        complete += [(max(position[m["msgid"]] for m in copy), account, copy) for copy in copies]
+            complete.sort(key=lambda found: found[0])
+            if not complete or complete[0][1] not in owners:
+                continue
+            for later in complete[1:]:
+                if later[1] in owners and later[1] != complete[0][1]:
+                    reason = json.dumps({"selected": self.reply_evidence(complete[0]), "replay": self.reply_evidence(later)},
+                                        sort_keys=True)
+                    if not self.db.execute("SELECT 1 FROM audit WHERE item=? AND operation='owner_replay' AND reason=?",
+                                           (ident, reason)).fetchone():
+                        self.db.execute("INSERT INTO audit VALUES(?,?,?,?)", (self.clock(), ident, "owner_replay", reason))
 
     def reconcile(self):
         messages = [json.loads(r[0]) for r in self.db.execute("SELECT payload FROM messages ORDER BY rowid")]
@@ -391,6 +466,7 @@ class Inbox:
             if any({m["msgid"] for m in copy} <= accepted for copy in copies):
                 status = "waiting_owner" if decision["kind"] == "escalate" else "accepted"
             self.db.execute("UPDATE items SET status=? WHERE id=?", (status, ident))
+        self.record_replays(messages)
 
     def refresh(self):
         self.read()
@@ -449,7 +525,8 @@ class Inbox:
                     not isinstance(decision.get(k), str) or not decision[k].strip() for k in ("answer", "source")):
                 raise Blocked("decision requires kind, answer or unresolved choice, and source evidence")
             decision = {k: decision[k] for k in ("kind", "answer", "source")}
-            if self.cfg["owner"] in {m.lower() for m in re.findall(r"@([A-Za-z0-9_-]+)", json.dumps(decision))}:
+            owners = owner_accounts(self.cfg) | owner_accounts(json.loads(row["context"]))
+            if owners & {m.lower() for m in re.findall(r"@([A-Za-z0-9_-]+)", json.dumps(decision))}:
                 raise Blocked("reply contains an owner mention")
             if row["attempts"] and json.loads(row["decision"]) != decision:
                 raise Blocked("a retried action must retain its original content")
@@ -473,9 +550,11 @@ class Inbox:
             if not row["decision"]:
                 raise Blocked("prepare the decision before sending")
             # Partial/unframed resolutions suppress sends until reconciled.
+            senders = {*owner_accounts(self.cfg), *owner_accounts(json.loads(row["context"])),
+                       self.cfg["projects"][row["project"]]["manager"]}
             for raw in self.db.execute("SELECT payload FROM messages"):
                 m = json.loads(raw[0])
-                if m["account"] in (self.cfg["owner"], self.cfg["projects"][row["project"]]["manager"]) and m["target"] == row["target"] and m.get("reply_to") == ident and m["request"] == row["request"] and m["kind"] in ("answer", "decision"):
+                if m["account"] in senders and m["target"] == row["target"] and m.get("reply_to") == ident and m["request"] == row["request"] and m["kind"] in ("answer", "decision"):
                     raise Blocked("incomplete resolution evidence; reconcile before sending")
             outgoing = self.outgoing(row)
             self.db.execute("UPDATE items SET status='sending',attempts=attempts+1 WHERE id=?", (ident,))
@@ -529,6 +608,7 @@ class Inbox:
                 if (project != row["project"] or not route or route["manager"] != context["manager"]
                         or route["recipient"] != context["recipient"]
                         or any(self.cfg[k] != context[k] for k in ('assistant','owner','alias'))
+                        or self.cfg.get('owner_accounts', []) != context.get('owner_accounts', [])
                         or row["request"] and any(row["request"].startswith(p["request_prefix"])
                             for n, p in self.cfg["projects"].items() if n != project)):
                     raise Blocked("new configuration changes pending question identity or routing")

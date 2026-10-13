@@ -2,6 +2,7 @@
   "alias": "helper",
   "assistant": "assistant",
   "owner": "operator",
+  "owner_accounts": ["operator-two"],
   "claim_seconds": 600,
   "projects": {
     "alpha": {

@@ -5,6 +5,7 @@ the message text, says who spoke. Config and passwords live in
 ~/.config/chat/config.json (mode 0600):
 
     {"server": "127.0.0.1", "port": 6667, "owner": "<owner>", "assistants": ["<assistant>", ...],
+     "owner_accounts": ["<second owner account>", ...],     (optional; supplements "owner")
      "ntfy": "https://ntfy.sh/<topic>",
      "accounts": {"<account>": "<password>", ...},
      "identities": {"<account>": {"role": "<role>", "project": "<project>|null"}, ...},
@@ -113,6 +114,46 @@ def find_message(msgid: str) -> dict | None:
     return None
 
 
+def _account_name(value) -> bool:
+    """Whole, printable, space-free text: no coercion, trimming or partial reading of a configured account."""
+    return type(value) is str and bool(value) and value.isprintable() and not any(c.isspace() for c in value)
+
+
+def listed_owner_accounts(cfg: dict) -> frozenset:
+    """The optional `owner_accounts` entries that supplement `owner`, exactly as configured.
+
+    The list is read whole or not at all: anything but a list of account names (a string, a number, a name
+    that is not text, an assistant's account) grants nothing, and neither does an empty list. It never
+    loads another configuration; `cfg` is the one supplied."""
+    listed = cfg.get("owner_accounts")
+    if not isinstance(listed, list) or not all(_account_name(a) for a in listed):
+        return frozenset()
+    if set(listed) & set(cfg.get("assistants", [])):
+        return frozenset()
+    return frozenset(listed)
+
+
+def owner_accounts(cfg: dict) -> frozenset:
+    """Every account that is the owner: `owner` plus the optional listed accounts (none if `owner` is unusable)."""
+    return frozenset({cfg["owner"], *listed_owner_accounts(cfg)}) if _account_name(cfg.get("owner")) else frozenset()
+
+
+def authority_accounts(cfg: dict) -> frozenset:
+    """The owner accounts and the assistants: who may speak with the owner's authority."""
+    return owner_accounts(cfg) | set(cfg.get("assistants", []))
+
+
+def owner_identity(cfg: dict, account, verified) -> str | None:
+    """The canonical owner name when `account` is an owner account the server verified, else None.
+
+    The server's verification is the only evidence: it must be affirmative (`True`), and the account must equal a
+    configured owner account as a whole. A nickname, a prefix, a claim in the text or a role flag never counts,
+    and `identity_aliases` is not consulted. Callers keep the raw account and nickname as their evidence."""
+    if verified is True and _account_name(account) and account in owner_accounts(cfg):
+        return cfg["owner"]
+    return None
+
+
 def cited_authority(msgid: str, cfg: dict) -> tuple[dict | None, str]:
     """The verified owner or assistant post a delegation cites, or (None, why not)."""
     entry = find_message(msgid)
@@ -120,8 +161,9 @@ def cited_authority(msgid: str, cfg: dict) -> tuple[dict | None, str]:
         return None, f"no post with msgid {msgid} in the record"
     if not entry.get("verified"):
         return None, "the cited post is not from a verified account"
-    if entry.get("from") not in {cfg.get("owner"), *cfg.get("assistants", [])}:
-        return None, f"the cited post is from {entry.get('from')}, who has no owner authority"
+    account = entry.get("from")
+    if owner_identity(cfg, account, entry.get("verified")) is None and account not in set(cfg.get("assistants", [])):
+        return None, f"the cited post is from {account}, who has no owner authority"
     return entry, ""
 
 
