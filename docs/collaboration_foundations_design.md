@@ -1,12 +1,18 @@
 # Collaboration foundations design
 
-This design states how plateia makes requests between the owner, assistants,
-managers and workers safe to repeat and accountable. It covers what a
-logical request is, who may ask, when a request counts as accepted and
+This design states how plateia could make requests between the owner,
+assistants, managers and workers safe to repeat and accountable. It covers
+what a logical request is, who may ask, when a request counts as accepted and
 executed, how it comes back, how lost or repeated messages are handled, and
-how every message a request costs is counted. It is the design half of
-#26, written from that issue's fixture and live-trial evidence. It
+how every message a request costs is counted and capped. It is the design
+half of #26, written from that issue's fixture and live-trial evidence. It
 implements nothing.
+
+**Owner decision, 2026-10-13: design only.** The owner authorized writing
+this design from #26's findings. That decision approves the design work, not
+the choices below: every `D-N` here is a **proposal, not yet ratified**, and
+`Q-1` to `Q-7` are open. Implementation, tests, trials, and skill,
+configuration or security changes are not authorized by it.
 
 Design state: `exploring`
 
@@ -17,24 +23,24 @@ concrete precondition
 ## Processing status
 
 - [#26] EPIC. Collaboration foundations (umbrella: #26; no new epic)
-- [ ] COLLAB-1. Define the request envelope and its codec in the shared chat package
+- [ ] COLLAB-1. Reconcile the generic request form with `card-move/v1`
 - [ ] COLLAB-2. Record requests and claims durably in the bridge's authority
 - [ ] COLLAB-3. Correlate results, stops and blockers, and bound the return
-- [ ] COLLAB-4. Account every request message against a reserved budget
+- [ ] COLLAB-4. Enforce message budgets with reserved slots
 - [ ] COLLAB-5. Verify the foundations in one bounded, isolated live trial
 
 ## Epic contract
 
 - **Goal:** a logical request between plateia's participants has one stable
   identity. It is verified against a scoped authority, accepted explicitly,
-  claimed once, executed at most once by plateia's own mechanism, and
-  answered within a bound. Every message it costs is counted.
+  claimed once by a component that enforces the claim, and answered within a
+  bound. Every message it costs is reserved before it is sent.
 - **Done when:**
   - a reposted or relayed request never causes a second claim or execution
-    in any shipped component;
-  - every accepted request ends in a result, stop or blocker that names it,
-    or is visibly expired;
-  - a trial's message count matches its reservation exactly.
+    in any component that enforces the claim;
+  - every accepted request ends in a durable result, stop or blocker, or a
+    visible expiry;
+  - no participant can send past its reserved budget.
 - **Users and operators:** the owner and the owner's assistants, who ask;
   project managers and workers, who accept and execute; the operator who
   reads the record.
@@ -61,11 +67,24 @@ Three kinds of behavior are kept apart here.
   the sender.
 - The bridge delivers a wake with `cmux agent message`. Live, an idle
   Claude Code session woke on it within 6 s.
-- The clarification inbox (`packages/routine_inbox/`) carries a routing
-  envelope in IRCv3 client tags (`+plateia/to`, `+plateia/key`,
-  `+plateia/part`, `+plateia/parts`), keyed per message.
+- The clarification inbox (`packages/routine_inbox/`) routes with IRCv3
+  client tags (`+plateia/to`, `+plateia/key`, `+plateia/part`,
+  `+plateia/parts`).
 
-**Gaps in those mechanisms:**
+**Approved designs that are not yet built** (`plateia_design.md`):
+- **`card-move/v1`** (D-8): a readable one-line command after
+  `[request <id>]`.
+- **D-33:** one request per card move; a retry keeps the request ID; a
+  superseded move is closed as superseded.
+- **D-37:**
+  - client operation IDs, and service-allocated request IDs in the
+    `<project>-<yyyymmdd>-<n>` style;
+  - no free text in a move, and one line only;
+  - the same operation ID with the same content returns the original
+    receipt, and with different content is rejected.
+- **D-60:** one live execution per card, fenced by generation.
+
+**Gaps in today's mechanisms:**
 - **Dedup is by message ID only.** A repost or relay of the same logical
   request with a new ID queued a new wake: 3 wakes for 1 request in the
   fixture, and a fresh wake live.
@@ -73,7 +92,7 @@ Three kinds of behavior are kept apart here.
   check applies only to manager senders, and the cited post's room is not
   checked.
 - **Routing is by channel prefix to the project's manager.** No room is
-  authoritative for a request.
+  bound to a request.
 - **Nothing bounds the return.** After acceptance the wake is removed, and
   nothing tracks a result.
 - **The identity registry can disagree with live sessions.** A worker was
@@ -86,10 +105,10 @@ Three kinds of behavior are kept apart here.
   was its own reasoning, confounded by the trial's one-marker limit. No
   component enforced it.
 
-**Accounting.** The corrected trial reported 3 subject activations (one typed
+**Accounting.** The corrected trial counted 3 subject activations (one typed
 preparation and two requests). The recipient's two replies brought the
-conservative total to 5 messages, over a cap of 4. The reply cost was not
-reserved in advance.
+conservative total of submissions to 5, over a cap of 4. The replies were
+neither reserved nor capped.
 
 ## Desired experience
 
@@ -100,19 +119,18 @@ authority, not its own. Anyone reading the record can see, for each request:
 - whether it was accepted, claimed, started and finished, or when it expired;
 - the exact result.
 
-An operator running a trial reserves its whole message budget before sending
-anything, and the count afterwards matches.
+A participant at its budget cap sends nothing more, and the record says why.
 
 ## Scope
 
 ### In scope
 
-- A logical request identity, separate from transport message IDs.
+- A generic request identity, reconciled with `card-move/v1`.
 - An authority envelope.
-- Acceptance, claim, start, result and acknowledgement as distinct records.
+- Acceptance, claim, start, result and closure as distinct transitions.
 - Restart and lost-reply recovery.
 - Bounded return, expiry and tombstones.
-- Full message accounting.
+- Enforced message budgets.
 - A mapping to PLT-1, PLT-3 and the clarification inbox.
 
 ### Out of scope
@@ -122,29 +140,46 @@ anything, and the count afterwards matches.
   identities.
 - Another live trial before COLLAB-5 is separately approved.
 - Exactly-once guarantees for arbitrary external side effects.
+- Deleting or compacting the chat archive.
 - The card-move rules of PLT-1 and PLT-3 themselves.
 
 ## Design
 
+Every rule in this section is **proposed** (see Decisions).
+
 ### 1. Request identity
 
-- **The request ID.** Every logical request carries a stable, namespaced
-  ID: `<origin-project>/<origin-request>/<action>`, such as
-  `alpha/alpha-20261013-1/solve-12`. The transport message ID stays
-  separate.
-- **Content binding.** Each ID binds the request's exact content: the
-  action, target and parameters, as a canonical digest, plus a revision
-  number.
-- **Repeats.** A message whose ID and digest match a known request is a
-  *repeat*, whether it is a repost, a relay or a replay. It is answered
-  from the record and never re-executed.
-- **Conflicts.** The same ID with a different digest is a *conflicting
-  reuse*. It is refused visibly, never merged.
-- **Revisions.** An intentional change is a new revision of the same ID,
-  allowed only by the original authority.
-- **New actions.** A deliberately new action gets a new ID.
-- **One authoritative room.** The first accepted message names the room.
-  Copies elsewhere are pointers, not new requests.
+**The execution key.**
+- The request ID follows D-33 and D-37: it is allocated by the shared
+  service, in the `<project>-<yyyymmdd>-<n>` style.
+- The client's operation ID stays the idempotency key for recovering a lost
+  response.
+- The **execution key** is the request ID plus its revision number. It is
+  immutable: one key, one exact content digest, one execution.
+
+**Repeats and conflicts.**
+- A message whose key and digest match a known key is a **repeat**, whether
+  it is a repost, a relay or a replay. It is answered from the record and
+  never re-executed.
+- The same key with a different digest is a **conflicting reuse**. It is
+  refused visibly, and the existing record is unchanged.
+
+**Supersession.** Changing a request creates a new key: the same request ID
+at revision n+1, with its own digest. It is accepted only from the request's
+original authority, or from one that authority names. A superseding
+revision:
+- closes the earlier key as `superseded`, but only if that key has not
+  started;
+- if the earlier key has started, or its outcome is unknown, waits until
+  that key reaches a terminal or reconciled state. It never re-executes the
+  earlier work and never erases its claim or result;
+- is refused while a newer revision already exists.
+
+**Registration.** Registering a key is one atomic insert-if-absent in the
+request store. Two concurrent registrations of the same key converge: one
+wins, and the other gets the winner's record. The authoritative room is
+bound in that same insert, before any dispatch or acceptance. Copies of the
+request elsewhere are pointers to it, not new requests.
 
 ### 2. Authority envelope
 
@@ -158,121 +193,175 @@ anything, and the count afterwards matches.
   original grant, such as a merge or live-action gate, travel with it.
 - **No widening.** A relay never widens scope, and no envelope carries a
   blanket delegation.
+- **Authorization that isn't a chat post.** Some owner authorization reaches
+  agents directly, for example typed into an agent's own session, rather
+  than as an IRC post. That cannot be verified as a citation. How it maps
+  into an envelope is unresolved (Q-6), and until it is resolved it is never
+  trusted on the strength of a sender label.
 
-### 3. Lifecycle records
+### 3. Transitions and their actors
 
-Each step is its own durable record, correlated by request ID:
+Each transition is a durable record, correlated by execution key. Each names
+the only actor allowed to make it. A transition from the wrong actor, for
+the wrong key, or with a stale generation is refused and recorded.
 
-- **Receipt.** Delivered or read. It is not acceptance.
-- **Acceptance.** The decision-maker's explicit reply naming the request
-  ID. It is not execution.
-- **Claim.** An atomic, fenced record of who owns execution: a compare
-  and set on the request ID, holding an owner, a generation and a fence
-  token. A second claim fails. A stale owner's writes are refused by the
-  fence.
-- **Start.** Recorded before any external effect.
-- **Result, stop or blocker.** Exactly one terminal record, naming the
-  request ID and claim generation.
-- **Acknowledgement of the result.** One acknowledgement closes the
-  request. It is never itself acknowledged, so there are no ack-of-ack
-  loops.
+| Transition | Actor | Meaning |
+|---|---|---|
+| Receipt | Transport | Delivered or read. Not acceptance. |
+| Acceptance | The envelope's decision-maker | An explicit reply naming the request ID. Not execution. |
+| Claim | The executing component | An atomic, fenced claim of execution: a compare and set on the key, holding an owner, a generation and a fence token (D-60's shape). A second claim fails and adopts the existing one. |
+| Start | The claimant | Recorded before any external effect. |
+| Result, stop or blocker | The claimant, at its generation | Durable as soon as it is written. |
+| Closure | The requester, or the decision-maker for it | One receipt or acknowledgement naming the result. |
 
-### 4. Restart, replay and lost replies
+**The proposed closure rule:**
+- A result is durable when written.
+- The request is closed by one correlated receipt or acknowledgement of that
+  result.
+- A missing acknowledgement never reruns the work. It leaves the request
+  "result delivered, unclosed", and may be reminded within the budget.
+- Acknowledgements are never themselves acknowledged.
+- A late or stale-generation result is kept in the record, but cannot
+  overwrite a newer terminal outcome.
+
+**The decision-maker and the claimant are different roles.** A manager may
+accept a request and a worker may claim it. The record keeps both.
+
+### 4. Restart, replay, fencing and its limits
 
 - **After a restart,** the claimant recovers its persisted claim and any
   persisted result. A lost reply is answered again from the record.
 - **Unknown outcomes.** If a start is recorded but its external effect's
-  outcome is unknown, the request stays `unknown` until it is reconciled
-  against that effect. It is never retried blindly, and an expired lease
-  never redispatches it.
+  outcome is unknown, the key stays `unknown` until it is reconciled against
+  that effect. An expired lease or a restart never permits a takeover
+  without positive evidence of the earlier attempt's outcome.
+- **A fence protects only components that check it.** The fence guarantees
+  single execution only for components and adapters that check it *before*
+  their side effect. A shared ledger alone cannot stop an agent or tool that
+  bypasses it. Covering a participant therefore means building the check
+  into that participant's adapter, which is a rollout gate (Q-4).
 - **Adapters.** No exactly-once promise is made for arbitrary external
   effects. Each adapter that acts on the world (a GitHub write, a merge, a
-  file publication) must name its idempotency key or its verification
-  query. An adapter without one is refused automatic recovery.
+  file publication) must name its idempotency key or its verification query.
+  An adapter without one is refused automatic recovery.
 
-### 5. Bounded return and closure
+### 5. Bounded return, expiry and tombstones
 
-- **The bound.** Every accepted request has a return bound. Past it, the
-  request is visibly expired and the requester is told. Expiry is not
-  logical closure: a late result is still recorded, and closes the request.
-- **Tombstones.** A closed request leaves a permanent minimal record: its
-  ID, digest, terminal state and time. An old message can never resurrect
-  it.
-- **Retention.** Full records follow a stated retention policy (Q-3).
-- **Steps.** Multi-step work uses child IDs, such as
-  `…/solve-12/review-1`, each with its own lifecycle.
+- **The bound.** Every accepted key has a return bound. Past it, the key is
+  visibly `expired` and the requester is told. Expiry is not closure: a
+  later result is still recorded under the rules in section 3.
+- **Tombstones.** A closed or superseded key leaves a permanent minimal
+  tombstone: its key, digest, terminal state and time. An old message can
+  never resurrect it.
+- **Fail closed.** If a tombstone store is unreadable, or of an
+  incompatible version, or a rollback would lose tombstones, the store
+  refuses new registrations for the affected keys. It never silently
+  forgets them.
+- **Retention.** The chat itself is never touched: V-2 keeps every room's
+  archive forever and searchable. Only the request store's execution
+  payloads could be compacted, under a policy the owner decides (Q-3).
+  Tombstones are never compacted.
+- **Steps.** Multi-step work uses child keys, each with its own lifecycle
+  and its own reserved budget (section 6).
 
-### 6. Full message accounting
+### 6. Enforced message budgets
 
-- **Reservation.** Before every submission, the sender reserves budget
-  for it. That includes preparations, first and repeated wakes, replies,
-  acknowledgements, and sends that end queued, failed or unknown.
-- **Two counts.** The ledger counts *submissions* (what was attempted)
-  separately from *deliveries and activations* (what woke someone).
-- **No refunds.** An unknown result is never refunded.
-- **Coordination overhead.** Messages that coordinate a request are
-  counted separately from the request's own budget, and the report says
-  which is which.
-- **Waking.** A reply or acknowledgement that needs no action is sent
-  without waking an idle model where the transport allows. Otherwise its
-  cost is reserved.
+Budgets are enforced, not just reported.
+
+- **One shared cap per scope.** A request, or a trial, has a single cap.
+  Every boundary that sends on its behalf draws from that same cap: the
+  requester, the bridge, the decision-maker, the claimant, child work, and
+  replies and acknowledgements.
+- **Reserve before every send.** Each submission atomically reserves a slot
+  first. That covers preparations, requests, reposts, replies,
+  acknowledgements, reminders, and sends that wake no one. Concurrent
+  senders cannot overspend.
+- **Reserve the whole exchange up front.** Before work starts, the requester
+  reserves a finite allowance for the whole exchange, including the terminal
+  report, so a result is never stranded for lack of budget.
+- **Refusal at the cap sends nothing.** A send refused at the cap produces
+  no submission and wakes no one. It is recorded locally, and no error
+  message is sent about it, so there is no unbudgeted error loop.
+- **Crashes keep the slot consumed.** A crash after reserving, whether
+  before or after the send, leaves the slot consumed, with the outcome
+  unknown unless it is proven unused. There are no refunds for unknowns.
+- **Coordination overhead.** Overhead has its own bounded cap. Callers
+  cannot move a request's or trial's own messages, replies included, into
+  overhead.
+- **Three counts.** The ledger counts submissions, deliveries and
+  activations separately. A delivery that wakes no one is not an
+  activation.
+
+COLLAB-4 builds this enforcement only at plateia's own sending boundaries.
+Enforcement inside agents does not exist, and this design does not claim it.
 
 ### 7. Who enforces what
 
 | Behavior | Today | Proposed |
 |---|---|---|
 | Message-ID dedup | Bridge (mechanism) | Kept |
-| Logical request dedup | Recipient judgment only | Authority enforces by request ID and digest (COLLAB-2) |
+| Logical request dedup | Recipient judgment only | Request store, by execution key and digest, at components that check it (COLLAB-2) |
 | Citation check | Annotation; a missing citation is ignored | The envelope is required and verified (COLLAB-1, COLLAB-2) |
-| Exact acceptance | Bridge, by reply naming the message ID | By reply naming the request ID (COLLAB-1, COLLAB-3) |
-| Execution once | Agent judgment | Fenced claim (COLLAB-2) |
+| Exact acceptance | Bridge, by a reply naming the message ID | By a reply naming the request ID (COLLAB-1, COLLAB-3) |
+| Execution once | Agent judgment | Fenced claim, at participants whose adapter checks it (COLLAB-2, Q-4) |
 | Bounded return | None | Return bound, expiry and tombstone (COLLAB-3) |
-| Message budget | Manual, under-counted | Reservation ledger (COLLAB-4) |
+| Message budget | Manual, under-counted | Reserved slots under one cap at plateia's boundaries (COLLAB-4) |
 
 ### 8. Overlap with PLT-1, PLT-3 and the clarification inbox
 
-- **PLT-1** (durable logical card-move submission):
-  - *serves* its need for a stable logical ID, dedup and authority;
-  - *leaves open* card-move semantics and ordering;
-  - *conflicts* only if PLT-1 defines its own envelope. It should reuse
-    COLLAB-1's.
+- **PLT-1** (durable logical card-move submission, `card-move/v1`):
+  - this design reuses its request-ID allocation, its operation-ID
+    idempotency and its duplicate rule (D-33, D-37), and generalizes them to
+    other requests;
+  - *serves* its need for authority and closure;
+  - *leaves open* card-move semantics.
+  - **Owner decision before processing (Q-5):** whether a generic request
+    uses a readable one-line command like `card-move/v1`, IRCv3 client tags,
+    or both. Any difference from approved `card-move/v1` is an owner
+    decision, never a silent change.
 - **PLT-3** (reconcile ordered card intent before dispatch):
-  - *serves* claim, fencing and terminal records;
+  - *serves* claim, fencing and terminal records, in D-60's generation-fenced
+    shape;
   - *leaves open* intent ordering across cards.
-- **Clarification inbox:** COLLAB-1 extends the existing `+plateia/` tag
-  namespace rather than adding a second codec. The inbox's per-message
-  `key` stays as is. *Conflicts* only if the two keys were confused; the
-  request ID is a separate tag.
+- **Clarification inbox:**
+  - its `+plateia/` tags and per-message `key` stay as they are;
+  - *conflicts* only if the codec choice in Q-5 differed from both forms
+    without a mapping.
 
 ## Decisions
 
+These are **proposals, not ratified owner decisions**. The owner's
+2026-10-13 decision authorized the design only.
+
 ### D-1. The request ID and the message ID are different things
 
-A transport message ID identifies one delivery. Only the request ID and its
-digest decide repeats. This is grounded in the fixture: one request
+Proposed. A transport message ID identifies one delivery. The execution key
+and its digest decide repeats. This is grounded in the fixture: one request
 produced three wakes.
 
 ### D-2. Repeats are answered from the record, never re-executed
 
-Every component answers a repeat from its record. A recipient's own
-judgment remains a defense, but is never the guarantee.
+Proposed. Components that check the record answer a repeat from it. A
+recipient's own judgment remains a defense, but is never the guarantee.
 
-### D-3. Acceptance, claim and execution are separate records
+### D-3. Acceptance, claim, execution and closure are separate transitions with named actors
 
-Both live trials showed that waking a recipient is not acceptance, and
-accepting is not executing.
+Proposed. Both live trials showed that waking a recipient is not acceptance,
+and accepting is not executing.
 
 ### D-4. Unknown external outcomes are reconciled, not retried
 
-No lease expiry or restart turns an unknown into a redispatch.
+Proposed. No lease expiry or restart turns an unknown into a takeover
+without positive evidence.
 
-### D-5. Every message is reserved before it is sent, replies included
+### D-5. Every send reserves a slot under one shared cap, replies included
 
-The corrected trial's overrun came from unreserved replies.
+Proposed. The corrected trial's overrun came from unreserved replies.
 
-### D-6. The envelope extends `+plateia/` client tags
+### D-6. Reuse `card-move/v1`'s identity rules; the codec is an owner decision
 
-There is one codec, shared with the clarification inbox.
+Proposed. This replaces the first draft's choice of `+plateia/` client tags,
+which would have competed with approved `card-move/v1`. See Q-5.
 
 ## Open questions
 
@@ -287,103 +376,153 @@ COLLAB-2's scope; it is the owner's decision.
 It affects COLLAB-3. The known options are a per-request bound set by the
 requester, or a project default.
 
-### Q-3. What is the retention policy for full records?
+### Q-3. What may be compacted in the request store?
 
-Tombstones are permanent and minimal. How long full records are kept is a
-privacy and size trade-off for the owner. It affects COLLAB-3.
+V-2's chat archive is never deleted or compacted, and tombstones are kept
+forever. Whether and when the request store's execution payloads may be
+compacted is a privacy and size trade-off for the owner. It affects
+COLLAB-3.
 
-### Q-4. Must existing agents and skills adopt the envelope, and when?
+### Q-4. Which participants must check the claim before acting, and when?
 
-Skills are out of scope here. Until they adopt it, dedup is enforced only
-where plateia's own components act. Adoption timing is the owner's
-decision. It affects COLLAB-2's done condition.
+This is a **rollout gate**, not a note. Until a participant's adapter checks
+the claim before its side effects, the single-execution guarantee does not
+cover that participant. Skills are out of scope here, so which agents and
+tools adopt the check, and when, is the owner's decision. It gates COLLAB-2's
+done condition.
+
+### Q-5. Which form do generic requests use?
+
+The options are a readable one-line command like `card-move/v1`, IRCv3
+client tags like the clarification inbox, or both with a mapping. Any
+incompatibility with approved `card-move/v1` (D-8, D-33, D-37) is an owner
+decision. It gates COLLAB-1.
+
+### Q-6. How does authorization that isn't a chat post enter an envelope?
+
+Owner authorization typed into an agent's own session can't be verified as
+an IRC citation. A mapping is needed, for example the owner reposting it,
+or a signed record. Until then it is not trusted by sender label. It affects
+COLLAB-1.
+
+### Q-7. What are the default caps, and who sets them?
+
+The design fixes enforcement, not amounts. It affects COLLAB-4.
 
 ## Verification strategy
 
-- Invented-fixture tests per slice: repeat, relay, conflicting reuse,
-  revision, a lost reply after a restart, an unknown outcome, expiry and a
-  late result, a tombstone against an old message, and reservation
-  arithmetic.
+- Invented-fixture tests per slice:
+  - identity: repeat, relay, conflicting reuse, concurrent registration and
+    supersession, both before and after start;
+  - recovery: a lost reply after a restart, an unknown outcome, wrong-actor
+    and stale-generation refusals;
+  - closure: expiry and a late result, a tombstone against an old message,
+    a fail-closed tombstone store;
+  - budgets: refusal at the cap, concurrent reservations, and a crash after
+    reservation.
 - One bounded live trial at the end (COLLAB-5), only with separate owner
-  approval. It runs under a reserved budget that covers every submission in
-  both directions, and the report must match the reservation exactly.
+  approval. It runs under a reserved cap covering every submission in both
+  directions, and the report must show the cap was never exceeded.
 
 ## Delivery plan
 
-### COLLAB-1. Define the request envelope and its codec in the shared chat package
+### COLLAB-1. Reconcile the generic request form with `card-move/v1`
 
-- **Outcome:** the request ID, digest, revision and authority chain encode
-  and decode as `+plateia/` client tags, with refusal of malformed,
-  conflicting or unverified envelopes.
+- **Outcome:** a generic request form and authority envelope, reusing
+  `card-move/v1`'s identity rules, in the form the owner chooses in Q-5,
+  with refusal of malformed, conflicting or unverified requests.
 - **Scope:** the codec and validation only. No storage.
 - **Phase:** 1
 - **Depends on:** `none`
-- **Ordering:** `can land first`
+- **Ordering:** `can land first`, once Q-5 is decided
 - **Relevant decisions:** D-1, D-6
-- **Acceptance signals:** fixture round-trips, and refusals for each
-  invalid form.
+- **Acceptance signals:** fixture round-trips, and a refusal for each
+  invalid form; existing `card-move/v1` examples parse unchanged.
 - **Out of scope:** persistence, routing, skills.
-- **Open questions:** `None`
+- **Open questions:** Q-5, Q-6
 
 ### COLLAB-2. Record requests and claims durably in the bridge's authority
 
-- **Outcome:** repeats are answered from the record, conflicting reuse is
-  refused, and claims are atomic and fenced.
-- **Scope:** request and claim records; repeat handling; recovery after a
-  restart.
+- **Outcome:**
+  - atomic registration with the room bound;
+  - repeats answered from the record, and conflicting reuse refused;
+  - supersession rules enforced;
+  - fenced claims with actor and generation checks.
+- **Scope:** the request and claim records, repeat handling, and recovery
+  after a restart.
 - **Phase:** 2
 - **Depends on:** COLLAB-1
 - **Ordering:** `critical path`
 - **Relevant decisions:** D-2, D-3, D-4
 - **Acceptance signals:**
   - a repost or relay produces no second claim;
+  - concurrent registrations converge;
   - a stale claimant is fenced;
   - an unknown outcome stays unknown.
-- **Out of scope:** return bounds, accounting.
+- **Out of scope:** return bounds, budgets, adapter rollout to agents.
 - **Open questions:** Q-1, Q-4
 
 ### COLLAB-3. Correlate results, stops and blockers, and bound the return
 
-- **Outcome:** each accepted request ends in one terminal record, or a
-  visible expiry. Tombstones block resurrection.
-- **Scope:** terminal records, acknowledgement without loops, the return
-  bound, retention.
+- **Outcome:**
+  - durable results;
+  - closure by one correlated acknowledgement;
+  - visible expiry;
+  - tombstones that fail closed.
+- **Scope:** terminal records, the closure rule, the return bound, and
+  compaction of the request store only.
 - **Phase:** 2
 - **Depends on:** COLLAB-2
 - **Ordering:** `critical path`
 - **Relevant decisions:** D-3
-- **Acceptance signals:** expiry and late-result fixtures; an old message
-  cannot reopen a closed request.
-- **Out of scope:** accounting.
+- **Acceptance signals:**
+  - expiry and late-result fixtures;
+  - a stale result never overwrites a newer one;
+  - an old message cannot reopen a closed key.
+- **Out of scope:** budgets, and the chat archive.
 - **Open questions:** Q-2, Q-3
 
-### COLLAB-4. Account every request message against a reserved budget
+### COLLAB-4. Enforce message budgets with reserved slots
 
-- **Outcome:** a reservation ledger that counts submissions and
-  activations separately, includes replies and acknowledgements, and never
-  refunds an unknown.
-- **Scope:** the ledger and its report.
+- **Outcome:** one shared cap per scope, with:
+  - an atomic slot reserved before every send at plateia's own boundaries;
+  - a full-exchange allowance reserved up front;
+  - refusal at the cap with no send and no error loop;
+  - crash-consumed slots;
+  - a bounded, unrelabelable overhead cap;
+  - separate counts of submissions, deliveries and activations.
+- **Scope:** the reservation store and the checks at plateia's sending
+  boundaries. Not enforcement inside agents.
 - **Phase:** 2
 - **Depends on:** COLLAB-1
 - **Ordering:** `independent`
 - **Relevant decisions:** D-5
-- **Acceptance signals:** the arithmetic fixtures, including the corrected
-  trial's shape (1 preparation, 2 requests, 2 replies gives 5).
-- **Out of scope:** enforcement inside agents.
-- **Open questions:** `None`
+- **Acceptance signals:**
+  - concurrent reservations never overspend;
+  - a send refused at the cap emits nothing;
+  - the corrected trial's shape (1 preparation, 2 requests, 2 replies)
+    under a cap of 4 is stopped at the fifth reservation.
+- **Out of scope:** agent-internal enforcement.
+- **Open questions:** Q-7
 
 ### COLLAB-5. Verify the foundations in one bounded, isolated live trial
 
-- **Outcome:** live evidence of idle wake, exact acceptance by request ID,
-  claim once, refusal of a repeat by mechanism, and an exact message count.
-- **Scope:** one trial under a reservation covering every message, with
+- **Outcome:** live evidence of:
+  - idle wake;
+  - exact acceptance by request ID;
+  - a single claim;
+  - a repeat refused by mechanism;
+  - a cap that holds.
+- **Scope:** one trial under an enforced cap covering every message, with
   disposable participants provisioned by an approved route.
 - **Phase:** 3
 - **Depends on:** COLLAB-2, COLLAB-3, COLLAB-4
 - **Ordering:** `not on the critical path`
 - **Relevant decisions:** D-2, D-5
-- **Acceptance signals:** the report's counts equal the reservation, and
-  the repeat is refused by the authority, not by the recipient's judgment.
+- **Acceptance signals:**
+  - the repeat is refused by the request store, not by the recipient's
+    judgment;
+  - no send exceeds the cap.
 - **Out of scope:** production sessions, routing changes.
-- **Open questions:** needs separate owner approval of its budget and of
+- **Open questions:** it needs separate owner approval of its budget and of
   how participants are provisioned.
