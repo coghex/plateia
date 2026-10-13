@@ -10,9 +10,21 @@ implements nothing.
 
 **Owner decision, 2026-10-13: design only.** The owner authorized writing
 this design from #26's findings. That decision approves the design work, not
-the choices below: every `D-N` here is a **proposal, not yet ratified**, and
+the choices below: every `D-N` here except D-7 is a **proposal, not yet
+ratified**, and
 `Q-1` to `Q-7` are open. Implementation, tests, trials, and skill,
 configuration or security changes are not authorized by it.
+
+**Owner direction, 2026-10-13 (later the same day).**
+- **Device-neutral authority.** The owner's instructions to an assistant
+  carry the same authority from any client, phone or desktop. Use from a
+  phone must not be treated any differently, and the owner is not asked to
+  repeat routine approvals in IRC or to set up an IRC client.
+- **Format and validation.** The owner agrees with having a request format
+  and validation.
+
+These two points are confirmed. The technical details below that implement
+them are still proposals.
 
 Design state: `exploring`
 
@@ -193,11 +205,52 @@ request elsewhere are pointers to it, not new requests.
   original grant, such as a merge or live-action gate, travel with it.
 - **No widening.** A relay never widens scope, and no envelope carries a
   blanket delegation.
-- **Authorization that isn't a chat post.** Some owner authorization reaches
-  agents directly, for example typed into an agent's own session, rather
-  than as an IRC post. That cannot be verified as a citation. How it maps
-  into an envelope is unresolved (Q-6), and until it is resolved it is never
-  trusted on the strength of a sender label.
+- **Device-neutral owner authority (owner-confirmed).**
+  - The owner gives an instruction to an assistant in whatever client the
+    owner uses. The assistant conveys the bounded decision into chat,
+    posting as its own server-verified account. That chat post is the
+    request's authority.
+  - Plateia validates three things: the request's correlation, the
+    delegation's scope, and the relay's provenance. None of them depends on
+    the owner's device.
+  - Plateia does not try to authenticate copied owner text as if the owner
+    had posted it in IRC. Trace references from the owner's conversation,
+    such as a thread or message reference, are recorded for audit. They are
+    never self-authenticating proof.
+- **What existing anchors support today.**
+  - **Verified authorship.** `cited_authority` resolves a chat post to its
+    server-verified account, and refuses unverified or non-owner-or-assistant
+    accounts.
+  - **The operational grant.** The owner's own manager policy already grants
+    authority to registered, server-verified assistant accounts, and asks
+    that such work be logged as "owner via assistant". Its exception for
+    managers is scoped to the cited post and its endpoint. This design
+    relies on that existing grant. It does not create, widen or reinterpret
+    it.
+  - **Precedence.** A request's own restrictions, and owner-only or security
+    gates, still win over the grant.
+- **What those anchors do not support yet.** These are engineering
+  prerequisites for *every* client, not phone restrictions:
+  - **Scope, expiry and revocation.** `cited_authority` proves who posted.
+    It does not prove the delegation's full scope, its expiry or its
+    revocation, and it cannot validate the original conversation.
+  - **A request-scoped delegation record.** Proposed: a structured record
+    posted by the verified assistant, carrying:
+    - the request ID;
+    - a scope that is narrower than, or equal to, the policy grant;
+    - the gates that travel with it;
+    - a policy reference;
+    - optional expiry;
+    - supersession or revocation by a later verified post.
+
+    Plateia would check each request against that record.
+  - **No widening.** The record is derived from the existing grant with
+    narrower limits. It never turns the configured list of assistant
+    accounts into blanket scope, and it adds no new security policy.
+- **Nothing beyond the existing grant is needed** to start, and no new trust
+  bridge is proposed. Verifying the owner's original conversation directly,
+  as a cryptographic or importer bridge, is explicitly deferred and not
+  required (Q-6).
 
 ### 3. Transitions and their actors
 
@@ -330,8 +383,9 @@ Enforcement inside agents does not exist, and this design does not claim it.
 
 ## Decisions
 
-These are **proposals, not ratified owner decisions**. The owner's
-2026-10-13 decision authorized the design only.
+D-1 to D-6 are **proposals, not ratified owner decisions**. The owner's
+2026-10-13 decision authorized the design only. D-7 records what the owner
+confirmed later that day.
 
 ### D-1. The request ID and the message ID are different things
 
@@ -362,6 +416,13 @@ Proposed. The corrected trial's overrun came from unreserved replies.
 
 Proposed. This replaces the first draft's choice of `+plateia/` client tags,
 which would have competed with approved `card-move/v1`. See Q-5.
+
+### D-7. Owner authority is device-neutral; requests have a format and validation
+
+**Owner-confirmed** (2026-10-13). An owner instruction relayed by a verified
+assistant has the same authority from any client. The owner agrees with a
+request format and validation. How the delegation is represented and checked
+(section 2) is still a proposal.
 
 ## Open questions
 
@@ -398,12 +459,25 @@ client tags like the clarification inbox, or both with a mapping. Any
 incompatibility with approved `card-move/v1` (D-8, D-33, D-37) is an owner
 decision. It gates COLLAB-1.
 
-### Q-6. How does authorization that isn't a chat post enter an envelope?
+### Q-6. How is relayed owner authority checked by machine?
 
-Owner authorization typed into an agent's own session can't be verified as
-an IRC citation. A mapping is needed, for example the owner reposting it,
-or a signed record. Until then it is not trusted by sender label. It affects
-COLLAB-1.
+The owner's intent is settled: authority is device-neutral, and relayed
+through a verified assistant under the existing grant (D-7). What is open
+is engineering, and it applies to every client.
+
+- **Today:** verified authorship, plus the existing policy grant.
+- **Proposed:** the request-scoped delegation record in section 2. Plateia
+  checks each request against it for correlation, a scope no wider than the
+  grant, and relay provenance.
+- **Owner action:** none is required beyond the authority already given. One
+  choice is the owner's, as the author of that policy: whether the record's
+  policy reference names the existing manager policy as it stands, or a
+  versioned copy of it. The default is the policy as it stands, with no new
+  confirmation needed.
+- **Deferred:** verifying the original conversation itself, which would be a
+  new trust bridge. It is not needed for this contract.
+
+It affects COLLAB-1.
 
 ### Q-7. What are the default caps, and who sets them?
 
@@ -429,15 +503,23 @@ The design fixes enforcement, not amounts. It affects COLLAB-4.
 ### COLLAB-1. Reconcile the generic request form with `card-move/v1`
 
 - **Outcome:** a generic request form and authority envelope, reusing
-  `card-move/v1`'s identity rules, in the form the owner chooses in Q-5,
-  with refusal of malformed, conflicting or unverified requests.
+  `card-move/v1`'s identity rules, in the form the owner chooses in Q-5. It
+  includes validation of the request-scoped delegation record: correlation,
+  a scope no wider than the existing grant, and relay provenance. It refuses
+  malformed, conflicting, unverified or out-of-scope requests. Validation is
+  the same for every client.
 - **Scope:** the codec and validation only. No storage.
 - **Phase:** 1
 - **Depends on:** `none`
 - **Ordering:** `can land first`, once Q-5 is decided
 - **Relevant decisions:** D-1, D-6
-- **Acceptance signals:** fixture round-trips, and a refusal for each
-  invalid form; existing `card-move/v1` examples parse unchanged.
+- **Acceptance signals:**
+  - fixture round-trips, and a refusal for each invalid form;
+  - existing `card-move/v1` examples parse unchanged;
+  - an out-of-scope request is refused;
+  - a request relayed by a verified assistant is accepted exactly like one
+    the owner posted directly;
+  - a trace reference alone never authorizes anything.
 - **Out of scope:** persistence, routing, skills.
 - **Open questions:** Q-5, Q-6
 
