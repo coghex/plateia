@@ -9,6 +9,7 @@ built from an invented repository and staged offline under a private
 destination. Services, processes and checkpoints are fakes (FakeOps); no real
 installed tool, service, chat server or state is read or touched, and the
 outbox database is never opened by the controller."""
+import atexit
 import contextlib
 import json
 import os
@@ -16,6 +17,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -90,6 +92,23 @@ def ops(bridge=None, writers="default", producers="default"):
     return FakeOps(bridge, writers, producers)
 
 
+_BUILT = {}
+
+
+def built_release():
+    """#19's real release (its release.json), built once per test process from an invented repository and
+    shared by every activation test class: tests only read it (each stages its own copy), and a build per class
+    cost about four seconds each on CI."""
+    if not _BUILT:
+        tmp = tempfile.TemporaryDirectory(prefix="plateia-activation-release-")
+        atexit.register(tmp.cleanup)
+        root = Path(os.path.realpath(tmp.name))
+        repo, _ = make_repo(root)
+        release, _ = build_release.build(repo, root / "releases")
+        _BUILT.update(release=release, manifest=build_release.verify(release))
+    return _BUILT["release"], _BUILT["manifest"]
+
+
 class ActivationCase(unittest.TestCase):
     """A test-free base: each case gets a fresh invented home (fresh() makes
     another inside one test, for subTest loops)."""
@@ -97,9 +116,7 @@ class ActivationCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.sandbox = _support.Sandbox()
-        repo, _ = make_repo(cls.sandbox.root)
-        cls.release, _ = build_release.build(repo, cls.sandbox.root / "releases")  # #19's real release.json
-        cls.manifest = build_release.verify(cls.release)
+        cls.release, cls.manifest = built_release()
 
     @classmethod
     def tearDownClass(cls):
