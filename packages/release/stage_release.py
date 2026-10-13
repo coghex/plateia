@@ -977,8 +977,10 @@ def _first_writes_at(fd):
         out["outbox-db/1"] = f"written: {', '.join(found)} exists" if found else "absent"
     except OSError as e:
         out["outbox-db/1"] = f"unknown: {e.strerror or e.__class__.__name__}"
-    try:
-        out["outbox/2"] = "written: outbox.d exists" if exists("outbox.d") else "absent"
+    try:  # the refusal sink holds outbox/2 files too (writer admission 12; #21 amendment 4)
+        found = [n for n in ("outbox.d", "refused.d") if exists(n)]
+        out["outbox/2"] = f"written: {' and '.join(found)} {'exist' if len(found) > 1 else 'exists'}" if found \
+            else "absent"
     except OSError as e:
         out["outbox/2"] = f"unknown: {e.strerror or e.__class__.__name__}"
     try:

@@ -40,9 +40,24 @@ ROTATE_PLIST = "Library/LaunchAgents/com.coghex.log-rotate.plist"
 class FakeOps:
     """What the controller reads about services, processes and checkpoints,
     invented: a bridge that is or isn't running (and which release it runs),
-    the legacy writers with their checkpoint state, and each designated
-    account's producers. It only answers reads: nothing here can start, stop,
-    signal or restart anything."""
+    the legacy writers with their checkpoint state, each designated account's
+    producers, the boot (a fake boot id; reboot() changes it) and the owner's
+    inhibition evidence (complete, no unmanaged launcher, unless a test says
+    otherwise). It only answers reads: nothing here can start, stop, signal or
+    restart anything."""
+
+    boot_id = "boot-A"
+    inhibition_evidence = {"complete": True, "launchers": []}
+
+    def boot(self):
+        return self.boot_id
+
+    def reboot(self):
+        """The owner's reboot (writer admission 8.1; gate G-1), invented: a new boot id."""
+        self.boot_id = f"boot-{chr(ord(self.boot_id[-1]) + 1)}"
+
+    def inhibition(self):
+        return None if self.inhibition_evidence is None else dict(self.inhibition_evidence)
 
     def __init__(self, bridge=None, writers="default", producers="default"):
         """None for writers or producers means there is no evidence at all."""
@@ -141,7 +156,16 @@ class ActivationCase(unittest.TestCase):
         return activate_release.stage_admitted(path, ops=self.ops, spec_path=self.spec)
 
     def activate(self, path, crash=None):
-        return activate_release.activate(path, self.ops, spec_path=self.spec, crash=crash)
+        """activate as the published operator plan runs it (writer admission 9.1): when it reports the targets
+        bound and full waiting for retirement, with no bridge running, the invented host reboots (the owner's
+        step) and activate runs again to write full. The first run's result is returned, with the second's
+        maintenance outcome. One crash hook spans both runs."""
+        result = activate_release.activate(path, self.ops, spec_path=self.spec, crash=crash)
+        if (result.get("maintenance") or {}).get("next") == "reboot" and self.ops.bridge.get("running") is False:
+            self.ops.reboot()
+            again = activate_release.activate(path, self.ops, spec_path=self.spec, crash=crash)
+            result = dict(result, maintenance=again.get("maintenance"))
+        return result
 
     def rollback(self, path, crash=None):
         return activate_release.rollback(path, self.ops, spec_path=self.spec, crash=crash)
@@ -687,23 +711,15 @@ class ResumeTests(ActivationCase):
 
 
 class QuietWriterTests(ActivationCase):
-    """A3 and the review's sixth addition: every legacy writer, running or
-    cached, must be at an acknowledged checkpoint, and every designated
-    account's producers tracked, before anything changes. A delivered request
-    is not an acknowledgement, unknown is never quiet, and nothing is
-    interrupted, restarted or killed, nor the list changed."""
+    """A3, as #21's owner amendment 4 (2026-10-13) leaves it: the quiet-writer
+    checks are replaced by writer admission (test_activation_admission: the
+    record fences new-release writers; retirement and inhibition cover legacy
+    ones before full). Its kept case: every designated account's producers
+    must be tracked before anything changes, and the list is never changed."""
 
-    def test_anything_short_of_acknowledged_quiet_blocks_before_any_change(self):
-        writers = ops().writer_list
-        cases = {
-            "a delivered but unacknowledged request": ops(writers=[dict(writers[1], checkpoint="requested")]),
-            "a cached producer not yet quiet": ops(writers=[dict(writers[2], checkpoint="requested")]),
-            "an unknown checkpoint": ops(writers=[dict(writers[0], checkpoint=None)]),
-            "an unknown kind of writer": ops(writers=[dict(writers[0], kind="mystery")]),
-            "no checkpoint evidence": ops(writers=None),
-            "an untracked producer": ops(producers={"alp-solver-2": "tracked", "sam": "untracked"}),
-            "no producer evidence": ops(producers=None),
-        }
+    def test_an_untracked_producer_blocks_before_any_change(self):
+        cases = {"an untracked producer": ops(producers={"alp-solver-2": "tracked", "sam": "untracked"}),
+                 "no producer evidence": ops(producers=None)}
         for name, fake in cases.items():
             with self.subTest(case=name):
                 self.fresh()
@@ -720,7 +736,7 @@ class QuietWriterTests(ActivationCase):
     def test_an_explicit_empty_list_needs_no_producer_evidence(self):
         self.ops = ops(producers=None)
         self.activated(designations=[])
-        self.assertEqual(self.kinds()[-1], "selected")
+        self.assertIn("selected", self.kinds())
 
     def test_a_writer_of_the_new_release_is_not_a_legacy_writer(self):
         plan, path = self.prepared()
@@ -858,7 +874,9 @@ class PreservationTests(ActivationCase):
         after = _staging.snapshot_tree(self.home)
         changed = {k for k in set(after) | set(self.before) if after.get(k) != self.before.get(k)}
         self.assertEqual({k for k in changed if k.startswith(".local/state/chat")},
-                         {".local/state/chat/designation-bootstrap.json"})
+                         {".local/state/chat/designation-bootstrap.json", ".local/state/chat/maintenance.json",
+                          ".local/state/chat/admission.lock"},
+                         "and writer admission's record and lock (#21 amendment 4)")
         self.assertFalse({k for k in changed if k.startswith((".config/", ".local/state/project-manager",
                                                               ".local/state/ergo"))})
         text = (self.root / "activation-journal.jsonl").read_text() + json.dumps(self.postcheck(path), default=str)
@@ -973,18 +991,6 @@ class SlotTwoFindingTests(ActivationCase):
         self.assertFalse(self.postcheck(path)["ok"])
 
     # 5. Every writer the sealed plan names needs current evidence.
-    def test_a_writer_the_plan_names_needs_a_current_acknowledgement_or_retirement(self):
-        plan, path = self.prepared()
-        named = ops().writer_list
-        for name, writers in (("no writers at all", []), ("one omitted", named[1:])):
-            with self.subTest(evidence=name):
-                self.ops = ops(writers=writers)
-                with self.assertRaisesRegex(Refused, "blocked"):
-                    self.activate(path)
-                self.assertEqual(self.targets_snapshot(), self.before_targets())
-        self.ops = ops(writers=[dict(named[0], checkpoint="retired")] + named[1:])
-        self.assertEqual(self.activate(path)["state"], "selected", "a verified retirement counts")
-
     # 6. A folder interrupted between two entries resumes, and rolls back.
     def test_an_interruption_between_script_replacements_resumes_and_rolls_back(self):
         for then in ("resume", "rollback"):
@@ -1426,7 +1432,7 @@ class CodeThreeTests(ActivationCase):
     def test_a_first_write_or_a_waking_producer_during_rollback_refuses_before_the_next_restore(self):
         for name, when in (("a first write before the first restore", "restoring"),
                            ("a first write between two restores", "entry-restored"),
-                           ("a producer leaving its checkpoint", "restoring")):
+                           ("the maintenance record no longer this operation's", "restoring")):
             with self.subTest(case=name):
                 self.fresh()
                 plan, path = self.activated()
@@ -1435,8 +1441,8 @@ class CodeThreeTests(ActivationCase):
                 def late(record):
                     if record["kind"] == when and not seen:
                         seen.append(record)
-                        if "producer" in name:
-                            self.ops.writer_list[1]["checkpoint"] = "requested"
+                        if "record" in name:  # what fences new-release writers (amendment 4, section 3)
+                            (self.state / "maintenance.json").unlink()
                         else:
                             (self.state / "outbox.d").mkdir()
                 with self.assertRaisesRegex(Refused, "repair or roll-forward" if "write" in name else "blocked"):
@@ -1527,14 +1533,16 @@ class CodeThreeSweepTests(ActivationCase):
         self.assertNotIn("bootstrap-intent", self.kinds())
         self.assertNotIn("binding", self.kinds())
 
-    def test_a_producer_leaving_its_checkpoint_during_binding_stops_the_next_write(self):
+    def test_the_record_no_longer_held_during_binding_stops_the_next_write(self):
+        """Amendment 4: the binding guard's quiet-writer check is replaced by the record check (writer
+        admission 6.1, 9.2)."""
         plan, path = self.prepared()
         seen = []
 
         def wake(record):
             if record["kind"] == "entry-bound" and not seen:
                 seen.append(record)
-                self.ops.writer_list[1]["checkpoint"] = "requested"
+                (self.state / "maintenance.json").unlink()
         with self.assertRaisesRegex(Refused, "blocked"):
             self.activate(path, crash=wake)
         self.assertEqual(self.kinds().count("entry-bound"), 1, "nothing more was written")

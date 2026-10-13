@@ -860,6 +860,31 @@ def sink_count(paths, fs=None):
     return sum(1 for n in names if is_published_name(n))
 
 
+BRIDGE_START = "bridge-start"  # what a `full` record's binding permits: the bound bridge's start (6.3)
+
+
+def bound_start_problem(record, binding):
+    """Why `record`, read holding L_adm shared, does not admit the operation-owned start that `binding` names
+    (writer admission 6.3; #21 amendment 4, K3), or None when it does: the record is valid and `full`, it
+    permits the bridge's start, and it names this launch's operation, bootstrap digest and release.
+    `binding` is {"operation", "bootstrap_digest", "release_id"}."""
+    if not record.valid:
+        return f"the maintenance record is unknown ({record.why})"
+    f = record.fields
+    if f["state"] != "full":
+        return f"maintenance is {f['state']}, not full"
+    bound = f["binding"]
+    if BRIDGE_START not in bound["permits"]:
+        return "the record does not permit the bridge's start"
+    if f["operation"] != binding.get("operation"):
+        return "the record is another operation's"
+    if bound["bootstrap_digest"] != binding.get("bootstrap_digest"):
+        return "the record binds another bootstrap digest"
+    if bound["release_id"] != binding.get("release_id"):
+        return "the record binds another release"
+    return None
+
+
 class StorageError(OSError):
     """The admission lock does not exist and could not be created: the state directory cannot be written. That is
     not held maintenance (the owner creates the lock before it writes the record); the call fails as an unwritable
@@ -2380,6 +2405,38 @@ class _Peer:
         self.buf, self.out, self.reply_ready = b"", b"", None
 
 
+class StartGate:
+    """What an authority's start section found, and its one admission decision (writer admission 6.3)."""
+
+    def __init__(self, authority, adm):
+        self.authority, self.adm, self.owned = authority, adm, False
+
+    def admit(self, binding=None):
+        """None for an ordinary start (no record); the record, for a start a matching `full` record admits as
+        the operation's own section. Otherwise raises Unavailable, having opened nothing. Inside an enclosing
+        bound start, a nested start section with no binding of its own is judged by the enclosing one's."""
+        adm, a = self.adm, self.authority
+        if adm.admitted:
+            return None
+        if binding is None and a._owned_starts:
+            binding = a._owned_binding
+        problem = None
+        if binding is not None and adm.locked:
+            problem = bound_start_problem(adm.record, binding)
+            if problem is None:
+                if not self.owned:
+                    self.owned = True
+                    a._owned_starts += 1
+                    a._owned_binding = binding
+                return adm.record
+        info = adm.record.describe() or {"state": "unknown"}
+        who = f"held by {info['operation']} ({info['state']})" if "operation" in info else \
+            f"unknown ({adm.record.why})"
+        a.unavailable = (f"maintenance is {who}: the authority does not start" + (f"; {problem}" if problem else ""),
+                         a.unavailable[1] if a.unavailable else a.clock())
+        raise Unavailable(a.unavailable[0])
+
+
 class Authority:
     """The bridge's authority: the only holder of the only connection to
     outbox.db (section 2.4). `launch` is the bridge's whole start: the
@@ -2408,6 +2465,8 @@ class Authority:
         self.ready = False  # set only once a start has completed; cleared by close()
         self.bridge_only = False  # no socket: its path is over the platform's limit
         self._bound = False  # outbox.sock was bound by this authority, and is still to be removed
+        self._owned_starts = 0  # open start sections admitted by a matching `full` record (6.3)
+        self._owned_binding = None  # the binding they admitted
 
     @property
     def epoch(self):
@@ -2419,36 +2478,41 @@ class Authority:
         return (self.ready and self.store.con is not None
                 and (self.thread is None or self.thread.is_alive()))
 
-    def start(self):
+    def start(self, binding=None):
         """Steps 1-4 of section 2.4.1, all or nothing; requests then run at once,
-        in this thread (the tests). Raises, having opened and bound nothing."""
-        with self._start_section():
+        in this thread (the tests). Raises, having opened and bound nothing.
+        `binding` admits it under a matching `full` record (6.3)."""
+        with self.start_section() as gate:
+            gate.admit(binding)
             self._open()
         self.ready = True
         return self.epoch
 
     @contextlib.contextmanager
-    def _start_section(self):
-        """The start is one section (writer admission 4.2, 6.3): L_adm shared, the record read while holding it,
-        and the start refused while any record exists. The start of an authority bound by a `full` record is
-        #21's rework."""
+    def start_section(self):
+        """The start is one section (writer admission 4.2, 6.3): L_adm shared, held from admission through
+        the start, the socket's binding and a failed start's cleanup, with the record read while holding it.
+        Yields a StartGate, whose admit() decides once: no record admits the start as before; a `full` record
+        whose binding matches the launch admits the operation-owned start (#21 amendment 4, K3), which then
+        serves read-only requests only, every mutation being answered `maintenance`; anything else refuses,
+        having opened nothing. A caller may judge its launch (the bridge's bootstrap) inside the section
+        before it calls admit()."""
         _make_state_tree(self.fs, self.paths.state)  # as _open does, and failing as it does (code review CODE16)
         with section(self.paths, fs=self.fs) as adm:
-            if not adm.admitted:
-                info = adm.record.describe() or {"state": "unknown"}
-                who = f"held by {info['operation']} ({info['state']})" if "operation" in info else \
-                    f"unknown ({adm.record.why})"
-                self.unavailable = (f"maintenance is {who}: the authority does not start",
-                                    self.unavailable[1] if self.unavailable else self.clock())
-                raise Unavailable(self.unavailable[0])
-            yield
+            gate = StartGate(self, adm)
+            try:
+                yield gate
+            finally:
+                if gate.owned:
+                    self._owned_starts -= 1
 
-    def launch(self):
+    def launch(self, binding=None):
         """The bridge's whole start: steps 1-4, the socket (step 5) and the
         authority thread. All or nothing: any failure closes what was opened,
         releases the lock and raises; running only once every step is done."""
         try:
-            with self._start_section():
+            with self.start_section() as gate:
+                gate.admit(binding)
                 try:
                     self._open()
                     self.bridge_only = not self.bind()
@@ -2556,7 +2620,7 @@ class Authority:
         self.wake_r = self.wake_w = None
         if self.released:
             return
-        if in_admitted_section():
+        if in_admitted_section() or self._owned_starts:  # inside a section: an ordinary one, or a bound start's
             self._release_files()
             return
         try:

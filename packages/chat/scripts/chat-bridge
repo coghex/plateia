@@ -80,6 +80,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -2089,8 +2090,8 @@ def canonical_bytes(record):
 
 class PinnedRoot:
     """The state root as classification validated it: its descriptor, held open
-    through the authority's whole start, and its identity (code review slot 3,
-    finding 2)."""
+    through the authority's whole start, its identity (code review slot 3,
+    finding 2) and its realpath (code review 6112483129, finding 4)."""
 
     def __init__(self, fd, real):
         st = os.fstat(fd)
@@ -2102,11 +2103,15 @@ class PinnedRoot:
             self.fd = None
 
     def check(self, paths, *names):
-        """The state path still names the validated root, and each named entry
-        reached through it is the one in that root: else BootstrapUnknown."""
+        """The state path still resolves to the validated realpath, that
+        realpath is still the pinned directory itself (not a link to it), and
+        each named entry reached through the path is the one in that root:
+        else BootstrapUnknown. A directory moved away with a link left at its
+        old path keeps its inode, so the identity alone is not the binding."""
         try:
-            st = os.stat(paths.state)
-            ok = (st.st_dev, st.st_ino) == self.identity
+            st = os.lstat(self.real)
+            ok = os.path.realpath(paths.state) == self.real and stat.S_ISDIR(st.st_mode) \
+                and (st.st_dev, st.st_ino) == self.identity
             for name in names if ok else ():
                 inside = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
                 there = os.stat(Path(paths.state) / name, follow_symlinks=False)
@@ -2182,6 +2187,19 @@ class BootstrapStore(delivery_store.Store):
         self.expected, self.record, self.root = expected, record, root
         self.bootstrap = None  # what this open did: "none" (S1), "applied" (S2) or "replayed" (S3)
 
+    def open(self):
+        """For an activated launch, a database whose bootstrap state can't be
+        read, classified or committed (corrupt, unreadable, made by other code,
+        busy) establishes none of S1, S2 and S3: it is UNKNOWN, never an
+        ordinary failure (code review 6112483129, finding 3). Nothing was
+        committed: Store.open is all or nothing."""
+        try:
+            super().open()
+        except (sqlite3.Error, OSError, delivery_store.Unavailable) as err:
+            if self.record is None:
+                raise
+            raise BootstrapUnknown(f"the database's bootstrap state can't be read or committed ({err})") from None
+
     def set_meta(self, name, value):
         if name == "authority_epoch" and self.bootstrap is None:
             if self.root is not None:  # inside the opening transaction, before any commit
@@ -2229,38 +2247,74 @@ class BootstrapStore(delivery_store.Store):
         super().set_meta(BOOTSTRAP_META, json.dumps(applied, sort_keys=True))
 
 
+def launch_binding(record, expected):
+    """What this launch asks a `full` maintenance record to admit (writer
+    admission 6.3): the operation its validated bootstrap record names, its
+    launch digest, and the release it runs. None for a launch with no
+    activation, which no record admits."""
+    if record is None or expected is None:
+        return None
+    return {"operation": record["operation"], "bootstrap_digest": f"sha256:{expected}",
+            "release_id": running_release()}
+
+
 def start_authority(authority, expected=None):
     """The bridge's whole start (section 2.4.1), with the designation bootstrap
     (D-74, PLT-14): E and R judged before the database is opened, M judged and
     any bootstrap committed in the opening transaction, then the socket and
     the thread. All or nothing: any failure closes what was opened and raises;
-    BootstrapUnknown before anything was opened or committed."""
-    record, root = classify_launch(authority.paths.state, expected)
-    try:
-        if root is not None:
-            root.check(authority.paths)  # before anything opens
-        authority.store = BootstrapStore(authority.paths, clock=authority.clock, fs=authority.fs,
-                                         expected=expected, record=record, root=root)
+    BootstrapUnknown before anything was opened or committed.
+
+    The whole start is one section of writer admission (#21 amendment 4, K3):
+    L_adm is held shared from the admission through the classification, the
+    start, the socket's binding and a failed start's cleanup. With no
+    maintenance record it starts as before; a `full` record whose binding is
+    this launch's (operation, digest and release) admits it as the
+    operation's own start, which then serves read-only requests only; any
+    other record refuses it (delivery_store.Unavailable), and nothing is
+    opened, committed or bound."""
+    with authority.start_section() as gate:
+        record, root = classify_launch(authority.paths.state, expected)
         try:
-            authority.start()
+            binding = launch_binding(record, expected)
+            gate.admit(binding)
             if root is not None:
-                root.check(authority.paths, "outbox.db")  # after the commit, before the socket
-            if authority.store.bootstrap in ("applied", "replayed"):
-                log(f"designation bootstrap {authority.store.bootstrap}: operation {record['operation']}, "
-                    f"{len(record['accounts'])} account(s)")
-            authority.bridge_only = not authority.bind()
+                root.check(authority.paths)  # before anything opens
+            authority.store = BootstrapStore(authority.paths, clock=authority.clock, fs=authority.fs,
+                                             expected=expected, record=record, root=root)
+            try:
+                authority.start()  # its own section, nested: admitted by this one's binding
+                if root is not None:
+                    root.check(authority.paths, "outbox.db")  # after the commit, before the socket
+                if authority.store.bootstrap in ("applied", "replayed"):
+                    log(f"designation bootstrap {authority.store.bootstrap}: operation {record['operation']}, "
+                        f"{len(record['accounts'])} account(s)")
+                authority.bridge_only = not authority.bind()
+                if root is not None:
+                    root.check(authority.paths, "outbox.db", *(() if authority.bridge_only else ("outbox.sock",)))
+                authority.run_in_thread()
+            except BaseException as err:
+                authority.close()  # inside the start's section: released, never deferred
+                if root is not None and not isinstance(err, BootstrapUnknown):
+                    root.check(authority.paths)  # a swap that surfaced as another failure is UNKNOWN too
+                raise
+        finally:
             if root is not None:
-                root.check(authority.paths, "outbox.db", *(() if authority.bridge_only else ("outbox.sock",)))
-            authority.run_in_thread()
-        except BaseException as err:
-            authority.close()
-            if root is not None and not isinstance(err, BootstrapUnknown):
-                root.check(authority.paths)  # a swap that surfaced as another failure is UNKNOWN too
-            raise
-    finally:
-        if root is not None:
-            root.close()
+                root.close()
     return authority.epoch
+
+
+def bound_start_offered(record):
+    """Whether a held record may admit this launch's authority start (writer
+    admission 6.3): `full`, permitting the bridge's start, for this launch's
+    digest and this bridge's release. Its operation is judged against the
+    bootstrap record inside the start's section; otherwise the bridge stays in
+    its hold without starting anything."""
+    if not record.valid or ACTIVATION is None or record.fields["state"] != "full":
+        return False
+    bound = record.fields["binding"]
+    return delivery_store.BRIDGE_START in bound["permits"] and bound["bootstrap_digest"] == f"sha256:{ACTIVATION}" \
+        and bound["release_id"] == running_release()
 
 
 def ensure_authority():
@@ -2318,7 +2372,10 @@ def main(argv=None):
     coverage = Coverage()
     while True:
         try:
-            if held_record() is not None:  # the hold (4.6): no authority start, no connection, nothing written
+            held = held_record()
+            if held is not None:  # the hold (4.6): no connection, nothing written
+                if bound_start_offered(held):
+                    ensure_authority()  # the operation-owned start under `full` (6.3); it serves read-only status
                 time.sleep(delivery_store.HOLD_RECHECK)
                 continue
             ensure_authority()  # before the first index, coverage change or flush of this connection

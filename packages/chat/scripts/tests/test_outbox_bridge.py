@@ -804,6 +804,145 @@ class BootstrapRootBindingTests(BootstrapCase):
                 self.stop()
                 self.unswap(moved[0])
 
+    def move_root_behind_a_link(self):
+        """The validated directory renamed away, and its former path made a symlink to it: the same inode is
+        still reached through the path, but the path no longer resolves to the validated realpath."""
+        moved = self.state.with_name(f"{self.state.name}-moved-{__import__('secrets').token_hex(4)}")
+        self.state.rename(moved)
+        self.state.symlink_to(moved)
+        self.addCleanup(self.unlink_root, moved)
+        return moved
+
+    def unlink_root(self, moved):
+        if self.state.is_symlink() and moved.exists():
+            self.state.unlink()
+            moved.rename(self.state)
+
+    def test_a_root_moved_behind_a_symlink_after_classification_is_unknown(self):
+        """Code review 6112483129, finding 4: the pinned identity alone is not the binding; the validated realpath
+        is revalidated with it throughout the start."""
+        for moment in ("before the database opens", "right after the connection opens", "before the bind"):
+            with self.subTest(move=moment):
+                self.stop()
+                for name in ("outbox.db", "outbox.db-wal", "outbox.db-shm"):
+                    with contextlib.suppress(FileNotFoundError):
+                        (self.state / name).unlink()
+                d = self.publish(self.record(["alp-solver-2"]))
+                moved, binds = [], []
+                real_start, real_connect = self.ds.Authority.start, self.ds.sqlite3.connect
+
+                def start(authority, *a, **k):
+                    if moment == "before the database opens":
+                        moved.append(self.move_root_behind_a_link())
+                    return real_start(authority, *a, **k)
+
+                def connect(*a, **k):
+                    con = real_connect(*a, **k)
+                    if moment == "right after the connection opens" and not moved:
+                        moved.append(self.move_root_behind_a_link())
+                    return con
+
+                def bind(authority):
+                    if moment == "before the bind" and not moved:
+                        moved.append(self.move_root_behind_a_link())
+                    binds.append(1)
+                    return False
+                with mock.patch.object(self.ds.Authority, "start", start), \
+                        mock.patch.object(self.ds.sqlite3, "connect", connect), \
+                        mock.patch.object(self.ds.Authority, "bind", bind):
+                    authority = self.launch(d)
+                self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, f"{moment}: {authority.unavailable}")
+                self.assertFalse(authority.running)
+                self.assertFalse(binds and moment != "before the bind", "nothing was bound")
+                if moment != "before the bind":
+                    validated = self.committed(moved[0])
+                    self.assertTrue(validated in (None, {}) or "designation_bootstrap" not in validated["meta"],
+                                    "no designation was committed")
+                self.stop()
+                self.unlink_root(moved[0])
+
+
+class BootstrapUnreadableMetaTests(BootstrapCase):
+    """Code review 6112483129, finding 3: with a valid record and launch digest, a database whose bootstrap
+    metadata (M) can't be read or classified (corrupt, unreadable, or made by other code) establishes none of S1,
+    S2 and S3. It is UNKNOWN: the status snapshot is not rewritten, recovery stays stopped, and the evidence (the
+    database's bytes) is unchanged."""
+
+    def bad_database(self, how):
+        db = self.state / "outbox.db"
+        if how == "corrupt":
+            db.write_bytes(b"not a database, invented\n" * 200)
+        else:
+            con = sqlite3.connect(db)
+            con.execute("PRAGMA journal_mode=WAL")  # as the authority's own (its open changes no header then)
+            con.execute("CREATE TABLE invented (x)")
+            con.commit()
+            con.close()
+            if how == "unreadable":
+                db.chmod(0)
+                self.addCleanup(lambda: db.exists() and db.chmod(0o600))
+        return db
+
+    def evidence(self):
+        db = self.state / "outbox.db"
+        mode = db.stat().st_mode
+        try:
+            db.chmod(0o600)
+            data = db.read_bytes()
+        finally:
+            db.chmod(mode)
+        return data, (self.state / "outbox-status.json").exists()
+
+    def test_through_ensure_authority(self):
+        for how in ("corrupt", "made by other code", "unreadable"):
+            with self.subTest(database=how):
+                self.stop()
+                self.wipe_database()
+                d = self.publish(self.record(["alp-solver-2"]))
+                self.bad_database(how)
+                before = self.evidence()
+                written = []
+                with mock.patch.object(self.bridge, "write_unavailable_status", lambda *a: written.append(a)), \
+                        mock.patch.object(self.ds.Store, "designate", side_effect=AssertionError("designated")):
+                    authority = self.launch(d)
+                self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+                self.assertFalse(authority.running)
+                self.assertTrue(self.lock_free(), "the authority lock is released")
+                self.assertEqual(written, [], "the status snapshot is not rewritten")
+                self.assertEqual(self.evidence(), before, "the database is unchanged")
+                (self.state / "outbox.db").chmod(0o600)
+
+    def test_through_main(self):
+        for how in ("corrupt", "made by other code", "unreadable"):
+            with self.subTest(database=how):
+                self.stop()
+                self.wipe_database()
+                self.bridge.BOOTSTRAP_UNKNOWN = None
+                d = self.publish(self.record(["alp-solver-2"]))
+                self.bad_database(how)
+                before = self.evidence()
+                ran, slept = [], []
+
+                class Stop(BaseException):
+                    pass
+
+                def sleep(seconds):
+                    slept.append(seconds)
+                    raise Stop()
+
+                def run(*a, **k):
+                    ran.append(a)
+                    raise Stop()
+                with mock.patch.object(self.bridge, "run", run), \
+                        mock.patch.object(self.bridge.time, "sleep", sleep), \
+                        mock.patch.object(self.bridge.chatlib, "load_config", lambda: {}), self.assertRaises(Stop):
+                    self.bridge.main(["--activation-bootstrap", "sha256:" + d])
+                self.assertEqual(ran, [], "no recovery, import or serving")
+                self.assertEqual(slept, [self.bridge.UNKNOWN_RECHECK])
+                self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN)
+                self.assertEqual(self.evidence(), before, "the database and the status snapshot are unchanged")
+                (self.state / "outbox.db").chmod(0o600)
+
 
 class BootstrapCrashTests(BootstrapCase):
     """Crashes around the bridge's commit: inside it nothing is committed; after

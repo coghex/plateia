@@ -3,34 +3,45 @@
 
 It carries #19's release through the one admitted format transition
 (activation.json): from the D-19 baseline formats to #19's, plus the one
-designation-bootstrap/1 read input (#21's owner amendment of 2026-10-11).
+designation-bootstrap/1 read input (#21's owner amendment of 2026-10-11) and
+writer admission's maintenance/1 record (#23, #24; amendment 4 of 2026-10-13).
 
     activate_release plan --release DIR --dest DIR --root DIR --evidence FILE
                           (--designate NAME ... | --no-designations) --out FILE
     activate_release stage --plan FILE
     activate_release activate --plan FILE --evidence FILE
     activate_release postcheck --plan FILE --evidence FILE
+    activate_release release --plan FILE --evidence FILE
     activate_release rollback --plan FILE --evidence FILE
     activate_release operator-plan --plan FILE
-    activate_release status --root DIR
+    activate_release status --root DIR [--plan FILE]
 
 - plan: read-only. It seals one release, the seven D-26 targets as they are,
   one state snapshot and the state root's identity, activation.json's
   transition, a private root and the designation list (or an explicit empty
   one) under one digest, with a new operation id.
 - stage: stages the release under the plan's admission (stage_release).
-- activate: under a fenced journal, once the old writers are quiet, it
+- activate: under a fenced journal it seals the staged release, acquires
+  writer admission's maintenance (docs/writer_admission.md: the record
+  `draining`, the drain, `partial`), backs up every original privately,
   publishes the bridge's designation bootstrap record (derived from the
   sealed plan; never replacing anything), journals its digest D, and binds
-  the seven targets to the staged release, every original backed up
-  privately. The chat-bridge LaunchAgent runs the release's chat-bridge with
-  exactly `--activation-bootstrap sha256:<D>`. It starts, stops and restarts
-  nothing: the operator restarts the bridge at an acknowledged checkpoint, as
-  the published operator plan says.
-- postcheck: read-only, with the new bridge running; it never opens the
-  outbox database. The activation is complete only when it passes.
+  the seven targets to the staged release. The chat-bridge LaunchAgent runs
+  the release's chat-bridge with exactly `--activation-bootstrap
+  sha256:<D>`. Run again after the owner's reboot, it verifies retirement
+  (a boot change since the binding), inhibition and every target, and writes
+  `full`, which admits the bound bridge's start. It starts, stops and
+  restarts nothing: the owner stops the legacy bridge before binding and
+  reboots after it, as the published operator plan says.
+- postcheck: read-only, with the new bridge serving under `full`; it never
+  opens the outbox database.
+- release: ends maintenance (unlinks the record), only while every
+  post-check passes, or, after a rollback, once the restored targets, the
+  record, a boot change since the restore and the absence of any first write
+  are verified. The activation is complete only once released.
 - rollback: before the first new-format write only (D-74); refused after it.
-  It leaves the bootstrap record in place.
+  It leaves the bootstrap record in place and keeps the maintenance record
+  until the release.
 - operator-plan: the private plan an operator publishes before any live step
   (A9), with the expected skills-repository change (D-27).
 
@@ -151,6 +162,15 @@ class LiveOps:
         data = self._evidence()
         return data.get("producers") if data and isinstance(data.get("producers"), dict) else None
 
+    def inhibition(self):
+        """The owner-authorized inhibition evidence (writer admission 8.2; gate
+        G-2), from the operator's evidence file: whether it is complete, and
+        each unmanaged launcher found with its coverage. None when absent or
+        stale. The controller never searches for launchers itself: that
+        inventory, and what it may read, is the owner's (G-2)."""
+        data = self._evidence()
+        return data.get("inhibition") if data and isinstance(data.get("inhibition"), dict) else None
+
     def authority_status(self, plan):
         """The bridge authority's live answer to the existing read-only status
         request (outbox-authority/1) over its socket, through the pinned
@@ -179,39 +199,12 @@ def bridge_verdict(ops, plan):
                   "this operation's; nothing was changed")
 
 
-def check_quiet(ops, plan):
-    """Refused unless the old writers are quiet. Every writer the sealed plan
-    names, and every legacy writer the current evidence lists (old bridge,
-    flusher, helper, running or cached producer), must be at an acknowledged
-    checkpoint or verifiably retired; a writer the plan names that the evidence
-    omits is unknown. Every designated account's producers must be tracked. A
-    delivered request is not an acknowledgement; anything unknown is never
-    assumed quiet. Nothing is interrupted, restarted or killed (A3)."""
-    writers = ops.writers()
-    if writers is None:
-        raise Refused("blocked: no checkpoint evidence for the old writers; nothing was changed")
-    if not isinstance(writers, list) or not all(
-            isinstance(w, dict) and isinstance(w.get("name"), str) and isinstance(w.get("kind"), str)
-            and (w.get("checkpoint") is None or isinstance(w.get("checkpoint"), str)) for w in writers):
-        raise Refused("blocked: the checkpoint evidence is malformed; nothing was changed")
-    by_name = {w["name"]: w for w in writers}
-    for c in plan["checkpoints"]:
-        if c["name"] not in by_name:
-            raise Refused(f"blocked: {c['name']}, which the activation plan names, has no current checkpoint "
-                          "evidence: unknown, never assumed quiet; nothing was changed")
-    for w in writers:
-        if w.get("release") == plan["release"]:
-            continue
-        if w["kind"] not in LEGACY_KINDS:
-            raise Refused(f"blocked: {w['name']}: an unknown kind of writer; nothing was changed")
-        state = w.get("checkpoint")
-        if state in ("acknowledged", "retired"):
-            continue
-        if state == "requested":
-            raise Refused(f"blocked: {w['name']}: a quiet request was delivered but not acknowledged; "
-                          "nothing was changed")
-        raise Refused(f"blocked: {w['name']}: its checkpoint is unknown, and it is never assumed quiet; "
-                      "nothing was changed")
+def check_producers(ops, plan):
+    """Every designated account's producers must be tracked, so the designation
+    list is complete (A3's one kept case; writer admission 9.2). The
+    quiet-writer checks that sat beside it are replaced: new-release writers by
+    the maintenance record (acquisition to `partial`), legacy writers by
+    retirement and inhibition before `full` (#21 amendment 4, section 3)."""
     producers = ops.producers()
     if plan["designations"]:
         if not isinstance(producers, dict):
@@ -227,8 +220,9 @@ def check_quiet(ops, plan):
 
 def make_plan(release, dest, root, designations, ops, spec_path=None, activation_path=None):
     """An activation plan: read-only. Refused if the release can't be staged,
-    a target is blocked, the state already holds a new-format write or a
-    bootstrap record, or the designation list is invalid."""
+    a target is blocked, the state already holds a new-format write, a
+    bootstrap record, a maintenance record or a refusal sink, or the
+    designation list is invalid."""
     spec = load_activation(activation_path)
     if designations is None or not isinstance(designations, (list, tuple)):
         raise Refused("a designation list, or an explicit empty one, is required")
@@ -257,6 +251,11 @@ def make_plan(release, dest, root, designations, ops, spec_path=None, activation
     if os.path.lexists(Path(root_id["path"]) / spec["bootstrap"]["file"]):
         raise Refused("a designation bootstrap record is already in the chat state; an activation never replaces "
                       "one it didn't publish: this needs an owner decision")
+    for name, what in ((MAINT_FILE, "a maintenance record (writer admission is held by an operation)"),
+                       (SINK_DIR, "a refusal sink (refused writes kept for an owner decision)")):
+        if os.path.lexists(Path(root_id["path"]) / name):
+            raise Refused(f"the chat state already holds {what}: no plan is made over it; it needs its own "
+                          "operation's release, or an owner decision")
     writers = ops.writers() or []
     plan = {
         "schema": PLAN_SCHEMA, "operation": "activate-" + secrets.token_hex(8), "made_at": now(),
@@ -613,7 +612,9 @@ RECORD_FIELDS = {  # what each journal record must carry, by kind (shape checks 
     "binding": {"target": str}, "entry-binding": {"target": str, "rel": str, "tmp": str, "to": str},
     "entry-bound": {"target": str, "rel": str}, "bound": {"target": str},
     "entry-restoring": {"target": str, "rel": str, "tmp": str}, "entry-restored": {"target": str, "rel": str},
-    "restored": {"target": str}, "release-seal-baseline": {"dirs": list}, "release-sealed": {"dirs": list}}
+    "restored": {"target": str}, "release-seal-baseline": {"dirs": list}, "release-sealed": {"dirs": list},
+    "maint-intent": {"step": dict}, "maint-progress": {"step": dict, "facts": dict},
+    "maint-outcome": {"step": dict, "result": dict}, "full": {"boot": str}}
 
 
 def record_problem(r):
@@ -735,6 +736,12 @@ class Journal:
         if self.crash:
             self.crash(record)
 
+    def point(self, name):
+        """A named place inside a maintenance step (delivery_store.Owner.point): nothing is journaled; a test's
+        crash hook that asks for points (its `points` attribute) sees it as a record of kind maint-point:<name>."""
+        if self.crash is not None and getattr(self.crash, "points", False):
+            self.crash({"kind": f"maint-point:{name}"})
+
     def close(self):
         for fd in (self.fd, self.lock_fd, self.root_fd):
             if fd is not None:
@@ -770,11 +777,333 @@ def operation_state(records, op):
     mine = [r for r in records if r.get("op") == op]
     kinds = [r["kind"] for r in mine]
     return {"records": mine, "admitted": "admitted" in kinds, "selected": "selected" in kinds,
-            "rolled_back": "rolled-back" in kinds,
+            "rolled_back": "rolled-back" in kinds, "released": "released" in kinds, "full": "full" in kinds,
             "bound": {r["target"] for r in mine if r["kind"] == "bound"},
             "backups": {r["target"]: r for r in mine if r["kind"] == "backup"},
             "digest": next((r["digest"] for r in mine if r["kind"] == "bootstrap"), None),
             "written": {(r["target"], r["rel"]): r["to"] for r in mine if r["kind"] == "entry-binding"}}
+
+
+# --- writer admission (#21 amendment 4; docs/writer_admission.md 4, 6, 8, 9, 12) --------------
+# The controller is the owning operation: it drives the release's own delivery_store.Owner
+# (loaded from the verified wheel) under its fenced journal, and keeps its own decisions:
+# retirement, inhibition and targets before `full`, the release, and the rollback's release.
+
+MAINT_FILE, SINK_DIR = "maintenance.json", "refused.d"
+MAINT_KIND = "plateia-activation"
+BRIDGE_START = "bridge-start"
+MAINT_RECORDS = ("maint-intent", "maint-progress", "maint-outcome")
+COVERAGE = ("managed-target", "disabled", "never-writes")  # writer admission 8.2: what covers an unmanaged launcher
+
+
+def step_key(step):
+    return json.dumps({k: v for k, v in step.items() if k != "progress"}, sort_keys=True)
+
+
+class OwnerFence:
+    """delivery_store.Owner's fence for this operation: its fenced journal
+    (amendment 4's APPROVE, clarification K4). Each intent, progress fact and
+    outcome is a journal record, synced before the call returns; the pending
+    step and the latest record evidence are derived from those records alone,
+    so they survive across commands and crashes. Verifying checks the
+    journal's fence and the sealed state root, and before `full` the
+    controller's own checks. With no journal (records only) it is read-only:
+    it verifies nothing, so it permits no mutation."""
+
+    def __init__(self, journal, plan, full_check=None, records=None):
+        self.journal, self.plan, self.full_check, self._records = journal, plan, full_check, records
+
+    def records(self):
+        records = self.journal.records if self.journal is not None else (self._records or [])
+        return [r for r in records if r.get("op") == self.plan["operation"] and r["kind"] in MAINT_RECORDS]
+
+    def verify(self, step):
+        if self.journal is None:
+            return False
+        self.journal.check_fence()
+        os.close(open_state_root(self.plan))  # the plan's sealed state root, still at its path
+        if self.full_check is not None and (step.get("to") or {}).get("state") == "full" and "progress" not in step:
+            self.full_check()  # immediately before the durable intent of `full` (writer admission 8.3)
+        return True
+
+    def _append(self, kind, **fields):
+        self.journal.append({"op": self.plan["operation"], "kind": kind, **fields})
+
+    def intent(self, step):
+        self._append("maint-intent", step=dict(step), state_root=self.plan["state_root"]["path"])
+
+    def progress(self, step, facts):
+        self._append("maint-progress", step=json.loads(step_key(step)), facts=dict(facts))
+
+    def outcome(self, step, result):
+        self._append("maint-outcome", step=json.loads(step_key(step)), result=dict(result))
+
+    def pending(self):
+        records = self.records()
+        intents = [i for i, r in enumerate(records) if r["kind"] == "maint-intent"]
+        if not intents:
+            return None
+        start = intents[-1]
+        step = records[start]["step"]
+        key, facts = step_key(step), {}
+        for r in records[start + 1:]:
+            if step_key(r["step"]) != key:
+                continue
+            if r["kind"] == "maint-outcome":
+                return None
+            facts.update(r["facts"])
+        return dict(step, progress=facts)
+
+    def released(self):
+        """Whether the last maintenance outcome journaled is this operation's landed release."""
+        outcomes = [r for r in self.records() if r["kind"] == "maint-outcome"]
+        return bool(outcomes) and outcomes[-1]["step"].get("step") == "release" \
+            and outcomes[-1]["result"].get("landed") is True
+
+    def evidence(self):
+        found = None
+        for r in self.records():
+            if r["kind"] != "maint-outcome" or not r["result"].get("landed"):
+                continue
+            name = r["step"].get("step")
+            if name in ("write-draining", "write-record") and isinstance(r["result"].get("evidence"), dict):
+                found = r["result"]["evidence"]
+            elif name == "release":
+                found = None
+        return dict(found) if found else None
+
+
+class ControllerProbes:
+    """What Owner asks of the host: the boot (the operator's evidence when it
+    gives one, else the release's own read-only probe; unreadable is
+    "unknown"), this process's identity, and whether a recorded process is
+    gone (for the read-only reconcile)."""
+
+    def __init__(self, ops, store):
+        self.ops, self.store = ops, store
+
+    def boot(self):
+        read = self.ops.boot() if hasattr(self.ops, "boot") else self.store._boot_id()
+        return read if isinstance(read, str) and read else "unknown"
+
+    def identity(self, conn_id=None):
+        return {"boot": self.boot(), "pid": os.getpid(), "start": None}
+
+    def gone(self, writer):
+        probe = getattr(self.ops, "process_gone", None)
+        return probe(writer) if probe is not None else self.store.HostProbes().gone(writer)
+
+
+def maintenance(journal, plan, ops, full_check=None, records=None):
+    """(the release's delivery_store, its Owner for this operation, the fence)."""
+    store = load_release_module(plan, "delivery_store")
+    fence = OwnerFence(journal, plan, full_check, records)
+    clock = getattr(ops, "clock", None)  # tests: a fake clock bounds the drain's waits
+    owner = store.Owner(store.Paths(plan["state_root"]["path"]), operation=plan["operation"], kind=MAINT_KIND,
+                        plan_sha256=plan["digest"], fence=fence, probes=ControllerProbes(ops, store),
+                        **({"mono": clock.mono, "sleep": clock.advance} if clock is not None else {}))
+    if journal is not None:
+        owner.point = journal.point
+    return store, owner, fence
+
+
+@contextlib.contextmanager
+def owner_step(store, what):
+    """An Owner primitive's refusal, as the controller's: nothing further is done."""
+    try:
+        yield
+    except store.OwnerError as e:
+        raise Refused(f"blocked: {what}: {e}; nothing more was changed") from None
+
+
+def held_problem(store, fence, plan, states):
+    """(the record, why it is not this operation's own, exactly its last journaled write, in one of `states`;
+    or None). Never writes anything."""
+    rec = store.read_maintenance(store.Paths(plan["state_root"]["path"]))
+    if not rec.present:
+        return rec, "there is no maintenance record"
+    if not rec.valid:
+        return rec, f"the maintenance record is unknown ({rec.why})"
+    f = rec.fields
+    if (f["operation"], f["kind"], f["plan_sha256"]) != (plan["operation"], MAINT_KIND, plan["digest"]):
+        return rec, "the maintenance record is another operation's"
+    if not store.same_evidence(fence.evidence(), rec.evidence()):
+        return rec, "the maintenance record is not this operation's last journaled write"
+    if f["state"] not in states:
+        return rec, f"the maintenance record is {f['state']}, not {' or '.join(states)}"
+    return rec, None
+
+
+def require_held(store, fence, plan, states, what):
+    rec, problem = held_problem(store, fence, plan, states)
+    if problem:
+        raise Refused(f"blocked: {problem}, so {what}; nothing more was changed")
+    return rec
+
+
+def acquire(owner, store, probes):
+    """Step 3 (writer admission 4.4, 9.1): the record `draining`, the drain, `partial`. On resume it continues
+    from the record's state, and drains again in a new boot. Returns the record."""
+    with owner_step(store, "acquiring maintenance"):
+        rec = owner.acquire()  # settles a pending step first; another operation's or an unknown record refuses
+        boot = probes.boot()
+        if rec.state == "draining" or (rec.state == "partial" and rec.fields["boot"] != boot):
+            if not owner.drain(boot=boot).get("drained"):
+                raise Refused("blocked: the drain did not complete within its deadline (a writer's section is still "
+                              "open); the record stays draining and keeps refusing new sections; run activate again, "
+                              "or roll back and release; nothing more was changed")
+            rec = store.read_maintenance(owner.paths)
+    return rec
+
+
+def inhibition_problems(evidence):
+    """Why the inhibition evidence does not cover the window (writer admission 8.2, 8.3; gate G-2)."""
+    if not isinstance(evidence, dict):
+        return ["no current inhibition evidence (gate G-2: the owner-authorized inventory of unmanaged launchers)"]
+    problems = []
+    if evidence.get("complete") is not True:
+        problems.append("the inhibition evidence is marked incomplete (gate G-2)")
+    launchers = evidence.get("launchers")
+    if not isinstance(launchers, list) or not all(isinstance(x, dict) and isinstance(x.get("name"), str)
+                                                  for x in launchers):
+        return problems + ["the inhibition evidence's launchers are malformed"]
+    for x in launchers:
+        if x.get("coverage") not in COVERAGE:
+            where = x.get("path") if isinstance(x.get("path"), str) else "an unknown path"
+            problems.append(f"the unmanaged launcher {x['name']} ({where}) has no coverage")
+    return problems
+
+
+def targets_problems(journal_root_fd, mine, paths, layout, d):
+    """Each target that this operation backed up, verified bound through its pinned directory, as the
+    post-check verifies it."""
+    problems = []
+    for name, (t, path) in paths.items():
+        backup = mine["backups"].get(name)
+        if backup is None:
+            problems.append(f"{name} is not bound by this operation")
+            continue
+        try:
+            current, _ = observe_target(t, path, layout, backup.get("container"))
+            want = desired_target(t, path, layout, restore_state(journal_root_fd, backup["folder"]), d)
+        except Refused as e:
+            problems.append(f"{name}: {e}")
+            continue
+        problem = invocation_problem(t, current.get(""), layout, d) if t["kind"] == "launchagent" else None
+        if summary_of(current) != summary_of(want) or problem:
+            problems.append(f"{name} is not bound as planned" + (f" ({problem})" if problem else ""))
+    return problems
+
+
+RETIREMENT = "retirement unverified"
+
+
+def full_problems(journal, plan, ops, store, probes, layout, paths, d):
+    """What `full` requires and doesn't have, in the current boot (writer admission 8.3): retirement (a known
+    boot that differs from the binding's), complete inhibition, every target bound, the bootstrap record
+    reconciled as this operation's, and the bridge stopped or this operation's own."""
+    problems = []
+    rec = store.read_maintenance(store.Paths(plan["state_root"]["path"]))
+    bound, boot = (rec.fields or {}).get("bound_boot"), probes.boot()
+    if store.known(boot) is None:
+        problems.append("the boot can't be read: unknown")
+    elif store.known(bound) is None:
+        problems.append(f"{RETIREMENT}: the record holds no known boot of the binding")
+    elif bound == boot:
+        problems.append(f"{RETIREMENT}: the boot has not changed since the targets were bound, so a legacy writer "
+                        "may still run (the owner's reboot, gate G-1)")
+    problems += inhibition_problems(ops.inhibition() if hasattr(ops, "inhibition") else None)
+    mine = operation_state(journal.records, plan["operation"])
+    problems += targets_problems(journal.root_fd, mine, paths, layout, d)
+    if mine["digest"] != d:
+        problems.append("the bootstrap digest is not journaled as this plan's")
+    else:
+        try:
+            publish_bootstrap(journal, plan)  # journaled: reconciles only, writing nothing
+        except Refused as e:
+            problems.append(str(e))
+    try:
+        bridge_verdict(ops, plan)
+    except Refused as e:
+        problems.append(str(e))
+    return problems
+
+
+def full_binding(plan, d):
+    return {"release_id": plan["release"], "bootstrap_digest": f"sha256:{d}", "permits": [BRIDGE_START]}
+
+
+def take_full(journal, plan, ops, layout, paths, d):
+    """Step 8 (writer admission 8.3, 9.1): after the owner's reboot, verify retirement, inhibition, targets and
+    the bootstrap, then write `full`, which admits the bound bridge's start. A refusal of `full` is reported,
+    never forced, and the record stays `partial`. With `full` already held, every target is verified again; a
+    changed one writes the record back to `partial`, needing a new retirement (8.2)."""
+    def check():
+        found = full_problems(journal, plan, ops, store, probes, layout, paths, d)
+        if found:
+            raise Refused("; ".join(found))
+    store, owner, fence = maintenance(journal, plan, ops, full_check=check)
+    probes = ControllerProbes(ops, store)
+    pending = fence.pending()
+    if fence.released() or (pending is not None and pending.get("step") == "release"):
+        return {"state": "releasing", "next": "release: it completes the release this operation began"}
+    if not store.read_maintenance(owner.paths).present and pending is None:
+        raise Refused("blocked: the maintenance record of this bound operation is missing; it is never acquired "
+                      "again after binding: this needs an owner decision; nothing more was changed")
+    with owner_step(store, "resuming maintenance"):
+        rec = owner.acquire()
+    boot = probes.boot()
+    if rec.state == "full":
+        changed = targets_problems(journal.root_fd, operation_state(journal.records, plan["operation"]), paths,
+                                   layout, d)
+        if not changed:
+            return {"state": "full", "next": "postcheck, then release"}
+        with owner_step(store, "writing the record back to partial"):
+            owner.advance("partial", boot=boot, bound_boot=boot, set_bound_boot=True)
+        return {"state": "partial", "refused": "full is withdrawn: " + "; ".join(changed),
+                "next": "an owner decision: a target changed while maintenance was full"}
+    if store.known(boot) is None:
+        return {"state": rec.state, "refused": "full is refused: the boot can't be read: unknown",
+                "next": "activate again once the boot can be read"}
+    rec = acquire(owner, store, probes)  # the drain, repeated in this boot (trivial after a reboot)
+    found = full_problems(journal, plan, ops, store, probes, layout, paths, d)
+    if found:
+        only_retirement = all(p.startswith(RETIREMENT) for p in found)
+        return {"state": rec.state, "refused": "full is refused: " + "; ".join(found),
+                "next": "reboot" if only_retirement else "resolve these, then activate again"}
+    with owner_step(store, "writing full"):
+        owner.advance("full", boot=boot, legacy="retired-and-inhibited", binding=full_binding(plan, d))
+    journal.append({"op": plan["operation"], "kind": "full", "boot": boot})
+    return {"state": "full", "next": "launchd's bound bridge starts its authority under full and serves read-only "
+                                     "status; then postcheck, then release"}
+
+
+def backup_problem(t_plan, t, path, captured):
+    """Why a captured target is not exactly what the sealed plan observed, or None (code review 6112483129,
+    finding 1): a LaunchAgent's exact bytes, a link's destination, and each captured file of a folder (or its
+    absence) against the plan's recorded hashes."""
+    observed = t_plan.get("observed") if isinstance(t_plan.get("observed"), dict) else {}
+    entry = captured.get("")
+    if t["kind"] == "launchagent":
+        if not (isinstance(entry, dict) and "bytes" in entry) or sha256_bytes(entry["bytes"]) != observed.get("sha256"):
+            return "its property list's bytes are not the ones the plan recorded"
+        return None
+    if t["kind"] == "symlink":
+        if not (isinstance(entry, dict) and "link" in entry) or observed.get("type") != "symlink":
+            return "it is not the link the plan recorded"
+        where = Path(os.path.normpath(os.path.join(os.path.dirname(path), entry["link"])))
+        return None if shown(where) == observed.get("target") else "its link doesn't point where the plan recorded"
+    files = observed.get("files")
+    prefix = "chat/" if t["kind"] == "skill-folder" else "chat/scripts/"
+    if captured.get(".") != {"directory": True} or not isinstance(files, dict):
+        return "it is not the directory the plan recorded"
+    for rel, e in sorted(captured.items()):
+        if rel == ".":
+            continue
+        have = None if e is None else sha256_bytes(e["bytes"]) if isinstance(e, dict) and "bytes" in e else "other"
+        if have != files.get(prefix + rel):
+            return f"{rel} is not as the plan recorded"
+    return None
 
 
 # --- the staged release ------------------------------------------------------------------
@@ -1434,8 +1763,11 @@ def stage_admitted(plan_path, python=None, crash=None, spec_path=None, ops=None)
 
 
 def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
-    """Publish the bootstrap and bind the seven targets, under the fenced journal.
-    A resume takes the original plan for its own journaled operation only."""
+    """Seal, acquire maintenance, back up, publish the bootstrap and bind the
+    seven targets, under the fenced journal (writer admission 9.1, steps 1 to
+    6); run again after the owner's reboot, verify retirement and inhibition
+    and write `full` (step 8). A resume takes the original plan for its own
+    journaled operation only."""
     plan = load_plan(plan_path)
     spec_targets = stage_release.load_spec(spec_path)[0]["targets"]
     with Journal(plan["root"], crash) as journal:
@@ -1449,36 +1781,32 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
         mine = operation_state(journal.records, plan["operation"])
         if mine["rolled_back"]:
             raise Refused("this operation was rolled back; a new activation needs a new plan")
-        if mine["selected"]:
-            return dict(postcheck(plan_path, ops, spec_path), state="already selected")
+        if mine["released"]:
+            return {"state": "released", "operation": plan["operation"], "release": plan["release"]}
         if not mine["admitted"]:
             stage_release.admission(plan, plan["release_path"], spec_path, activation_path)
         elif [r for r in mine["records"] if r["kind"] == "admitted"][0]["plan_sha256"] != plan["digest"]:
             raise Refused("the journaled operation was admitted with other inputs; nothing was changed")
         verify_staged_release(plan)  # before every activation and resume: nothing changed since staging
         layout = staged_layout(plan)
-        # The expected new bridge, started under this operation, allows only a
-        # read-only reconcile; any other running bridge blocks (review correction 2).
+        # This operation's own bridge (holding, or serving read-only status under `full`) permits the
+        # maintenance transitions, but no target write; any other running bridge, or an unknown state, blocks
+        # every change (amendment 4's APPROVE, K1).
         read_only = bridge_verdict(ops, plan) == "expected"
         if read_only and mine["digest"] is None:
             raise Refused("blocked: a bridge of this release is running, but this operation never journaled its "
                           "bootstrap; nothing was changed")
+        skills = skills_root(spec_path)
+        paths = target_paths(spec_targets, skills)
+        d = sha256_bytes(bootstrap_bytes(plan))  # the plan alone determines D
+        if mine["selected"]:
+            ownership = take_full(journal, plan, ops, layout, paths, d)
+            return dict(postcheck(plan_path, ops, spec_path), state="already selected", maintenance=ownership)
         if not read_only:
-            check_quiet(ops, plan)
-
-        def binding_guard():
-            """Before each write: producers still fenced (no bridge started,
-            every writer still quiet) and the release still sealed as journaled
-            (its paths, identities, modes and access metadata)."""
-            if bridge_verdict(ops, plan) != "stopped":
-                raise Refused("blocked: a bridge started during binding; nothing more was changed")
-            check_quiet(ops, plan)
-            seal_release(journal, plan, read_only=True)
+            check_producers(ops, plan)
         if not mine["admitted"]:
             journal.append({"op": plan["operation"], "kind": "admitted", "plan_sha256": plan["digest"],
                             "release": plan["release"], "targets": {t["name"]: t["digest"] for t in plan["targets"]}})
-        skills = skills_root(spec_path)
-        paths = target_paths(spec_targets, skills)
         pending = [t["name"] for t in plan["targets"] if t["name"] not in mine["backups"]]
         if pending:
             # Every original is backed up before anything is published or bound,
@@ -1494,16 +1822,36 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
             if changed:
                 raise Refused(f"blocked: {', '.join(changed)} changed since the activation plan was made; "
                               "nothing more was changed")
-            for name in pending:
-                t, path = paths[name]
-                current, container = observe_target(t, path, layout)
-                folder = backup_target(journal, plan["operation"], t, current)
-                journal.append({"op": plan["operation"], "kind": "backup", "target": name, "folder": folder,
-                                "digest": summary_of(current), "container": container})
-            mine = operation_state(journal.records, plan["operation"])
-        d = sha256_bytes(bootstrap_bytes(plan))  # the plan alone determines D
         if mine["digest"] not in (None, d):
             raise Refused("the journaled bootstrap digest is not this plan's; nothing was changed")
+        if not any(r["kind"].startswith("bootstrap") for r in mine["records"]):
+            sfd = open_state_root(plan)  # read-only, before anything is acquired: a record nobody here published
+            try:
+                foreign = entry_at(sfd, bootstrap_name()) is not None
+            finally:
+                os.close(sfd)
+            if foreign:
+                raise Refused(f"blocked: {bootstrap_name()} exists, and this operation's journal never staged a "
+                              "record: it is retained, never replaced, and this needs an owner decision")
+        seal_release(journal, plan, read_only)  # step 2: verified, or guarded and journaled
+        seal_release(journal, plan, read_only=True)  # and verified again across that durable record
+        store, owner, fence = maintenance(journal, plan, ops)
+        probes = ControllerProbes(ops, store)
+        acquire(owner, store, probes)  # step 3: new-release writers drained and refused (`partial`)
+        by_name = {t["name"]: t for t in plan["targets"]}
+        for name in pending:  # step 4, admitted in `partial` (writer admission 6.2)
+            t, path = paths[name]
+            current, container = observe_target(t, path, layout)
+            problem = backup_problem(by_name[name], t, path, current)
+            if problem:
+                raise Refused(f"blocked: {name} changed since the activation plan was made ({problem}): the change "
+                              "is kept, and nothing more was changed")
+            folder = backup_target(journal, plan["operation"], t, current)
+            if summary_of(restore_state(journal.root_fd, folder)) != summary_of(current):
+                raise Refused(f"blocked: {name}'s backup doesn't read back as captured; nothing more was changed")
+            journal.append({"op": plan["operation"], "kind": "backup", "target": name, "folder": folder,
+                            "digest": summary_of(current), "container": container})
+        mine = operation_state(journal.records, plan["operation"])
         steps = []
         for t_plan in plan["targets"]:  # every target is judged before anything is published or written
             t, path = paths[t_plan["name"]]
@@ -1516,14 +1864,29 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
             writes = [(rel, current.get(rel), desired.get(rel)) for rel in sorted(set(current) | set(desired))
                       if rel != "." and entry_digest(current.get(rel)) != entry_digest(desired.get(rel))]
             if writes and read_only:
-                raise Refused(f"blocked: {t['name']} isn't bound while a bridge runs; binding waits for it to stop "
-                              "at an acknowledged checkpoint; nothing was changed")
+                raise Refused(f"blocked: {t['name']} isn't bound while a bridge runs; binding waits for it to stop; "
+                              "nothing was changed")
             steps.append((t, path, backup, original, desired, writes))
-        seal_release(journal, plan, read_only)  # before any target is written: verified, or guarded and journaled
-        seal_release(journal, plan, read_only=True)  # and verified again across that durable record
+        seal_release(journal, plan, read_only=True)  # still sealed as journaled, before anything is published
         if not read_only:
-            publish_bootstrap(journal, plan)
-        for t, path, backup, original, desired, writes in steps:
+            publish_bootstrap(journal, plan)  # step 5, admitted in `partial`
+        # The binding's boot, recorded before the first target write of this boot: retirement then needs a boot
+        # change after every binding write (writer admission 8.1). A resume in a new boot records it again.
+        boot = probes.boot()
+        rec = require_held(store, fence, plan, ("partial",), "nothing is bound")
+        if rec.fields["bound_boot"] != boot:
+            with owner_step(store, "recording the binding's boot"):
+                owner.advance("partial", boot=boot, bound_boot=boot, set_bound_boot=True)
+
+        def binding_guard():
+            """Before each write: no bridge started, the record still this
+            operation's own and `partial` (which is what fences every
+            new-release writer), and the release still sealed as journaled."""
+            if bridge_verdict(ops, plan) != "stopped":
+                raise Refused("blocked: a bridge started during binding; nothing more was changed")
+            require_held(store, fence, plan, ("partial",), "nothing more is bound")
+            seal_release(journal, plan, read_only=True)
+        for t, path, backup, original, desired, writes in steps:  # step 6
             if writes:
                 journal.append({"op": plan["operation"], "kind": "binding", "target": t["name"],
                                 "from": summary_of(original), "to": summary_of(desired)})
@@ -1541,8 +1904,10 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
                         "skills_repository_change": change})
         return {"state": "selected", "operation": plan["operation"], "release": plan["release"],
                 "bootstrap_digest": d, "skills_repository_change": change,
-                "next": "restart the bridge at an acknowledged checkpoint, then run postcheck; the activation is "
-                        "complete only when postcheck passes"}
+                "maintenance": {"state": "partial", "next": "reboot"},
+                "next": "the owner reboots the machine (retirement, gate G-1); launchd then starts the bound bridge, "
+                        "which waits in its hold; then run activate again to verify retirement and inhibition and "
+                        "write full; then postcheck, then release. The activation is complete only once released"}
 
 
 def serving_evidence(reply):
@@ -1563,9 +1928,15 @@ def postcheck(plan_path, ops, spec_path=None):
 
     The live answer ties the evidence to this activation: once the record
     exists, a bridge launched without its exact digest is UNKNOWN and never
-    binds its socket, so an authority that answers was started for this D."""
+    binds its socket, so an authority that answers was started for this D.
+
+    It also reports the maintenance record (writer admission 6.4, 9.3): it
+    must be this operation's own last journaled write, in `full`, binding
+    this release, D and the bridge's start (or released by this operation).
+    The record is reported beside the checks, not among them."""
     plan = load_plan(plan_path)
-    mine = operation_state(read_journal(plan["root"]), plan["operation"])
+    records = read_journal(plan["root"])
+    mine = operation_state(records, plan["operation"])
     data = bootstrap_bytes(plan)
     d = sha256_bytes(data)
     checks = [("bootstrap digest", "matches" if mine["digest"] == d else "not journaled as this plan's")]
@@ -1630,10 +2001,33 @@ def postcheck(plan_path, ops, spec_path=None):
         bridge = f"blocks any mutation: {e}"
     reply = ops.authority_status(plan) if bridge == "expected" else None
     serving = serving_evidence(reply)
-    ok = mine["selected"] and bridge == "expected" and serving and all(c[1] in ("bound", "matches") for c in checks)
+    held = maintenance_report(plan, ops, records, d)
+    ok = mine["selected"] and bridge == "expected" and serving and held["ok"] \
+        and all(c[1] in ("bound", "matches") for c in checks)
     return {"operation": plan["operation"], "selected": mine["selected"], "checks": checks, "bridge": bridge,
             "authority_serving": serving, "authority_epoch": reply.get("authority_epoch") if serving else None,
+            "maintenance": held,
             "first_writes": first_write_evidence(plan["state_root"]["path"], plan["state_root"]), "ok": ok}
+
+
+def maintenance_report(plan, ops, records, d):
+    """The record as the post-check judges it, read-only: {state, problem, refused_files, ok}."""
+    mine = operation_state(records, plan["operation"])
+    try:
+        store, _, fence = maintenance(None, plan, ops, records=records)
+    except Refused as e:
+        return {"state": "not checked", "problem": str(e), "refused_files": None, "ok": False}
+    paths = store.Paths(plan["state_root"]["path"])
+    count = store.sink_count(paths)
+    if mine["released"]:
+        rec = store.read_maintenance(paths)
+        return {"state": "released", "problem": None if not rec.present else "a record is present again",
+                "refused_files": count, "ok": not rec.present}
+    rec, problem = held_problem(store, fence, plan, ("full",))
+    if problem is None and (rec.fields["binding"] != full_binding(plan, d)
+                            or rec.fields["legacy"] != "retired-and-inhibited"):
+        problem = "the record does not bind this release, D and the bridge's start, retired and inhibited"
+    return {"state": rec.state, "problem": problem, "refused_files": count, "ok": problem is None}
 
 
 def rollback(plan_path, ops, spec_path=None, crash=None):
@@ -1641,9 +2035,17 @@ def rollback(plan_path, ops, spec_path=None, crash=None):
     exactly (D-27), entry by entry, which removes the launch option. The
     bootstrap record is left in place, and journaled. The first writes are
     judged in the plan's sealed state root alone (its realpath, device and
-    inode): a missing, replaced or unreadable root is unknown, and refuses.
+    inode): a missing, replaced or unreadable root is unknown, and refuses; a
+    file in the refusal sink is a first write too (writer admission 12).
     After the first write, refused: the recovery is a reviewed repair or a
-    roll-forward that keeps the newer state (D-74)."""
+    roll-forward that keeps the newer state (D-74).
+
+    Every new-release writer is fenced by the maintenance record, which must
+    be this operation's own and held, checked before anything and again
+    before every restoring write (amendment 4, section 3; code review
+    6112483129, finding 2). The record is kept: `release` ends it once the
+    boot has changed since the restore. This adds no automatic rollback and
+    no rollback trigger."""
     plan = load_plan(plan_path)
     with Journal(plan["root"], crash) as journal:
         mine = operation_state(journal.records, plan["operation"])
@@ -1651,21 +2053,28 @@ def rollback(plan_path, ops, spec_path=None, crash=None):
             raise Refused("this operation never began; there is nothing to roll back")
         if mine["rolled_back"]:
             return {"state": "already rolled back", "operation": plan["operation"]}
+        if mine["released"]:
+            raise Refused("rollback refused: this operation was released, so writers have been admitted since; the "
+                          "recovery is a reviewed repair or a roll-forward; nothing was changed")
         bridge = ops.bridge_state() or {}
         if bridge.get("running") is not False:
-            raise Refused("rollback refused for now: a bridge is running, or its state is unknown; it must stop at an "
-                          "acknowledged checkpoint first; nothing was changed")
+            raise Refused("rollback refused for now: a bridge is running, or its state is unknown; it must be stopped "
+                          "first; nothing was changed")
+        store, owner, fence = maintenance(journal, plan, ops)
+        if fence.pending() is not None:
+            raise Refused("rollback refused for now: a maintenance step is pending in the journal; activate (or "
+                          "release) settles it first; nothing was changed")
 
         def eligible():
-            """Rollback stays eligible all the way through (code review slot 3,
-            finding 1): checked before anything and again immediately before
-            every restoring write. No bridge has started, every writer is still
-            at its acknowledged checkpoint, and the plan's sealed state root
-            still shows no first write, judged now."""
+            """Rollback stays eligible all the way through: checked before
+            anything and again immediately before every restoring write. No
+            bridge has started, the maintenance record is still this
+            operation's own and held (so every new-release writer is fenced),
+            and the plan's sealed state root still shows no first write,
+            judged now."""
             if (ops.bridge_state() or {}).get("running") is not False:
                 raise Refused("blocked: a bridge started, or its state became unknown, during rollback; nothing "
                               "more was changed")
-            check_quiet(ops, plan)
             evidence = first_write_evidence(plan["state_root"]["path"], plan["state_root"])
             written = {k: v for k, v in evidence.items() if v != "absent"}
             if written:
@@ -1673,8 +2082,10 @@ def rollback(plan_path, ops, spec_path=None, crash=None):
                 raise Refused("rollback refused: " + "; ".join(f"{k}: {v}" for k, v in sorted(written.items()))
                               + ". Old code can't read the new state, or nothing shows it wasn't written, so the "
                                 "recovery is repair or roll-forward: a reviewed repair, or a roll-forward that keeps "
-                                "the newer state (D-74). The recorded targets, backups and the state are kept, and "
-                                "nothing more was changed")
+                                "the newer state (D-74). The recorded targets, backups, the state and any refused "
+                                "writes are kept, and nothing more was changed")
+            require_held(store, fence, plan, ("partial", "full"),
+                         "new-release writers are not fenced and nothing is restored")
         eligible()
         layout = staged_layout(plan)
         paths = target_paths(stage_release.load_spec(spec_path)[0]["targets"], skills_root(spec_path))
@@ -1714,19 +2125,132 @@ def rollback(plan_path, ops, spec_path=None, crash=None):
             present = None
         journal.append({"op": plan["operation"], "kind": "bootstrap-retained", "present": present,
                         "digest": mine["digest"]})
-        journal.append({"op": plan["operation"], "kind": "rolled-back"})
+        journal.append({"op": plan["operation"], "kind": "rolled-back", "boot": ControllerProbes(ops, store).boot()})
         return {"state": "rolled-back", "operation": plan["operation"], "release": plan["release"],
-                "bootstrap_record": "left in place"}
+                "bootstrap_record": "left in place",
+                "maintenance": "held: a process started after the binding may hold new-release code, so the record "
+                               "stays until the boot has changed since this restore; then release"}
 
 
-def status(root):
+def rollback_release_problems(journal, plan, ops, store, fence, spec_path):
+    """What the release after a completed pre-write rollback verifies (amendment 4's APPROVE, K2): the exact
+    restored targets, the retained record as this operation's own, a known boot change since the restore, and
+    still no first write, the refusal sink included. A refused write meanwhile is kept for the owner (G-9)."""
+    problems = []
+    _, problem = held_problem(store, fence, plan, ("partial", "full"))
+    if problem:
+        problems.append(problem)
+    bridge = ops.bridge_state() or {}
+    if bridge.get("running") is None:
+        problems.append(f"the bridge's state is unknown ({bridge.get('unknown', 'no evidence')})")
+    elif bridge["running"] and bridge.get("release") == plan["release"]:
+        problems.append("a bridge of the rolled-back release is running")
+    mine = operation_state(journal.records, plan["operation"])
+    layout = staged_layout(plan)
+    paths = target_paths(stage_release.load_spec(spec_path)[0]["targets"], skills_root(spec_path))
+    for name, (t, path) in paths.items():
+        backup = mine["backups"].get(name)
+        if backup is None:
+            continue
+        try:
+            current, _ = observe_target(t, path, layout, backup.get("container"))
+            same = summary_of(current) == summary_of(restore_state(journal.root_fd, backup["folder"]))
+        except Refused as e:
+            problems.append(f"{name}: {e}")
+            continue
+        if not same:
+            problems.append(f"{name} is not exactly as restored")
+    restored = next((r.get("boot") for r in reversed(mine["records"]) if r["kind"] == "rolled-back"), None)
+    now_boot = ControllerProbes(ops, store).boot()
+    if store.known(restored) is None:
+        problems.append("the boot at the restore is unknown")
+    elif store.known(now_boot) is None:
+        problems.append("the boot can't be read: unknown")
+    elif restored == now_boot:
+        problems.append("the boot has not changed since the restore: a process started after the binding may "
+                        "still hold new-release code (the owner reboots first)")
+    evidence = first_write_evidence(plan["state_root"]["path"], plan["state_root"])
+    written = {k: v for k, v in evidence.items() if v != "absent"}
+    if written:
+        problems.append("a first write since the restore (" + "; ".join(f"{k}: {v}" for k, v in sorted(written.items()))
+                        + "): it is kept, never deleted, for the owner's decision (G-9)")
+    return problems
+
+
+def release(plan_path, ops, spec_path=None, crash=None):
+    """End maintenance: unlink the record, the moment every writer is admitted
+    again (writer admission 4.7). After a completed activation it is refused
+    while any post-check fails; after a completed pre-write rollback it
+    verifies what K2 names instead. A crash between the unlink and the journal
+    resumes to a completed release; a record that is not provably this
+    operation's own is never released."""
+    plan = load_plan(plan_path)
+    with Journal(plan["root"], crash) as journal:
+        mine = operation_state(journal.records, plan["operation"])
+        if not mine["admitted"]:
+            raise Refused("this operation never began; there is nothing to release")
+        if mine["released"]:
+            return {"state": "already released", "operation": plan["operation"]}
+        store, owner, fence = maintenance(journal, plan, ops)
+        if fence.released() and not store.read_maintenance(owner.paths).present:  # journaled, then a crash
+            journal.append({"op": plan["operation"], "kind": "released"})
+            return {"state": "released", "operation": plan["operation"], "release": plan["release"],
+                    "refused_files": store.sink_count(owner.paths)}
+        pending = fence.pending()
+        if pending is not None and pending.get("step") != "release":
+            raise Refused("release refused for now: a maintenance step is pending in the journal; activate settles "
+                          "it first; nothing was changed")
+        if pending is None:  # a pending release is settled below, from what is on disk
+            if mine["rolled_back"]:
+                problems = rollback_release_problems(journal, plan, ops, store, fence, spec_path)
+            elif mine["selected"]:
+                report = postcheck(plan_path, ops, spec_path)
+                problems = [f"{name}: {value}" for name, value in report["checks"] if value not in ("bound", "matches")]
+                if report["bridge"] != "expected":
+                    problems.append(f"the bridge: {report['bridge']}")
+                elif not report["authority_serving"]:
+                    problems.append("no live answer from the bridge's authority")
+                if report["maintenance"]["problem"]:
+                    problems.append(report["maintenance"]["problem"])
+                if not report["ok"] and not problems:
+                    problems.append("the post-check does not pass")
+            else:
+                raise Refused("release refused: the activation is not complete; finish it, or roll it back first; "
+                              "nothing was changed")
+            if problems:
+                raise Refused("release refused: " + "; ".join(problems) + ". The record stays and keeps every "
+                              "writer refused; nothing was changed")
+        with owner_step(store, "releasing maintenance"):
+            owner.release()
+        journal.append({"op": plan["operation"], "kind": "released"})
+        return {"state": "released", "operation": plan["operation"], "release": plan["release"],
+                "refused_files": store.sink_count(owner.paths),
+                "next": "writers are admitted again; the bridge resumes from its checkpoints and imports the "
+                        "refusal sink"}
+
+
+def status(root, plan_path=None, ops=None):
+    """Each operation's state from the journal, read-only. With the plan, also
+    its maintenance record and Owner's read-only reconcile (writer admission
+    4.8): the record, whether it is exactly the journaled write, whether its
+    acting process is gone, the refusal sink's count, any pending step and
+    temporary files, and the next permitted step."""
     records = read_journal(root)
     out = []
     for op in dict.fromkeys(r["op"] for r in records if r.get("op")):
         s = operation_state(records, op)
-        state = ("rolled back" if s["rolled_back"] else "selected (complete only once postcheck passes)"
-                 if s["selected"] else f"unfinished (last: {s['records'][-1]['kind']})")
+        state = ("released" if s["released"] else
+                 "rolled back (maintenance held until its release)" if s["rolled_back"] else
+                 "full (complete only once postcheck passes and it is released)" if s["full"] else
+                 "selected (maintenance partial: the owner's reboot, then activate again)" if s["selected"] else
+                 f"unfinished (last: {s['records'][-1]['kind']})")
         out.append({"operation": op, "state": state})
+    if plan_path is not None:
+        plan = load_plan(plan_path)
+        _, owner, _ = maintenance(None, plan, ops or LiveOps(), records=records)
+        for entry in out:
+            if entry["operation"] == plan["operation"]:
+                entry["maintenance"] = owner.reconcile()
     return out
 
 
@@ -1746,17 +2270,38 @@ def render_operator_plan(plan):
     imp = plan["importers"]
     lines += [f"  affected helper {k['name']}: {k['path']}" for k in imp["known"] if k["found"]]
     lines += [f"  unlisted importer (stays on old code): {u}" for u in imp["unlisted"]]
-    lines += [f"  safe checkpoint: {c['name']} ({c['kind']}), owner {c['owner']}" for c in plan["checkpoints"]]
+    lines += [f"  safe checkpoint (informational: maintenance refuses new-release writers, and retirement and "
+              f"inhibition cover legacy ones; writer admission 9.2): {c['name']} ({c['kind']}), owner {c['owner']}"
+              for c in plan["checkpoints"]]
     lines += [f"  preserved state: snapshot {plan['state_snapshot']['digest'][:12]}; no new-format write yet "
               f"({', '.join(sorted(plan['state_snapshot']['first_writes']))} absent)",
-              "  migration point: the new bridge's first start (its bootstrap commit is the first outbox-db/1 write)",
+              "  migration point: the new bridge's first start under full (its bootstrap commit is the first "
+              "outbox-db/1 write)",
               f"  designation list: {', '.join(plan['designations']) or 'explicitly empty'}",
               f"  bootstrap record digest D: sha256:{d} (the chat-bridge LaunchAgent's {BOOTSTRAP_OPTION})",
+              "  writer admission (docs/writer_admission.md 9.1): activate acquires maintenance (draining, the "
+              "drain, partial); from then until the release every new-release writer's post, acknowledgement and "
+              "notice is refused into the refusal sink (exit 5), and kept",
+              "  before activate: the owner stops the legacy bridge service",
+              "  after activate reports the targets bound: the owner reboots the machine (retirement, gate G-1); "
+              "launchd starts the bound bridge, which waits in its hold",
+              "  inhibition evidence (gate G-2): the owner-authorized inventory of every unmanaged launcher and "
+              "its coverage (a managed target, disabled for the window, or shown never to write), in the evidence "
+              "file; full is refused while it is missing or incomplete",
+              "  then activate again: retirement, inhibition, targets and the bootstrap verified, then full; the "
+              "bound bridge's start commits the bootstrap and serves read-only status",
               "  postchecks: activate_release postcheck (record and D recomputed from this plan, every target "
-              "bound, the LaunchAgents' effective executable, the expected new bridge serving)",
+              "bound, the LaunchAgents' effective executable, the maintenance record full and this operation's, "
+              "the expected new bridge serving)",
+              "  release: activate_release release, refused while any post-check fails; the unlink admits every "
+              "writer again; the bridge catches up from its checkpoints and imports the refusal sink",
+              "  watch during the window: the refusal sink's count (activate_release status --plan, pchat status)",
+              "  the window against the chat server's history retention (gate G-6): the window is shorter, and no "
+              "channel is created during it",
               "  permitted recovery: rollback restores the recorded targets only before the first new-format "
-              "write, leaving the bootstrap record in place; after it, a reviewed repair or a roll-forward "
-              "keeping the newer state",
+              "write (a refused write in the sink is one), leaving the bootstrap record in place and keeping the "
+              "maintenance record until a release after a boot change since the restore; after a first write, a "
+              "reviewed repair or a roll-forward keeping the newer state",
               "  skills repository: the expected change to the chat skill folder and chat/scripts is reported "
               "by activate; the owner commits it (D-27)"]
     lines += seal_plan_lines(plan)
@@ -1802,12 +2347,14 @@ def main(argv=None):
     g.add_argument("--designate", nargs="+")
     g.add_argument("--no-designations", action="store_true")
     p.add_argument("--out", required=True, type=Path)
-    for name in ("stage", "activate", "postcheck", "rollback", "operator-plan"):
+    for name in ("stage", "activate", "postcheck", "release", "rollback", "operator-plan"):
         c = sub.add_parser(name)
         c.add_argument("--plan", required=True, type=Path)
         c.add_argument("--evidence", type=Path)
     s = sub.add_parser("status")
     s.add_argument("--root", required=True, type=Path)
+    s.add_argument("--plan", type=Path)
+    s.add_argument("--evidence", type=Path)
     a = ap.parse_args(argv)
     try:
         if a.cmd == "plan":
@@ -1818,18 +2365,24 @@ def main(argv=None):
             summary, _, _ = stage_admitted(a.plan)
             print(f"{summary['state']}: {summary['release_dir']} (operation {summary['operation']})")
         elif a.cmd == "activate":
-            print(json.dumps(activate(a.plan, LiveOps(a.evidence)), indent=2, sort_keys=True))
+            result = activate(a.plan, LiveOps(a.evidence))
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 1 if (result.get("maintenance") or {}).get("refused") else 0
         elif a.cmd == "postcheck":
             report = postcheck(a.plan, LiveOps(a.evidence))
             print(json.dumps(report, indent=2, sort_keys=True))
             return 0 if report["ok"] else 1
+        elif a.cmd == "release":
+            print(json.dumps(release(a.plan, LiveOps(a.evidence)), indent=2, sort_keys=True))
         elif a.cmd == "rollback":
             print(json.dumps(rollback(a.plan, LiveOps(a.evidence)), indent=2, sort_keys=True))
         elif a.cmd == "operator-plan":
             print(render_operator_plan(load_plan(a.plan)))
         else:
-            for op in status(a.root):
+            for op in status(a.root, a.plan, LiveOps(a.evidence)):
                 print(f"{op['operation']}: {op['state']}")
+                if "maintenance" in op:
+                    print(json.dumps(op["maintenance"], indent=2, sort_keys=True))
         return 0
     except Refused as e:
         print(f"activate_release: {e}", file=sys.stderr)

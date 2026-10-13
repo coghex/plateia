@@ -21,7 +21,7 @@
   "first_writes": {
     "note": "The first new-format write, after which an automatic return to pre-#19 code is refused (D-74). The controller judges each from the state directory alone, never from its journal, and never opens the outbox database.",
     "outbox-db/1": "outbox.db, or any of its -wal, -shm or -journal files, exists in the chat state directory",
-    "outbox/2": "the outbox.d directory exists in the chat state directory",
+    "outbox/2": "the outbox.d directory, or the refusal sink refused.d (writer admission's refused writes, which only new code reads), exists in the chat state directory",
     "delivery-records/2": "dead-letters.jsonl holds a record carrying version or supersedes"
   },
   "bootstrap": {
