@@ -61,8 +61,10 @@ Runs as a service (launchd). Logged in as the `chatbridge` account, it:
   record is known complete well past the attempt and holds no such message;
   one still undecided after a day is dead-lettered, with the owner told. This
   is at-least-once delivery with that check, not exactly-once;
-- pushes an ntfy notification to the owner when the owner is @-mentioned. The
-  push says who needs the owner and where, never the message text;
+- pushes an ntfy notification to the owner when the owner is @-mentioned, once
+  however many of the owner's accounts (`owner` and the optional
+  `owner_accounts`) the post names, and never for a post from an owner account.
+  The push says who needs the owner and where, never the message text;
 - routes by who speaks to whom. The manager hears its project's unaddressed
   posts, posts naming it, and any post where someone else goes over its head
   to the owner or an assistant. When the owner or an assistant names a
@@ -791,7 +793,7 @@ class Deliveries:
                 if announce(cfg, item, f"interrupt → {item['target']}: {detail}", "held"):
                     item["held_announced"] = True
             since = item.setdefault("waiting_since", time.time())
-            authority = {cfg.get("owner")} | set(cfg.get("assistants", []))
+            authority = chatlib.authority_accounts(cfg)
             if time.time() - since > MAX_WAIT:
                 self._dead(item, detail, cfg, reason=f"still waiting after {MAX_WAIT // 3600} h")
                 return
@@ -1155,7 +1157,7 @@ def _ring_surface(cfg, item, surface, brand, label):
             return False, f"message no longer in {label} {surface[:8]}'s inbox; re-sending"
     if state in ("delivered", "read"):
         return True, f"{state} to {label} {surface[:8]}"
-    authority = {cfg.get("owner")} | set(cfg.get("assistants", []))
+    authority = chatlib.authority_accounts(cfg)
     waiting = _input_state(surface).get("waiting_on_human")
     if waiting and item["sender"] in authority:
         ok, detail = _type_into_prompt(surface, "[chat] " + text)
@@ -1700,11 +1702,17 @@ def handle(msg, cfg, record, deliveries, acks, replayed=False):
         return index_message(evidence)  # already logged and handled; V1 is INSERT OR IGNORE
     queue = []
     if entry["verified"]:  # an unauthenticated sender never wakes anyone
-        authority = {cfg.get("owner")} | set(cfg.get("assistants", []))
-        named = mentions(text, set(cfg.get("accounts", {}))) - {sender}
+        authority = chatlib.authority_accounts(cfg)
+        owners = chatlib.owner_accounts(cfg)
+        # An owner account is a destination even without a password entry here (it never logs in as an agent);
+        # with no `owner_accounts` configured the set is the password map's, exactly as before.
+        known = set(cfg.get("accounts", {})) | (owners if chatlib.listed_owner_accounts(cfg) else set())
+        named = mentions(text, known) - {sender}
         base = {"msgid": entry["msgid"], "channel": channel, "sender": sender, "text": text,
                 "attempt": 0, "next_at": 0}
-        if cfg.get("owner") in named and sender != cfg.get("owner"):
+        # One push however many owner accounts the post names, and none from an owner account itself. The verified
+        # sender's raw account stays in the item; the canonical owner name is only the rule's answer.
+        if named & owners and chatlib.owner_identity(cfg, sender, entry["verified"]) is None:
             queue.append({**base, "kind": "push", "project": None})
         project, p = project_for(channel, cfg)
         manager = p["manager"] if p else None

@@ -72,7 +72,7 @@
      "covers": "the bridge's content-free push to the owner's configured ntfy URL",
      "read": [], "write": "ntfy-push/1", "embedded_version": false},
     {"name": "chat-config", "kind": "state", "path": "$CHAT_CONFIG (default ~/.config/chat/config.json)",
-     "covers": "read by every command; written by identities.register() when it provisions an account, records an identity's role or adds an assistant",
+     "covers": "read by every command; written by identities.register() when it provisions an account, records an identity's role or adds an assistant. The optional `owner_accounts` list (#29) is an additive key read from the same file: it supplements `owner`, so the owner's other server-verified accounts are recognized as that one owner; when it is absent or empty, or is not entirely a list of valid account names, the single `owner` applies, no command writes it, and the format identifier does not change",
      "read": ["chat-config/1"], "write": "chat-config/1", "embedded_version": false},
     {"name": "identity-registry", "kind": "state", "path": "$CHAT_STATE/identities.json, identities.lock",
      "read": ["1"], "write": "1", "embedded_version": true, "field": "version"},
