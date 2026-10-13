@@ -26,6 +26,12 @@ configuration or security changes are not authorized by it.
 These two points are confirmed. The technical details below that implement
 them are still proposals.
 
+**Owner approval, 2026-10-13: COLLAB-1 only (#27).** One draft pull request,
+never merged, for a library-only `request/v1` with a readable one-line form in
+the `[request <id>]` convention. That settles Q-5 for this slice, without
+settling `card-move/v1`'s final schema. Every other slice and question stays
+open.
+
 Design state: `exploring`
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -35,7 +41,7 @@ concrete precondition
 ## Processing status
 
 - [#26] EPIC. Collaboration foundations (umbrella: #26; no new epic)
-- [ ] COLLAB-1. Reconcile the generic request form with `card-move/v1`
+- [#27] COLLAB-1. Reconcile the generic request form with `card-move/v1`
 - [ ] COLLAB-2. Record requests and claims durably in the bridge's authority
 - [ ] COLLAB-3. Correlate results, stops and blockers, and bound the return
 - [ ] COLLAB-4. Enforce message budgets with reserved slots
