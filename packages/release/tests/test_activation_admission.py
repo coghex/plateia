@@ -551,5 +551,120 @@ class StatusTests(AdmissionCase):
             self.assertIn(item, text)
 
 
+
+class ReviewOneTests(AdmissionCase):
+    """PR #22 review 1 (6154026430), the controller's three findings, each reproduced at 0c081e6 first."""
+
+    def shared_section_after_the_redrain(self, hold):
+        """A journal hook: once this run's re-drain has landed, a writer opens a section (L_adm shared) and keeps
+        it open, so the next maintenance transition can't take the lock before its deadline."""
+        def hook(record):
+            if record["kind"] == "maint-outcome" and record["step"].get("step") == "write-record" \
+                    and record["result"].get("landed") and "fd" not in hold:
+                fd = os.open(self.state / "admission.lock", os.O_RDWR)
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                hold["fd"] = fd
+        return hook
+
+    def release_section(self, hold):
+        if hold.get("fd") is not None:
+            os.close(hold.pop("fd"))
+
+    # 1. Every maintenance advancement must have landed before anything relies on it.
+    def test_contention_at_the_binding_boot_stops_before_any_target_write(self):
+        plan, path = self.prepared()
+        with self.assertRaises(Crash):
+            self.run_activate(path, crash=self.crash_on("entry-bound"))  # binding interrupted in boot-A
+        self.ops.reboot()
+        self.ops.clock = FakeClock()
+        hold, written = {}, self.kinds().count("entry-bound")
+        try:
+            with self.assertRaisesRegex(Refused, "did not complete|binding's boot"):
+                self.run_activate(path, crash=self.shared_section_after_the_redrain(hold))
+        finally:
+            self.release_section(hold)
+        self.assertEqual(self.kinds().count("entry-bound"), written, "no target written")
+        self.assertEqual(self.maintenance()["bound_boot"], "boot-A")
+        self.assertEqual(self.run_activate(path)["state"], "selected")
+        self.assertEqual(self.maintenance()["bound_boot"], "boot-B")
+        self.assertIn("retirement unverified", self.run_activate(path)["maintenance"]["refused"],
+                      "the resumed binding needs its own reboot")
+
+    def test_contention_at_full_never_reports_or_journals_full(self):
+        plan, path = self.bound()
+        self.ops.reboot()
+        self.ops.clock = FakeClock()
+        hold = {}
+        try:
+            result = self.run_activate(path, crash=self.shared_section_after_the_redrain(hold))
+        finally:
+            self.release_section(hold)
+        self.assertEqual(result["maintenance"]["state"], "partial")
+        self.assertIn("did not complete", result["maintenance"]["refused"])
+        self.assertNotIn("full", self.kinds())
+        self.assertEqual(self.maintenance()["state"], "partial")
+        self.assertEqual(self.run_activate(path)["maintenance"]["state"], "full", "without contention, full")
+
+    # 2. An interrupted release repeats its checks unless its unlink already landed.
+    def test_an_interrupted_release_repeats_the_post_check(self):
+        plan, path = self.activated()
+        self.serve(plan)
+        with self.assertRaises(Crash):
+            self.do_release(path, crash=self.crash_on("maint-intent"))
+        (self.skills / "chat/SKILL.md").write_text((self.skills / "chat/SKILL.md").read_text() + "\nan edit\n")
+        self.assertFalse(self.postcheck(path)["ok"])
+        with self.assertRaisesRegex(Refused, "release refused"):
+            self.do_release(path)
+        self.assertEqual(self.maintenance()["state"], "full", "the record stays")
+
+    def test_an_interrupted_rollback_release_repeats_its_checks(self):
+        plan, path = self.bound()
+        self.rollback(path)
+        self.ops.reboot()
+        with self.assertRaises(Crash):
+            self.do_release(path, crash=self.crash_on("maint-intent"))
+        _staging.write(self.state / "refused.d/1-invented.json", "{}\n", 0o600)
+        with self.assertRaisesRegex(Refused, "release refused"):
+            self.do_release(path)
+        self.assertEqual(self.maintenance()["state"], "partial", "the record stays")
+        self.assertTrue((self.state / "refused.d/1-invented.json").exists(), "kept, never deleted")
+
+    # 3. Owner's file system effects stay bound to the sealed root and the expected record, across the intent.
+    def test_a_root_swapped_at_the_draining_intent_publishes_nothing(self):
+        plan, path = self.prepared()
+        moved = self.state.with_name("chat-moved")
+
+        def swap(record):
+            if record["kind"] == "maint-intent" and record["step"].get("step") == "write-draining" \
+                    and not moved.exists():
+                self.state.rename(moved)
+                self.state.mkdir()
+        with self.assertRaises(Refused):
+            self.run_activate(path, crash=swap)
+        self.assertFalse((self.state / "maintenance.json").exists(), "nothing published in the replacement")
+        self.assertFalse((moved / "maintenance.json").exists(), "nor in the moved root")
+        self.assertFalse([r for r in self.journal() if r["kind"] == "maint-outcome"
+                          and r["step"].get("step") == "write-draining"], "no outcome journaled")
+
+    def test_a_foreign_record_at_the_release_intent_is_never_removed(self):
+        plan, path = self.activated()
+        self.serve(plan)
+        foreign = json.dumps({"v": "maintenance/1", "operation": OTHER_OPERATION, "kind": "plateia-activation",
+                              "plan_sha256": "e" * 64, "state": "partial", "generation": 2,
+                              "acquired_boot": "boot-other", "boot": "boot-other", "bound_boot": None,
+                              "legacy": "unverified", "binding": {"release_id": "", "bootstrap_digest": None,
+                                                                  "permits": []}},
+                             sort_keys=True, separators=(",", ":")) + "\n"
+
+        def replace(record):
+            if record["kind"] == "maint-intent" and record["step"].get("step") == "release":
+                (self.state / "maintenance.json").unlink()
+                _staging.write(self.state / "maintenance.json", foreign, 0o600)
+        with self.assertRaises(Refused):
+            self.do_release(path, crash=replace)
+        self.assertEqual((self.state / "maintenance.json").read_text(), foreign, "the foreign record is kept")
+        self.assertNotIn("released", self.kinds())
+
+
 if __name__ == "__main__":
     unittest.main()

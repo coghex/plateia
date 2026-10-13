@@ -861,6 +861,30 @@ class BootstrapRootBindingTests(BootstrapCase):
                 self.stop()
                 self.unlink_root(moved[0])
 
+    def test_a_root_moved_during_the_bootstrap_application_rolls_it_back(self):
+        """PR #22 review 1 (6154026430), finding 5: the root and the database are checked again inside the
+        transaction after the bootstrap's designations and M, immediately before COMMIT; drift rolls them back."""
+        d = self.publish(self.record(["alp-solver-2", "sam"]))
+        moved, real = [], self.ds.Store.designate
+
+        def designate(store, account, at):
+            real(store, account, at)
+            if not moved:
+                moved.append(self.swap_root())
+        with mock.patch.object(self.ds.Store, "designate", designate):
+            authority = self.launch(d)
+        self.assertTrue(moved, "the root was moved during the application")
+        self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+        self.assertFalse(authority.running)
+        validated = self.committed(moved[0])
+        self.assertTrue(validated in (None, {}) or ("designation_bootstrap" not in validated["meta"]
+                                                    and validated["designated"] == []
+                                                    and validated["meta"].get("authority_epoch") != "1"),
+                        f"nothing of the application was committed: {validated}")
+        self.assertIn(self.committed(self.state), (None, {}), "nothing in the replacement either")
+        self.stop()
+        self.unswap(moved[0])
+
 
 class BootstrapUnreadableMetaTests(BootstrapCase):
     """Code review 6112483129, finding 3: with a valid record and launch digest, a database whose bootstrap
@@ -942,6 +966,49 @@ class BootstrapUnreadableMetaTests(BootstrapCase):
                 self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN)
                 self.assertEqual(self.evidence(), before, "the database and the status snapshot are unchanged")
                 (self.state / "outbox.db").chmod(0o600)
+
+    def test_malformed_startup_metadata_is_unknown_through_ensure_authority_and_main(self):
+        """PR #22 review 1 (6154026430), finding 4: startup metadata of the wrong shape (here an authority epoch
+        that is not an integer), which fails before M is classified, is UNKNOWN too."""
+        for through in ("ensure_authority", "main"):
+            with self.subTest(through=through):
+                self.stop()
+                self.wipe_database()
+                self.bridge.BOOTSTRAP_UNKNOWN = None
+                d = self.publish(self.record(["alp-solver-2"]))
+                self.launch(d)
+                self.stop()
+                con = sqlite3.connect(self.state / "outbox.db")
+                con.execute("UPDATE meta SET value = 'not-an-integer' WHERE name = 'authority_epoch'")
+                con.commit()
+                con.close()
+                (self.state / "outbox-status.json").unlink(missing_ok=True)
+                before = self.evidence()
+                written, ran, slept = [], [], []
+                with mock.patch.object(self.bridge, "write_unavailable_status", lambda *a: written.append(a)):
+                    if through == "ensure_authority":
+                        authority = self.launch(d)
+                        self.assertFalse(authority.running)
+                    else:
+                        class Stop(BaseException):
+                            pass
+
+                        def sleep(seconds):
+                            slept.append(seconds)
+                            raise Stop()
+
+                        def run(*a, **k):
+                            ran.append(a)
+                            raise Stop()
+                        with mock.patch.object(self.bridge, "run", run), \
+                                mock.patch.object(self.bridge.time, "sleep", sleep), \
+                                mock.patch.object(self.bridge.chatlib, "load_config", lambda: {}), \
+                                self.assertRaises(Stop):
+                            self.bridge.main(["--activation-bootstrap", "sha256:" + d])
+                        self.assertEqual((ran, slept), ([], [self.bridge.UNKNOWN_RECHECK]))
+                self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN)
+                self.assertEqual(written, [], "no ordinary status write")
+                self.assertEqual(self.evidence(), before, "the database is unchanged")
 
 
 class BootstrapCrashTests(BootstrapCase):

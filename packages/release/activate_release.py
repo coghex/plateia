@@ -894,6 +894,88 @@ class ControllerProbes:
         return probe(writer) if probe is not None else self.store.HostProbes().gone(writer)
 
 
+class SealedRootFS:
+    """Owner's file system effects, bound to the plan's sealed state root
+    across the durable intent (PR #22 review 1, finding 3). Each mutation
+    opens the root through its sealed realpath and identity (refused if it
+    was moved or replaced) and acts through that descriptor, never through a
+    path; a replacement or removal of the record first checks, through the
+    same descriptor, that the record there is exactly the one the pending
+    step journaled as its `from`. Reads are delegated unchanged."""
+
+    def __init__(self, base, plan, fence, store):
+        self.base, self.plan, self.fence, self.store = base, plan, fence, store
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+    def _name(self, path):
+        path = Path(path)
+        if str(path.parent) != self.plan["state_root"]["path"]:
+            raise Refused(f"blocked: {path.name} is not in the sealed chat state root; nothing more was changed")
+        return path.name
+
+    @contextlib.contextmanager
+    def _root(self):
+        fd = open_state_root(self.plan)
+        try:
+            yield fd
+        finally:
+            os.close(fd)
+
+    def _expected(self, fd, name):
+        if name != MAINT_FILE:
+            return
+        want = (self.fence.pending() or {}).get("from")
+        try:
+            data, st = read_private_at(fd, name, cap=self.store.MAINT_MAX + 1)
+            generation = json.loads(data).get("generation")
+        except (FileNotFoundError, Refused, ValueError, AttributeError):
+            data = None
+        actual = None if data is None else {"generation": generation, "sha256": sha256_bytes(data),
+                                            "ino": st.st_ino, "dev": st.st_dev, "ctime_ns": st.st_ctime_ns}
+        if want is None or not self.store.same_evidence(want, actual):
+            raise Refused("blocked: the maintenance record at the sealed root is not the one this step journaled; "
+                          "it is never replaced or removed, and nothing more was changed")
+
+    def create_excl(self, path, data):
+        with self._root() as root:
+            fd = os.open(self._name(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o600, dir_fd=root)
+            try:
+                write_fd(fd, data)
+                self.base.fsync_fd(fd)
+            finally:
+                os.close(fd)
+
+    def link(self, src, dst):
+        with self._root() as root:
+            os.link(self._name(src), self._name(dst), src_dir_fd=root, dst_dir_fd=root, follow_symlinks=False)
+
+    def replace(self, src, dst):
+        with self._root() as root:
+            self._expected(root, self._name(dst))
+            os.replace(self._name(src), self._name(dst), src_dir_fd=root, dst_dir_fd=root)
+
+    def unlink(self, path):
+        with self._root() as root:
+            self._expected(root, self._name(path))
+            os.unlink(self._name(path), dir_fd=root)
+
+    def sync_dir(self, path):
+        if str(path) != self.plan["state_root"]["path"]:
+            return self.base.sync_dir(path)
+        with self._root() as root:
+            self.base.fsync_fd(root)
+
+    def sync_file(self, path):
+        with self._root() as root:
+            fd = os.open(self._name(path), os.O_RDONLY | O_NOFOLLOW, dir_fd=root)
+            try:
+                self.base.fsync_fd(fd)
+            finally:
+                os.close(fd)
+
+
 def maintenance(journal, plan, ops, full_check=None, records=None):
     """(the release's delivery_store, its Owner for this operation, the fence)."""
     store = load_release_module(plan, "delivery_store")
@@ -901,6 +983,7 @@ def maintenance(journal, plan, ops, full_check=None, records=None):
     clock = getattr(ops, "clock", None)  # tests: a fake clock bounds the drain's waits
     owner = store.Owner(store.Paths(plan["state_root"]["path"]), operation=plan["operation"], kind=MAINT_KIND,
                         plan_sha256=plan["digest"], fence=fence, probes=ControllerProbes(ops, store),
+                        fs=SealedRootFS(store.FS_DEFAULT, plan, fence, store),
                         **({"mono": clock.mono, "sleep": clock.advance} if clock is not None else {}))
     if journal is not None:
         owner.point = journal.point
@@ -914,6 +997,8 @@ def owner_step(store, what):
         yield
     except store.OwnerError as e:
         raise Refused(f"blocked: {what}: {e}; nothing more was changed") from None
+    except OSError as e:  # an effect that couldn't complete: the pending intent is settled from disk next time
+        raise Refused(f"blocked: {what}: {e.strerror or e}; nothing more was changed") from None
 
 
 def held_problem(store, fence, plan, states):
@@ -948,12 +1033,21 @@ def acquire(owner, store, probes):
         rec = owner.acquire()  # settles a pending step first; another operation's or an unknown record refuses
         boot = probes.boot()
         if rec.state == "draining" or (rec.state == "partial" and rec.fields["boot"] != boot):
-            if not owner.drain(boot=boot).get("drained"):
+            if not landed(owner.drain(boot=boot)):
                 raise Refused("blocked: the drain did not complete within its deadline (a writer's section is still "
-                              "open); the record stays draining and keeps refusing new sections; run activate again, "
-                              "or roll back and release; nothing more was changed")
+                              "open); the record stays as it was and keeps refusing new sections; run activate "
+                              "again, or roll back and release; nothing more was changed")
             rec = store.read_maintenance(owner.paths)
+            if not (rec.valid and rec.fields["state"] == "partial" and rec.fields["boot"] == boot):
+                raise Refused("blocked: the drain reported success, but the record is not partial in this boot; "
+                              "nothing more was changed")
     return rec
+
+
+def landed(result):
+    """Whether an Owner advancement wrote its record: on its lock's deadline it returns landed and drained
+    false, and writes nothing (PR #22 review 1, finding 1)."""
+    return isinstance(result, dict) and result.get("landed") is True and result.get("drained", True) is True
 
 
 def inhibition_problems(evidence):
@@ -1059,7 +1153,10 @@ def take_full(journal, plan, ops, layout, paths, d):
         if not changed:
             return {"state": "full", "next": "postcheck, then release"}
         with owner_step(store, "writing the record back to partial"):
-            owner.advance("partial", boot=boot, bound_boot=boot, set_bound_boot=True)
+            done = owner.advance("partial", boot=boot, bound_boot=boot, set_bound_boot=True)
+        if not landed(done):
+            return {"state": "full", "refused": "withdrawing full did not complete within its deadline: "
+                                                + "; ".join(changed), "next": "activate again"}
         return {"state": "partial", "refused": "full is withdrawn: " + "; ".join(changed),
                 "next": "an owner decision: a target changed while maintenance was full"}
     if store.known(boot) is None:
@@ -1072,7 +1169,16 @@ def take_full(journal, plan, ops, layout, paths, d):
         return {"state": rec.state, "refused": "full is refused: " + "; ".join(found),
                 "next": "reboot" if only_retirement else "resolve these, then activate again"}
     with owner_step(store, "writing full"):
-        owner.advance("full", boot=boot, legacy="retired-and-inhibited", binding=full_binding(plan, d))
+        done = owner.advance("full", boot=boot, legacy="retired-and-inhibited", binding=full_binding(plan, d))
+    if not landed(done):
+        return {"state": "partial", "refused": "full is refused: writing full did not complete within its deadline "
+                                               "(a writer's section is still open)", "next": "activate again"}
+    rec, problem = held_problem(store, fence, plan, ("full",))
+    if problem is None and (rec.fields["boot"] != boot or rec.fields["binding"] != full_binding(plan, d)
+                            or rec.fields["legacy"] != "retired-and-inhibited"):
+        problem = "the record written is not this boot's full binding"
+    if problem:
+        raise Refused(f"blocked: after writing full, {problem}; full is not journaled")
     journal.append({"op": plan["operation"], "kind": "full", "boot": boot})
     return {"state": "full", "next": "launchd's bound bridge starts its authority under full and serves read-only "
                                      "status; then postcheck, then release"}
@@ -1876,7 +1982,13 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
         rec = require_held(store, fence, plan, ("partial",), "nothing is bound")
         if rec.fields["bound_boot"] != boot:
             with owner_step(store, "recording the binding's boot"):
-                owner.advance("partial", boot=boot, bound_boot=boot, set_bound_boot=True)
+                done = owner.advance("partial", boot=boot, bound_boot=boot, set_bound_boot=True)
+            if not landed(done):
+                raise Refused("blocked: recording the binding's boot did not complete within its deadline (a "
+                              "writer's section is still open); nothing is bound; run activate again")
+            rec = require_held(store, fence, plan, ("partial",), "nothing is bound")
+            if rec.fields["bound_boot"] != boot:
+                raise Refused("blocked: the record does not hold the binding's boot; nothing is bound")
 
         def binding_guard():
             """Before each write: no bridge started, the record still this
@@ -2200,7 +2312,9 @@ def release(plan_path, ops, spec_path=None, crash=None):
         if pending is not None and pending.get("step") != "release":
             raise Refused("release refused for now: a maintenance step is pending in the journal; activate settles "
                           "it first; nothing was changed")
-        if pending is None:  # a pending release is settled below, from what is on disk
+        # A pending release whose unlink already landed only records its completion; one whose record is still
+        # there repeats every check first (PR #22 review 1, finding 2).
+        if pending is None or store.read_maintenance(owner.paths).present:
             if mine["rolled_back"]:
                 problems = rollback_release_problems(journal, plan, ops, store, fence, spec_path)
             elif mine["selected"]:

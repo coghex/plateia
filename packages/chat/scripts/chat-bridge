@@ -2102,6 +2102,16 @@ class PinnedRoot:
             os.close(self.fd)
             self.fd = None
 
+    def identity_of(self, name):
+        """The (device, inode) of an entry inside the pinned root, never followed; BootstrapUnknown if it can't
+        be read."""
+        try:
+            st = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except OSError as err:
+            raise BootstrapUnknown(f"{name} can't be read in the validated state root ({err.strerror or err})") \
+                from None
+        return st.st_dev, st.st_ino
+
     def check(self, paths, *names):
         """The state path still resolves to the validated realpath, that
         realpath is still the pinned directory itself (not a link to it), and
@@ -2195,16 +2205,31 @@ class BootstrapStore(delivery_store.Store):
         committed: Store.open is all or nothing."""
         try:
             super().open()
-        except (sqlite3.Error, OSError, delivery_store.Unavailable) as err:
+        except BootstrapUnknown:
+            raise
+        except (sqlite3.Error, OSError, ValueError, TypeError, delivery_store.Unavailable) as err:
+            # ValueError and TypeError: startup metadata of the wrong shape, such as an authority epoch that is
+            # not an integer, met before M is classified (PR #22 review 1, finding 4). A crash still propagates.
             if self.record is None:
                 raise
-            raise BootstrapUnknown(f"the database's bootstrap state can't be read or committed ({err})") from None
+            raise BootstrapUnknown(f"the database's bootstrap state can't be read or committed "
+                                   f"({type(err).__name__}: {err})") from None
 
     def set_meta(self, name, value):
         if name == "authority_epoch" and self.bootstrap is None:
             if self.root is not None:  # inside the opening transaction, before any commit
                 self.root.check(self.paths, "outbox.db")
+                self.database = self.root.identity_of("outbox.db")
             self.bootstrap = self.classify_meta()
+            super().set_meta(name, value)
+            if self.root is not None:
+                # The epoch is the opening transaction's last write: the root and the database are checked once
+                # more, after the bootstrap's designations and M, immediately before COMMIT. Drift raises, and
+                # the transaction rolls back (PR #22 review 1, finding 5).
+                self.root.check(self.paths, "outbox.db")
+                if self.root.identity_of("outbox.db") != self.database:
+                    raise BootstrapUnknown("the database was replaced during the bootstrap's application")
+            return
         super().set_meta(name, value)
 
     def classify_meta(self):
