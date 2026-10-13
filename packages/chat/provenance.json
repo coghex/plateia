@@ -103,7 +103,7 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "d5fd3bca06e139c3f61dfb6d34ef56947255c0b723fb9778c6da3afea874e8d0",
       "capture": "changed",
-      "sha256": "b1eb31c2a3c1a71fe382653184ea36c2113c032d6b00082caf99dd3df8ad13c5",
+      "sha256": "bea4d8592b6a3b70acadeff03429eb56fcaebc48894a2088e88b0b191ea35d9d",
       "changes": [
         {
           "change": "The config example in the module docstring shows placeholder owner and assistant names.",
@@ -116,6 +116,10 @@
         {
           "change": "post(), ack() and deliver_entry() are each one section of writer admission: admission.lock held shared (taken without blocking, a miss read as held maintenance) from before the first create, queue or fallback publication to the end of the call, with the maintenance record read while holding it. A held or unreadable record, or a `maintenance` reply to any request, keeps the call whole as one immutable file in the refusal sink refused.d/ (with any attestation of an outcome or void the authority did not record) and raises Held, a kind of Queued; a lock that cannot be created fails as an unwritable outbox does; the bridge's own entry delivery starts nothing under maintenance.",
           "reason": "Deliberate deviation from c572bad, by the owner's decision of 2026-10-12 to implement docs/writer_admission.md (issue #24: the chat package's side of serialized writer admission; recorded in D-75 of docs/plateia_design.md, whose design (issue #23) the decision approved). The running tools keep the baseline behavior until activation (D-23); activation of this release stays separately gated (#21)."
+        },
+        {
+          "change": "The optional `owner_accounts` list in the config (shown in the module docstring) and four helpers: listed_owner_accounts(), owner_accounts(), authority_accounts() and owner_identity(). An account is the owner only when the server verified it (the flag must be True) and it equals `owner` or a listed entry as a whole, with no nickname, prefix, alias or claim matching; a list that is not entirely valid account names, or that names an assistant, is ignored whole, and an absent or empty list leaves `owner` alone. cited_authority() accepts a verified post from any owner account through owner_identity() and returns the entry with its raw account; the assistants' delegated authority is unchanged.",
+          "reason": "Deliberate deviation from c572bad, by the owner's decision of 2026-10-13 (issue #29, staged slice 1): the owner's two server-verified accounts are one owner. With the key absent nothing changes. Owner-led routing, which the installed tree has and this capture does not, is not covered, so activation stays blocked until it is captured with the same rule and the owner separately approves the configuration."
         }
       ]
     },
@@ -307,7 +311,7 @@
       "source_commit": "c572bad60b06f262d11a7175f52fd62f23257241",
       "effective_sha256": "920dc73a12330f1ca3a14e7244d93dd1295a8bdebe17d4402c1e311f5deb6210",
       "capture": "changed",
-      "sha256": "86a3da4b31b11730ec7937d1cc779d9c9cc05485033da83fa14175b6f06b35c7",
+      "sha256": "8027c8eeab0d7fe45b8d63773335baa83f20bc9d333cbb8bcb564b08b13dfc65",
       "changes": [
         {
           "change": "Record._load builds the msgid deduplication set from every line of a channel's log instead of the newest 5,000.",
@@ -320,6 +324,10 @@
         {
           "change": "The bridge holds while a maintenance record exists or cannot be read: each message, join, catch-up completion, acknowledgement, coverage update at a PONG, delivery pass, flush lock, flush step and entry delivery is one section of writer admission, and a section that finds the record held starts nothing, closes the connection and puts the bridge in a hold that reads the record every HOLD_RECHECK seconds. It starts no authority, writes no status snapshot (the unavailable one included), and logs the holder once per change. After the release it catches up from its checkpoints and imports the refusal sink with outbox.d/. An authority whose close was deferred by maintenance is kept, not dropped with its database open, and closed at a later pass.",
           "reason": "Deliberate deviation from c572bad, by the owner's decision of 2026-10-12 to implement docs/writer_admission.md (issue #24: the chat package's side of serialized writer admission; recorded in D-75 of docs/plateia_design.md, whose design (issue #23) the decision approved). The running tools keep the baseline behavior until activation (D-23); activation of this release stays separately gated (#21)."
+        },
+        {
+          "change": "The authority set (the stuck-post alert, the typing into a prompt waiting on the owner, and handle()) comes from chatlib.authority_accounts(). handle() names every owner account as a mention destination when `owner_accounts` is set, even one with no password entry, pushes the owner once for a post naming any of them unless the sender is itself a verified owner account, and applies the same owner set to direct-agent permission, upward routing, receipt suppression and needs_ack. The module docstring describes the push.",
+          "reason": "Deliberate deviation from c572bad, by the owner's decision of 2026-10-13 (issue #29, staged slice 1): the owner's two server-verified accounts are one owner. With the key absent nothing changes. Owner-led routing, which the installed tree has and this capture does not, is not covered, so activation stays blocked until it is captured with the same rule and the owner separately approves the configuration."
         }
       ]
     },
@@ -574,6 +582,10 @@
     {
       "path": "packages/chat/scripts/tests/test_request_v1.py",
       "purpose": "request/v1 round trip, refusal of non-canonical forms, digest stability, conflicting reuse and the verified, unresolved and refused outcomes, in eight offline scenarios on invented data (COLLAB-1, #27)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_owner_accounts.py",
+      "purpose": "Owner accounts (#29, staged slice 1): the exact, server-verified owner account rule and its refusals, a malformed or absent optional list, the second account's routing and waiting-owner authority, and one owner push per post with none from an owner account, in three offline scenarios on invented data."
     }
   ]
 }
