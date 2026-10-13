@@ -56,6 +56,8 @@ RECORDS = {
     "m-unverified": rq.Record("sam", False, text()),
     "m-later-hop": rq.Record("sam", True, hop()),
     "m-chat": rq.Record("sam", True, "go ahead, approved"),
+    "m-relayed": rq.Record("sam", True, text(relay="sam")),
+    "m-bad-claim": rq.Record("sam", True, text(relay="alpha-manager")),  # sam's post naming someone else
 }
 GOOD = rq.Evidence(post=rq.Post("sam", "m5r8w2", True), assistants=frozenset({"sam"}), lookup=RECORDS.get,
                    grant=GRANT, now=NOW, expiry=rq.VALID, revocation=rq.VALID)
@@ -261,6 +263,7 @@ class RequestV1Tests(unittest.TestCase):
                                  rq.Verdict(rq.VERIFIED, (), RELAY_ID))
         self.assertEqual(rq.validate(hop(trace="pat-thread-7"), good(post=MANAGER)).status, rq.VERIFIED)
         self.assertEqual(rq.validate(hop(), good(post=None)).status, rq.VERIFIED)  # the hop's own post is not proof
+        self.assertEqual(rq.validate(hop(cite="m-relayed"), good(post=MANAGER)).status, rq.VERIFIED)
         # beta's request within the same grant; a request with no expiry needs no clock
         beta = text(request_id="beta-20261013-4", target="beta-repo", scope=("check-beta",))
         self.assertEqual(rq.validate(beta, GOOD).status, rq.VERIFIED)
@@ -290,6 +293,12 @@ class RequestV1Tests(unittest.TestCase):
              "cited-content-malformed:bad-prefix"),
             ("a claim that sam relayed what a manager cited", hop(relay="alpha-manager"), sender("alpha-manager"),
              "relay-claim-mismatch"),
+            ("sam's post naming another relay, posted directly", text(relay="alpha-manager"), GOOD,
+             "relay-claim-mismatch"),
+            ("a citation of that post, naming sam", hop(cite="m-bad-claim"), sender("alpha-manager"),
+             "cited-relay-claim-mismatch"),
+            ("a citation of that post, naming no one", text(cite="m-bad-claim"), sender("alpha-manager"),
+             "cited-relay-claim-mismatch"),
         ]
         for label, wire, evidence, reason in cases:
             with self.subTest(case=label, reason=reason):
@@ -348,6 +357,10 @@ class RequestV1Tests(unittest.TestCase):
             ("no grant", text(), good(grant=None), "grant-evidence-unavailable"),
             ("no assistant list", text(), good(assistants=None), "assistants-unavailable"),
             ("no transport evidence", text(), good(post=None), "transport-evidence-unavailable"),
+            ("a post with no message ID", text(), good(post=rq.Post("sam", "", True)),
+             "transport-evidence-unavailable"),
+            ("a post whose verification is unknown", text(), good(post=rq.Post("sam", "m7", None)),
+             "transport-evidence-unavailable"),
             ("a cited record that cannot be found", hop(), good(post=MANAGER, lookup=lambda msgid: None),
              "cited-record-unavailable"),
             ("no lookup at all", hop(), good(post=MANAGER, lookup=None), "cited-record-unavailable"),
@@ -373,7 +386,13 @@ class RequestV1Tests(unittest.TestCase):
                 ("known revocation, citation unavailable", hop(),
                  good(post=MANAGER, lookup=None, revocation=rq.INVALID), "revoked"),
                 ("a trace from a manager, grant missing", text(trace="pat-thread-7"),
-                 good(post=MANAGER, grant=None), "trace-reference-only")):
+                 good(post=MANAGER, grant=None), "trace-reference-only"),
+                ("an unverified author with no message ID", text(), good(post=rq.Post("sam", "", False)),
+                 "relay-unverified"),
+                ("a non-assistant sender with no message ID", text(), good(post=rq.Post("alpha-manager", "", True)),
+                 "sender-label-only"),
+                ("a wrong relay claim with no message ID", text(relay="alpha-manager"),
+                 good(post=rq.Post("sam", "", True)), "relay-claim-mismatch")):
             with self.subTest(refused_over_unresolved=label):
                 verdict = self.assertVerdict(wire, evidence, rq.REFUSED, reason)
                 self.assertFalse([r for r in verdict.reasons if r.endswith(("-unknown", "-unavailable"))], verdict)

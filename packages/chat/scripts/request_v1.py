@@ -92,7 +92,9 @@ from a verified account on the assistant list. A later hop (`cite`) is
 authorized by the cited post alone, whoever posts it: the cited post must be
 from a verified assistant, and its content must be a first-hop request that
 matches this one in request ID, revision, digest, scope, gates, expiry and
-policy reference, so a later hop keeps exactly the cited restrictions. In
+policy reference, so a later hop keeps exactly the cited restrictions. Any
+`relay` claim, in this request and in the cited one, must name the cited post's
+verified author, so a citation cannot rehabilitate a refused claim. In
 both, the policy name and digest must equal the independently supplied grant's,
 the scope must be a subset of the grant's, the action and target must be ones
 the grant lists, and the request's gates must include the grant's. The
@@ -410,20 +412,30 @@ def _listed(assistants, account):
 
 def _first_hop(request, evidence, refused, unresolved):
     post = evidence.post
-    if (not isinstance(post, Post) or not isinstance(post.account, str)
-            or not isinstance(post.msgid, str) or not _MSGID.fullmatch(post.msgid)):
+    if not isinstance(post, Post):
         unresolved.append("transport-evidence-unavailable")
         return None
-    if post.verified is not True:
+    # Each fact the post does carry is checked on its own, so a known refusal is not hidden by a
+    # fact it lacks; whatever is missing is recorded once, apart from the refusals.
+    complete = isinstance(post.msgid, str) and bool(_MSGID.fullmatch(post.msgid))
+    if post.verified is False:
         refused.append("relay-unverified")
-    listed = _listed(evidence.assistants, post.account)
-    if listed is None:
-        unresolved.append("assistants-unavailable")
-    elif not listed:
-        # the post cites nothing, so all it offers is who sent it, or a pointer into a conversation
-        refused.append("trace-reference-only" if request.trace is not None else "sender-label-only")
-    if request.relay is not None and request.relay != post.account:
-        refused.append("relay-claim-mismatch")
+    elif post.verified is not True:
+        complete = False
+    if isinstance(post.account, str):
+        listed = _listed(evidence.assistants, post.account)
+        if listed is None:
+            unresolved.append("assistants-unavailable")
+        elif not listed:
+            # the post cites nothing, so all it offers is who sent it, or a pointer into a conversation
+            refused.append("trace-reference-only" if request.trace is not None else "sender-label-only")
+        if request.relay is not None and request.relay != post.account:
+            refused.append("relay-claim-mismatch")
+    else:
+        complete = False
+    if not complete:
+        unresolved.append("transport-evidence-unavailable")
+        return None
     return post.msgid
 
 
@@ -460,6 +472,9 @@ def _later_hop(request, evidence, refused, unresolved):
         refused.append("cited-digest-mismatch")
     if request.relay is not None and request.relay != record.author:
         refused.append("relay-claim-mismatch")
+    if cited.relay is not None and cited.relay != record.author:
+        # the cited post's own claim is held to its author too: a citation cannot rehabilitate it
+        refused.append("cited-relay-claim-mismatch")
     return request.cite
 
 
