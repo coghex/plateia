@@ -112,6 +112,8 @@ class BuildTests(BuildCase):
             # #24: the maintenance record is read by every writer and written by the owning operation's
             # primitives, which ship in this package, so it is declared both read and written
             r"maintenance\.json": ("maintenance", True, True),
+            # #27: the request/v1 line is parsed and encoded by a library nothing calls yet, so it is both
+            r'FORMAT = "request/v1"': ("request-line", True, True),
         }
         manifest = build_release.verify(self.build()[0])
         formats = {f["name"]: f for f in manifest["formats"]}
@@ -445,12 +447,13 @@ class RefusalTests(BuildCase):
 # The declarative content of release.json that #19 and #24 leave exactly as it was:
 # everything but package.files, the interpreter note and the outbox,
 # delivery-records, outbox-db, outbox-authority, boot-id and tcp-sockets
-# format entries (the second to fifth amendments of #19, acceptance 11), and
-# the maintenance format (#24: writer admission, read and written, maintenance/1),
-# and the designation-bootstrap format (#21: read only, designation-bootstrap/1).
+# format entries (the second to fifth amendments of #19, acceptance 11), the
+# maintenance format (#24: writer admission, read and written, maintenance/1),
+# the designation-bootstrap format (#21: read only, designation-bootstrap/1)
+# and the request-line format (#27: request/v1, read and written).
 UNCHANGED_DECLARATIVE = "f2895cb0c6145ded6b845e214ab21cc06ae5f68426d73cb71bfecadb66602f81"
 CHANGED_BY_19 = {"outbox", "delivery-records", "outbox-db", "outbox-authority", "boot-id", "tcp-sockets",
-                 "designation-bootstrap", "maintenance"}
+                 "designation-bootstrap", "maintenance", "request-line"}
 GENERATED = ("release", "source", "builder", "build_interpreter", "artifacts")
 
 

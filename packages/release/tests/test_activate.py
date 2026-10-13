@@ -274,13 +274,15 @@ class AdmissionTests(ActivationCase):
                          "tcp-sockets", "designation-bootstrap"} <= refused, report["refused"])
 
     def test_a_bound_plan_admits_exactly_19s_delta_and_the_bootstrap_input(self):
+        """Exactly the one transition: #19's delta, designation-bootstrap, maintenance (amendment 4) and #27's
+        request-line, a library format no running tool uses (#21 amendment 6)."""
         _, path = self.plan()
         summary, _, report = self.staged(path)
         self.assertEqual(summary["state"], "staged")
         self.assertEqual(report["refused"], [])
         admitted = sorted(r[1] for r in report["results"] if r[0] == "admitted")
         self.assertEqual(admitted, ["boot-id", "delivery-records", "designation-bootstrap", "maintenance", "outbox",
-                                    "outbox-authority", "outbox-db", "tcp-sockets"])
+                                    "outbox-authority", "outbox-db", "request-line", "tcp-sockets"])
         self.assertEqual(_staging.snapshot_tree(self.home), self.before)
 
     def test_the_transition_admits_no_other_format_change(self):

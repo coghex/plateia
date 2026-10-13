@@ -534,7 +534,9 @@ schedules, and it posts nothing to chat.
 
 `packages/release/activate_release.py` carries #19's release through one
 guarded format cutover (D-74, D-26, D-27; #21 with its owner amendments 1
-and 2 of 2026-10-11). **It has never been run on the owner's machine.**
+to 3 of 2026-10-11 and amendment 4 of 2026-10-13, which integrates writer
+admission: [writer_admission.md](writer_admission.md), #23 and #24). **It has
+never been run on the owner's machine.**
 Everything here was exercised on invented homes, state and service
 definitions, with fake service and process reads. Implementing or reviewing
 it authorizes no live step: that needs the owner's decision and a published
@@ -549,7 +551,11 @@ formats (`live_versions` in `staging.json`, unchanged) to:
 - #19's delta: `outbox` and `delivery-records` write `/2` and still read
   `/1`; `outbox-authority/1` and `outbox-db/1` are new; `boot-id/1` and
   `tcp-sockets/1` are new read-only host interfaces;
-- one read input, `designation-bootstrap/1` (owner amendment 1).
+- one read input, `designation-bootstrap/1` (owner amendment 1);
+- writer admission's record, `maintenance/1`, read and written (amendment 4,
+  gate G-3). Only the activation's fenced operation writes it, through the
+  chat package's `delivery_store.Owner`; it holds no work and is not a
+  first-write boundary.
 
 `stage_release.admission(plan, release)` returns an admission only for an
 activation plan (`plateia-activation-plan/1`) whose digest holds and which is
@@ -576,16 +582,17 @@ activate_release plan --release <dir> --dest <dir> --root <private dir> --eviden
 activate_release stage --plan <plan file>
 activate_release activate --plan <plan file> --evidence <file>
 activate_release postcheck --plan <plan file> --evidence <file>
+activate_release release --plan <plan file> --evidence <file>
 activate_release rollback --plan <plan file> --evidence <file>
 activate_release operator-plan --plan <plan file>
-activate_release status --root <private dir>
+activate_release status --root <private dir> [--plan <plan file> [--evidence <file>]]
 ```
 
 - **`plan`** is read-only. It seals one new operation id, the release, the
   targets, the state snapshot and root, the transition, the private root and
   the designation list (an explicit empty list is allowed) under one digest.
-  It refuses a state that already holds a new-format write, or a bootstrap
-  record.
+  It refuses a state that already holds a new-format write, a bootstrap
+  record, a maintenance record or a refusal sink (`refused.d/`).
 - **`activate`** works under a fenced journal in the private root
   (`plateia-activation-journal/1`). In order:
   1. **The journal is fenced.**
@@ -650,21 +657,41 @@ activate_release status --root <private dir>
          the owner's confirmation at the time of the action.
      - The skill and the status client the controller uses are read from
        the hash-verified artifacts.
-  3. **The old writers are quiet.**
-     - Every writer the sealed plan names, and every legacy writer the
-       current evidence lists (the old bridge, the flusher, helpers, running
-       or cached producers), must be at an acknowledged checkpoint or
-       verifiably retired. A named writer the evidence omits is unknown.
-     - Every designated account's producers must be tracked.
-     - The evidence must be current: `observed_at` within 15 minutes.
-     - A delivered request is not an acknowledgement, and unknown evidence
-       blocks.
-     - Nothing is interrupted, restarted or killed, and the list is never
-       changed.
+  3. **Maintenance is acquired** (writer admission 4.4; amendment 4,
+     section 3). This replaces "the old writers are quiet":
+     - Every designated account's producers must be tracked (kept as a
+       precondition). Nothing is interrupted, restarted or killed, and the
+       list is never changed.
+     - Everything that can refuse read-only (the staged release, the seal, a
+       bootstrap record nobody here published, every target against the plan)
+       is judged before the record exists.
+     - The controller drives the release's own `delivery_store.Owner`, loaded
+       from the hash-verified wheel, under its fenced journal: it creates
+       `admission.lock`, links the record `draining`, takes the admission lock
+       exclusive without blocking (retried to `DRAIN_MAX`) and writes
+       `partial`. From then on every new-release writer's section is refused,
+       and its post, acknowledgement or notice is kept in the refusal sink. A
+       drain that misses its deadline leaves the record `draining` and reports
+       it. On resume in a new boot the drain is repeated and the record names
+       the new boot; a boot change is never a release.
+     - **The fence (K4).** Each Owner step's intent, progress facts (the
+       temporary file's identity before it is published, the published
+       record's evidence after) and outcome are journal records, synced
+       before the step goes on. The pending step and the record's latest
+       evidence are derived from them alone. A crash is settled from what is
+       on disk: a landed write is adopted only if it is the very file the
+       operation published (its journaled identity, generation, bytes and
+       change time), and an identical-byte replacement, before or after the
+       outcome is journaled, is never adopted. Another operation's or an
+       unknown record is never touched.
   4. **Every original is backed up** privately (mode 0600, through the
-     pinned root) before anything is changed, after re-checking each target
-     against the plan. Each target's directory identity (device and inode)
-     is recorded with it.
+     pinned root), admitted in `partial`. Each captured target is validated
+     against the sealed plan before it is accepted (code review 6112483129,
+     finding 1): a LaunchAgent's exact bytes, a link's destination, and each
+     captured file of a folder against the plan's recorded hashes. A target
+     changed before its capture, or between two captures, refuses with the
+     change kept, and its capture is never journaled as its backup. Each
+     target's directory identity (device and inode) is recorded with it.
   5. **The bootstrap record is published.** Its canonical bytes come from the
      sealed plan: the format version, the operation, the pinned manifest hash
      and release identity, the state root's realpath, device and inode, the
@@ -678,7 +705,13 @@ activate_release status --root <private dir>
      checks both. A
      record this operation can't show it published is retained and stops the
      activation for an owner decision.
-  6. **The seven targets are bound**, all checked before any is written:
+  6. **The seven targets are bound** (admitted in `partial`), all checked
+     before any is written. The binding's boot is recorded in the record
+     (`bound_boot`) before the first target write of the boot, and again on a
+     resume in a new boot. Before every write the guard checks: no bridge has
+     started, the record is still this operation's own last journaled write in
+     `partial` (which is what fences every new-release writer; it replaces the
+     quiet-writer check), and the release is still sealed as journaled.
      - the `pchat` and role-colors links point to the release;
      - `SKILL.md` is the release's;
      - the `chat/scripts` handoff layer runs the release's copy of each
@@ -697,11 +730,40 @@ activate_release status --root <private dir>
        entry. That journal is the ownership evidence.
      - A temporary that a crash leaves behind is removed on resume, but only
        if this operation journaled it.
-- **`activate` starts, stops and restarts nothing.** The operator restarts
-  the bridge at an acknowledged checkpoint, as the published plan says. A
-  running bridge of this operation's release allows only a read-only
-  reconcile; any other running bridge, or an unknown state, blocks every
-  change.
+
+     `activate` then reports `selected`, with the record `partial`.
+  7. **The owner reboots** (retirement, the design's gate G-1). launchd starts
+     the bound bridge, which waits in its hold.
+  8. **`activate` again writes `full`** (writer admission 8.3), only when, in
+     the current boot: the boot is known and differs from `bound_boot`
+     (otherwise "retirement unverified", and the record stays `partial`); the
+     owner's inhibition evidence (gate G-2) is present, complete, and covers
+     every unmanaged launcher it lists (a managed target, disabled for the
+     window, or shown never to write); every target is verified bound; the
+     bootstrap record reconciles as this operation's; and the bridge is
+     stopped or this operation's own. The checks run again immediately before
+     the durable intent. `full` records `legacy: retired-and-inhibited` and
+     binds this release, `sha256:<D>` and the bridge's start. A refusal of
+     `full` is reported, never forced. The controller never searches for
+     launchers itself: that inventory, and what it may read, is the owner's.
+     With `full` held, a resume verifies every target again; a changed one
+     writes the record back to `partial`, needing a new retirement.
+  9. **The bound bridge's start** (writer admission 6.3; K3): only under a
+     `full` record binding its operation, digest and release does the
+     bridge's authority start. That start is one operation-owned section,
+     holding the admission lock shared from the admission through the
+     bootstrap's classification, the start, the socket's binding and a failed
+     start's cleanup; it commits the bootstrap (S2, or the replay S3), binds
+     the socket and serves read-only status. Every mutating request is
+     answered `maintenance`, and nothing else runs: no chat connection,
+     import or flush. In `partial`, or under any other record, no database,
+     WAL or socket is created.
+- **`activate` starts, stops and restarts nothing.** The owner stops the
+  legacy bridge before binding and reboots after it; launchd then starts the
+  bound bridge, which waits for `full`. This operation's own bridge (holding,
+  or serving read-only status) permits the maintenance transitions and
+  `release`, but no target write and no rollback; any other running bridge,
+  or an unknown state, blocks every change (K1).
 - **A resume** takes the original plan for its own journaled operation only:
   changed inputs are refused, and every step reconciles from what is on disk.
 - **`postcheck`** is read-only and never opens the outbox database. It
@@ -713,12 +775,24 @@ activate_release status --root <private dir>
   - the expected new bridge;
   - a live answer from its authority to the existing read-only status
     request over its socket. This uses the release's own client, within its
-    bounded deadline, and reports the authority's epoch.
+    bounded deadline, and reports the authority's epoch;
+  - the maintenance record, reported beside the checks: this operation's own
+    last journaled write, `full`, binding this release, D and the bridge's
+    start (or released by this operation), with the refusal sink's count.
 
   An old status snapshot proves nothing. The live answer ties the evidence
   to this activation: once the record exists, a bridge launched without its
-  exact digest is UNKNOWN and never binds its socket. The activation is
-  complete only when every check passes.
+  exact digest is UNKNOWN and never binds its socket.
+- **`release`** ends maintenance: it unlinks the record, the moment every
+  writer is admitted again; the bridge then catches up from its checkpoints
+  and imports the refusal sink. After a completed activation it repeats the
+  post-check and is refused while any of it fails. After a completed
+  pre-write rollback it verifies instead (K2): the targets exactly as
+  restored, the retained record as this operation's own, a known boot change
+  since the restore, and still no first write, the sink included; a running
+  bridge of the rolled-back release, or an unknown bridge state, refuses. A
+  crash between the unlink and its journal record resumes to a completed
+  release. The activation is complete only once released.
 - **`rollback`** works only before the first new-format write. It judges the
   three first-write boundaries from the state directory itself, never from
   the journal, through one descriptor of the root the plan sealed. A root
@@ -726,28 +800,79 @@ activate_release status --root <private dir>
   every boundary unknown, and refuses:
   - `outbox-db/1`: `outbox.db` or any of its `-wal`, `-shm` or `-journal`
     files exists;
-  - `outbox/2`: `outbox.d/` exists;
+  - `outbox/2`: `outbox.d/` or the refusal sink `refused.d/` exists (a
+    refused write is a first write, kept for the owner, never deleted);
   - `delivery-records/2`: `dead-letters.jsonl` holds a versioned record.
 
-  Anything unreadable counts as written. Before the first write, it restores
-  every recorded target exactly, entry by entry through its pinned
-  directory, which removes the launch option. An entry may be as backed up
-  or as this operation journaled writing it, and anything else blocks. It
-  leaves the bootstrap record in place, journaled. After it, it refuses: the
-  recovery is repair or roll-forward on the latest state, and every target,
-  backup and state file is kept.
+  Anything unreadable counts as written. The bridge must be stopped, and the
+  maintenance record must be this operation's own and held (`partial` or
+  `full`), which is what fences every new-release writer; this replaces the
+  quiet-writer check (code review 6112483129, finding 2). Both are checked
+  before anything and again before every restoring write. Before the first
+  write, it restores every recorded target exactly, entry by entry through
+  its pinned directory, which removes the launch option. An entry may be as
+  backed up or as this operation journaled writing it, and anything else
+  blocks. It leaves the bootstrap record in place, journaled, and keeps the
+  maintenance record: a process started after the binding may hold
+  new-release code, so `release` ends it only once the boot has changed
+  since the restore. After the first write, it refuses: the recovery is
+  repair or roll-forward on the latest state, and every target, backup and
+  state file is kept. This adds no automatic rollback and no rollback
+  trigger; the rollback mode stays the owner's gate (G-9).
+- **`status`** reports each operation from the journal; with the plan, also
+  its maintenance record and Owner's read-only reconcile (whether the record
+  is exactly the journaled write, whether its acting process is gone, the
+  sink's count, a pending step, journaled and unjournaled temporary files,
+  and the next permitted step).
 - **`operator-plan`** prints the private plan an operator publishes (A9): the
   source commit, the release and artifact hashes, the private environment and
   root, the targets, the affected helpers, the checkpoint owners, the
   preserved state, the migration point, the designation list, D, the
-  post-checks, the permitted recovery and the skills-repository change.
+  post-checks, the permitted recovery and the skills-repository change; and
+  for writer admission: stopping the legacy bridge, the reboot, the
+  inhibition evidence, the release step, the sink's count to watch, and the
+  window against the chat server's history retention (gate G-6).
 - **The skills-repository change** (D-27) is reported by `activate` as paths
   under the skills root with their new hashes; the owner commits it.
 
 ### Activation tests
 
-`test_activate.py` (63 tests) and `test_cutover.py` (1 end-to-end test), all
-on invented homes. The guarded seal has its own tests (`GuardedSealTests`):
+`test_activate.py`, `test_activation_admission.py` (amendment 4) and
+`test_cutover.py` (1 end-to-end test), all on invented homes. The shared
+fixture runs `activate` as the operator plan does: when it reports the targets
+bound with nothing running, the invented host reboots (a fake boot id) and
+`activate` runs again to write `full`.
+
+Amendment 4's tests (`test_activation_admission.py`), with fake boots, a fake
+clock for the drain and fake inhibition evidence:
+
+- the four blockers of code review 6112483129, each reproduced before its
+  fix: a target edited at a backup boundary (each kind of target), and an
+  unacknowledged new-release writer while the record is missing, unknown or
+  another operation's (the bridge's two are in the chat suite);
+- retirement: an unchanged boot refuses `full` naming retirement unverified,
+  and a legacy append is not refused; an unreadable boot is unknown; a reboot
+  mid-activation drains again and is never a release;
+- inhibition: an invented unmanaged launch agent running a copy of the
+  baseline `pchat`, incomplete evidence and missing evidence each refuse
+  `full` and name it, binding nothing;
+- `full` binds the release, D and the bridge's start, and is reached while
+  the operation's own bridge holds (K1);
+- release refused while the post-check fails (bridge stopped, no live answer,
+  a target changed), and a crash after the unlink, before or after its
+  outcome, resuming to a completed release;
+- the fence: identical-byte replacements before and after the outcome is
+  journaled are never adopted, and the fence is durable journal records;
+- a crash at each acquisition, `full` and release point resumes to a released
+  operation, with no torn record and no journaled temporary left;
+- rollback's release: the record kept until the boot changes; a sink file, a
+  changed target, a bridge of the rolled-back release or an unknown bridge
+  refuse it; a sink file before the restore refuses the rollback and is kept;
+- `plan` refuses a record or a sink; an open section holds the drain without
+  blocking until it ends or `DRAIN_MAX`; `status` reports the record and the
+  reconcile, read-only; the operator plan names the new steps.
+
+The guarded seal has its own tests (`GuardedSealTests`):
 
 - a seal from 0755, with the originals journaled and owners, ACLs, flags and
   parents unchanged;
@@ -811,9 +936,9 @@ The earlier tests cover:
   a target write, resumes to the same bindings; a changed plan can't resume;
   a concurrent upgrader is refused; a target changed or swapped for a symlink
   mid-activation blocks; the staged release and the 0600 backups are kept.
-- **Quiet writers (A3):** a delivered but unacknowledged request, a cached
-  producer not yet quiet, an unknown checkpoint or kind, missing evidence or
-  an untracked producer each block before any change.
+- **Producers (A3, as amendment 4 leaves it):** an untracked producer, or no
+  producer evidence, blocks before any change. The rest of A3 is replaced by
+  writer admission's tests above.
 - **Rollback (A7):** before a first write, the targets are restored exactly
   and the record is left; after an `outbox.db`, a WAL alone, an `outbox.d/`
   file, a versioned dead letter, or unreadable delivery records, it is
@@ -821,68 +946,53 @@ The earlier tests cover:
   controller's acknowledgement.
 - **Targets, preservation and the plan (A2, A4, A9):** every target resolves
   to the release, and a module imported by path loads from it with no source
-  checkout on the path; the chat state changes only by the new record, with
-  no config, credential or project state touched; the operator plan names
-  every required item.
-- **End to end (A8):** in the staged release's own interpreter, with #19's
-  invented chat server and in-process authority, the test covers:
-  - posting and a notice with the bridge down, each queued as one `outbox/2`
-    file;
-  - `pchat status`;
-  - the bridge's first start, committing the plan-bound designation;
-  - import and delivery, each item once, with an unsupported legacy row held;
-  - post, ack and notify with the bridge up;
+  checkout on the path; the chat state changes only by the new record and
+  writer admission's record and lock, with no config, credential or project
+  state touched; the operator plan names every required item.
+- **End to end (A8, under ownership):** in the staged release's own
+  interpreter, with #19's invented chat server and in-process authority,
+  after `activate`, the reboot and `full`, the test covers:
+  - a post and a notice during the window, each refused into the refusal
+    sink (exit 5, and a visible line), and `pchat status` naming the holder;
+  - the bound bridge's start under `full`, committing the plan-bound
+    designation, answering status with the record, and answering a post
+    `maintenance`; nothing is published;
+  - rollback refused, the post-check failing without a live answer and
+    passing with it, `release` refused and then completed;
+  - after the release: the restart replays the bootstrap, the sink and the
+    legacy row are imported and delivered once each, with an unsupported
+    legacy row held;
+  - post (exit 0), ack and notify with the bridge up;
   - a long post whose last confirmation times out, never reposted;
-  - a restart that changes nothing;
-  - rollback refused afterwards, and the post-check passing.
+  - a restart that changes nothing, and the post-check passing after the
+    release.
 
-### Writer admission (#23): proposed changes
+### Writer admission (#23, #24): integrated by amendment 4
 
 [writer_admission.md](writer_admission.md) designs the write-admission barrier
 this activation needs, in place of observing that writers are quiet (the
 owner's decision of 2026-10-11; D-75 in [plateia_design.md](plateia_design.md)).
-Nothing in this section is in force: it lists what the design would change in
-this contract, which applies only once the owner approves the implementation.
-The contract above stands as written until then.
+#21's owner amendment 4 (2026-10-13; APPROVE 6151464851) approves its #21
+contract changes (gate G-3), and PR #22 implements them as described above.
+Merge, deployment, the live activation and the cutover stay separately gated,
+and the owner's gates G-1 (retirement by reboot), G-2 (the unmanaged-launcher
+inventory) and G-9 (the rollback mode) stay undecided: the controller verifies
+their evidence and decides none of them.
 
-**The order is kept.** Seal, then the writer step, then publish the bootstrap
-record, journal D, and only then bind (steps 2, 3, 5 and 6 above). The writer
-step becomes **maintenance acquisition**: the controller writes a durable
-maintenance record (`$CHAT_STATE/maintenance.json`, `maintenance/1`) naming
-this operation and the boot, drains every new-release writer through the
-admission lock, and reaches the intermediate state `partial`. Publishing the
-bootstrap record, journaling D and binding are operation-owned writes
-admitted in `partial`. After binding, the owner reboots (the proposed
-retirement step, an owner decision: the design's gate G-1); the resumed
-`activate` verifies the boot changed since binding (retirement) and that no
-legacy writer can start (inhibition), and only then writes `full`. Only under
-`full` may the bound bridge make its bootstrap commit, the first
-`outbox-db/1` write. A new `release` command repeats the post-check's checks
-and ends maintenance. The design's section 9.1 gives the whole sequence.
-
-**Each quiet-writer clause** (the design's section 9.2):
+**Each quiet-writer clause** (the design's section 9.2), as now in force:
 
 | Clause | Disposition |
 | --- | --- |
-| Step 3, "The old writers are quiet" | **Replaced** by acquisition (new-release writers) and by retirement and inhibition before `full` (legacy writers). The 15-minute `observed_at` evidence is no longer a gate. "Every designated account's producers must be tracked" is **kept** as an extra precondition. "Nothing is interrupted, restarted or killed" is **kept** for `activate`; the owner's reboot is the retirement step. |
-| The A3 test row (quiet writers) | **Replaced** by the design's tests 1, 10, 11, 12 and 13; its untracked-producer case is **kept**. |
-| "`activate` starts, stops and restarts nothing. The operator restarts the bridge at an acknowledged checkpoint" | **Amended.** The first sentence is kept. The owner stops the legacy bridge before binding and reboots after it; launchd then starts the bound bridge, which waits for `full`. The running-bridge rules are kept. |
+| Step 3, "The old writers are quiet" | **Replaced** by acquisition (new-release writers) and by retirement and inhibition before `full` (legacy writers). The 15-minute `observed_at` evidence is no longer a gate. "Every designated account's producers must be tracked" is **kept** as a precondition. "Nothing is interrupted, restarted or killed" is **kept** for `activate`; the owner's reboot is the retirement step. |
+| The A3 test row (quiet writers) | **Replaced** by writer admission's tests; its untracked-producer case is **kept**. |
+| "`activate` starts, stops and restarts nothing. The operator restarts the bridge at an acknowledged checkpoint" | **Amended.** The first sentence is kept. The owner stops the legacy bridge before binding and reboots after it; launchd then starts the bound bridge, which waits for `full`. The running-bridge rules are kept, with K1's permission for the maintenance transitions and `release`. |
 | D-74's stop condition, a protected workflow "that cannot be shown to be quiet" | **Amended** to a protected workflow that cannot tolerate its chat writes being held for the window, or a reboot. It still stops for an owner decision. |
+| Rollback's eligibility check, `check_quiet` | **Replaced** by "the record is this operation's and still held", at the same points, beside the unchanged first-write evidence. The bridge must still be stopped. |
 
 **The post-check's status request** stays answerable while every ordinary
 write is refused: `status` writes nothing and is answered in every state. The
 bridge's status snapshot is deferred while maintenance is held, which the
 post-check never relies on.
-
-**The maintenance format's admission.** The chat package reads
-`maintenance/1`, and (since #24) ships the owning operation's primitives, which
-alone write it, so the format is declared both read and written; ordinary
-writers only read it. Default staging refuses it, so it would join the one
-admitted transition's `added` formats beside `designation-bootstrap/1`. It holds no work and is not a first-write boundary.
-The design's refusal sink, `refused.d/` (`outbox/2` files), would be one:
-`outbox/2`'s first write becomes "`outbox.d/` or `refused.d/` exists".
-`plan` would refuse a state that already holds either. Rollback (report-only
-or automatic) remains the owner's open gate, and blocks the cutover.
 
 ## Evidence
 

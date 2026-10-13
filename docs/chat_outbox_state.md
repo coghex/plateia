@@ -91,9 +91,11 @@ decision of 2026-10-12 (D-75 in [plateia_design.md](plateia_design.md)). Section
 2.4.6 and the notes on I-11 and I-12 describe behaviour the chat package now
 implements: refusal into a sink with exit 5, sections under an admission lock,
 admission by the authority on every execution path, the bridge's hold, and the
-owning operation's primitives. **What stays pending is #21's work, which is
-separately gated:** the authority's start bound by a `full` record, the
-controller's own decisions and the activation. Section 12 lists the revision.
+owning operation's primitives. #21's side (its owner amendment 4,
+2026-10-13) is implemented in PR #22, not yet merged: the authority's start
+bound by a `full` record (section 2.4.6, item 4) and the controller's own
+decisions. The activation itself stays separately gated. Section 12 lists the
+revision.
 
 Section 12 lists what changed and why. The owner's decisions of 2026-10-09 and
 2026-10-10 are recorded in section 11, and in D-73 of
@@ -524,7 +526,14 @@ additions):
   valid record, M without either, M naming another operation or digest, or a
   malformed M. Anything that can't be judged, such as a value of an
   unforeseen type in a digest-matching record, is UNKNOWN too, never an
-  ordinary failure. In that state:
+  ordinary failure. So is, for an activated launch (E given), a database
+  whose bootstrap state can't be read, classified or committed: corrupt,
+  unreadable, or made by other code (code review 6112483129 on PR #22). The
+  validated state root is held through the whole start, by its descriptor,
+  its identity and its realpath: a root swapped, or moved away with a link
+  left at its old path, before the database opens, inside the opening
+  transaction, after the commit or around the bind is UNKNOWN wherever it
+  surfaces. In that state:
   - the transaction rolls back, so nothing is committed, not even the epoch;
   - no socket is bound, and nothing is imported or recovered;
   - nothing is deleted or rewritten, and the status snapshot isn't replaced;
@@ -832,10 +841,21 @@ each specified in the design (its section 11):
    `status` are answered in every state, in a read-only transaction that
    changes no database or WAL file, and `status` reports the record and the
    refusal sink's count.
-4. **The authority's start. Implemented in part.** Every start is refused
-   while any record exists, before the database or the socket is touched.
-   **Pending #21:** the start bound by a matching `full` record (the
-   designation bootstrap under `full`), which is #21's rework against PR #22.
+4. **The authority's start. Implemented** (the bound start by #21's owner
+   amendment 4, in PR #22, not yet merged). The start is one section,
+   holding the admission lock shared from the admission through the
+   bootstrap's classification, the start, the socket's binding and a failed
+   start's cleanup (so a failed start under `full` releases its files at
+   once, and the next pass starts again). With no record it starts as
+   before. A `full` record whose binding names this launch's operation (the
+   bootstrap record's), its digest (`sha256:<D>`) and this bridge's release,
+   and permits `bridge-start`, admits the operation-owned start: the
+   bootstrap commits (S2, or the replay S3), the socket is bound and the
+   authority serves read-only requests; every mutating request is answered
+   `maintenance`, and the bridge stays in its hold otherwise (no chat
+   connection, import or flush). Any other record, or an unknown one,
+   refuses the start before the database or the socket is touched. A close
+   outside any section stays deferred while maintenance is held.
 5. **The bridge's hold. Implemented.** While a record exists, the bridge
    writes nothing but its log: no chat connection, message, checkpoint,
    delivery, import, flush or status snapshot, and it starts no authority. A
@@ -852,9 +872,10 @@ each specified in the design (its section 11):
    before its outcome is recorded; it mutates only on evidence
    that matches the operation, plan, generation, exact bytes, inode and change
    time of its own last journaled write; and a failed or unknown fence permits
-   nothing further. **Pending #21:** the controller that calls them, and its
-   own decisions (verifying retirement, inhibition and targets before `full`,
-   the operation's journal, the `release` command and its post-check).
+   nothing further. #21's controller calls them under its fenced journal and
+   keeps its own decisions (retirement, inhibition and targets before
+   `full`, the `release` command and its post-check), in PR #22 (#21's owner
+   amendment 4; [release_staging.md](release_staging.md#activation-plt-14-21)).
 
 ## 3. State and transition tables
 
@@ -3638,7 +3659,8 @@ review. Merging and activation are not approved by any of them.
     and the other formats, at-least-once delivery with the absence check, and
     the unavailable-authority behaviour of section 2.4.4 when no maintenance is
     held.
-  - **Pending #21, separately gated:** the authority's start bound by a `full`
-    record, the controller's changes, the admitted `maintenance` format in
-    the activation transition, and the cutover. Nothing here waives a gate
-    (G-3 of the design).
+  - **#21's side** (its owner amendment 4, 2026-10-13, which approves G-3):
+    the authority's start bound by a `full` record, the controller's changes
+    and the admitted `maintenance` format in the activation transition, in
+    PR #22, not yet merged. The cutover stays separately gated. Nothing here
+    waives a gate.

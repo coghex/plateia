@@ -574,6 +574,14 @@
     {
       "path": "packages/chat/scripts/tests/test_admission_import.py",
       "purpose": "The two import sources: the refusal sink beside outbox.d/ with source identity, entry-id deduplication, basename collisions, bounded fairness, listing failures and the import pass's accounting (#24; A4)."
+    },
+    {
+      "path": "packages/chat/scripts/request_v1.py",
+      "purpose": "The request/v1 one-line request form: strict parsing and canonical encoding, the logical-content digest and request-scoped authority validation against injected evidence. A pure library that nothing calls yet (COLLAB-1, #27)."
+    },
+    {
+      "path": "packages/chat/scripts/tests/test_request_v1.py",
+      "purpose": "request/v1 round trip, refusal of non-canonical forms, digest stability, conflicting reuse and the verified, unresolved and refused outcomes, in eight offline scenarios on invented data (COLLAB-1, #27)."
     }
   ]
 }
