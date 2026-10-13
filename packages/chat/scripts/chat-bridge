@@ -2222,6 +2222,17 @@ class BootstrapStore(delivery_store.Store):
         super().__init__(paths, **kw)
         self.expected, self.record, self.root = expected, record, root
         self.bootstrap = None  # what this open did: "none" (S1), "applied" (S2) or "replayed" (S3)
+        self.m_absent = False  # for a launch with no activation: M's absence established (S1 so far)
+
+    def meta(self, name):
+        """For a launch with no activation, M is classified at the opening transaction's first read of any
+        other metadata, before that metadata can fail: a committed M without E and R is UNKNOWN (PR #22
+        review 3, finding 3)."""
+        if self.record is None and not self.m_absent and name != BOOTSTRAP_META and self.con is not None:
+            if super().meta(BOOTSTRAP_META) is not None:
+                raise BootstrapUnknown("a bootstrap is committed, but this launch names no digest and no record")
+            self.m_absent = True
+        return super().meta(name)
 
     def open(self):
         """For an activated launch, a database whose bootstrap state can't be
@@ -2229,6 +2240,7 @@ class BootstrapStore(delivery_store.Store):
         busy) establishes none of S1, S2 and S3: it is UNKNOWN, never an
         ordinary failure (code review 6112483129, finding 3). Nothing was
         committed: Store.open is all or nothing."""
+        existed = os.path.lexists(self.paths.db)
         try:
             super().open()
         except BootstrapUnknown:
@@ -2236,7 +2248,9 @@ class BootstrapStore(delivery_store.Store):
         except (sqlite3.Error, OSError, ValueError, TypeError, delivery_store.Unavailable) as err:
             # ValueError and TypeError: startup metadata of the wrong shape, such as an authority epoch that is
             # not an integer, met before M is classified (PR #22 review 1, finding 4). A crash still propagates.
-            if self.record is None:
+            # With no activation the failure is ordinary only once S1 is established: M shown absent, or no
+            # database before this start, which can hold no M (PR #22 review 3, finding 3).
+            if self.record is None and (self.m_absent or not existed):
                 raise
             raise BootstrapUnknown(f"the database's bootstrap state can't be read or committed "
                                    f"({type(err).__name__}: {err})") from None

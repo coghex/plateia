@@ -1058,6 +1058,51 @@ class BootstrapUnreadableMetaTests(BootstrapCase):
                 self.assertEqual(written, [], "no ordinary status write")
                 self.assertEqual(self.evidence(), before, "the database is unchanged")
 
+    def test_a_committed_m_without_a_launch_digest_and_unreadable_startup_metadata_is_unknown(self):
+        """PR #22 review 3 (6157690404), finding 3: M's absence is established before the ordinary no-activation
+        failure path. A committed bootstrap row, no launch digest and no record, and an authority epoch that is
+        not an integer: UNKNOWN, through ensure_authority() and main()."""
+        for through in ("ensure_authority", "main"):
+            with self.subTest(through=through):
+                self.stop()
+                self.wipe_database()
+                self.bridge.BOOTSTRAP_UNKNOWN = None
+                d = self.publish(self.record(["alp-solver-2"]))
+                self.launch(d)  # S2: M committed
+                self.stop()
+                (self.state / self.bridge.BOOTSTRAP_FILE).unlink()  # the test's own removal
+                con = sqlite3.connect(self.state / "outbox.db")
+                con.execute("UPDATE meta SET value = 'not-an-integer' WHERE name = 'authority_epoch'")
+                con.commit()
+                con.close()
+                (self.state / "outbox-status.json").unlink(missing_ok=True)
+                before = self.evidence()
+                written, ran, slept = [], [], []
+                with mock.patch.object(self.bridge, "write_unavailable_status", lambda *a: written.append(a)):
+                    if through == "ensure_authority":
+                        authority = self.launch(None)
+                        self.assertFalse(authority.running)
+                    else:
+                        class Stop(BaseException):
+                            pass
+
+                        def sleep(seconds):
+                            slept.append(seconds)
+                            raise Stop()
+
+                        def run(*a, **k):
+                            ran.append(a)
+                            raise Stop()
+                        with mock.patch.object(self.bridge, "run", run), \
+                                mock.patch.object(self.bridge.time, "sleep", sleep), \
+                                mock.patch.object(self.bridge.chatlib, "load_config", lambda: {}), \
+                                self.assertRaises(Stop):
+                            self.bridge.main([])
+                        self.assertEqual((ran, slept), ([], [self.bridge.UNKNOWN_RECHECK]))
+                self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN)
+                self.assertEqual(written, [], "no ordinary status write")
+                self.assertEqual(self.evidence(), before, "the database is unchanged")
+
 
 class BootstrapCrashTests(BootstrapCase):
     """Crashes around the bridge's commit: inside it nothing is committed; after

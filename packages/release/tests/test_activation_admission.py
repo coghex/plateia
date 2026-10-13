@@ -773,5 +773,92 @@ class ReviewTwoTests(AdmissionCase):
         self.assertEqual(scripts.stat().st_mode & 0o777, 0o755, "never resealed")
 
 
+
+class ReviewThreeTests(AdmissionCase):
+    """PR #22 review 3 (6157690404), the controller's two findings, each reproduced at e603ef0 first."""
+
+    def backup_dir(self, plan, target):
+        return self.root / "backups" / plan["operation"] / activate_release.re.sub(r"[^A-Za-z0-9._-]+", "_", target)
+
+    # 1. A loaded backup must match its journaled digest, not only its own (mutable) index.
+    def test_a_changed_backup_index_or_a_coordinated_payload_and_hash_change_is_refused(self):
+        for change in ("the pchat link destination in its index", "a payload and its index hash together"):
+            with self.subTest(change=change):
+                self.fresh()
+                plan, path = self.activated()
+                if change.startswith("the pchat"):
+                    index = self.backup_dir(plan, "pchat") / "index.json"
+                    data = json.loads(index.read_text())
+                    data[""] = {"link": str(self.where / "invented-elsewhere/pchat")}
+                else:
+                    folder = self.backup_dir(plan, "chat/scripts import location")
+                    index = folder / "index.json"
+                    data = json.loads(index.read_text())
+                    entry = data["chatlib.py"]
+                    payload = b"# an invented replacement payload\n"
+                    (folder / entry["file"]).write_bytes(payload)
+                    entry["sha256"] = activate_release.sha256_bytes(payload)
+                index.write_text(json.dumps(data, sort_keys=True) + "\n")
+                bound = self.targets_snapshot()
+                with self.assertRaisesRegex(Refused, "journaled digest"):
+                    self.rollback(path)
+                self.assertEqual(self.targets_snapshot(), bound, "nothing was restored from the altered backup")
+                self.assertNotIn("rolled-back", self.kinds())
+
+    # 2. The record and the root are checked again after the final callbacks, immediately before the effect.
+    def foreign_record(self):
+        return json.dumps({"v": "maintenance/1", "operation": OTHER_OPERATION, "kind": "plateia-activation",
+                           "plan_sha256": "e" * 64, "state": "partial", "generation": 2,
+                           "acquired_boot": "boot-other", "boot": "boot-other", "bound_boot": None,
+                           "legacy": "unverified", "binding": {"release_id": "", "bootstrap_digest": None,
+                                                               "permits": []}},
+                          sort_keys=True, separators=(",", ":")) + "\n"
+
+    def swap_in_foreign(self):
+        (self.state / "maintenance.json").unlink()
+        _staging.write(self.state / "maintenance.json", self.foreign_record(), 0o600)
+
+    def test_a_foreign_record_swapped_in_during_the_release_final_check_is_kept(self):
+        plan, path = self.activated()
+        self.serve(plan)
+        after_intent, real = [], activate_release.first_write_evidence
+
+        def hook(record):
+            if record["kind"] == "maint-intent" and record["step"].get("step") == "release":
+                after_intent.append(1)
+
+        def evidence(*a, **k):
+            if after_intent and after_intent[0] == 1:
+                after_intent[0] = 2
+                self.swap_in_foreign()
+            return real(*a, **k)
+        with mock.patch.object(activate_release, "first_write_evidence", evidence), self.assertRaises(Refused):
+            self.do_release(path, crash=hook)
+        self.assertEqual(after_intent, [2], "swapped during the final first-write evidence check")
+        self.assertEqual((self.state / "maintenance.json").read_text(), self.foreign_record(), "kept")
+        self.assertNotIn("released", self.kinds())
+
+    def test_a_foreign_record_swapped_in_during_the_full_final_bridge_query_is_kept(self):
+        plan, path = self.bound()
+        self.ops.reboot()
+        after_intent, real = [], self.ops.bridge_state
+
+        def hook(record):
+            if record["kind"] == "maint-intent" and (record["step"].get("to") or {}).get("state") == "full":
+                after_intent.append(1)
+
+        def bridge_state():
+            if after_intent and after_intent[0] == 1:
+                after_intent[0] = 2
+                self.swap_in_foreign()
+            return real()
+        self.ops.bridge_state = bridge_state
+        result = self.run_activate(path, crash=hook)
+        self.assertEqual(after_intent, [2], "swapped during the final bridge-state query")
+        self.assertIn("refused", result["maintenance"])
+        self.assertEqual((self.state / "maintenance.json").read_text(), self.foreign_record(), "not overwritten")
+        self.assertNotIn("full", self.kinds())
+
+
 if __name__ == "__main__":
     unittest.main()

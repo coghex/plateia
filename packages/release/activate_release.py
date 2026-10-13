@@ -954,12 +954,21 @@ class SealedRootFS:
         with self._root() as root:
             os.link(self._name(src), self._name(dst), src_dir_fd=root, dst_dir_fd=root, follow_symlinks=False)
 
+    def _still_bound(self, root, name):
+        """Immediately before the effect, after any callback's I/O: the root's path still names the sealed
+        root this descriptor holds, and the record is still the one the pending step expects (PR #22 review 3,
+        finding 2)."""
+        if not still_there(self.plan["state_root"]["path"], root):
+            raise Refused("blocked: the chat state root was moved or replaced; nothing more was changed")
+        self._expected(root, name)
+
     def replace(self, src, dst):
         with self._root() as root:
             self._expected(root, self._name(dst))
             if self._name(dst) == MAINT_FILE and self.before_full is not None \
                     and ((self.fence.pending() or {}).get("to") or {}).get("state") == "full":
                 self.before_full()
+            self._still_bound(root, self._name(dst))
             os.replace(self._name(src), self._name(dst), src_dir_fd=root, dst_dir_fd=root)
 
     def unlink(self, path):
@@ -968,6 +977,7 @@ class SealedRootFS:
             if self._name(path) == MAINT_FILE and self.before_release is not None \
                     and (self.fence.pending() or {}).get("step") == "release":
                 self.before_release()
+            self._still_bound(root, self._name(path))
             os.unlink(self._name(path), dir_fd=root)
 
     def sync_dir(self, path):
@@ -1088,7 +1098,7 @@ def targets_problems(journal_root_fd, mine, paths, layout, d):
             continue
         try:
             current, _ = observe_target(t, path, layout, backup.get("container"))
-            want = desired_target(t, path, layout, restore_state(journal_root_fd, backup["folder"]), d)
+            want = desired_target(t, path, layout, load_backup(journal_root_fd, backup), d)
         except Refused as e:
             problems.append(f"{name}: {e}")
             continue
@@ -1862,6 +1872,17 @@ def backup_target(journal, op, t, state):
     return "/".join(parts)
 
 
+def load_backup(root_fd, backup):
+    """A journaled backup, read through the pinned root, and accepted only if it is exactly the state the
+    journal recorded when it was taken (its immutable `digest`), not only consistent with its own mutable index
+    (PR #22 review 3, finding 1). Refused otherwise, before anything uses it."""
+    state = restore_state(root_fd, backup["folder"])
+    if summary_of(state) != backup.get("digest"):
+        raise Refused(f"blocked: the private backup {backup['folder']} doesn't match its journaled digest: it is "
+                      "never used for reconciliation or restoration; nothing more was changed")
+    return state
+
+
 def restore_state(root_fd, folder):
     """A backed-up state, read through the pinned root and verified."""
     parts = folder.split("/")
@@ -2020,7 +2041,7 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
             t, path = paths[t_plan["name"]]
             backup = mine["backups"][t["name"]]
             current, _ = observe_target(t, path, layout, backup.get("container"))
-            original = restore_state(journal.root_fd, backup["folder"])
+            original = load_backup(journal.root_fd, backup)
             desired = desired_target(t, path, layout, original, d)
             allowed = {rel: {entry_digest(e)} for rel, e in desired.items()}
             judge_entries(t, current, original, allowed, t["name"])
@@ -2152,7 +2173,7 @@ def postcheck(plan_path, ops, spec_path=None):
                 continue
             try:
                 current, _ = observe_target(t, path, layout, backup.get("container"))
-                want = desired_target(t, path, layout, restore_state(root_fd, backup["folder"]), d)
+                want = desired_target(t, path, layout, load_backup(root_fd, backup), d)
             except Refused as e:
                 checks.append((name, f"differs: {e}"))
                 continue
@@ -2264,7 +2285,7 @@ def rollback(plan_path, ops, spec_path=None, crash=None):
             backup = mine["backups"].get(t["name"])
             if backup is None:
                 continue
-            original = restore_state(journal.root_fd, backup["folder"])
+            original = load_backup(journal.root_fd, backup)
             current, _ = observe_target(t, path, layout, backup.get("container"))
             # Ownership evidence, entry by entry: what this operation journaled
             # writing, and what the staged release makes it now.
@@ -2323,7 +2344,7 @@ def rollback_release_problems(journal, plan, ops, store, fence, spec_path):
             continue
         try:
             current, _ = observe_target(t, path, layout, backup.get("container"))
-            same = summary_of(current) == summary_of(restore_state(journal.root_fd, backup["folder"]))
+            same = summary_of(current) == summary_of(load_backup(journal.root_fd, backup))
         except Refused as e:
             problems.append(f"{name}: {e}")
             continue
