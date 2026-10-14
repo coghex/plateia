@@ -860,5 +860,83 @@ class ReviewThreeTests(AdmissionCase):
         self.assertNotIn("full", self.kinds())
 
 
+
+def fd_path(fd):
+    """The path a directory descriptor names (Linux /proc, or macOS F_GETPATH): for the trace only."""
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        return fcntl.fcntl(fd, 50, b"\0" * 1024).split(b"\0")[0].decode()  # F_GETPATH
+
+
+class ExtensionOneTests(AdmissionCase):
+    """PR #22 review 4 (6158063208), extension round 1, the controller's finding, reproduced at 38cb21a first."""
+
+    def trace(self):
+        """Patch the file system calls to log, in order: each new directory entry (its parent directory's path
+        and identity), each fsync (the identity synced) and each journal append."""
+        events, real_mkdir, real_open, real_fsync = [], os.mkdir, os.open, os.fsync
+        real_append = activate_release.Journal.append
+
+        def parent(path, dir_fd):
+            if dir_fd is not None:
+                st, where = os.fstat(dir_fd), fd_path(dir_fd)
+            else:
+                where = os.path.dirname(os.path.abspath(path))
+                st = os.stat(where)
+            return (st.st_dev, st.st_ino), os.path.realpath(where)
+
+        def mkdir(path, mode=0o777, *, dir_fd=None):
+            real_mkdir(path, mode, dir_fd=dir_fd)
+            events.append(("create", *parent(path, dir_fd), os.path.basename(path)))
+
+        def open_(path, flags, mode=0o777, *, dir_fd=None):
+            existed = True
+            if flags & os.O_CREAT:
+                try:
+                    os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    existed = False
+            fd = real_open(path, flags, mode, dir_fd=dir_fd)
+            if not existed:
+                events.append(("create", *parent(path, dir_fd), os.path.basename(path)))
+            return fd
+
+        def fsync(fd):
+            real_fsync(fd)
+            st = os.fstat(fd)
+            events.append(("fsync", (st.st_dev, st.st_ino)))
+
+        def append(journal, record):
+            events.append(("append", record["kind"]))
+            return real_append(journal, record)
+        return events, [mock.patch.object(activate_release.os, "mkdir", mkdir),
+                        mock.patch.object(activate_release.os, "open", open_),
+                        mock.patch.object(activate_release.os, "fsync", fsync),
+                        mock.patch.object(activate_release.Journal, "append", append)]
+
+    def test_every_new_entry_in_the_activation_root_is_synced_before_what_depends_on_it(self):
+        plan, path = self.prepared()
+        events, patches = self.trace()
+        for p in patches:
+            p.start()
+        try:
+            self.assertEqual(self.run_activate(path)["state"], "selected")
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        root = os.path.realpath(self.root)
+        mine = [i for i, e in enumerate(events) if e[0] == "create"
+                and (e[2] == os.path.dirname(root) and e[3] == os.path.basename(root) or e[2].startswith(root))]
+        self.assertGreater(len(mine), 10, "the root, its lock and journal, and the backup hierarchy")
+        unsynced = []
+        for i in mine:
+            _, parent, where, name = events[i]
+            nxt = next((j for j in range(i + 1, len(events)) if events[j][0] == "append"), len(events))
+            if not any(events[j] == ("fsync", parent) for j in range(i + 1, nxt)):
+                unsynced.append(f"{where}/{name}")
+        self.assertEqual(unsynced, [], "each new entry's parent is synced before the next journal record")
+
+
 if __name__ == "__main__":
     unittest.main()

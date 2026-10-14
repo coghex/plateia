@@ -278,9 +278,13 @@ def make_plan(release, dest, root, designations, ops, spec_path=None, activation
 
 
 def save_plan(plan, path):
+    """The plan, written exclusively, synced, and its directory entry synced too."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(plan, indent=2, sort_keys=True) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    fsync_dir(os.path.dirname(os.path.abspath(path)))
     return Path(path)
 
 
@@ -421,8 +425,11 @@ def subdir(base_fd, parts, create=False):
     try:
         for part in parts:
             if create:
-                with contextlib.suppress(FileExistsError):
+                try:
                     os.mkdir(part, 0o700, dir_fd=fd)
+                    os.fsync(fd)  # the new entry is durable before anything is put in it (PR #22 review 4)
+                except FileExistsError:
+                    pass
             nxt = os.open(part, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = nxt
@@ -545,6 +552,7 @@ def publish_bootstrap(journal, plan):
                     st = os.fstat(fd)
                 finally:
                     os.close(fd)
+                fsync_dir(sfd)  # the staged copy's name, before its record depends on it
                 inode = (st.st_dev, st.st_ino)
                 journal.append({"op": op, "kind": "bootstrap-staged", "tmp": tmp, "inode": list(inode)})
                 os.link(tmp, final, src_dir_fd=sfd, dst_dir_fd=sfd)  # never replaces a file
@@ -657,6 +665,22 @@ def parse_journal(data):
     return records, data[cut:]
 
 
+def make_durable_dirs(path):
+    """Create each missing level of `path` (0700), syncing its parent after each new entry, so a power loss
+    can't keep what depends on a directory while losing its name (PR #22 review 4, finding 1)."""
+    path = Path(os.path.abspath(path))
+    missing = []
+    while not os.path.lexists(path):
+        missing.append(path)
+        path = path.parent
+    for p in reversed(missing):
+        try:
+            os.mkdir(p, 0o700)
+        except FileExistsError:
+            continue
+        fsync_dir(str(p.parent))
+
+
 class Journal:
     """The activation journal in the private root, fenced: the root, the lock
     and the journal file are opened once, never through a link, and kept as
@@ -670,24 +694,33 @@ class Journal:
         self.root, self.crash = Path(root), crash
         self.root_fd = self.lock_fd = self.fd = None
         try:
-            if not os.path.lexists(self.root):
-                os.makedirs(self.root, mode=0o700)
+            make_durable_dirs(self.root)
             self.root_fd = open_dir(self.root, what="the activation root")
             st = os.fstat(self.root_fd)
             if st.st_uid != os.getuid() or st.st_mode & 0o022:
                 raise Refused("blocked: the activation root is not this user's own, or others can write it")
             self.ident = ident(st)
+            new = [name for name in (LOCK, JOURNAL) if not self._exists(name)]
             self.lock_fd = self._file(LOCK, os.O_RDWR | os.O_CREAT)
             try:
                 fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise Refused("blocked: another activation holds the journal lock; nothing was changed") from None
             self.fd = self._file(JOURNAL, os.O_RDWR | os.O_CREAT | os.O_APPEND)
+            if new:
+                fsync_dir(self.root_fd)  # the new lock and journal names, before the first record depends on them
             self.check_fence()
             self.records = self._load()
         except BaseException:
             self.close()
             raise
+
+    def _exists(self, name):
+        try:
+            os.stat(name, dir_fd=self.root_fd, follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            return False
 
     def _file(self, name, flags):
         try:
@@ -949,6 +982,7 @@ class SealedRootFS:
                 self.base.fsync_fd(fd)
             finally:
                 os.close(fd)
+            self.base.fsync_fd(root)  # its name, before Owner journals its identity
 
     def link(self, src, dst):
         with self._root() as root:

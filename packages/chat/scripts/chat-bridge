@@ -2110,6 +2110,22 @@ class PinnedRoot:
             os.close(self.fd)
             self.fd = None
 
+    def entry(self, name):
+        """(device, inode, change time) of an entry in the pinned root, never followed; None if it is not
+        there."""
+        try:
+            st = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except OSError:
+            return None
+        return st.st_dev, st.st_ino, st.st_ctime_ns
+
+    def remove_own(self, name, own):
+        """Remove `name` from the pinned root only if it is still exactly `own` (this start's entry); anything
+        else, here or at the state path, is never touched."""
+        if own is not None and self.entry(name) == own:
+            with contextlib.suppress(OSError):
+                os.unlink(name, dir_fd=self.fd)
+
     def identity_of(self, name):
         """The (device, inode) of an entry inside the pinned root, never followed; BootstrapUnknown if it can't
         be read."""
@@ -2224,6 +2240,38 @@ class BootstrapStore(delivery_store.Store):
         self.bootstrap = None  # what this open did: "none" (S1), "applied" (S2) or "replayed" (S3)
         self.m_absent = False  # for a launch with no activation: M's absence established (S1 so far)
 
+    def preflight(self):
+        """For an activated launch, an existing outbox.db is classified before the authority opens it, read-only
+        through the pinned root, so that nothing (not SQLite's journal-mode change, nor a sidecar) is created,
+        changed or removed for a database that is not this authority's (PR #22 review 4, finding 3). This
+        authority's database is always a SQLite database in WAL mode (header bytes 18 and 19 are 2) and never
+        has a rollback journal; anything else is UNKNOWN, with every byte kept. An empty or missing database is
+        a new one."""
+        try:
+            fd = os.open("outbox.db", os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+                         dir_fd=self.root.fd)
+        except FileNotFoundError:
+            fd = None
+        except OSError as err:
+            raise BootstrapUnknown(f"outbox.db can't be opened to classify it ({err.strerror or err})") from None
+        try:
+            if fd is not None:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise BootstrapUnknown("outbox.db is not a regular file")
+                header = os.read(fd, 100) if st.st_size else b""
+                if header and (len(header) < 100 or not header.startswith(b"SQLite format 3\x00")):
+                    raise BootstrapUnknown("outbox.db is not a SQLite database")
+                if header and header[18:20] != b"\x02\x02":
+                    raise BootstrapUnknown("outbox.db is not in WAL mode, so it is not this authority's database")
+        except OSError as err:
+            raise BootstrapUnknown(f"outbox.db can't be read to classify it ({err.strerror or err})") from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+        if self.root.entry("outbox.db-journal") is not None:
+            raise BootstrapUnknown("outbox.db has a rollback journal, so it is not this authority's database")
+
     def meta(self, name):
         """For a launch with no activation, M is classified at the opening transaction's first read of any
         other metadata, before that metadata can fail: a committed M without E and R is UNKNOWN (PR #22
@@ -2241,6 +2289,8 @@ class BootstrapStore(delivery_store.Store):
         ordinary failure (code review 6112483129, finding 3). Nothing was
         committed: Store.open is all or nothing."""
         existed = os.path.lexists(self.paths.db)
+        if self.record is not None and self.root is not None:
+            self.preflight()  # before anything can change the database's journal mode or its sidecars
         try:
             super().open()
         except BootstrapUnknown:
@@ -2340,6 +2390,7 @@ def start_authority(authority, expected=None):
     opened, committed or bound."""
     with authority.start_section() as gate:
         record, root = classify_launch(authority.paths.state, expected)
+        sock = None
         try:
             binding = launch_binding(record, expected)
             gate.admit(binding)
@@ -2355,11 +2406,21 @@ def start_authority(authority, expected=None):
                     log(f"designation bootstrap {authority.store.bootstrap}: operation {record['operation']}, "
                         f"{len(record['accounts'])} account(s)")
                 authority.bridge_only = not authority.bind()
+                if expected is not None and root is not None and not authority.bridge_only:
+                    sock = root.entry("outbox.sock")  # what this bind made, in the pinned root (None: not there)
                 if root is not None:
                     root.check(authority.paths, "outbox.db", *(() if authority.bridge_only else ("outbox.sock",)))
                 authority.run_in_thread()
             except BaseException as err:
-                authority.close()  # inside the start's section: released, never deferred
+                if expected is not None and root is not None and authority._bound:
+                    # An activated start's failed cleanup never removes a socket by its pathname, which may now
+                    # name a foreign root's entry: only this bind's own socket, through the pinned root, and only
+                    # while it is still that very entry (PR #22 review 4, finding 2).
+                    authority._bound = False
+                    authority.close()  # inside the start's section: released, never deferred
+                    root.remove_own("outbox.sock", sock)
+                else:
+                    authority.close()  # inside the start's section: released, never deferred
                 if root is not None and not isinstance(err, BootstrapUnknown):
                     root.check(authority.paths)  # a swap that surfaced as another failure is UNKNOWN too
                 raise

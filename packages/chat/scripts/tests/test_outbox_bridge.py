@@ -10,6 +10,7 @@ import os
 import shutil
 import socket
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -1102,6 +1103,91 @@ class BootstrapUnreadableMetaTests(BootstrapCase):
                 self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN)
                 self.assertEqual(written, [], "no ordinary status write")
                 self.assertEqual(self.evidence(), before, "the database is unchanged")
+
+
+class BootstrapPreservationTests(BootstrapCase):
+    """PR #22 review 4 (6158063208), extension round 1: UNKNOWN preserves what is not this start's own."""
+
+    def files(self, root):
+        return {p.name: (p.read_bytes() if p.is_file() else "fifo" if stat.S_ISFIFO(p.lstat().st_mode) else "other")
+                for p in sorted(Path(root).iterdir()) if p.name.startswith("outbox.")}
+
+    def move_root(self):
+        moved = self.state.with_name(f"{self.state.name}-moved-{__import__('secrets').token_hex(4)}")
+        self.state.rename(moved)
+        self.state.mkdir()
+        (self.state / "outbox.sock").write_text("a foreign entry, invented\n")
+        self.addCleanup(self.unmove, moved)
+        return moved
+
+    def unmove(self, moved):
+        if moved.exists():
+            shutil.rmtree(self.state)
+            moved.rename(self.state)
+
+    def test_a_failed_start_after_the_bind_removes_only_its_own_socket_in_the_pinned_root(self):
+        """Finding 2: after the bind, the root is replaced (a foreign outbox.sock in the replacement), during the
+        check after the bind or during the thread's start. The foreign entry is kept; this start's own socket is
+        removed through the pinned root, and only by its identity."""
+        for failing in ("the check after the bind", "the thread's start"):
+            with self.subTest(failing=failing):
+                self.stop()
+                self.wipe_database()
+                (self.state / "outbox.sock").unlink(missing_ok=True)
+                d = self.publish(self.record(["alp-solver-2"]))
+                moved = []
+
+                def bind(authority):  # a socket entry made at the bind, as the real bind makes one
+                    os.mkfifo(authority.paths.sock, 0o600)
+                    authority._bound = True
+                    if failing == "the check after the bind":
+                        moved.append(self.move_root())
+                    return True
+
+                def run_in_thread(authority):
+                    if not moved:
+                        moved.append(self.move_root())
+                    raise OSError("invented: the thread can't start")
+                with mock.patch.object(self.ds.Authority, "bind", bind), \
+                        mock.patch.object(self.ds.Authority, "run_in_thread", run_in_thread):
+                    authority = self.launch(d)
+                self.assertFalse(authority.running)
+                self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+                self.assertEqual((self.state / "outbox.sock").read_text(), "a foreign entry, invented\n",
+                                 "the foreign entry in the replacement root is kept")
+                self.assertFalse((moved[0] / "outbox.sock").exists(), "this start's own socket is removed")
+                self.stop()
+                self.unmove(moved[0])
+
+    def test_a_database_not_in_wal_mode_is_unknown_with_every_byte_kept(self):
+        """Finding 3: an existing outbox.db made by other code in SQLite's default (rollback) journal mode is
+        classified before anything changes its journal mode: UNKNOWN, with the database and every sidecar
+        byte-identical."""
+        d = self.publish(self.record(["alp-solver-2"]))
+        con = sqlite3.connect(self.state / "outbox.db")
+        con.execute("CREATE TABLE invented (x)")
+        con.execute("INSERT INTO invented VALUES (1)")
+        con.commit()
+        con.close()
+        before = self.files(self.state)
+        self.assertEqual(before["outbox.db"][18:20], b"\x01\x01", "a rollback-journal database")
+        authority = self.launch(d)
+        self.assertFalse(authority.running)
+        self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+        self.stop()
+        self.assertEqual(self.files(self.state), before, "the database and every sidecar are byte-identical")
+
+    def test_an_existing_wal_database_is_still_classified(self):
+        """Finding 3's other side: this authority's own WAL database, with its committed bootstrap, replays (S3)."""
+        d = self.publish(self.record(["alp-solver-2"]))
+        self.assert_running_under_the_lock(self.launch(d))
+        self.stop()
+        self.assertEqual((self.state / "outbox.db").read_bytes()[18:20], b"\x02\x02", "a WAL database")
+        meta, _ = self.rows()
+        with mock.patch.object(self.ds.Store, "designate", side_effect=AssertionError("designated again")):
+            again = self.launch(d)
+        self.assert_running_under_the_lock(again)
+        self.assertEqual(self.rows()[0]["designation_bootstrap"], meta["designation_bootstrap"])
 
 
 class BootstrapCrashTests(BootstrapCase):
