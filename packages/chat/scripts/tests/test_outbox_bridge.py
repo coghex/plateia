@@ -1306,6 +1306,96 @@ class BootstrapPinnedRootTests(BootstrapCase):
             self.assertTrue((self.state / name).exists(), name)
 
 
+class BootstrapWalEvidenceTests(BootstrapCase):
+    """PR #22 review R1 of the new allowance (6159854400), finding 1: existing WAL evidence is classified without
+    any possibility of a checkpoint or a sidecar change. With an outstanding WAL (a crash's state), startup that
+    ends UNKNOWN keeps outbox.db and outbox.db-wal byte-identical and present."""
+
+    def files(self, root):
+        """{name: sha256} of every outbox.* entry: byte identity, compared by digest."""
+        return {p.name: __import__("hashlib").sha256(p.read_bytes()).hexdigest()
+                for p in sorted(Path(root).iterdir()) if p.name.startswith("outbox.") and p.is_file()}
+
+    def crashed_snapshot(self, write):
+        """outbox.db and its outstanding -wal as a crash leaves them: copied while a connection that has
+        committed `write` (in WAL mode, never checkpointed) is still open, then put back after it closes."""
+        db = self.state / "outbox.db"
+        con = write()
+        try:
+            snapshot = {n: (self.state / n).read_bytes() for n in ("outbox.db", "outbox.db-wal")
+                        if (self.state / n).exists()}
+        finally:
+            con()
+        for name in ("outbox.db", "outbox.db-wal", "outbox.db-shm"):
+            (self.state / name).unlink(missing_ok=True)
+        for name, data in snapshot.items():
+            (self.state / name).write_bytes(data)
+        self.assertIn("outbox.db-wal", snapshot, "an outstanding WAL")
+        return db
+
+    def test_an_unrelated_wal_database_with_an_outstanding_wal_is_unknown_and_kept(self):
+        d = self.publish(self.record(["alp-solver-2"]))
+
+        def write():
+            con = sqlite3.connect(self.state / "outbox.db", isolation_level=None)
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA wal_autocheckpoint=0")
+            con.execute("CREATE TABLE invented (x)")
+            con.execute("INSERT INTO invented VALUES (1)")
+            return con.close
+        self.crashed_snapshot(write)
+        before = self.files(self.state)
+        authority = self.launch(d)
+        self.assertFalse(authority.running)
+        self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+        self.stop()
+        self.assertEqual(self.files(self.state), before, "outbox.db and its -wal are byte-identical and present")
+
+    def test_an_authority_database_with_malformed_m_after_a_crash_is_unknown_and_kept(self):
+        d = self.publish(self.record(["alp-solver-2"]))
+
+        def write():
+            with mock.patch.object(self.ds.Authority, "run_in_thread", lambda a: None):  # no serving thread
+                authority = self.launch(d)  # S2, committed
+            con = authority.store.con
+            con.execute("PRAGMA wal_autocheckpoint=0")
+            with authority.store.tx():
+                con.execute("UPDATE meta SET value = '{malformed' WHERE name = 'designation_bootstrap'")
+            return self.stop
+        self.crashed_snapshot(write)
+        before = self.files(self.state)
+        authority = self.launch(d)
+        self.assertFalse(authority.running)
+        self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+        self.stop()
+        self.assertEqual(self.files(self.state), before, "outbox.db and its -wal are byte-identical and present")
+
+
+class BootstrapOuterLockTests(BootstrapCase):
+    """Review R1, finding 2: the activated start's outer section opens its admission lock through the pinned
+    root, so a swap just before the first lock opening leaves nothing in the replacement and fails closed."""
+
+    replace_root = BootstrapPinnedRootTests.replace_root
+    restore_root = BootstrapPinnedRootTests.restore_root
+
+    def test_a_swap_just_before_the_first_admission_lock_leaves_none_in_the_replacement(self):
+        d = self.publish(self.record(["alp-solver-2"]))
+        (self.state / "admission.lock").unlink(missing_ok=True)
+        real, moved = self.ds._open_admission_lock, []
+
+        def open_lock(*a, **k):
+            if not moved:
+                moved.append(self.replace_root())
+            return real(*a, **k)
+        with mock.patch.object(self.ds, "_open_admission_lock", open_lock):
+            authority = self.launch(d)
+        self.assertTrue(moved)
+        self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+        self.assertFalse(authority.running)
+        self.stop()
+        self.assertFalse((self.state / "admission.lock").exists(), "no admission.lock in the replacement")
+
+
 class BootstrapCrashTests(BootstrapCase):
     """Crashes around the bridge's commit: inside it nothing is committed; after
     it, a restart is the replay."""
