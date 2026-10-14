@@ -447,8 +447,8 @@ fenced state. There is no separate store.
 
 **Owner decision** (2026-10-14; it answers Q-2's structure). The requester sets
 a request's return bound, up to a project maximum. A project default applies
-when the requester sets none. The default and the maximum are still open
-(Q-2).
+when the requester sets none. The owner set the amounts the same day: the
+project default is **4 hours** and the project maximum is **24 hours**.
 
 ### D-10. Nothing in the request store is compacted for now
 
@@ -496,7 +496,7 @@ COLLAB-2's scope; it is the owner's decision.
 
 ### Q-2. What is the default return bound, and who may extend it?
 
-**Partly decided** (2026-10-14): D-9 settles the structure. **Still open:** the project default and the maximum, before COLLAB-3.
+**Decided** (2026-10-14): see D-9. The default is 4 hours and the maximum is 24 hours.
 
 It affects COLLAB-3. The known options are a per-request bound set by the
 requester, or a project default.
