@@ -440,8 +440,15 @@ request format and validation. How the delegation is represented and checked
 ### D-8. Requests and claims live in the outbox authority's database
 
 **Owner decision** (2026-10-14; it answers Q-1). The request and claim records
-live in the bridge's outbox authority database (#19, #24), which already holds
-fenced state. There is no separate store.
+live under the bridge's outbox authority (#19, #24), which already holds
+fenced state.
+
+**Refinement (owner, the same day).** They live in a separate SQLite file in
+the chat state directory, `requests.db` (format `request-store/1`). It is
+opened only by the authority while it holds the authority lock, and is fenced
+by its `authority_epoch`. `outbox.db` stays `outbox-db/1`, so #21's tested
+cutover is unchanged. The new format is live only after its own, later
+activation.
 
 ### D-9. A request's return bound
 
