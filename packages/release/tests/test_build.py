@@ -114,6 +114,8 @@ class BuildTests(BuildCase):
             r"maintenance\.json": ("maintenance", True, True),
             # #27: the request/v1 line is parsed and encoded by a library nothing calls yet, so it is both
             r'FORMAT = "request/v1"': ("request-line", True, True),
+            # #32: the request store, which only the outbox authority opens, reads and writes
+            r"requests\.db": ("request-store", True, True),
         }
         manifest = build_release.verify(self.build()[0])
         formats = {f["name"]: f for f in manifest["formats"]}
@@ -128,14 +130,17 @@ class BuildTests(BuildCase):
 
     def test_the_versions_the_shipped_code_embeds_are_the_declared_ones(self):
         """#19: outbox/2's fallback file, the outbox-authority frame and the
-        outbox-db meta row each carry their version, and declare where."""
+        outbox-db meta row each carry their version, and declare where; so
+        does #32's request-store meta row."""
         manifest = build_release.verify(self.build()[0])
         formats = {f["name"]: f for f in manifest["formats"]}
-        code = (_support.CHECKOUT / "packages/chat/scripts/delivery_store.py").read_text()
+        code = "\n".join((_support.CHECKOUT / "packages/chat/scripts" / f).read_text()
+                         for f in ("delivery_store.py", "request_store.py"))
         for name, constant, field in (("outbox", 'FALLBACK_FORMAT = "outbox/2"', "v"),
                                       ("outbox-authority", 'PROTOCOL = "outbox-authority/1"', "v"),
                                       ("outbox-db", 'DB_FORMAT = "outbox-db/1"', "meta.schema"),
-                                      ("maintenance", 'MAINT_FORMAT = "maintenance/1"', "v")):
+                                      ("maintenance", 'MAINT_FORMAT = "maintenance/1"', "v"),
+                                      ("request-store", 'FORMAT = "request-store/1"', "meta.schema")):
             with self.subTest(format=name):
                 self.assertIn(constant, code)
                 self.assertTrue(formats[name]["embedded_version"])
@@ -449,13 +454,14 @@ class RefusalTests(BuildCase):
 # delivery-records, outbox-db, outbox-authority, boot-id and tcp-sockets
 # format entries (the second to fifth amendments of #19, acceptance 11), the
 # maintenance format (#24: writer admission, read and written, maintenance/1),
-# the designation-bootstrap format (#21: read only, designation-bootstrap/1)
-# and the request-line format (#27: request/v1, read and written). The digest also
+# the designation-bootstrap format (#21: read only, designation-bootstrap/1),
+# the request-line format (#27: request/v1, read and written) and the request-store
+# format (#32: request-store/1, read and written). The digest also
 # covers the one declared text change of #29: the chat-config entry's `covers` now names the
 # optional `owner_accounts` key, with its read and write identifiers unchanged.
 UNCHANGED_DECLARATIVE = "d58c3a44135efadd8664821ae384a7eee024afbf886ad75a666f3a479281bbae"
 CHANGED_BY_19 = {"outbox", "delivery-records", "outbox-db", "outbox-authority", "boot-id", "tcp-sockets",
-                 "designation-bootstrap", "maintenance", "request-line"}
+                 "designation-bootstrap", "maintenance", "request-line", "request-store"}
 GENERATED = ("release", "source", "builder", "build_interpreter", "artifacts")
 
 

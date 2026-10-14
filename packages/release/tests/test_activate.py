@@ -93,20 +93,32 @@ def ops(bridge=None, writers="default", producers="default"):
 
 
 _BUILT = {}
+COLLAB_2 = ("request-store",)  # #32's format, which #21's transition does not admit
 
 
-def built_release():
-    """#19's real release (its release.json), built once per test process from an invented repository and
-    shared by every activation test class: tests only read it (each stages its own copy), and a build per class
-    cost about four seconds each on CI."""
-    if not _BUILT:
+def activation_release_spec(path):
+    """The checkout's release.json without COLLAB-2's request-store format (#32's owner amendment 1), as
+    _staging.baseline_release_spec leaves out what the live tools don't use for test_stage: the release #21's
+    transition admits. The checkout's own release is refused (Collab2ReleaseTests)."""
+    spec = json.loads((_support.RELEASE / "release.json").read_text(encoding="utf-8"))
+    spec["formats"] = [f for f in spec["formats"] if f["name"] not in COLLAB_2]
+    path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+    return path
+
+
+def built_release(spec=True):
+    """#19's release (release.json without COLLAB-2's format; with `spec=False`, the checkout's release.json as
+    it is), built once per test process from an invented repository and shared by every activation test class:
+    tests only read it (each stages its own copy), and a build per class cost about four seconds each on CI."""
+    if spec not in _BUILT:
         tmp = tempfile.TemporaryDirectory(prefix="plateia-activation-release-")
         atexit.register(tmp.cleanup)
         root = Path(os.path.realpath(tmp.name))
         repo, _ = make_repo(root)
-        release, _ = build_release.build(repo, root / "releases")
-        _BUILT.update(release=release, manifest=build_release.verify(release))
-    return _BUILT["release"], _BUILT["manifest"]
+        spec_path = activation_release_spec(root / "release-activation.json") if spec else build_release.SPEC_PATH
+        release, _ = build_release.build(repo, root / "releases", spec_path=spec_path)
+        _BUILT[spec] = (release, build_release.verify(release))
+    return _BUILT[spec]
 
 
 class ActivationCase(unittest.TestCase):
@@ -387,6 +399,31 @@ class AdmissionTests(ActivationCase):
         _staging.write(self.record_path(), "{}\n", 0o600)
         with self.assertRaisesRegex(Refused, "owner decision"):
             self.plan()
+
+
+class Collab2ReleaseTests(ActivationCase):
+    """#32's owner amendment 1: the checkout's own release declares request-store (COLLAB-2), and is refused both
+    by a plain preflight and under #21's transition, through a plan bound to it, with nothing staged. Admitting
+    it is a later, separately gated activation step; activation.json and the controllers are unchanged."""
+
+    def test_the_collab_2_release_is_refused_by_default_and_under_21s_transition(self):
+        release, manifest = built_release(spec=False)
+        self.assertIn("request-store", {f["name"] for f in manifest["formats"]})
+        self.assertNotIn("request-store", {f["name"] for f in self.manifest["formats"]}, "the fixture's is #19's")
+        report = stage_release.preflight(release, None, self.spec)
+        self.assertIn("request-store", {line.split(":", 1)[0] for line in report["refused"]}, report["refused"])
+        transition = activate_release.load_activation()["transition"]
+        self.assertNotIn("request-store", transition["added"])
+        spec = stage_release.load_spec(self.spec)[0]
+        refused = {r[1] for r in stage_release.compatibility(manifest, spec, transition) if r[0] == "refused"}
+        self.assertEqual(refused, {"request-store"}, "the one format #21's transition does not admit")
+        plan = activate_release.make_plan(release, self.dest, self.root, ACCOUNTS, self.ops, spec_path=self.spec)
+        path = self.where / "activation-plan-collab-2.json"
+        activate_release.save_plan(plan, path)
+        with self.assertRaisesRegex(Refused, "request-store"):
+            self.staged(path)
+        self.assertFalse(os.path.lexists(self.dest), "nothing staged")
+        self.assertEqual(_staging.snapshot_tree(self.home), self.before)
 
 
 class BootstrapPublicationTests(ActivationCase):

@@ -8,7 +8,9 @@ pchat ack, an agent run's notice) asks that thread over a local socket to apply
 its transitions, and still sends its own bytes to the chat server. A caller that
 gets no committed answer queues durably instead, in one immutable fallback file
 per call under outbox.d/, which the bridge imports without taking any lock a
-client could hold.
+client could hold. The authority also holds request_store's requests.db
+(COLLAB-2, #32), a separate file under the same lock, and serves its operations
+on the same protocol.
 
 Standard library only; works on Python 3.10 (transactions use explicit BEGIN
 IMMEDIATE / COMMIT on an isolation_level=None connection). The section numbers
@@ -34,6 +36,8 @@ import threading
 import time
 import uuid
 from pathlib import Path
+
+request_store = None  # requests.db's module (COLLAB-2, #32): imported by the first Authority, see _load_request_store
 
 # --- constants (section 1) ----------------------------------------------------
 
@@ -2402,9 +2406,10 @@ def peer_credentials(sock):
 class _Job:
     """An in-process request: queued, then running, then done; or cancelled while still queued."""
 
-    def __init__(self, fn, readonly=False, sectioned=False):
+    def __init__(self, fn, readonly=False, sectioned=False, request=None):
         self.fn, self.state, self.result, self.error = fn, "queued", None, None
         self.readonly, self.sectioned = readonly, sectioned  # sectioned: its caller held an admitted section
+        self.request = request  # a request-store operation, run in its own store's transaction
         self.cond = threading.Condition()
 
 
@@ -2446,6 +2451,14 @@ class StartGate:
         raise Unavailable(a.unavailable[0])
 
 
+def _load_request_store():
+    """Import request_store, which only the authority uses. Not at this module's import: the activation controller
+    executes this module alone from a release's wheel, for Owner, the maintenance record and Client, which never
+    need it (packages/release/activate_release.py, load_release_module)."""
+    global request_store
+    import request_store
+
+
 class Authority:
     """The bridge's authority: the only holder of the only connection to
     outbox.db (section 2.4). `launch` is the bridge's whole start: the
@@ -2459,6 +2472,8 @@ class Authority:
         self.probes = probes or HostProbes()
         self.fs = fs or FS()
         self.store = Store(self.paths, clock=clock, fs=self.fs)
+        _load_request_store()
+        self.requests = request_store.RequestStore(self.paths.state, clock=clock, fs=FS())
         self.lock_file = None
         self.listener = None
         self.peers = {}
@@ -2608,6 +2623,23 @@ class Authority:
                     os.close(fallback)
         except OSError as err:
             self.log(f"authority: cannot create outbox.d: {err}")
+        if self._owned_starts:
+            return  # a bound start makes no other effect (writer admission 6.2): requests.db waits for admission
+        try:
+            self._open_requests()
+        except request_store.RootChanged as err:  # the whole start fails closed (#21 amendment 7)
+            self._release_files()
+            self.unavailable = (str(err), self.clock())
+            raise Unavailable(str(err)) from None
+
+    def _open_requests(self):
+        """requests.db, opened while the authority lock is held: at the start, or deferred to the first request
+        mutation a section admits. One that is foreign, corrupt or unreadable is kept, and refuses only the request
+        operations (#32 decision 4); a changed pinned root raises RootChanged."""
+        try:
+            self.requests.open(root_fd=self.root_fd)
+        except request_store.Refused as err:
+            self.log(f"authority: request operations refused: {err}")
 
     def bind(self):
         """Step 5: the socket, mode 0600, unless its path is over the platform's
@@ -2722,7 +2754,8 @@ class Authority:
     @property
     def released(self):
         """Whether every file this authority opened is released: false after a close() deferred by maintenance."""
-        return not (self._bound or self.store.con is not None or self.lock_file is not None)
+        return not (self._bound or self.store.con is not None or self.requests.con is not None
+                    or self.lock_file is not None)
 
     def _release_files(self):
         if self._bound:
@@ -2732,6 +2765,7 @@ class Authority:
                     os.unlink(self.paths.sock)
             else:  # a failed activated start: only its own socket, through the pinned root (#21 amendment 7)
                 self._remove_own_socket()
+        self.requests.close()
         self.store.close()
         if self.lock_file is not None:
             fcntl.flock(self.lock_file, fcntl.LOCK_UN)
@@ -2746,8 +2780,11 @@ class Authority:
 
         def reply(result, **data):
             return {"v": PROTOCOL, "request_id": rid, "authority_epoch": self.epoch, "result": result, **data}
-        if not isinstance(request, dict) or request.get("v") != PROTOCOL or request.get("op") not in CLIENT_OPS:
+        if not isinstance(request, dict) or request.get("v") != PROTOCOL \
+                or request.get("op") not in CLIENT_OPS + request_store.OPS:
             return reply("refused", detail="invalid request or unknown version")
+        if request["op"] in request_store.OPS:
+            return self._handle_request(request, reply, peer_pid)
         writer = request.get("writer")
         if not valid_writer(writer, optional=request["op"] == "status"):
             return reply("refused", detail="no valid writer")
@@ -2793,6 +2830,125 @@ class Authority:
                 return record.describe()
             return None
         return record.describe()
+
+    # --- the request store's operations (COLLAB-2, #32) ---
+
+    def _request_problem(self, request, peer_pid=None):
+        """Why a request-store operation is refused as malformed, or None."""
+        writer = request.get("writer")
+        if not valid_writer(writer, optional=request["op"] in request_store.READ_OPS):
+            return "no valid writer"
+        problem = request_store.request_error(request)
+        if problem:
+            return problem
+        if peer_pid is not None and isinstance(writer, dict) and writer.get("pid") != peer_pid:
+            return "the request does not speak for its sender"
+        return None
+
+    def _handle_request(self, request, reply, peer_pid):
+        """A client's request-store operation: `lookup` read-only in every state; any other in one requests.db
+        transaction inside an admitted section, never an outbox.db transaction. A refusal is recorded before
+        the reply."""
+        problem = self._request_problem(request, peer_pid)
+        if problem:
+            return reply("refused", detail=problem)
+        if not self.running:
+            return reply("error", detail="authority not running")
+        try:
+            if request["op"] in request_store.READ_OPS:
+                result, data = self._lookup(request)
+            else:
+                with section(self.paths, fs=self.fs, wait=0) as adm:  # one try: this may be the selector thread
+                    refusal = self._request_refusal(adm, request, bridge=False)
+                    if refusal is not None:  # committed nothing, begun nothing
+                        return reply("maintenance", maintenance=refusal, detail="held for maintenance")
+                    result, data = self._mutate_request(request)
+        except Exception as err:  # rolled back; this request fails alone
+            self.log(f"authority: request {request.get('op')} failed: {err!r:.120}")
+            return reply("error")
+        return reply(result, **data)
+
+    def _request_refusal(self, adm, request, *, bridge, sectioned=False):
+        """The admission table of writer admission 4.5 for a request-store mutation: None to run it, else what to
+        answer `maintenance` (or, in-process, not to run). In `draining`, registering a new key, a claim and a start
+        are new work and refused, on both paths, as is any mutation while requests.db is not yet open; the others
+        continue (in-process, only from a section already open). In `partial`, `full` or an unknown record, every
+        one is refused."""
+        if not adm.locked:
+            return {"state": "unknown", "why": adm.record.why}
+        record = adm.record
+        if not record.present:
+            return None
+        if record.state == "draining":
+            if bridge and not sectioned:
+                return record.describe()
+            op = request["op"]
+            if self.requests.con is None or op in request_store.NEW_WORK or (op == "register" and not self._known(
+                    request)):
+                return record.describe()
+            return None
+        return record.describe()
+
+    def _known(self, request):
+        try:
+            key = request_store.request_v1.parse(request["line"]).execution_key
+        except request_store.request_v1.RequestError:
+            return False
+        return self.requests.known(*key)
+
+    def _lookup(self, request):
+        if self.requests.con is None:
+            return self._unavailable()
+        return self.requests.lookup(request)
+
+    def _unavailable(self):
+        why = self.requests.why or "requests.db is not open yet: it opens at the first request mutation admitted"
+        return "refused", {"refusal": {"reason": "request-store-unavailable", "detail": why, "recorded": False}}
+
+    def _mutate_request(self, request):
+        """Inside an admitted section: open requests.db if it is not open yet (after a bound start, or after a
+        refusal), then the operation in one requests.db transaction."""
+        if self.requests.con is None:
+            self._open_requests()  # path-based: the pinned root covers only the activated start
+            if self.requests.con is None:
+                return self._unavailable()
+        return self.requests.apply(request, epoch=self.epoch, post=self._verified_post)
+
+    def _verified_post(self, msgid):
+        """The one read of outbox.db a request operation makes: a verified post indexed in its messages table, read
+        by one query outside any transaction this authority opens, and never written."""
+        return self.store.con.execute("SELECT account, text FROM messages WHERE msgid = ?", (msgid,)).fetchone()
+
+    def run_request(self, request):
+        """The bridge's in-process request-store operation (LocalTransport(bridge=True)): the reply, or None when it
+        never began (CANCELLED: not admitted, or not begun within AUTH_WAIT), having committed nothing. Like run_tx it
+        runs on the authority thread, but in a requests.db transaction, never _exec_tx's outbox.db one."""
+        base = {"v": PROTOCOL, "request_id": request.get("request_id")}
+        problem = self._request_problem(request)
+        if problem:
+            return dict(base, result="refused", authority_epoch=self.epoch, detail=problem)
+        if not self.running:
+            return None
+        sectioned = in_admitted_section()
+        try:
+            if self.thread is None or threading.current_thread() is self.thread:
+                done = self._exec_request(request, sectioned)
+            else:
+                done = self._await(_Job(None, sectioned=sectioned, request=request))
+        except Exception:  # rolled back: this request fails alone
+            return dict(base, result="error", authority_epoch=self.epoch)
+        if done is CANCELLED:
+            return None
+        result, data = done
+        return dict(base, authority_epoch=self.epoch, result=result, **data)
+
+    def _exec_request(self, request, sectioned):
+        if request["op"] in request_store.READ_OPS:
+            return self._lookup(request)
+        with section(self.paths, fs=self.fs, wait=0) as adm:
+            if self._request_refusal(adm, request, bridge=True, sectioned=sectioned) is not None:
+                return CANCELLED
+            return self._mutate_request(request)
 
     def _dispatch(self, r, bridge):
         s, op, writer = self.store, r["op"], r.get("writer")
@@ -2856,7 +3012,10 @@ class Authority:
             return CANCELLED
         if self.thread is None or threading.current_thread() is self.thread:
             return self._exec_tx(fn, readonly, in_admitted_section())
-        job = _Job(fn, readonly, in_admitted_section())
+        return self._await(_Job(fn, readonly, in_admitted_section()))
+
+    def _await(self, job):
+        """Queue `job` for the authority thread and wait for it: CANCELLED if it has not begun within AUTH_WAIT."""
         with self.mutex:
             self.jobs.append(job)
         self._wake()
@@ -2883,7 +3042,10 @@ class Authority:
                 return
             job.state = "running"
         try:
-            job.result = self._exec_tx(job.fn, job.readonly, job.sectioned)
+            if job.request is not None:
+                job.result = self._exec_request(job.request, job.sectioned)
+            else:
+                job.result = self._exec_tx(job.fn, job.readonly, job.sectioned)
         except BaseException as err:  # reported to the waiting thread
             job.error = err
         with job.cond:
@@ -3094,7 +3256,11 @@ class LocalTransport:
 
     def exchange(self, request):
         request, _ = decode_frame(encode_frame(request, FRAME_MAX), FRAME_MAX)
-        if self.bridge:
+        if self.bridge and request.get("op") in request_store.OPS:
+            reply = self.authority.run_request(request)
+            if reply is None:
+                return None  # never began: nothing committed
+        elif self.bridge:
             base = {"v": PROTOCOL, "request_id": request.get("request_id")}
             if (request.get("op") not in CLIENT_OPS
                     or not valid_writer(request.get("writer"), optional=request.get("op") == "status")
@@ -3132,6 +3298,14 @@ class Client:
         return self.transport is not None
 
     def call(self, op, writer, **args):
+        return self._call(op, writer, args, ("ok", "replay", "conflict", "maintenance"))
+
+    def request(self, op, writer, **args):
+        """A request-store operation (COLLAB-2, #32; request_store.OPS): the reply, a refusal included, which `call`
+        would discard. None only when there is no usable reply."""
+        return self._call(op, writer, args, ("ok", "replay", "conflict", "refused", "maintenance"))
+
+    def _call(self, op, writer, args, results):
         if self.transport is None:
             return None
         request = {"v": PROTOCOL, "op": op, "request_id": uuid.uuid4().hex, "writer": writer, **args}
@@ -3141,7 +3315,7 @@ class Client:
             return None
         if not isinstance(reply, dict) or reply.get("v") != PROTOCOL or reply.get("request_id") != request["request_id"]:
             return None
-        if reply.get("result") not in ("ok", "replay", "conflict", "maintenance"):
+        if reply.get("result") not in results:
             return None
         epoch = reply.get("authority_epoch") or 0
         if epoch < self.epoch:
