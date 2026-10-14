@@ -108,6 +108,7 @@ class BuildTests(BuildCase):
             r"\"supersedes\"": ("delivery-records", True, True),
             r"kern\.bootsessionuuid|random/boot_id": ("boot-id", True, False),
             r"-iTCP": ("tcp-sockets", True, False),
+            r"designation-bootstrap/1": ("designation-bootstrap", True, False),
             # #24: the maintenance record is read by every writer and written by the owning operation's
             # primitives, which ship in this package, so it is declared both read and written
             r"maintenance\.json": ("maintenance", True, True),
@@ -447,13 +448,14 @@ class RefusalTests(BuildCase):
 # everything but package.files, the interpreter note and the outbox,
 # delivery-records, outbox-db, outbox-authority, boot-id and tcp-sockets
 # format entries (the second to fifth amendments of #19, acceptance 11), the
-# maintenance format (#24: writer admission, read and written, maintenance/1)
+# maintenance format (#24: writer admission, read and written, maintenance/1),
+# the designation-bootstrap format (#21: read only, designation-bootstrap/1)
 # and the request-line format (#27: request/v1, read and written). The digest also
 # covers the one declared text change of #29: the chat-config entry's `covers` now names the
 # optional `owner_accounts` key, with its read and write identifiers unchanged.
 UNCHANGED_DECLARATIVE = "d58c3a44135efadd8664821ae384a7eee024afbf886ad75a666f3a479281bbae"
 CHANGED_BY_19 = {"outbox", "delivery-records", "outbox-db", "outbox-authority", "boot-id", "tcp-sockets",
-                 "maintenance", "request-line"}
+                 "designation-bootstrap", "maintenance", "request-line"}
 GENERATED = ("release", "source", "builder", "build_interpreter", "artifacts")
 
 

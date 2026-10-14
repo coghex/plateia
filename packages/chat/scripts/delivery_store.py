@@ -860,17 +860,50 @@ def sink_count(paths, fs=None):
     return sum(1 for n in names if is_published_name(n))
 
 
+BRIDGE_START = "bridge-start"  # what a `full` record's binding permits: the bound bridge's start (6.3)
+
+
+def bound_start_problem(record, binding):
+    """Why `record`, read holding L_adm shared, does not admit the operation-owned start that `binding` names
+    (writer admission 6.3; #21 amendment 4, K3), or None when it does: the record is valid and `full`, it
+    permits the bridge's start, and it names this launch's operation, bootstrap digest and release.
+    `binding` is {"operation", "bootstrap_digest", "release_id"}."""
+    if not record.valid:
+        return f"the maintenance record is unknown ({record.why})"
+    f = record.fields
+    if f["state"] != "full":
+        return f"maintenance is {f['state']}, not full"
+    bound = f["binding"]
+    if BRIDGE_START not in bound["permits"]:
+        return "the record does not permit the bridge's start"
+    if f["operation"] != binding.get("operation"):
+        return "the record is another operation's"
+    if bound["bootstrap_digest"] != binding.get("bootstrap_digest"):
+        return "the record binds another bootstrap digest"
+    if bound["release_id"] != binding.get("release_id"):
+        return "the record binds another release"
+    return None
+
+
 class StorageError(OSError):
     """The admission lock does not exist and could not be created: the state directory cannot be written. That is
     not held maintenance (the owner creates the lock before it writes the record); the call fails as an unwritable
     outbox does today."""
 
 
-def _open_admission_lock(paths, fs=None):
+def _open_admission_lock(paths, fs=None, dir_fd=None):
     """L_adm's file descriptor. The file is content-free; a writer that finds it missing creates it, empty:
     the only path of this format the chat package ever creates (4.2). A lock that exists and cannot be opened
-    raises OSError (the caller reads that as held); one that cannot be created raises StorageError."""
+    raises OSError (the caller reads that as held); one that cannot be created raises StorageError. With
+    `dir_fd` (the bridge's activated start, #21 amendment 7) it is opened, or made, only in that directory."""
     flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    if dir_fd is not None:
+        try:
+            return os.open(paths.admission_lock.name, flags, 0o600, dir_fd=dir_fd)
+        except OSError as err:
+            if os.path.lexists(paths.admission_lock):
+                raise
+            raise StorageError(err.errno, f"the admission lock cannot be created ({err.strerror or err})") from err
     try:
         try:
             return os.open(paths.admission_lock, flags, 0o600)
@@ -907,7 +940,7 @@ class Admission:
 
 
 @contextlib.contextmanager
-def section(paths, *, fs=None, wait=None, clock=time.monotonic, sleep=time.sleep):
+def section(paths, *, fs=None, wait=None, clock=time.monotonic, sleep=time.sleep, dir_fd=None):
     """One section of a new-release writer (4.2): L_adm shared, taken without blocking and retried to an
     absolute deadline of `wait` (ADMIT_WAIT), then the record read while holding it. Yields an Admission.
     A miss, or a lock that cannot be opened, reads as held maintenance. wait=0 tries exactly once and never
@@ -916,7 +949,7 @@ def section(paths, *, fs=None, wait=None, clock=time.monotonic, sleep=time.sleep
     fd, locked, why = None, False, "the admission lock is busy"
     try:
         try:
-            fd = _open_admission_lock(paths, fs)
+            fd = _open_admission_lock(paths, fs, dir_fd)
         except StorageError:
             raise
         except OSError as err:
@@ -989,9 +1022,10 @@ class Owner:
     are bound, stays with the caller: it does so in its own `verify` before it permits `full`."""
 
     def __init__(self, paths, *, operation, kind, plan_sha256, fence, fs=None, probes=None, clock=time.time,
-                 mono=time.monotonic, sleep=time.sleep):
+                 mono=time.monotonic, sleep=time.sleep, root_fd=None):
         self.paths, self.operation, self.kind, self.plan = paths, operation, kind, plan_sha256
         self.fence, self.fs = fence, fs or FS_DEFAULT
+        self.root_fd = root_fd  # the sealed state root's descriptor: the admission lock is made and opened there
         self.probes = probes
         self.clock, self.mono, self.sleep = clock, mono, sleep
         self.failed = None  # why the fence failed: nothing further is mutated
@@ -1180,7 +1214,7 @@ class Owner:
         self._settle()
 
         def effect(progress):
-            fd = _open_admission_lock(self.paths, self.fs)
+            fd = _open_admission_lock(self.paths, self.fs, self.root_fd)
             os.close(fd)
             return {"landed": True}
         return self._fenced(self._step("create-lock"), effect)
@@ -1228,7 +1262,7 @@ class Owner:
     @contextlib.contextmanager
     def _exclusive(self, wait):
         """L_adm exclusive, without blocking, every ADMIT_POLL until `wait`. Yields (held, tries)."""
-        fd = _open_admission_lock(self.paths, self.fs)
+        fd = _open_admission_lock(self.paths, self.fs, self.root_fd)
         try:
             end, tries, held = self.mono() + wait, 0, False
             while True:
@@ -2380,6 +2414,38 @@ class _Peer:
         self.buf, self.out, self.reply_ready = b"", b"", None
 
 
+class StartGate:
+    """What an authority's start section found, and its one admission decision (writer admission 6.3)."""
+
+    def __init__(self, authority, adm):
+        self.authority, self.adm, self.owned = authority, adm, False
+
+    def admit(self, binding=None):
+        """None for an ordinary start (no record); the record, for a start a matching `full` record admits as
+        the operation's own section. Otherwise raises Unavailable, having opened nothing. Inside an enclosing
+        bound start, a nested start section with no binding of its own is judged by the enclosing one's."""
+        adm, a = self.adm, self.authority
+        if adm.admitted:
+            return None
+        if binding is None and a._owned_starts:
+            binding = a._owned_binding
+        problem = None
+        if binding is not None and adm.locked:
+            problem = bound_start_problem(adm.record, binding)
+            if problem is None:
+                if not self.owned:
+                    self.owned = True
+                    a._owned_starts += 1
+                    a._owned_binding = binding
+                return adm.record
+        info = adm.record.describe() or {"state": "unknown"}
+        who = f"held by {info['operation']} ({info['state']})" if "operation" in info else \
+            f"unknown ({adm.record.why})"
+        a.unavailable = (f"maintenance is {who}: the authority does not start" + (f"; {problem}" if problem else ""),
+                         a.unavailable[1] if a.unavailable else a.clock())
+        raise Unavailable(a.unavailable[0])
+
+
 class Authority:
     """The bridge's authority: the only holder of the only connection to
     outbox.db (section 2.4). `launch` is the bridge's whole start: the
@@ -2408,6 +2474,10 @@ class Authority:
         self.ready = False  # set only once a start has completed; cleared by close()
         self.bridge_only = False  # no socket: its path is over the platform's limit
         self._bound = False  # outbox.sock was bound by this authority, and is still to be removed
+        self._owned_starts = 0  # open start sections admitted by a matching `full` record (6.3)
+        self.root_fd = None  # the pinned state root's descriptor, during the bridge's activated start only
+        self._sock_id = None  # the (device, inode) of the socket bind made in the pinned root
+        self._owned_binding = None  # the binding they admitted
 
     @property
     def epoch(self):
@@ -2419,36 +2489,67 @@ class Authority:
         return (self.ready and self.store.con is not None
                 and (self.thread is None or self.thread.is_alive()))
 
-    def start(self):
+    @contextlib.contextmanager
+    def pinned_root(self, fd):
+        """The bridge's activated start (#21 amendment 7): with `fd`, the validated state root's descriptor,
+        every effect the standard library can make directory-relative is made through it (the authority lock,
+        outbox.d, removing a stale socket), and the state tree is not re-made by path. The database's open and
+        the socket's bind stay pathname-based; the caller checks the root's identity immediately before and
+        after them. With None, nothing changes."""
+        self.root_fd = fd
+        try:
+            yield
+        finally:
+            self.root_fd = None
+
+    def _mkdir_at(self, name, parent_fd):
+        """`name` made relative to `parent_fd` if missing, then its entry and itself made durable, as FS.mkdir."""
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            self.fs.fsync_fd(fd)
+            self.fs.fsync_fd(parent_fd)
+            return os.dup(fd)
+        finally:
+            os.close(fd)
+
+    def start(self, binding=None):
         """Steps 1-4 of section 2.4.1, all or nothing; requests then run at once,
-        in this thread (the tests). Raises, having opened and bound nothing."""
-        with self._start_section():
+        in this thread (the tests). Raises, having opened and bound nothing.
+        `binding` admits it under a matching `full` record (6.3)."""
+        with self.start_section() as gate:
+            gate.admit(binding)
             self._open()
         self.ready = True
         return self.epoch
 
     @contextlib.contextmanager
-    def _start_section(self):
-        """The start is one section (writer admission 4.2, 6.3): L_adm shared, the record read while holding it,
-        and the start refused while any record exists. The start of an authority bound by a `full` record is
-        #21's rework."""
-        _make_state_tree(self.fs, self.paths.state)  # as _open does, and failing as it does (code review CODE16)
-        with section(self.paths, fs=self.fs) as adm:
-            if not adm.admitted:
-                info = adm.record.describe() or {"state": "unknown"}
-                who = f"held by {info['operation']} ({info['state']})" if "operation" in info else \
-                    f"unknown ({adm.record.why})"
-                self.unavailable = (f"maintenance is {who}: the authority does not start",
-                                    self.unavailable[1] if self.unavailable else self.clock())
-                raise Unavailable(self.unavailable[0])
-            yield
+    def start_section(self):
+        """The start is one section (writer admission 4.2, 6.3): L_adm shared, held from admission through
+        the start, the socket's binding and a failed start's cleanup, with the record read while holding it.
+        Yields a StartGate, whose admit() decides once: no record admits the start as before; a `full` record
+        whose binding matches the launch admits the operation-owned start (#21 amendment 4, K3), which then
+        serves read-only requests only, every mutation being answered `maintenance`; anything else refuses,
+        having opened nothing. A caller may judge its launch (the bridge's bootstrap) inside the section
+        before it calls admit()."""
+        if self.root_fd is None:
+            _make_state_tree(self.fs, self.paths.state)  # as _open does, and failing as it does (code review CODE16)
+        with section(self.paths, fs=self.fs, dir_fd=self.root_fd) as adm:
+            gate = StartGate(self, adm)
+            try:
+                yield gate
+            finally:
+                if gate.owned:
+                    self._owned_starts -= 1
 
-    def launch(self):
+    def launch(self, binding=None):
         """The bridge's whole start: steps 1-4, the socket (step 5) and the
         authority thread. All or nothing: any failure closes what was opened,
         releases the lock and raises; running only once every step is done."""
         try:
-            with self._start_section():
+            with self.start_section() as gate:
+                gate.admit(binding)
                 try:
                     self._open()
                     self.bridge_only = not self.bind()
@@ -2469,8 +2570,13 @@ class Authority:
         opened nothing and released the lock. First the state tree, made
         durable entry by entry (whoever made it, the bridge's main() included)
         before anything is served, imported or acknowledged (code review CODE16)."""
-        _make_state_tree(self.fs, self.paths.state)
-        f = open(self.paths.auth_lock, "a")
+        if self.root_fd is None:
+            _make_state_tree(self.fs, self.paths.state)
+            f = open(self.paths.auth_lock, "a")
+        else:  # the pinned root: the lock is made and opened only there (#21 amendment 7)
+            fd = os.open(self.paths.auth_lock.name, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
+                         | getattr(os, "O_CLOEXEC", 0), 0o666, dir_fd=self.root_fd)
+            f = open(fd, "a")
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -2491,8 +2597,15 @@ class Authority:
         self.lock_file = f
         self.unavailable = None
         try:
-            self.fs.mkdir(self.paths.fallback)
-            self.fs.mkdir(self.paths.staging)
+            if self.root_fd is None:
+                self.fs.mkdir(self.paths.fallback)
+                self.fs.mkdir(self.paths.staging)
+            else:  # outbox.d and outbox.d/tmp only in the pinned root
+                fallback = self._mkdir_at(self.paths.fallback.name, self.root_fd)
+                try:
+                    os.close(self._mkdir_at(self.paths.staging.name, fallback))
+                finally:
+                    os.close(fallback)
         except OSError as err:
             self.log(f"authority: cannot create outbox.d: {err}")
 
@@ -2503,8 +2616,11 @@ class Authority:
         if len(os.fsencode(path)) > SOCKET_LIMIT:
             self.log(f"authority: socket path over {SOCKET_LIMIT} bytes; serving the bridge only")
             return False
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(path)
+        if self.root_fd is None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+        else:
+            self._remove_stale_socket()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             old = os.umask(0o177)  # the socket is created 0600: only this user may connect
@@ -2512,18 +2628,53 @@ class Authority:
                 listener.bind(path)
             finally:
                 os.umask(old)
+            self.remember_socket()  # what this bind made in the pinned root, if it is there
             if os.stat(path).st_mode & 0o777 != 0o600:
                 raise Unavailable("socket mode is not 0600")
             listener.listen(CONN_MAX)
             listener.setblocking(False)
         except BaseException:  # nothing half-bound is left behind: the next start binds again
             listener.close()
-            with contextlib.suppress(OSError):
-                os.unlink(path)
+            if self.root_fd is None:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+            else:
+                self._remove_own_socket()
             raise
         self.listener = listener
         self._bound = True
         return True
+
+    def _entry_at(self, sockets_only):
+        """(device, inode) of the entry named outbox.sock in the pinned root, never followed; None if it is
+        missing (or, with `sockets_only`, not a socket)."""
+        try:
+            st = os.stat(self.paths.sock.name, dir_fd=self.root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        return None if sockets_only and not stat.S_ISSOCK(st.st_mode) else (st.st_dev, st.st_ino)
+
+    def remember_socket(self):
+        """After a bind, during a pinned start: the entry that bind made in the pinned root, by identity. A bind
+        that landed elsewhere leaves nothing to remember, and so nothing is ever removed for it."""
+        if self.root_fd is not None and self._sock_id is None:
+            self._sock_id = self._entry_at(sockets_only=False)
+
+    def _remove_stale_socket(self):
+        """Before the bind, in the pinned root only: a socket left there is removed, while it is still that
+        socket; anything else (and anything at the state path outside the pinned root) is never touched."""
+        stale = self._entry_at(sockets_only=True)
+        if stale is not None and self._entry_at(sockets_only=True) == stale:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.paths.sock.name, dir_fd=self.root_fd)
+
+    def _remove_own_socket(self):
+        """A failed start's cleanup, in the pinned root only: the entry this bind made, while it is still that
+        very entry (its identity, recorded right after the bind)."""
+        own, self._sock_id = self._sock_id, None
+        if own is not None and self._entry_at(sockets_only=False) == own:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.paths.sock.name, dir_fd=self.root_fd)
 
     def close(self):
         """Stop serving and release everything a start opened, whatever step it
@@ -2556,7 +2707,7 @@ class Authority:
         self.wake_r = self.wake_w = None
         if self.released:
             return
-        if in_admitted_section():
+        if in_admitted_section() or self._owned_starts:  # inside a section: an ordinary one, or a bound start's
             self._release_files()
             return
         try:
@@ -2576,8 +2727,11 @@ class Authority:
     def _release_files(self):
         if self._bound:
             self._bound = False
-            with contextlib.suppress(OSError):
-                os.unlink(self.paths.sock)
+            if self.root_fd is None:
+                with contextlib.suppress(OSError):
+                    os.unlink(self.paths.sock)
+            else:  # a failed activated start: only its own socket, through the pinned root (#21 amendment 7)
+                self._remove_own_socket()
         self.store.close()
         if self.lock_file is not None:
             fcntl.flock(self.lock_file, fcntl.LOCK_UN)

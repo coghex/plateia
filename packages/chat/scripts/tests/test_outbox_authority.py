@@ -376,10 +376,18 @@ class SandboxTests(AuthorityCase):
 
     def test_no_designation_interface_exists(self):
         """No command, option, request or chat-config key designates an account:
-        designation exists only as rows, which tests set directly."""
+        designation exists only as rows, which tests set directly, and as the
+        bridge's one bootstrap commit (#21's owner amendment, section 3): a
+        single call, in BootstrapStore.apply, inside the authority's opening
+        transaction."""
         self.assertNotIn("designate", self.ds.CLIENT_OPS)
         for name in ("pchat", "chatlib.py", "agentcli.py", "chat-bridge"):
             text = (SCRIPTS / name).read_text()
+            if name == "chat-bridge":
+                self.assertEqual(text.count(".designate("), 1, "the bootstrap commit is the bridge's only call")
+                apply = text[text.index("class BootstrapStore("):text.index("\ndef start_authority(")]
+                self.assertIn("self.designate(account, at)", apply[apply.index("    def apply(self):"):])
+                text = text.replace("self.designate(account, at)", "")
             for marker in (".designate(", "\"designate\"", "'designate'", "add_parser(\"designat",
                            "cfg.get(\"designat", "cfg[\"designat", "--designat"):
                 self.assertNotIn(marker, text, f"{name}: {marker}")

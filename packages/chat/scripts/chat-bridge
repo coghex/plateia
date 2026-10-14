@@ -79,10 +79,15 @@ import contextlib
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
+import shutil
+import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import uuid
@@ -1976,12 +1981,592 @@ def boundary_mark(server_time):
     return f"timestamp={time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t))}.{int(t % 1 * 1000):03d}Z"
 
 
+BOOTSTRAP_FILE = "designation-bootstrap.json"
+BOOTSTRAP_FORMAT = "designation-bootstrap/1"
+BOOTSTRAP_META = "designation_bootstrap"
+BOOTSTRAP_MAX = 64 * 1024  # the record is read whole, within this cap
+BOOTSTRAP_ACCOUNT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+BOOTSTRAP_DIGEST = re.compile(r"sha256:([0-9a-f]{64})")
+BOOTSTRAP_FIELDS = {"v", "operation", "release", "release_id", "state_root", "accounts", "plan_sha256", "time"}
+BOOTSTRAP_META_FIELDS = {"operation", "digest", "effective_at", "version", "accounts", "already_present"}
+UNKNOWN_RECHECK = 60  # seconds between checks while the bootstrap state is UNKNOWN
+ACTIVATION = None  # this launch's --activation-bootstrap digest (E), set by main(); None: no activation
+BOOTSTRAP_UNKNOWN = None  # why the authority's bootstrap state is UNKNOWN, while it is
+
+
+class BootstrapUnknown(Exception):
+    """The designation bootstrap's state is UNKNOWN (D-74, amended 2026-10-11;
+    #21's owner amendment, section 3): the authority does not start, and nothing
+    is committed, deleted or rewritten."""
+
+
+def activation_digest(argv):
+    """E, from this launch's arguments: none, or exactly `--activation-bootstrap
+    sha256:<hex>` (the only option the activation's LaunchAgent sets). Anything
+    else is malformed, which is UNKNOWN."""
+    if not argv:
+        return None
+    if len(argv) == 2 and argv[0] == "--activation-bootstrap":
+        found = BOOTSTRAP_DIGEST.fullmatch(argv[1])
+        if found:
+            return found.group(1)
+    raise BootstrapUnknown("this launch's arguments are not one --activation-bootstrap sha256:<digest>")
+
+
+def running_release():
+    """The release this bridge runs from: the <identity> of a staged release's
+    releases/<identity>/env/ on this file's own resolved path; None from
+    anywhere else (a source checkout or the skills tree)."""
+    found = re.search(r"/releases/([^/]+)/env/", Path(__file__).resolve().as_posix())
+    return found.group(1) if found else None
+
+
+def release_problem(record):
+    """Why the record isn't for this bridge's running release, or None. The one
+    place the record's release fields are compared: the release identity it
+    names against this bridge's own path; its manifest hash is bound by the
+    launch digest, the plan's digest and the controller's post-check."""
+    if record["release_id"] != running_release():
+        return f"it is for {record['release_id']}, not this bridge's release"
+    return None
+
+
+def read_bootstrap(state_fd):
+    """R: (None, None) when there is no record; else (data, reason), where reason
+    is None only for a private regular file of this user, opened without
+    following links, relative to the pinned state root, and read whole within
+    BOOTSTRAP_MAX."""
+    try:
+        fd = os.open(BOOTSTRAP_FILE, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=state_fd)
+    except FileNotFoundError:
+        return None, None
+    except OSError as err:
+        return b"", f"it can't be opened ({err.strerror or err})"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            return b"", "it is not a private regular file of this user"
+        chunks, size = [], 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > BOOTSTRAP_MAX:
+                return b"", f"it is over {BOOTSTRAP_MAX} bytes"
+    except OSError as err:
+        return b"", f"it can't be read ({err.strerror or err})"
+    finally:
+        os.close(fd)
+    return b"".join(chunks), None
+
+
+def is_name_list(value):
+    """A sorted list of distinct account names: every element's type is checked
+    before anything compares, hashes or sorts them."""
+    return isinstance(value, list) and all(isinstance(a, str) and BOOTSTRAP_ACCOUNT.fullmatch(a) for a in value) \
+        and value == sorted(set(value))
+
+
+def bootstrap_record(data, expected, real, root_stat):
+    """The record when R is VALID against E: its bytes' sha256 equals E, it is
+    exactly designation-bootstrap/1 in canonical form, for this bridge's release
+    and this state root (realpath, device and inode, as pinned). Raises
+    BootstrapUnknown."""
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise BootstrapUnknown("the record's bytes don't match the launch digest")
+    try:
+        record = json.loads(data)
+    except ValueError:
+        raise BootstrapUnknown("the record is not valid JSON") from None
+    if not isinstance(record, dict) or set(record) != BOOTSTRAP_FIELDS or record["v"] != BOOTSTRAP_FORMAT \
+            or not all(isinstance(record[k], str) and record[k] for k in ("operation", "release", "release_id",
+                                                                         "plan_sha256", "time")) \
+            or not isinstance(record["state_root"], dict) or set(record["state_root"]) != {"path", "dev", "ino"} \
+            or not is_name_list(record["accounts"]) or canonical_bytes(record) != data:
+        raise BootstrapUnknown(f"the record is not {BOOTSTRAP_FORMAT} in canonical form")
+    problem = release_problem(record)
+    if problem:
+        raise BootstrapUnknown(f"the record is not for this release: {problem}")
+    if record["state_root"] != {"path": real, "dev": root_stat.st_dev, "ino": root_stat.st_ino}:
+        raise BootstrapUnknown("the record is for another chat state root")
+    return record
+
+
+def canonical_bytes(record):
+    return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+class PinnedRoot:
+    """The state root as classification validated it: its descriptor, held open
+    through the authority's whole start, its identity (code review slot 3,
+    finding 2) and its realpath (code review 6112483129, finding 4)."""
+
+    def __init__(self, fd, real):
+        st = os.fstat(fd)
+        self.fd, self.real, self.identity = fd, real, (st.st_dev, st.st_ino)
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def entry(self, name):
+        """(device, inode, change time) of an entry in the pinned root, never followed; None if it is not
+        there."""
+        try:
+            st = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except OSError:
+            return None
+        return st.st_dev, st.st_ino, st.st_ctime_ns
+
+    def read(self, name):
+        """The bytes of a regular file in the pinned root, read through its descriptor and never followed; None
+        if it is missing. Opened read-only: reading changes nothing."""
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=self.fd)
+        except FileNotFoundError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise BootstrapUnknown(f"{name} is not a regular file")
+            chunks = []
+            while True:
+                chunk = os.read(fd, 1 << 20)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+
+    def identity_of(self, name):
+        """The (device, inode) of an entry inside the pinned root, never followed; BootstrapUnknown if it can't
+        be read."""
+        try:
+            st = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except OSError as err:
+            raise BootstrapUnknown(f"{name} can't be read in the validated state root ({err.strerror or err})") \
+                from None
+        return st.st_dev, st.st_ino
+
+    def opened(self, name):
+        """The (device, inode) of `name` in the pinned root, only if this process has that very file open: the
+        database SQLite opened, not one put at its name since (PR #22 review 2, finding 3). The open descriptors
+        are listed from /dev/fd; anything that can't be shown is BootstrapUnknown."""
+        ident = self.identity_of(name)
+        try:
+            fds = os.listdir("/dev/fd")
+        except OSError as err:
+            raise BootstrapUnknown(f"this process's open files can't be listed ({err.strerror or err})") from None
+        for entry in fds:
+            try:
+                st = os.fstat(int(entry))
+            except (OSError, ValueError):
+                continue
+            if stat.S_ISREG(st.st_mode) and (st.st_dev, st.st_ino) == ident:
+                return ident
+        raise BootstrapUnknown(f"{name} at the validated state root is not the database this start opened")
+
+    def check(self, paths, *names):
+        """The state path still resolves to the validated realpath, that
+        realpath is still the pinned directory itself (not a link to it), and
+        each named entry reached through the path is the one in that root:
+        else BootstrapUnknown. A directory moved away with a link left at its
+        old path keeps its inode, so the identity alone is not the binding."""
+        try:
+            st = os.lstat(self.real)
+            ok = os.path.realpath(paths.state) == self.real and stat.S_ISDIR(st.st_mode) \
+                and (st.st_dev, st.st_ino) == self.identity
+            for name in names if ok else ():
+                inside = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+                there = os.stat(Path(paths.state) / name, follow_symlinks=False)
+                ok = ok and (inside.st_dev, inside.st_ino) == (there.st_dev, there.st_ino)
+        except OSError:
+            ok = False
+        if not ok:
+            raise BootstrapUnknown("the state root was moved or replaced after it was validated")
+
+
+def pin_state_root(state, expected):
+    """The state root, pinned by one descriptor of its realpath (a PinnedRoot the caller closes); None when there
+    is no state at all and no activation is involved (S1 so far). BootstrapUnknown otherwise."""
+    real = os.path.realpath(state)
+    try:
+        state_fd = os.open(real, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        if expected is not None:
+            raise BootstrapUnknown("this launch names a bootstrap digest, but the state root is missing") from None
+        return None  # no state at all: no record, no database, S1 so far
+    except OSError as err:
+        raise BootstrapUnknown(f"the state root can't be opened ({err.strerror or err})") from None
+    return PinnedRoot(state_fd, real)
+
+
+def classify_launch(state, expected):
+    """E and R, judged before any database is opened or created, through one
+    pinned descriptor of the state root: (record, root), where record is None
+    when no activation is involved (S1 so far) or the VALID record for an
+    activated launch (S2 or S3, by M), and root is the PinnedRoot (None when
+    there is no state at all), which the caller closes; or BootstrapUnknown.
+    Anything that can't be judged is UNKNOWN, never an ordinary failure."""
+    root = pin_state_root(state, expected)
+    if root is None:
+        return None, None
+    try:
+        return classify_pinned(root, expected), root
+    except BaseException:
+        root.close()
+        raise
+
+
+def classify_pinned(root, expected):
+    """E and R judged through the pinned root: None (no activation) or the VALID record; BootstrapUnknown
+    otherwise. The caller keeps and closes the root."""
+    real, state_fd = root.real, root.fd
+    try:
+        data, reason = read_bootstrap(state_fd)
+        if expected is None:
+            if data is not None:
+                raise BootstrapUnknown("a bootstrap record is present, but this launch names no digest")
+            return None
+        if data is None:
+            raise BootstrapUnknown("this launch names a bootstrap digest, but there is no record")
+        if reason:
+            raise BootstrapUnknown(f"the bootstrap record {reason}")
+        return bootstrap_record(data, expected, real, os.fstat(state_fd))
+    except BootstrapUnknown:
+        raise
+    except Exception as err:  # a shape or type nobody foresaw: never the ordinary failure path
+        raise BootstrapUnknown(f"the bootstrap record can't be judged ({type(err).__name__})") from None
+
+
+def valid_meta(committed, record, expected):
+    """M is well formed and consistent with this record and launch digest; every
+    field has its exact type (a bool is not a number)."""
+    at = committed.get("effective_at") if isinstance(committed, dict) else None
+    return isinstance(committed, dict) and set(committed) == BOOTSTRAP_META_FIELDS \
+        and isinstance(committed["operation"], str) and isinstance(committed["digest"], str) \
+        and type(at) in (int, float) and math.isfinite(at) \
+        and committed["version"] == {"format": record["v"], "release": record["release"],
+                                     "release_id": record["release_id"]} \
+        and is_name_list(committed["accounts"]) and committed["accounts"] == record["accounts"] \
+        and is_name_list(committed["already_present"]) \
+        and set(committed["already_present"]) <= set(record["accounts"]) \
+        and committed["digest"] == expected and committed["operation"] == record["operation"]
+
+
+def table_columns(con):
+    """{table: [column, ...]} of a database's tables."""
+    tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+    return {t: [c[1] for c in con.execute(f"PRAGMA table_info('{t}')")] for t in tables}
+
+
+def schema_problem(db):
+    """Why a (copied) database's tables and columns are not exactly this authority's schema, or None."""
+    ref = sqlite3.connect(":memory:")
+    try:
+        for statement in delivery_store.SCHEMA.split(";"):
+            if statement.strip():
+                ref.execute(statement)
+        want = table_columns(ref)
+    finally:
+        ref.close()
+    con = sqlite3.connect(db, isolation_level=None)
+    try:
+        have = table_columns(con)
+    finally:
+        con.close()
+    if not have:
+        return None  # an empty database: the opening transaction makes the schema
+    for table, columns in want.items():
+        if table not in have:
+            return f"outbox.db lacks the {table} table, so it is not this authority's database"
+        if have[table] != columns:
+            return f"outbox.db's {table} table is not this authority's"
+    extra = sorted(set(have) - set(want))
+    if extra:
+        return f"outbox.db has tables this authority doesn't make ({', '.join(extra)})"
+    return None
+
+
+class BootstrapStore(delivery_store.Store):
+    """The authority's store, with M judged inside the opening transaction:
+    Store.open() creates or checks the schema and then, in that same BEGIN
+    IMMEDIATE transaction, writes the next authority_epoch. Here that write
+    first classifies M against E and R (#21's APPROVE, spec addition 1): an
+    UNKNOWN state raises, so the transaction rolls back and nothing is
+    committed; S2 commits its designations and M with that write, in that one
+    transaction; S1 and S3 change nothing more."""
+
+    def __init__(self, paths, *, expected=None, record=None, root=None, **kw):
+        super().__init__(paths, **kw)
+        self.expected, self.record, self.root = expected, record, root
+        self.bootstrap = None  # what this open did: "none" (S1), "applied" (S2) or "replayed" (S3)
+        self.m_absent = False  # for a launch with no activation: M's absence established (S1 so far)
+
+    def preflight(self):
+        """An existing outbox.db is classified before the authority opens it, read-only through the pinned root,
+        so that nothing (not SQLite's journal-mode change, nor a sidecar) is created, changed or removed for
+        evidence that is not proven this authority's (PR #22 review 4, finding 3; review 2/4). The database is
+        new only when none of outbox.db, -wal, -shm and -journal exists, or an empty outbox.db has no sidecar;
+        any other sidecar without a non-empty outbox.db is ambiguous evidence, and UNKNOWN. A non-empty one
+        must be SQLite in WAL mode with no rollback journal, and is then classified on a private copy, which
+        proves the start would succeed; anything else is UNKNOWN, with every byte kept."""
+        sidecars = [n for n in ("outbox.db-wal", "outbox.db-shm", "outbox.db-journal") if self.root.entry(n) is not None]
+        try:
+            fd = os.open("outbox.db", os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+                         dir_fd=self.root.fd)
+        except FileNotFoundError:
+            fd = None
+        except OSError as err:
+            raise BootstrapUnknown(f"outbox.db can't be opened to classify it ({err.strerror or err})") from None
+        header = b""
+        try:
+            if fd is not None:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise BootstrapUnknown("outbox.db is not a regular file")
+                header = os.read(fd, 100) if st.st_size else b""
+        except OSError as err:
+            raise BootstrapUnknown(f"outbox.db can't be read to classify it ({err.strerror or err})") from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+        if not header:
+            if sidecars:
+                raise BootstrapUnknown(f"{', '.join(sidecars)} exist{'s' if len(sidecars) == 1 else ''} without a "
+                                       "non-empty outbox.db: ambiguous evidence, never treated as a new database")
+            return  # a new database
+        if len(header) < 100 or not header.startswith(b"SQLite format 3\x00"):
+            raise BootstrapUnknown("outbox.db is not a SQLite database")
+        if header[18:20] != b"\x02\x02":
+            raise BootstrapUnknown("outbox.db is not in WAL mode, so it is not this authority's database")
+        if "outbox.db-journal" in sidecars:
+            raise BootstrapUnknown("outbox.db has a rollback journal, so it is not this authority's database")
+        self.classify_copy()
+
+    def classify_copy(self):
+        """An existing WAL database is classified before the authority opens it, on a private copy: outbox.db and
+        its -wal, read through the pinned root into a private temporary directory, which is removed afterwards
+        (PR #22 review R1, finding 1). The copy is opened normally, so its committed WAL frames are read; the
+        originals are never opened for writing. The copy must prove that the start will succeed on this evidence
+        (review 2/4): its tables and columns are exactly this authority's schema, and the very opening
+        transaction, the bootstrap's classification and application included, runs on it and commits. Any
+        failure is UNKNOWN before the original is opened for writing."""
+        tmp = tempfile.mkdtemp(prefix="bootstrap-classify-")
+        try:
+            for name in ("outbox.db", "outbox.db-wal"):
+                data = self.root.read(name)
+                if data is not None:
+                    fd = os.open(os.path.join(tmp, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    try:
+                        view = memoryview(data)
+                        while view:
+                            view = view[os.write(fd, view):]
+                    finally:
+                        os.close(fd)
+            problem = schema_problem(os.path.join(tmp, "outbox.db"))
+            if problem:
+                raise BootstrapUnknown(problem)
+            trial = BootstrapStore(delivery_store.Paths(tmp), clock=self.clock, expected=self.expected,
+                                   record=self.record)
+            try:
+                trial.open()  # the same opening transaction, on the copy alone
+            finally:
+                trial.close()
+        except BootstrapUnknown:
+            raise
+        except Exception as err:  # unreadable or of the wrong shape: never the ordinary failure path
+            raise BootstrapUnknown(f"outbox.db can't be classified ({type(err).__name__}: {err})") from None
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def meta(self, name):
+        """For a launch with no activation, M is classified at the opening transaction's first read of any
+        other metadata, before that metadata can fail: a committed M without E and R is UNKNOWN (PR #22
+        review 3, finding 3)."""
+        if self.record is None and not self.m_absent and name != BOOTSTRAP_META and self.con is not None:
+            if super().meta(BOOTSTRAP_META) is not None:
+                raise BootstrapUnknown("a bootstrap is committed, but this launch names no digest and no record")
+            self.m_absent = True
+        return super().meta(name)
+
+    def open(self):
+        """For an activated launch, a database whose bootstrap state can't be
+        read, classified or committed (corrupt, unreadable, made by other code,
+        busy) establishes none of S1, S2 and S3: it is UNKNOWN, never an
+        ordinary failure (code review 6112483129, finding 3). Nothing was
+        committed: Store.open is all or nothing."""
+        existed = os.path.lexists(self.paths.db)
+        if self.root is not None:
+            # before anything can change the database's journal mode or its sidecars, for every launch while S1
+            # is unproven, a launch with no digest included (PR #22 extension review 1, finding 3)
+            self.preflight()
+            self.root.check(self.paths)  # immediately before the pathname-based open (#21 amendment 7)
+        try:
+            super().open()
+        except BootstrapUnknown:
+            raise
+        except (sqlite3.Error, OSError, ValueError, TypeError, delivery_store.Unavailable) as err:
+            # ValueError and TypeError: startup metadata of the wrong shape, such as an authority epoch that is
+            # not an integer, met before M is classified (PR #22 review 1, finding 4). A crash still propagates.
+            # With no activation the failure is ordinary only once S1 is established: M shown absent, or no
+            # database before this start, which can hold no M (PR #22 review 3, finding 3).
+            if self.record is None and (self.m_absent or not existed):
+                raise
+            raise BootstrapUnknown(f"the database's bootstrap state can't be read or committed "
+                                   f"({type(err).__name__}: {err})") from None
+
+    def set_meta(self, name, value):
+        if name == "authority_epoch" and self.bootstrap is None:
+            if self.root is not None:  # inside the opening transaction, before any commit
+                self.root.check(self.paths, "outbox.db")
+                self.database = self.root.opened("outbox.db")
+            self.bootstrap = self.classify_meta()
+            super().set_meta(name, value)
+            if self.root is not None:
+                # The epoch is the opening transaction's last write: the root and the database are checked once
+                # more, after the bootstrap's designations and M, immediately before COMMIT. Drift raises, and
+                # the transaction rolls back (PR #22 review 1, finding 5).
+                self.root.check(self.paths, "outbox.db")
+                if self.root.opened("outbox.db") != self.database:
+                    raise BootstrapUnknown("the database was replaced during the bootstrap's application")
+            return
+        super().set_meta(name, value)
+
+    def classify_meta(self):
+        raw = self.meta(BOOTSTRAP_META)
+        if self.record is None:
+            if raw is not None:
+                raise BootstrapUnknown("a bootstrap is committed, but this launch names no digest and no record")
+            return "none"
+        if raw is None:
+            self.apply()
+            return "applied"
+        try:
+            committed = json.loads(raw)
+        except (TypeError, ValueError):
+            committed = None
+        try:
+            ok = valid_meta(committed, self.record, self.expected)
+        except Exception:  # a shape nobody foresaw is malformed, never an ordinary failure
+            ok = False
+        if not ok:
+            raise BootstrapUnknown("the committed bootstrap record is malformed, inconsistent, or another "
+                                   "activation's (which needs its own approval)")
+        return "replayed"  # S3: designation is never applied again, so no suspension is cleared
+
+    def apply(self):
+        """S2: each listed account not yet in the database is designated from now
+        (none for an explicit empty list), and M records the operation, the
+        digest, the effective time and the version."""
+        at = self.clock()
+        present = []
+        for account in self.record["accounts"]:
+            if self.con.execute("SELECT 1 FROM accounts WHERE account = ?", (account,)).fetchone() is not None:
+                present.append(account)  # left as it is: designating it again would clear a suspension
+                continue
+            self.designate(account, at)
+        applied = {"operation": self.record["operation"], "digest": self.expected, "effective_at": at,
+                   "version": {"format": self.record["v"], "release": self.record["release"],
+                               "release_id": self.record["release_id"]},
+                   "accounts": self.record["accounts"], "already_present": present}
+        super().set_meta(BOOTSTRAP_META, json.dumps(applied, sort_keys=True))
+
+
+def launch_binding(record, expected):
+    """What this launch asks a `full` maintenance record to admit (writer
+    admission 6.3): the operation its validated bootstrap record names, its
+    launch digest, and the release it runs. None for a launch with no
+    activation, which no record admits."""
+    if record is None or expected is None:
+        return None
+    return {"operation": record["operation"], "bootstrap_digest": f"sha256:{expected}",
+            "release_id": running_release()}
+
+
+def start_authority(authority, expected=None):
+    """The bridge's whole start (section 2.4.1), with the designation bootstrap
+    (D-74, PLT-14): E and R judged before the database is opened, M judged and
+    any bootstrap committed in the opening transaction, then the socket and
+    the thread. All or nothing: any failure closes what was opened and raises;
+    BootstrapUnknown before anything was opened or committed.
+
+    The whole start is one section of writer admission (#21 amendment 4, K3):
+    L_adm is held shared from the admission through the classification, the
+    start, the socket's binding and a failed start's cleanup. With no
+    maintenance record it starts as before; a `full` record whose binding is
+    this launch's (operation, digest and release) admits it as the
+    operation's own start, which then serves read-only requests only; any
+    other record refuses it (delivery_store.Unavailable), and nothing is
+    opened, committed or bound."""
+    # An activated start pins the root before anything, so even the outer section's admission lock is opened
+    # through it (PR #22 review R1, finding 2). Its directory-relative effects (the admission and authority
+    # locks, outbox.d, a stale socket's removal, a failed start's own socket) go through the pinned root; the
+    # database's open and the socket's bind stay pathname-based, with the root checked immediately before and
+    # after each (#21 amendment 7). Any other launch pins it inside the section, as before.
+    root = pin_state_root(authority.paths.state, expected) if expected is not None else None
+    try:
+        with authority.pinned_root(root.fd if root is not None else None), authority.start_section() as gate:
+            if expected is None:
+                root = pin_state_root(authority.paths.state, None)
+            record = classify_pinned(root, expected) if root is not None else None
+            binding = launch_binding(record, expected)
+            gate.admit(binding)
+            if root is not None:
+                root.check(authority.paths)  # before anything opens
+            authority.store = BootstrapStore(authority.paths, clock=authority.clock, fs=authority.fs,
+                                             expected=expected, record=record, root=root)
+            try:
+                authority.start()  # its own section, nested: admitted by this one's binding
+                if root is not None:
+                    root.check(authority.paths, "outbox.db")  # after the commit, before the socket
+                if authority.store.bootstrap in ("applied", "replayed"):
+                    log(f"designation bootstrap {authority.store.bootstrap}: operation {record['operation']}, "
+                        f"{len(record['accounts'])} account(s)")
+                if root is not None:
+                    root.check(authority.paths, "outbox.db")  # immediately before the bind
+                authority.bridge_only = not authority.bind()
+                if not authority.bridge_only:
+                    authority.remember_socket()  # its identity in the pinned root, for a failed start's cleanup
+                if root is not None:
+                    root.check(authority.paths, "outbox.db", *(() if authority.bridge_only else ("outbox.sock",)))
+                authority.run_in_thread()
+            except BaseException as err:
+                authority.close()  # inside the start's section and the pinned root: its own entries only
+                if root is not None and not isinstance(err, BootstrapUnknown):
+                    root.check(authority.paths)  # a swap that surfaced as another failure is UNKNOWN too
+                raise
+    finally:
+        if root is not None:
+            root.close()
+    return authority.epoch
+
+
+def bound_start_offered(record):
+    """Whether a held record may admit this launch's authority start (writer
+    admission 6.3): `full`, permitting the bridge's start, for this launch's
+    digest and this bridge's release. Its operation is judged against the
+    bootstrap record inside the start's section; otherwise the bridge stays in
+    its hold without starting anything."""
+    if not record.valid or ACTIVATION is None or record.fields["state"] != "full":
+        return False
+    bound = record.fields["binding"]
+    return delivery_store.BRIDGE_START in bound["permits"] and bound["bootstrap_digest"] == f"sha256:{ACTIVATION}" \
+        and bound["release_id"] == running_release()
+
+
 def ensure_authority():
     """Start this bridge's outbox authority (section 2.4.1), all or nothing: the
-    lock, the database, the socket and the thread. A start that fails at any
-    step leaves nothing open and the lock free, and the next pass starts again
-    from the lock; so does an authority whose thread has died."""
-    global OUTBOX_AUTHORITY
+    lock, the database with the designation bootstrap, the socket and the
+    thread. A start that fails at any step leaves nothing open and the lock
+    free, and the next pass starts again from the lock; so does an authority
+    whose thread has died. An UNKNOWN bootstrap state is not an ordinary
+    failure: nothing is written, not even the status snapshot, and main()
+    neither serves nor recovers until it is resolved."""
+    global OUTBOX_AUTHORITY, BOOTSTRAP_UNKNOWN
     old = OUTBOX_AUTHORITY
     if old is not None and old.running:
         return old
@@ -1994,9 +2579,17 @@ def ensure_authority():
             return old
     authority = delivery_store.Authority(chatlib.STATE_DIR, log=log)
     try:
-        authority.launch()
+        start_authority(authority, ACTIVATION)
+        BOOTSTRAP_UNKNOWN = None
         log(f"outbox authority running, epoch {authority.epoch}")
+    except BootstrapUnknown as err:
+        if str(err) != BOOTSTRAP_UNKNOWN:  # the alert, once per state
+            log(f"ALERT designation bootstrap UNKNOWN: {err}; the authority is not started and nothing was "
+                "changed; clients keep their durable fallback; the activation is not complete")
+        BOOTSTRAP_UNKNOWN = str(err)
+        authority.unavailable = (f"designation bootstrap UNKNOWN: {err}", since or _now())
     except Exception as err:
+        BOOTSTRAP_UNKNOWN = None
         reason = str(err) or type(err).__name__
         since = since or _now()
         authority.unavailable = (reason, since)
@@ -2006,16 +2599,30 @@ def ensure_authority():
     return authority
 
 
-def main():
+def main(argv=None):
+    """The bridge. `argv` is this launch's arguments (the command line passes its own); none means a launch with
+    no arguments."""
+    global ACTIVATION, BOOTSTRAP_UNKNOWN
+    try:
+        ACTIVATION = activation_digest(argv or [])
+    except BootstrapUnknown as err:  # nothing starts: not the authority, not the bridge's recovery
+        log(f"ALERT designation bootstrap UNKNOWN: {err}; the bridge does not start")
+        return 2
     chatlib.STATE_DIR.mkdir(parents=True, exist_ok=True)
     record, deliveries, acks, checkpoints = Record(), Deliveries(), Acks(), Checkpoints()
     coverage = Coverage()
     while True:
         try:
-            if held_record() is not None:  # the hold (4.6): no authority start, no connection, nothing written
+            held = held_record()
+            if held is not None:  # the hold (4.6): no connection, nothing written
+                if bound_start_offered(held):
+                    ensure_authority()  # the operation-owned start under `full` (6.3); it serves read-only status
                 time.sleep(delivery_store.HOLD_RECHECK)
                 continue
             ensure_authority()  # before the first index, coverage change or flush of this connection
+            if BOOTSTRAP_UNKNOWN is not None:  # no serving, import or recovery: checked again later
+                time.sleep(UNKNOWN_RECHECK)
+                continue
             run(chatlib.load_config(), record, deliveries, acks, checkpoints, coverage)
         except Hold:  # a section found maintenance held; run() has closed its connection. Read the record again.
             continue
@@ -2025,4 +2632,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(sys.argv[1:]))

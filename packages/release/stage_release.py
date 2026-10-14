@@ -73,6 +73,9 @@ import drift_check  # noqa: E402
 from build_release import MANIFEST, Refused  # noqa: E402
 
 SPEC_PATH = HERE / "staging.json"
+ACTIVATION_PATH = HERE / "activation.json"
+ACTIVATION_SCHEMA = "plateia-activation-spec/1"
+ACTIVATION_PLAN_SCHEMA = "plateia-activation-plan/1"
 PLAN_SCHEMA = "plateia-stage-plan/1"
 JOURNAL_SCHEMA = "plateia-stage-journal/1"
 STAGED_SCHEMA = "plateia-staged-release/1"
@@ -835,8 +838,11 @@ def listing(folder, problems):
         return []
 
 
-def compatibility(manifest, spec):
-    """(result, check, detail) for each wire and state format the live tools use."""
+def compatibility(manifest, spec, transition=None):
+    """(result, check, detail) for each wire and state format the live tools use.
+    With an admitted `transition` (PLT-14, D-74: only from admission()), the
+    formats it names are checked against it exactly and reported "admitted";
+    every other format keeps the strict check."""
     results = []
     live = {k: v for k, v in spec["live_versions"].items() if k != "note"}
     formats = manifest.get("formats")
@@ -844,6 +850,7 @@ def compatibility(manifest, spec):
                                                 for f in formats):
         return [("refused", "formats", "the manifest's format inventory is malformed")]
     declared = {f["name"]: f for f in formats}
+    changed, added = (transition or {}).get("changed", {}), (transition or {}).get("added", {})
     observed = observed_versions()
     for name, version in sorted(live.items()):
         f = declared.get(name)
@@ -854,6 +861,15 @@ def compatibility(manifest, spec):
         if not isinstance(reads, list) or not all(isinstance(r, str) for r in reads) \
                 or not (writes is None or isinstance(writes, str)) or (not reads and writes is None):
             results.append(("refused", name, "the manifest's read and write versions are malformed"))
+            continue
+        if name in changed:
+            want = changed[name]
+            if version != want["live"] or reads != want["read"] or writes != want["write"]:
+                results.append(("refused", name, f"not the admitted transition: the live tools use {version}, "
+                                                 f"the release reads {', '.join(reads)} and writes {writes}"))
+            else:
+                results.append(("admitted", name, f"{version} -> {writes} (still reads {', '.join(reads)}), "
+                                                  f"by the admitted transition {transition['name']}"))
             continue
         if reads and version not in reads:
             results.append(("refused", name, f"unsupported version: the live tools use {version}; "
@@ -877,12 +893,205 @@ def compatibility(manifest, spec):
             continue
         results.append(("pass", name, f"{version} ({f.get('kind', 'format')})"))
     for name in sorted(set(declared) - set(live)):
+        f, want = declared[name], added.get(name)
+        if want is not None and f.get("kind") == want["kind"] and f.get("read") == want["read"] \
+                and f.get("write") == want["write"]:
+            results.append(("admitted", name, f"new {want['kind']} format {', '.join(want['read'])}, "
+                                              f"by the admitted transition {transition['name']}"))
+            continue
         results.append(("refused", name, f"the manifest declares {name}, which the live tools don't use: "
                                          "no compatibility evidence"))
+    for name in sorted(set(added) - set(declared)):
+        results.append(("refused", name, f"the admitted transition adds {name}, which the release doesn't declare"))
     _, problem = read_field(chat_config(), None)
     results.append(("refused", "chat-config file", f"{shown(chat_config())}: {problem}") if problem
                    else ("pass", "chat-config file", f"{shown(chat_config())} parses (values not read)"))
     return results
+
+
+# --- the one admitted format transition (PLT-14, #21; D-74) ---------------------
+
+FIRST_WRITES = ("outbox-db/1", "outbox/2", "delivery-records/2")
+OUTBOX_DB_FILES = ("outbox.db", "outbox.db-wal", "outbox.db-shm", "outbox.db-journal")
+
+
+def load_activation(path=None):
+    """activation.json: the one admitted transition, the first-write
+    boundaries and D-26's target names. Refused if malformed."""
+    path = Path(path or ACTIVATION_PATH)
+    try:
+        spec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise Refused(f"{shown(path)} can't be read: {e.__class__.__name__}") from None
+    t = spec.get("transition") if isinstance(spec, dict) else None
+    if not isinstance(spec, dict) or spec.get("schema") != ACTIVATION_SCHEMA or not isinstance(t, dict) or not isinstance(t.get("name"), str) \
+            or not isinstance(t.get("changed"), dict) or not isinstance(t.get("added"), dict) \
+            or not isinstance(spec.get("first_writes"), dict) \
+            or sorted(spec["first_writes"]) != sorted(FIRST_WRITES + ("note",)) \
+            or not isinstance(spec.get("bootstrap"), dict) \
+            or not all(isinstance(spec["bootstrap"].get(k), str) for k in ("schema", "file")) \
+            or not isinstance(spec.get("targets"), list) or not all(isinstance(n, str) for n in spec["targets"]):
+        raise Refused(f"{shown(path)} is not an activation spec ({ACTIVATION_SCHEMA})")
+    return spec
+
+
+def first_write_evidence(state=None, expect=None):
+    """{boundary: "absent" | "written: ..." | "unknown: ..."} for D-74's three
+    first-write boundaries, judged from the chat state directory alone: never
+    from a journal, and without opening the outbox database. The directory is
+    read through one pinned descriptor. With `expect` (the realpath, device and
+    inode an activation plan sealed), a root that is missing, replaced or
+    unreadable makes every boundary unknown; anything that can't be read is
+    unknown too, which never counts as absent."""
+    path = os.path.realpath(state or chat_state())
+    if expect is not None and (not isinstance(expect, dict) or expect.get("path") != path):
+        return {b: "unknown: the chat state root is not the activation plan's" for b in FIRST_WRITES}
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        if expect is None:  # no state at all, before any activation: nothing was ever written
+            return {b: "absent" for b in FIRST_WRITES}
+        return {b: "unknown: the chat state root is missing" for b in FIRST_WRITES}
+    except OSError as e:
+        return {b: f"unknown: the chat state root can't be opened ({e.strerror or e})" for b in FIRST_WRITES}
+    try:
+        st = os.fstat(fd)
+        if expect is not None and (st.st_dev, st.st_ino) != (expect.get("dev"), expect.get("ino")):
+            return {b: "unknown: the chat state root was replaced (another device or inode)" for b in FIRST_WRITES}
+        return _first_writes_at(fd)
+    finally:
+        os.close(fd)
+
+
+def _first_writes_at(fd):
+    out = {}
+
+    def exists(name):
+        try:
+            os.stat(name, dir_fd=fd, follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            return False
+    try:
+        found = [n for n in OUTBOX_DB_FILES if exists(n)]
+        out["outbox-db/1"] = f"written: {', '.join(found)} exists" if found else "absent"
+    except OSError as e:
+        out["outbox-db/1"] = f"unknown: {e.strerror or e.__class__.__name__}"
+    try:  # the refusal sink holds outbox/2 files too (writer admission 12; #21 amendment 4)
+        found = [n for n in ("outbox.d", "refused.d") if exists(n)]
+        out["outbox/2"] = f"written: {' and '.join(found)} {'exist' if len(found) > 1 else 'exists'}" if found \
+            else "absent"
+    except OSError as e:
+        out["outbox/2"] = f"unknown: {e.strerror or e.__class__.__name__}"
+    try:
+        dfd = os.open("dead-letters.jsonl", os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=fd)
+    except FileNotFoundError:
+        out["delivery-records/2"] = "absent"
+        return out
+    except OSError as e:
+        out["delivery-records/2"] = f"unknown: dead-letters.jsonl {e.strerror or e.__class__.__name__}"
+        return out
+    try:
+        if not stat.S_ISREG(os.fstat(dfd).st_mode):
+            out["delivery-records/2"] = "unknown: dead-letters.jsonl is not a regular file"
+            return out
+        chunks = []
+        while True:
+            chunk = os.read(dfd, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+    except OSError as e:
+        out["delivery-records/2"] = f"unknown: dead-letters.jsonl {e.strerror or e.__class__.__name__}"
+        return out
+    finally:
+        os.close(dfd)
+    verdict = "absent"
+    for n, raw in enumerate(data.splitlines(), 1):
+        if not raw.strip():
+            continue
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            verdict = f"unknown: dead-letters.jsonl line {n} can't be read"
+            break
+        if not isinstance(row, dict):
+            verdict = f"unknown: dead-letters.jsonl line {n} is not a record"
+            break
+        if "version" in row or "supersedes" in row:
+            verdict = f"written: dead-letters.jsonl line {n} is a versioned record"
+            break
+    out["delivery-records/2"] = verdict
+    return out
+
+
+def state_root_identity(state=None):
+    """The chat state root an activation binds: its realpath, device and inode
+    (None if it can't be read)."""
+    real = os.path.realpath(state or chat_state())
+    try:
+        st = os.stat(real)
+    except OSError:
+        return None
+    return {"path": real, "dev": st.st_dev, "ino": st.st_ino}
+
+
+def state_snapshot(state=None):
+    """What an activation plan binds about the existing state: where it is, the
+    versions it embeds, and D-74's first-write evidence; with its digest."""
+    state = Path(state or chat_state())
+    versions = {name: {"found": sorted(values), "problem": problem}
+                for name, (values, problem) in sorted(observed_versions().items())}
+    snap = {"root": os.path.realpath(state), "versions": versions, "first_writes": first_write_evidence(state)}
+    return dict(snap, digest=digest(snap))
+
+
+def plan_digest(plan):
+    """The digest an activation plan carries over everything else it holds."""
+    return digest({k: v for k, v in plan.items() if k != "digest"})
+
+
+class Admission:
+    """A validated activation plan's admission of the one transition: only
+    admission() makes one."""
+
+    def __init__(self, plan, manifest_sha256, transition):
+        self.operation, self.release = plan["operation"], plan["release"]
+        self.plan_sha256, self.manifest_sha256, self.transition = plan["digest"], manifest_sha256, transition
+
+
+def admission(plan, release, spec_path=None, activation_path=None):
+    """An Admission for `release`, or Refused: the plan must be an activation
+    plan whose digest holds, bound to this release's manifest, to the targets
+    and state snapshot as they are now, to this chat state root, and to
+    activation.json's one transition, exactly. Read-only."""
+    if not isinstance(plan, dict) or plan.get("schema") != ACTIVATION_PLAN_SCHEMA:
+        raise Refused(f"not an activation plan ({ACTIVATION_PLAN_SCHEMA})")
+    if plan.get("digest") != plan_digest(plan):
+        raise Refused("the activation plan was altered after it was made (its digest doesn't match)")
+    spec = load_activation(activation_path)
+    if plan.get("transition") != spec["transition"] \
+            or plan.get("activation_sha256") != drift_check.sha256(Path(activation_path or ACTIVATION_PATH)):
+        raise Refused("the plan's transition is not activation.json's one admitted transition")
+    manifest = build_release.verify(release)
+    sha = drift_check.sha256(Path(release) / MANIFEST)
+    if manifest["release"] != plan.get("release") or sha != plan.get("manifest_sha256"):
+        raise Refused("the activation plan is for another release")
+    if plan.get("state_root") != state_root_identity():
+        raise Refused("the activation plan is for another chat state root (its path, device or inode differ)")
+    now = make_plan(release, None, spec_path)["targets"]
+    names = [t["name"] for t in now]
+    if names != spec["targets"] or [t.get("name") for t in plan.get("targets", [])] != names:
+        raise Refused("the activation plan's targets are not D-26's seven managed targets")
+    changed = [t["name"] for t, old in zip(now, plan["targets"]) if t["digest"] != old.get("digest") or t["problems"]]
+    if changed:
+        raise Refused(f"blocked: {', '.join(changed)} changed since the activation plan was made")
+    snap = state_snapshot()
+    if snap["digest"] != (plan.get("state_snapshot") or {}).get("digest"):
+        raise Refused("blocked: the chat state changed since the activation plan was made "
+                      "(its versions or first-write evidence)")
+    return Admission(plan, sha, spec["transition"])
 
 
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
@@ -910,8 +1119,9 @@ def api_result(manifest):
                               "exists yet to check it against")
 
 
-def preflight(release, python=None, spec_path=None):
-    """{"results": [...], "refused": [...], "interpreter": probe}: read-only."""
+def preflight(release, python=None, spec_path=None, admission=None):
+    """{"results": [...], "refused": [...], "interpreter": probe}: read-only.
+    Strict unless given an `admission` from admission() (PLT-14, D-74)."""
     spec = json.loads(Path(spec_path or SPEC_PATH).read_text(encoding="utf-8"))
     python = str(python or sys.executable)
     results = []
@@ -930,7 +1140,10 @@ def preflight(release, python=None, spec_path=None):
         results.append(interpreter_result(manifest, found, python))
     except Refused as e:
         results.append(("refused", "interpreter", str(e).split(": ", 1)[-1]))
-    results += compatibility(manifest, spec)
+    if admission is not None and admission.manifest_sha256 != drift_check.sha256(Path(release) / MANIFEST):
+        return {"results": results + [("refused", "admission", "the admission is for another release")],
+                "refused": ["admission: the admission is for another release"], "interpreter": found}
+    results += compatibility(manifest, spec, admission.transition if admission is not None else None)
     results.append(api_result(manifest))
     return {"results": [list(r) for r in results],
             "refused": [f"{check}: {detail}" for result, check, detail in results if result == "refused"],
@@ -2113,8 +2326,9 @@ def verify_staged(writer, rel_dir, manifest_sha, manifest, interpreter, inventor
     return found
 
 
-def stage(release, dest, python=None, plan_path=None, spec_path=None, crash=None):
-    """Stage `release` under `dest`; returns (summary, plan, preflight report)."""
+def stage(release, dest, python=None, plan_path=None, spec_path=None, crash=None, admission=None):
+    """Stage `release` under `dest`; returns (summary, plan, preflight report).
+    `admission` (from admission()) admits activation.json's one transition."""
     release = Path(release)
     python = str(python or sys.executable)
     plan = make_plan(release, dest, spec_path)
@@ -2127,7 +2341,9 @@ def stage(release, dest, python=None, plan_path=None, spec_path=None, crash=None
                 raise Refused(f"blocked: {new['name']} changed since the plan was made; nothing was staged")
     if plan["blocked"]:
         raise Refused("blocked: " + "; ".join(plan["blocked"]) + "; nothing was staged")
-    report = preflight(release, python, spec_path)
+    if admission is not None and not isinstance(admission, Admission):
+        raise Refused("an admission must come from stage_release.admission(); nothing was staged")
+    report = preflight(release, python, spec_path, admission)
     if report["refused"]:
         raise Refused("preflight refused: " + "; ".join(report["refused"]) + "; nothing was staged")
     manifest = build_release.verify(release)
@@ -2140,14 +2356,15 @@ def stage(release, dest, python=None, plan_path=None, spec_path=None, crash=None
         check_root_contents(writer)
         journal = Journal(writer, crash)
         try:
-            return run_operation(journal, writer, release, manifest, plan, report, python, spec_path), plan, report
+            return (run_operation(journal, writer, release, manifest, plan, report, python, spec_path, admission),
+                    plan, report)
         finally:
             journal.close()
     finally:
         writer.close()
 
 
-def run_operation(journal, writer, release, manifest, plan, report, python, spec_path):
+def run_operation(journal, writer, release, manifest, plan, report, python, spec_path, admission=None):
     identity = manifest["release"]
     rel_dir = f"{RELEASES}/{identity}"
     release_dir = writer.root / RELEASES / identity
@@ -2165,6 +2382,9 @@ def run_operation(journal, writer, release, manifest, plan, report, python, spec
                "destination": str(writer.root), "release_dir": str(release_dir),
                "interpreter": {k: report["interpreter"][k] for k in ("path", "implementation", "version", "system")},
                "targets": {t["name"]: t["digest"] for t in recheck}}
+    if admission is not None:  # PLT-14: which plan admitted the transition (absent otherwise: unchanged ids)
+        binding["admission"] = {"transition": admission.transition["name"], "plan_sha256": admission.plan_sha256,
+                                "operation": admission.operation}
     op_id = "stage-" + digest(binding)[:16]
     ops = operations(journal.records)
     writer.load(journal.records, op_id)
