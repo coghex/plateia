@@ -2622,6 +2622,30 @@ rollback mode (G-9) stay the owner's undecided gates. The rework also fixes
 PR #22's four remaining review blockers (code review 6112483129). The
 contract is [release_staging.md](release_staging.md#activation-plt-14-21).
 
+### D-76. A stable chat-state root during startup and maintenance
+
+Owner decision, 2026-10-14 (#21 owner amendment 7; its canonical review
+APPROVE). The owner rejected a custom-VFS study and clarified the
+requirement instead.
+
+- **The precondition.** The chat state directory keeps its place and
+  identity through the activated bridge start and every maintenance
+  operation. Cooperating plateia tools never move, replace or restore it
+  then.
+- **What is kept.** Pinned-root identity checks, directory-relative effects
+  wherever the standard library allows, and failing closed on any detected
+  change.
+- **The bound.** A deliberate same-user replacement during one path-based
+  SQLite call or socket bind may land that call's effect before detection.
+  It is excluded, as in [writer_admission.md](writer_admission.md) section
+  13 and D-71.
+- **What is ruled out.** No working-directory change, custom SQLite VFS, new
+  dependency, or permission or security setting.
+
+The same review kept the merged #29 declaration pin
+(`UNCHANGED_DECLARATIVE = d58c3a44…`, which covers `chat-config`'s `covers`
+text), with `designation-bootstrap` excluded and marker-covered.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?

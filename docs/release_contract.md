@@ -149,12 +149,18 @@ they don't refresh the source's index.
 
 The manifest has no API version; the shared API slice (PLT-10) adds one.
 
-**The declaration pin.** `test_build.py`'s digest of the declarations #19
-leaves unchanged stays `f2895cb0…`. PLT-14 (#21) adds only
-`designation-bootstrap` to the format names that digest excludes, and one
-marker row, `designation-bootstrap/1`, for a format the shipped code reads
-and never writes; with #24's `maintenance` (below) the excluded names cover
-both, and the pin is unchanged. The builder and its privacy scan are
+**The declaration pin.** `test_build.py` keeps a digest of the declarations
+that #19 leaves unchanged.
+- **Today's value:** `d58c3a44…`. That is the merged #29 baseline, which
+  covers `chat-config`'s `covers` text naming the optional `owner_accounts`
+  key. It replaces the earlier `f2895cb0…`.
+- **#21's additions:** PLT-14 (#21) adds only `designation-bootstrap` to the
+  format names that digest excludes, plus one marker row,
+  `designation-bootstrap/1`, for a format the shipped code reads and never
+  writes. The excluded names also cover #24's `maintenance` (below) and
+  #27's `request-line`.
+- **What is not done:** `chat-config` is never excluded, and the pin is
+  never weakened (#21 amendment 7's review). The builder and its privacy scan are
 unchanged. Staging's
 default compatibility check still refuses the release; only an activation
 plan's admission admits its format delta

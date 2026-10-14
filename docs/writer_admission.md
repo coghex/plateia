@@ -1063,6 +1063,26 @@ target by hand during the window, writing the state with tools built to
 bypass the protocol, or breaking another process's flock are outside it.
 Nothing else is excluded.
 
+**A stable state root (#21 owner amendment 7, 2026-10-14).** The chat state
+directory keeps its place and identity for the whole activated bridge start
+and every maintenance operation. Cooperating plateia tools never move,
+replace or restore it then; this concerns the directory on disk, not any
+working directory, and no code changes directory to satisfy it.
+
+- **Pinned:** the validated root is pinned by descriptor, identity and
+  realpath. Effects the standard library can make directory-relative go
+  through that descriptor: the authority lock, `outbox.d`, and removal of a
+  stale socket, only when it is a socket of matching identity.
+- **Fails closed:** any detected change of the root is UNKNOWN for the
+  bridge start, with nothing committed, and refused by the activation.
+- **Bounded:** SQLite (its database and its `-wal`, `-shm` and `-journal`
+  sidecars) and a socket bind act by pathname text. So a deliberate
+  replacement of the directory **during** one such call may land that call's
+  file effect in the replacement before the next check detects it. That is
+  the deliberate same-user tampering excluded above, as D-71 already
+  excludes it for path-based staging steps. No lock or check is claimed to
+  prevent an arbitrary rename by a process of this user.
+
 ## 14. Blocking gates
 
 These block #21's live cutover. None blocks this design's completion.
