@@ -42,7 +42,7 @@ concrete precondition
 
 - [#26] EPIC. Collaboration foundations (umbrella: #26; no new epic)
 - [#27] COLLAB-1. Reconcile the generic request form with `card-move/v1`
-- [ ] COLLAB-2. Record requests and claims durably in the bridge's authority
+- [#32] COLLAB-2. Record requests and claims durably in the bridge's authority
 - [ ] COLLAB-3. Correlate results, stops and blockers, and bound the return
 - [ ] COLLAB-4. Enforce message budgets with reserved slots
 - [ ] COLLAB-5. Verify the foundations in one bounded, isolated live trial
@@ -445,8 +445,10 @@ fenced state.
 
 **Refinement (owner, the same day).** They live in a separate SQLite file in
 the chat state directory, `requests.db` (format `request-store/1`). It is
-opened only by the authority while it holds the authority lock, and is fenced
-by its `authority_epoch`. `outbox.db` stays `outbox-db/1`, so #21's tested
+opened only by the authority while it holds the authority lock, which guards
+the file. Claims are fenced by each key's own generation and fence token, and
+`authority_epoch` is recorded beside them for audit only (#32's owner
+amendment 1). `outbox.db` stays `outbox-db/1`, so #21's tested
 cutover is unchanged. The new format is live only after its own, later
 activation.
 
@@ -484,6 +486,33 @@ use one readable line in the existing `[request <request-id>]` convention, like
 **Owner decision** (2026-10-14; it answers Q-6's one owner choice). The
 request-scoped delegation record refers to the existing manager policy as it
 stands, not to a versioned copy. No new confirmation is needed.
+
+### D-15. COLLAB-2's actor, recovery and failure rules
+
+**Owner decisions** (2026-10-14, #32's owner amendments 1 and 2).
+- **Actors.** The registrant binds the decision-maker (in the chat account
+  form), the permitted claimants and any named successors at registration,
+  beside the room.
+  - Claims, starts and reconciliations carry a declared agent ID. This is
+    cooperative, and guards against mistakes, not deliberate same-user
+    tampering (writer_admission section 13).
+  - Acceptance must cite a server-verified chat post by the decision-maker
+    that names the request ID as a whole token. It is checked read-only
+    against `outbox.db`'s messages table.
+  - Only keys whose recorded `request_v1` verdict is verified can be
+    accepted, claimed or started.
+- **Recovery.** Each key has its own generation and fence token, so claims
+  survive a restart.
+  - An unstarted claim resumes with its token. A started key with no outcome
+    stays `unknown`.
+  - `reconcile`, by the claimant or the decision-maker with an evidence
+    reference, is fenced to the generation it reconciles:
+    - `no_effect` makes the key claimable at the next generation;
+    - `effect` closes it as `reconciled`.
+- **Failure.** A foreign, corrupt or unreadable `requests.db` under an
+  unchanged, verified root refuses only the request operations; the bridge
+  runs, and the file is preserved. A detected change of the shared state
+  root fails the whole bridge start closed (#21 amendment 7).
 
 ### D-14. The default message cap is 4 per request, replies included
 
