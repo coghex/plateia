@@ -135,9 +135,12 @@ class LiveOps:
                 return {"running": False, "release": None}
             return {"running": None, "release": None, "unknown": f"launchctl print exited {out.returncode}"}
         running = re.search(r"^\s*state = running\s*$", out.stdout, re.M) is not None
-        program = re.search(r"^\s*program = (\S+)\s*$", out.stdout, re.M)
-        found = re.search(r"/releases/([^/]+)/env/bin/chat-bridge$", program.group(1)) if program else None
-        return {"running": running, "release": found.group(1) if found else "skills-tree"}
+        # the complete program value, to the end of its line: a release or state path may hold spaces
+        # (PR #22 review 3/4); only the line's own end is taken off
+        program = re.search(r"^[ \t]*program = (.+)$", out.stdout, re.M)
+        program = program.group(1).rstrip("\r") if program else None
+        found = re.search(r"/releases/([^/]+)/env/bin/chat-bridge$", program) if program else None
+        return {"running": running, "release": found.group(1) if found else "skills-tree", "program": program}
 
     EVIDENCE_MAX_AGE = 900  # seconds: older checkpoint evidence is stale, and so unknown
 
@@ -194,8 +197,10 @@ def bridge_verdict(ops, plan):
                       "nothing was changed")
     if not bridge["running"]:
         return "stopped"
-    if bridge.get("release") == plan["release"]:
-        return "expected"
+    program = bridge.get("program")
+    expected = str(Path(plan["staged_release"]) / "env" / "bin" / "chat-bridge")
+    if bridge.get("release") == plan["release"] and (program is None or program == expected):
+        return "expected"  # with the service's program read, exactly this operation's staged command
     raise Refused(f"blocked: a chat bridge ({bridge.get('release') or 'unknown release'}) is running that is not "
                   "this operation's; nothing was changed")
 

@@ -1024,5 +1024,43 @@ class ReviewTwoOfFourTests(AdmissionCase):
         self.assertFalse((self.state / "maintenance.json").exists())
 
 
+
+class ReviewThreeOfFourTests(AdmissionCase):
+    """PR #22 review 3/4 (6160877810): a staging destination whose path holds a space. The service's status
+    (launchctl print, parsed by LiveOps itself) names the bound bridge's program in full, spaces kept, and the
+    expected running bridge is recognised: activation reaches full, and postcheck and release accept it."""
+
+    def live_bridge(self, program):
+        """The bridge's state as LiveOps reads it from an invented `launchctl print` answer."""
+        answer = mock.Mock(returncode=0, stderr="", stdout=(
+            "gui/501/com.coghex.chat-bridge = {\n\tactive count = 1\n\tstate = running\n\n"
+            f"\tprogram = {program}\n\targuments = {{\n\t\t{program}\n\t}}\n}}\n"))
+        with mock.patch.object(activate_release.subprocess, "run", return_value=answer):
+            return activate_release.LiveOps().bridge_state()
+
+    def test_a_staging_destination_with_a_space_is_recognised_through_full_postcheck_and_release(self):
+        self.dest = self.where / "Release Store"
+        plan, path = self.bound()
+        program = str(Path(plan["staged_release"]) / "env" / "bin" / "chat-bridge")
+        self.assertIn(" ", program)
+        state = self.live_bridge(program)
+        self.assertEqual((state["running"], state["release"]), (True, plan["release"]), state)
+        self.ops.reboot()
+        self.ops.bridge_state = lambda: self.live_bridge(program)  # the bound bridge, running, as launchctl says
+        self.assertEqual(self.run_activate(path)["maintenance"]["state"], "full")
+        self.serving()
+        report = self.postcheck(path)
+        self.assertEqual(report["bridge"], "expected")
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(self.do_release(path)["state"], "released")
+
+    def test_another_program_of_the_same_release_name_is_not_this_operations_bridge(self):
+        plan, path = self.bound()
+        other = f"/invented/other-store/releases/{plan['release']}/env/bin/chat-bridge"  # another store's copy
+        self.ops.bridge_state = lambda: self.live_bridge(other)
+        with self.assertRaisesRegex(Refused, "not this operation's"):
+            activate_release.bridge_verdict(self.ops, plan)
+
+
 if __name__ == "__main__":
     unittest.main()
