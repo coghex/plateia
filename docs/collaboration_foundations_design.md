@@ -397,7 +397,8 @@ Enforcement inside agents does not exist, and this design does not claim it.
 
 D-1 to D-6 are **proposals, not ratified owner decisions**. The owner's
 2026-10-13 decision authorized the design only. D-7 records what the owner
-confirmed later that day.
+confirmed later that day. D-8 to D-14 record the owner's answers to the open
+questions on 2026-10-14.
 
 ### D-1. The request ID and the message ID are different things
 
@@ -436,9 +437,58 @@ assistant has the same authority from any client. The owner agrees with a
 request format and validation. How the delegation is represented and checked
 (section 2) is still a proposal.
 
+### D-8. Requests and claims live in the outbox authority's database
+
+**Owner decision** (2026-10-14; it answers Q-1). The request and claim records
+live in the bridge's outbox authority database (#19, #24), which already holds
+fenced state. There is no separate store.
+
+### D-9. A request's return bound
+
+**Owner decision** (2026-10-14; it answers Q-2's structure). The requester sets
+a request's return bound, up to a project maximum. A project default applies
+when the requester sets none. The default and the maximum are still open
+(Q-2).
+
+### D-10. Nothing in the request store is compacted for now
+
+**Owner decision** (2026-10-14; it answers Q-3). Like V-2's chat archive,
+request records, results and tombstones are kept and not compacted. Revisit
+this only if size becomes a real problem.
+
+### D-11. Claim checks: plateia's own components first
+
+**Owner decision** (2026-10-14; it answers Q-4).
+- **Now:** plateia's own components check the claim before their side
+  effects.
+- **Later:** agents and their tools adopt the check through kanban's skills.
+- **Until then:** each participant that does not check the claim is listed
+  as not covered by the single-execution guarantee. COLLAB-2's done condition
+  covers plateia's own components.
+
+### D-12. Generic requests use the readable one-line form
+
+**Owner decision** (2026-10-13, through #27; it answers Q-5). Generic requests
+use one readable line in the existing `[request <request-id>]` convention, like
+`card-move/v1`. COLLAB-1 implements it (#27, PR #28).
+
+### D-13. The delegation record names the existing manager policy as it stands
+
+**Owner decision** (2026-10-14; it answers Q-6's one owner choice). The
+request-scoped delegation record refers to the existing manager policy as it
+stands, not to a versioned copy. No new confirmation is needed.
+
+### D-14. The default message cap is 4 per request, replies included
+
+**Owner decision** (2026-10-14; it answers Q-7). Each request's default cap is
+4 messages, counting replies (the corrected trial's cap). Only the owner may
+raise it, per request.
+
 ## Open questions
 
 ### Q-1. Where does the request record live?
+
+**Decided** (2026-10-14): see D-8.
 
 The outbox authority's database (#19, #24) is the natural home: it already
 holds fenced state. The alternative is a separate store. This decides
@@ -446,10 +496,14 @@ COLLAB-2's scope; it is the owner's decision.
 
 ### Q-2. What is the default return bound, and who may extend it?
 
+**Partly decided** (2026-10-14): D-9 settles the structure. **Still open:** the project default and the maximum, before COLLAB-3.
+
 It affects COLLAB-3. The known options are a per-request bound set by the
 requester, or a project default.
 
 ### Q-3. What may be compacted in the request store?
+
+**Decided** (2026-10-14): see D-10.
 
 V-2's chat archive is never deleted or compacted, and tombstones are kept
 forever. Whether and when the request store's execution payloads may be
@@ -457,6 +511,8 @@ compacted is a privacy and size trade-off for the owner. It affects
 COLLAB-3.
 
 ### Q-4. Which participants must check the claim before acting, and when?
+
+**Decided** (2026-10-14): see D-11.
 
 This is a **rollout gate**, not a note. Until a participant's adapter checks
 the claim before its side effects, the single-execution guarantee does not
@@ -466,12 +522,16 @@ done condition.
 
 ### Q-5. Which form do generic requests use?
 
+**Decided** (2026-10-13): see D-12.
+
 The options are a readable one-line command like `card-move/v1`, IRCv3
 client tags like the clarification inbox, or both with a mapping. Any
 incompatibility with approved `card-move/v1` (D-8, D-33, D-37) is an owner
 decision. It gates COLLAB-1.
 
 ### Q-6. How is relayed owner authority checked by machine?
+
+**Decided** (2026-10-14): see D-13 for the owner's one choice. The engineering below is the proposal it builds on.
 
 The owner's intent is settled: authority is device-neutral, and relayed
 through a verified assistant under the existing grant (D-7). What is open
@@ -492,6 +552,8 @@ is engineering, and it applies to every client.
 It affects COLLAB-1.
 
 ### Q-7. What are the default caps, and who sets them?
+
+**Decided** (2026-10-14): see D-14.
 
 The design fixes enforcement, not amounts. It affects COLLAB-4.
 
