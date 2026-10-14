@@ -1371,6 +1371,76 @@ class BootstrapWalEvidenceTests(BootstrapCase):
         self.assertEqual(self.files(self.state), before, "outbox.db and its -wal are byte-identical and present")
 
 
+class BootstrapEvidenceRuleTests(BootstrapCase):
+    """PR #22 review 2/4 (6160273780): a database is new only when none of outbox.db, -wal, -shm and -journal
+    exists, or an empty outbox.db has no sidecar; any other evidence is UNKNOWN, nothing is created and every byte
+    is kept. And the disposable copy proves the start would succeed before the original is opened for writing."""
+
+    files = BootstrapWalEvidenceTests.files
+    crashed_snapshot = BootstrapWalEvidenceTests.crashed_snapshot
+
+    def test_every_sidecar_without_a_non_empty_database_is_unknown_and_kept(self):
+        for db in ("absent", "empty"):
+            for sidecar in ("-wal", "-shm", "-journal"):
+                with self.subTest(db=db, sidecar=sidecar):
+                    self.stop()
+                    self.wipe_database()
+                    for name in ("outbox.db", "outbox.db-wal", "outbox.db-shm", "outbox.db-journal"):
+                        (self.state / name).unlink(missing_ok=True)
+                    self.bridge.BOOTSTRAP_UNKNOWN = None
+                    d = self.publish(self.record(["alp-solver-2"]))
+                    if db == "empty":
+                        (self.state / "outbox.db").write_bytes(b"")
+                    (self.state / f"outbox.db{sidecar}").write_bytes(b"an invented sidecar's bytes\n")
+                    before = self.files(self.state)
+                    authority = self.launch(d)
+                    self.assertFalse(authority.running)
+                    self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+                    self.stop()
+                    self.assertEqual(self.files(self.state), before, "nothing created, every byte kept")
+
+    def test_an_orphaned_wal_of_a_crashed_authority_is_unknown_and_kept(self):
+        d = self.publish(self.record(["alp-solver-2"]))
+
+        def write():
+            with mock.patch.object(self.ds.Authority, "run_in_thread", lambda a: None):
+                authority = self.launch(d)  # S2, committed
+            con = authority.store.con
+            con.execute("PRAGMA wal_autocheckpoint=0")
+            with authority.store.tx():  # a committed suspension, still only in the WAL
+                con.execute("UPDATE accounts SET suspended_at = 1, suspended_why = 'invented' "
+                            "WHERE account = 'alp-solver-2'")
+            return self.stop
+        self.crashed_snapshot(write)
+        (self.state / "outbox.db").unlink()  # the database is gone; its WAL is kept
+        before = self.files(self.state)
+        authority = self.launch(d)
+        self.assertFalse(authority.running)
+        self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+        self.stop()
+        self.assertFalse((self.state / "outbox.db").exists(), "no database created")
+        self.assertEqual(self.files(self.state), before, "the WAL, with its committed suspension, is kept")
+
+    def test_a_database_missing_a_required_table_is_unknown_and_kept(self):
+        d = self.publish(self.record(["alp-solver-2"]))
+
+        def write():
+            con = sqlite3.connect(self.state / "outbox.db", isolation_level=None)
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA wal_autocheckpoint=0")
+            con.execute("CREATE TABLE meta (name TEXT PRIMARY KEY, value TEXT)")
+            con.executemany("INSERT INTO meta VALUES (?, ?)", [
+                ("schema", self.ds.DB_FORMAT), ("writer_model", self.ds.WRITER_MODEL), ("authority_epoch", "1")])
+            return con.close
+        self.crashed_snapshot(write)
+        before = self.files(self.state)
+        authority = self.launch(d)
+        self.assertFalse(authority.running)
+        self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+        self.stop()
+        self.assertEqual(self.files(self.state), before, "outbox.db and its -wal are byte-identical and present")
+
+
 class BootstrapOuterLockTests(BootstrapCase):
     """Review R1, finding 2: the activated start's outer section opens its admission lock through the pinned
     root, so a swap just before the first lock opening leaves nothing in the replacement and fails closed."""

@@ -698,6 +698,7 @@ class Journal:
     def __init__(self, root, crash=None):
         self.root, self.crash = Path(root), crash
         self.root_fd = self.lock_fd = self.fd = None
+        self.adopted = []
         try:
             make_durable_dirs(self.root)
             self.root_fd = open_dir(self.root, what="the activation root")
@@ -774,7 +775,16 @@ class Journal:
         if self.crash is not None and getattr(self.crash, "points", False):
             self.crash({"kind": f"maint-point:{name}"})
 
+    def adopt(self, fd):
+        """A descriptor this command holds, closed with the journal."""
+        self.adopted.append(fd)
+        return fd
+
     def close(self):
+        for fd in getattr(self, "adopted", []):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        self.adopted = []
         for fd in (self.fd, self.lock_fd, self.root_fd):
             if fd is not None:
                 with contextlib.suppress(OSError):
@@ -1032,9 +1042,12 @@ def maintenance(journal, plan, ops, full_check=None, records=None):
     store = load_release_module(plan, "delivery_store")
     fence = OwnerFence(journal, plan, full_check, records)
     clock = getattr(ops, "clock", None)  # tests: a fake clock bounds the drain's waits
+    # The admission lock is made and opened only in the sealed root, through its descriptor, held for this
+    # command (PR #22 review 2/4); a read-only use mutates nothing and takes none.
+    sealed = journal.adopt(open_state_root(plan)) if journal is not None else None
     owner = store.Owner(store.Paths(plan["state_root"]["path"]), operation=plan["operation"], kind=MAINT_KIND,
                         plan_sha256=plan["digest"], fence=fence, probes=ControllerProbes(ops, store),
-                        fs=SealedRootFS(store.FS_DEFAULT, plan, fence, store),
+                        fs=SealedRootFS(store.FS_DEFAULT, plan, fence, store), root_fd=sealed,
                         **({"mono": clock.mono, "sleep": clock.advance} if clock is not None else {}))
     if journal is not None:
         owner.point = journal.point

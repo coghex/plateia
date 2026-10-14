@@ -1003,5 +1003,26 @@ class ExtensionTwoTests(AdmissionCase):
                 self.assertNotIn("full", self.kinds())
 
 
+
+class ReviewTwoOfFourTests(AdmissionCase):
+    """PR #22 review 2/4 (6160273780), the controller's finding: Owner's admission lock goes through the sealed
+    root too."""
+
+    def test_a_root_swapped_at_the_create_lock_intent_makes_no_lock_in_the_replacement(self):
+        plan, path = self.prepared()
+        moved = self.state.with_name("chat-moved")
+
+        def swap(record):
+            if record["kind"] == "maint-intent" and record["step"].get("step") == "create-lock" \
+                    and not moved.exists():
+                self.state.rename(moved)
+                self.state.mkdir()
+        with self.assertRaises(Refused):
+            self.run_activate(path, crash=swap)
+        self.assertTrue(moved.exists())
+        self.assertFalse((self.state / "admission.lock").exists(), "no admission.lock in the replacement")
+        self.assertFalse((self.state / "maintenance.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1022,9 +1022,10 @@ class Owner:
     are bound, stays with the caller: it does so in its own `verify` before it permits `full`."""
 
     def __init__(self, paths, *, operation, kind, plan_sha256, fence, fs=None, probes=None, clock=time.time,
-                 mono=time.monotonic, sleep=time.sleep):
+                 mono=time.monotonic, sleep=time.sleep, root_fd=None):
         self.paths, self.operation, self.kind, self.plan = paths, operation, kind, plan_sha256
         self.fence, self.fs = fence, fs or FS_DEFAULT
+        self.root_fd = root_fd  # the sealed state root's descriptor: the admission lock is made and opened there
         self.probes = probes
         self.clock, self.mono, self.sleep = clock, mono, sleep
         self.failed = None  # why the fence failed: nothing further is mutated
@@ -1213,7 +1214,7 @@ class Owner:
         self._settle()
 
         def effect(progress):
-            fd = _open_admission_lock(self.paths, self.fs)
+            fd = _open_admission_lock(self.paths, self.fs, self.root_fd)
             os.close(fd)
             return {"landed": True}
         return self._fenced(self._step("create-lock"), effect)
@@ -1261,7 +1262,7 @@ class Owner:
     @contextlib.contextmanager
     def _exclusive(self, wait):
         """L_adm exclusive, without blocking, every ADMIT_POLL until `wait`. Yields (held, tries)."""
-        fd = _open_admission_lock(self.paths, self.fs)
+        fd = _open_admission_lock(self.paths, self.fs, self.root_fd)
         try:
             end, tries, held = self.mono() + wait, 0, False
             while True:
