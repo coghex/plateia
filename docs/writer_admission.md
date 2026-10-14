@@ -1099,11 +1099,12 @@ These block #21's live cutover. None blocks this design's completion.
 | **G-8. Source recheck** | Before the cutover, the inventory and citations are rechecked against PR #22's final head and master's chat package, if either moved (section 1). | No |
 | **G-9. Rollback mode** | The owner chooses report-only or automatic rollback (section 12). | **Yes** |
 
-**Gate status, 2026-10-13.** G-3 is approved (#21's owner amendment 4 and its
-APPROVE; D-75) and implemented in PR #22, which is not yet merged. G-4 is
-closed (#24). G-5: the chat package's part is merged (#24, pull request #25);
-#21's part is PR #22, pending its review and merge. G-1, G-2, G-6, G-7, G-8 and
-G-9 stay open, and #21's live cutover stays blocked until they close.
+**Gate status, 2026-10-14.**
+- **Closed:**
+  - G-3 is approved (#21's owner amendment 4 and its APPROVE; D-75), and is implemented in PR #22, merged as `c1e2348`;
+  - G-4 is closed (#24);
+  - G-5 is closed: the chat package's part is merged (#24, pull request #25), and #21's part is merged (PR #22, `c1e2348`, with owner amendment 7).
+- **Still open:** G-1, G-2, G-6, G-7, G-8 and G-9. Nothing is installed or activated, and #21's live cutover stays blocked until they close.
 
 ## 15. Test designs (invented fixtures)
 
