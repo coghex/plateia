@@ -425,11 +425,11 @@ def subdir(base_fd, parts, create=False):
     try:
         for part in parts:
             if create:
-                try:
+                with contextlib.suppress(FileExistsError):
                     os.mkdir(part, 0o700, dir_fd=fd)
-                    os.fsync(fd)  # the new entry is durable before anything is put in it (PR #22 review 4)
-                except FileExistsError:
-                    pass
+                # The entry is durable before anything is put in it (PR #22 review 4), even when it already
+                # existed: an interrupted earlier run may have made it without syncing (extension review 1).
+                os.fsync(fd)
             nxt = os.open(part, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = nxt
@@ -666,19 +666,24 @@ def parse_journal(data):
 
 
 def make_durable_dirs(path):
-    """Create each missing level of `path` (0700), syncing its parent after each new entry, so a power loss
-    can't keep what depends on a directory while losing its name (PR #22 review 4, finding 1)."""
+    """Create each missing level of `path` (0700) and sync each level's parent, so a power loss can't keep what
+    depends on a directory while losing its name (PR #22 review 4, finding 1). Every level's parent is synced
+    even when the level already exists: an interrupted earlier run may have made it without syncing (extension
+    review 1, finding 1)."""
     path = Path(os.path.abspath(path))
-    missing = []
-    while not os.path.lexists(path):
-        missing.append(path)
-        path = path.parent
-    for p in reversed(missing):
+    levels = [path, *path.parents][:-1]  # every level but the file system's root
+    for p in reversed(levels):
+        made = False
+        if not os.path.lexists(p):
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(p, 0o700)
+                made = True
         try:
-            os.mkdir(p, 0o700)
-        except FileExistsError:
-            continue
-        fsync_dir(str(p.parent))
+            fsync_dir(str(p.parent))
+        except OSError:
+            if made or p == path:
+                raise
+            # an ancestor that existed before, which this user may not be able to sync: not one it made
 
 
 class Journal:
@@ -700,27 +705,20 @@ class Journal:
             if st.st_uid != os.getuid() or st.st_mode & 0o022:
                 raise Refused("blocked: the activation root is not this user's own, or others can write it")
             self.ident = ident(st)
-            new = [name for name in (LOCK, JOURNAL) if not self._exists(name)]
             self.lock_fd = self._file(LOCK, os.O_RDWR | os.O_CREAT)
             try:
                 fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise Refused("blocked: another activation holds the journal lock; nothing was changed") from None
             self.fd = self._file(JOURNAL, os.O_RDWR | os.O_CREAT | os.O_APPEND)
-            if new:
-                fsync_dir(self.root_fd)  # the new lock and journal names, before the first record depends on them
+            # the lock and journal names, before the first record depends on them; always, since an interrupted
+            # earlier run may have made them without syncing (extension review 1, finding 1)
+            fsync_dir(self.root_fd)
             self.check_fence()
             self.records = self._load()
         except BaseException:
             self.close()
             raise
-
-    def _exists(self, name):
-        try:
-            os.stat(name, dir_fd=self.root_fd, follow_symlinks=False)
-            return True
-        except FileNotFoundError:
-            return False
 
     def _file(self, name, flags):
         try:
@@ -1170,6 +1168,10 @@ def full_problems(journal, plan, ops, store, probes, layout, paths, d):
         problems.append(f"{RETIREMENT}: the boot has not changed since the targets were bound, so a legacy writer "
                         "may still run (the owner's reboot, gate G-1)")
     problems += inhibition_problems(ops.inhibition() if hasattr(ops, "inhibition") else None)
+    try:  # the retained precondition holds when full is written, not only when binding began (extension review 1)
+        check_producers(ops, plan)
+    except Refused as e:
+        problems.append(f"designated producers: {e}")
     mine = operation_state(journal.records, plan["operation"])
     problems += targets_problems(journal.root_fd, mine, paths, layout, d)
     problems += seal_problems(journal, plan)

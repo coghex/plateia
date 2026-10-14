@@ -700,7 +700,10 @@ class ReviewTwoTests(AdmissionCase):
                 else:
                     plan, path = self.bound()
                     match = lambda data: data == original  # noqa: E731
-                patch, done = self.at_temporary(match, lambda: open(self.chatlib(), "ab").write(edit))
+                def append_edit():
+                    with open(self.chatlib(), "ab") as f:
+                        f.write(edit)
+                patch, done = self.at_temporary(match, append_edit)
                 with patch, self.assertRaisesRegex(Refused, "changed just before it was written"):
                     self.run_activate(path) if phase == "binding" else self.rollback(path)
                 self.assertTrue(done)
@@ -936,6 +939,68 @@ class ExtensionOneTests(AdmissionCase):
             if not any(events[j] == ("fsync", parent) for j in range(i + 1, nxt)):
                 unsynced.append(f"{where}/{name}")
         self.assertEqual(unsynced, [], "each new entry's parent is synced before the next journal record")
+
+
+
+class ExtensionTwoTests(AdmissionCase):
+    """PR #22 extension review 1 (6158798456), the controller's two findings, reproduced at 13e9194 first."""
+
+    trace = ExtensionOneTests.trace
+
+    def traced(self, path):
+        events, patches = self.trace()
+        for p in patches:
+            p.start()
+        try:
+            return self.run_activate(path), events
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    @staticmethod
+    def ident(path):
+        st = os.stat(path)
+        return st.st_dev, st.st_ino
+
+    def synced_before(self, events, parent, kind):
+        """Whether `parent` was synced before the first journal record of `kind`."""
+        end = next((i for i, e in enumerate(events) if e == ("append", kind)), len(events))
+        return ("fsync", parent) in events[:end]
+
+    # 1. An entry left by an interrupted creation is synced before what depends on it, even though it exists.
+    def test_an_activation_root_left_unsynced_is_synced_before_the_first_record(self):
+        plan, path = self.prepared()
+        os.mkdir(self.root, 0o700)  # an earlier run made it and died before syncing its parent
+        result, events = self.traced(path)
+        self.assertEqual(result["state"], "selected")
+        first = next(e[1] for e in events if e[0] == "append")
+        self.assertTrue(self.synced_before(events, self.ident(self.root.parent), first),
+                        "the root's parent is synced before the first journal record")
+
+    def test_backup_directories_left_unsynced_are_synced_before_their_backup_record(self):
+        plan, path = self.prepared()
+        leaf = self.root / "backups" / plan["operation"] / "pchat"
+        os.makedirs(leaf, 0o700)  # an earlier run made them and died before syncing their parents
+        result, events = self.traced(path)
+        self.assertEqual(result["state"], "selected")
+        for parent in (self.root, self.root / "backups", self.root / "backups" / plan["operation"]):
+            with self.subTest(parent=parent.name):
+                self.assertTrue(self.synced_before(events, self.ident(parent), "backup"),
+                                f"{parent.name} is synced before the first backup record")
+
+    # 4. The producers precondition holds when full is written, not only when binding began.
+    def test_full_needs_every_designated_account_still_tracked(self):
+        for case, producers in (("no producer evidence", None),
+                                ("an untracked designated account", {"alp-solver-2": "tracked", "sam": "untracked"})):
+            with self.subTest(case=case):
+                self.fresh()
+                plan, path = self.bound()
+                self.ops.producer_map = producers
+                self.ops.reboot()
+                refused = self.run_activate(path)["maintenance"]
+                self.assertIn("producer", refused.get("refused", ""))
+                self.assertEqual(self.maintenance()["state"], "partial")
+                self.assertNotIn("full", self.kinds())
 
 
 if __name__ == "__main__":

@@ -2119,13 +2119,6 @@ class PinnedRoot:
             return None
         return st.st_dev, st.st_ino, st.st_ctime_ns
 
-    def remove_own(self, name, own):
-        """Remove `name` from the pinned root only if it is still exactly `own` (this start's entry); anything
-        else, here or at the state path, is never touched."""
-        if own is not None and self.entry(name) == own:
-            with contextlib.suppress(OSError):
-                os.unlink(name, dir_fd=self.fd)
-
     def identity_of(self, name):
         """The (device, inode) of an entry inside the pinned root, never followed; BootstrapUnknown if it can't
         be read."""
@@ -2241,7 +2234,7 @@ class BootstrapStore(delivery_store.Store):
         self.m_absent = False  # for a launch with no activation: M's absence established (S1 so far)
 
     def preflight(self):
-        """For an activated launch, an existing outbox.db is classified before the authority opens it, read-only
+        """An existing outbox.db is classified before the authority opens it, read-only
         through the pinned root, so that nothing (not SQLite's journal-mode change, nor a sidecar) is created,
         changed or removed for a database that is not this authority's (PR #22 review 4, finding 3). This
         authority's database is always a SQLite database in WAL mode (header bytes 18 and 19 are 2) and never
@@ -2289,8 +2282,11 @@ class BootstrapStore(delivery_store.Store):
         ordinary failure (code review 6112483129, finding 3). Nothing was
         committed: Store.open is all or nothing."""
         existed = os.path.lexists(self.paths.db)
-        if self.record is not None and self.root is not None:
-            self.preflight()  # before anything can change the database's journal mode or its sidecars
+        if self.root is not None:
+            # before anything can change the database's journal mode or its sidecars, for every launch while S1
+            # is unproven, a launch with no digest included (PR #22 extension review 1, finding 3)
+            self.preflight()
+            self.root.check(self.paths)  # immediately before the pathname-based open (#21 amendment 7)
         try:
             super().open()
         except BootstrapUnknown:
@@ -2390,40 +2386,39 @@ def start_authority(authority, expected=None):
     opened, committed or bound."""
     with authority.start_section() as gate:
         record, root = classify_launch(authority.paths.state, expected)
-        sock = None
         try:
-            binding = launch_binding(record, expected)
-            gate.admit(binding)
-            if root is not None:
-                root.check(authority.paths)  # before anything opens
-            authority.store = BootstrapStore(authority.paths, clock=authority.clock, fs=authority.fs,
-                                             expected=expected, record=record, root=root)
-            try:
-                authority.start()  # its own section, nested: admitted by this one's binding
+            # An activated start's directory-relative effects (the authority lock, outbox.d, a stale socket's
+            # removal, a failed start's own socket) go through the pinned root; the database's open and the
+            # socket's bind stay pathname-based, with the root checked immediately before and after each
+            # (#21 amendment 7).
+            with authority.pinned_root(root.fd if expected is not None and root is not None else None):
+                binding = launch_binding(record, expected)
+                gate.admit(binding)
                 if root is not None:
-                    root.check(authority.paths, "outbox.db")  # after the commit, before the socket
-                if authority.store.bootstrap in ("applied", "replayed"):
-                    log(f"designation bootstrap {authority.store.bootstrap}: operation {record['operation']}, "
-                        f"{len(record['accounts'])} account(s)")
-                authority.bridge_only = not authority.bind()
-                if expected is not None and root is not None and not authority.bridge_only:
-                    sock = root.entry("outbox.sock")  # what this bind made, in the pinned root (None: not there)
-                if root is not None:
-                    root.check(authority.paths, "outbox.db", *(() if authority.bridge_only else ("outbox.sock",)))
-                authority.run_in_thread()
-            except BaseException as err:
-                if expected is not None and root is not None and authority._bound:
-                    # An activated start's failed cleanup never removes a socket by its pathname, which may now
-                    # name a foreign root's entry: only this bind's own socket, through the pinned root, and only
-                    # while it is still that very entry (PR #22 review 4, finding 2).
-                    authority._bound = False
-                    authority.close()  # inside the start's section: released, never deferred
-                    root.remove_own("outbox.sock", sock)
-                else:
-                    authority.close()  # inside the start's section: released, never deferred
-                if root is not None and not isinstance(err, BootstrapUnknown):
-                    root.check(authority.paths)  # a swap that surfaced as another failure is UNKNOWN too
-                raise
+                    root.check(authority.paths)  # before anything opens
+                authority.store = BootstrapStore(authority.paths, clock=authority.clock, fs=authority.fs,
+                                                 expected=expected, record=record, root=root)
+                try:
+                    authority.start()  # its own section, nested: admitted by this one's binding
+                    if root is not None:
+                        root.check(authority.paths, "outbox.db")  # after the commit, before the socket
+                    if authority.store.bootstrap in ("applied", "replayed"):
+                        log(f"designation bootstrap {authority.store.bootstrap}: operation {record['operation']}, "
+                            f"{len(record['accounts'])} account(s)")
+                    if root is not None:
+                        root.check(authority.paths, "outbox.db")  # immediately before the bind
+                    authority.bridge_only = not authority.bind()
+                    if not authority.bridge_only:
+                        authority.remember_socket()  # its identity in the pinned root, for a failed start's cleanup
+                    if root is not None:
+                        root.check(authority.paths, "outbox.db",
+                                   *(() if authority.bridge_only else ("outbox.sock",)))
+                    authority.run_in_thread()
+                except BaseException as err:
+                    authority.close()  # inside the start's section and the pinned root: its own entries only
+                    if root is not None and not isinstance(err, BootstrapUnknown):
+                        root.check(authority.paths)  # a swap that surfaced as another failure is UNKNOWN too
+                    raise
         finally:
             if root is not None:
                 root.close()

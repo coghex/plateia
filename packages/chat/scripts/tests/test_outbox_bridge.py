@@ -1189,6 +1189,122 @@ class BootstrapPreservationTests(BootstrapCase):
         self.assert_running_under_the_lock(again)
         self.assertEqual(self.rows()[0]["designation_bootstrap"], meta["designation_bootstrap"])
 
+    def test_a_committed_m_in_a_rollback_journal_database_without_a_digest_keeps_every_byte(self):
+        """PR #22 extension review 1, finding 3: with no launch digest or record, a committed M in a database in
+        rollback-journal mode is classified read-only before any writable start: UNKNOWN, every byte and sidecar
+        kept."""
+        d = self.publish(self.record(["alp-solver-2"]))
+        self.launch(d)  # S2: M committed
+        self.stop()
+        (self.state / self.bridge.BOOTSTRAP_FILE).unlink()  # the test's own removal
+        con = sqlite3.connect(self.state / "outbox.db")
+        con.execute("PRAGMA journal_mode=DELETE")
+        con.close()
+        before = self.files(self.state)
+        self.assertEqual(before["outbox.db"][18:20], b"\x01\x01", "rollback-journal mode")
+        authority = self.launch(None)
+        self.assertFalse(authority.running)
+        self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+        self.stop()
+        self.assertEqual(self.files(self.state), before, "the database and every sidecar are byte-identical")
+
+
+class BootstrapPinnedRootTests(BootstrapCase):
+    """#21 amendment 7 (PR #22 extension review 1, finding 2): during an activated start, every effect the
+    standard library can make directory-relative goes through the pinned root (the authority lock, outbox.d,
+    a stale socket's removal); the database's open and the socket's bind stay pathname-based, and a root
+    changed around them is detected and fails closed."""
+
+    def replace_root(self, foreign=()):
+        moved = self.state.with_name(f"{self.state.name}-pinned-{__import__('secrets').token_hex(4)}")
+        self.state.rename(moved)
+        self.state.mkdir()
+        for name in foreign:
+            (self.state / name).write_text(f"a foreign {name}, invented\n")
+        self.addCleanup(self.restore_root, moved)
+        return moved
+
+    def restore_root(self, moved):
+        if moved.exists():
+            shutil.rmtree(self.state)
+            moved.rename(self.state)
+
+    def real_bind(self):
+        return next(p for p in self.patches if getattr(p, "attribute", None) == "bind").temp_original
+
+    def test_a_root_swapped_just_before_the_start_fails_closed_and_touches_nothing_foreign(self):
+        d = self.publish(self.record(["alp-solver-2"]))
+        moved, real_start = [], self.ds.Authority.start
+
+        def start(authority, *a, **k):
+            moved.append(self.replace_root(foreign=("outbox.sock", "notes.txt")))
+            return real_start(authority, *a, **k)
+        with mock.patch.object(self.ds.Authority, "start", start):
+            authority = self.launch(d)
+        self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+        self.assertFalse(authority.running)
+        self.stop()
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()), ["notes.txt", "outbox.sock"],
+                         "the replacement keeps its foreign entries, and gets no lock, database or outbox.d")
+        pinned = moved[0]
+        self.assertTrue((pinned / "outbox.authority.lock").exists(), "the lock was made in the pinned root")
+        self.assertFalse((pinned / "outbox.db").exists(), "nothing committed into the pinned database")
+
+    def test_a_foreign_socket_in_a_root_swapped_just_before_the_bind_is_never_removed(self):
+        d = self.publish(self.record(["alp-solver-2"]))
+        real_bind, moved = self.real_bind(), []
+
+        class Refusing:
+            def __init__(self, *a):
+                pass
+
+            def bind(self, path):
+                raise OSError(48, "invented: address in use")
+
+            def close(self):
+                pass
+
+        def bind(authority):
+            moved.append(self.replace_root(foreign=("outbox.sock",)))
+            return real_bind(authority)
+        with mock.patch.object(self.ds.Authority, "bind", bind), \
+                mock.patch.object(self.ds.socket, "socket", Refusing), \
+                mock.patch.object(self.ds, "SOCKET_LIMIT", 4096):  # the stand-in never binds: any path length
+            authority = self.launch(d)
+        self.assertTrue(moved)
+        self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+        self.stop()
+        self.assertEqual((self.state / "outbox.sock").read_text(), "a foreign outbox.sock, invented\n",
+                         "the stale-socket removal is in the pinned root only, and never removes it")
+
+    def test_outbox_d_is_made_only_in_the_pinned_root(self):
+        d = self.publish(self.record(["alp-solver-2"]))
+        real_open, moved = self.ds.Store.open, []
+
+        def store_open(store):
+            real_open(store)
+            if not moved:
+                moved.append(self.replace_root())
+        with mock.patch.object(self.ds.Store, "open", store_open):
+            authority = self.launch(d)
+        self.assertIsNotNone(self.bridge.BOOTSTRAP_UNKNOWN, authority.unavailable)
+        self.stop()
+        self.assertFalse((self.state / "outbox.d").exists(), "no outbox.d in the replacement")
+        self.assertTrue((moved[0] / "outbox.d" / "tmp").is_dir(), "outbox.d and its tmp in the pinned root")
+
+    def test_an_ordinary_start_leaves_the_option_unused(self):
+        seen, real_open = [], self.ds.Authority._open
+
+        def _open(authority):
+            seen.append(getattr(authority, "root_fd", None))
+            return real_open(authority)
+        with mock.patch.object(self.ds.Authority, "_open", _open):
+            authority = self.launch(None)
+        self.assert_running_under_the_lock(authority)
+        self.assertEqual(seen, [None], "no pinned root without an activation")
+        for name in ("outbox.authority.lock", "outbox.db", "outbox.d"):
+            self.assertTrue((self.state / name).exists(), name)
+
 
 class BootstrapCrashTests(BootstrapCase):
     """Crashes around the bridge's commit: inside it nothing is committed; after
