@@ -1037,14 +1037,17 @@ class SealedRootFS:
                 os.close(fd)
 
 
-def maintenance(journal, plan, ops, full_check=None, records=None):
-    """(the release's delivery_store, its Owner for this operation, the fence)."""
+def maintenance(journal, plan, ops, full_check=None, records=None, lock=False):
+    """(the release's delivery_store, its Owner for this operation, the fence). With `lock`, for the commands
+    whose Owner takes the admission lock (activate's acquisition and drain, and take_full's advances), Owner
+    makes and opens that lock only in the sealed root, through its descriptor (PR #22 review 2/4). Rollback,
+    release and status never take it, and keep their own order and refusals."""
     store = load_release_module(plan, "delivery_store")
     fence = OwnerFence(journal, plan, full_check, records)
     clock = getattr(ops, "clock", None)  # tests: a fake clock bounds the drain's waits
     # The admission lock is made and opened only in the sealed root, through its descriptor, held for this
     # command (PR #22 review 2/4); a read-only use mutates nothing and takes none.
-    sealed = journal.adopt(open_state_root(plan)) if journal is not None else None
+    sealed = journal.adopt(open_state_root(plan)) if lock and journal is not None else None
     owner = store.Owner(store.Paths(plan["state_root"]["path"]), operation=plan["operation"], kind=MAINT_KIND,
                         plan_sha256=plan["digest"], fence=fence, probes=ControllerProbes(ops, store),
                         fs=SealedRootFS(store.FS_DEFAULT, plan, fence, store), root_fd=sealed,
@@ -1215,7 +1218,7 @@ def take_full(journal, plan, ops, layout, paths, d):
         found = full_problems(journal, plan, ops, store, probes, layout, paths, d)
         if found:
             raise Refused("; ".join(found))
-    store, owner, fence = maintenance(journal, plan, ops, full_check=check)
+    store, owner, fence = maintenance(journal, plan, ops, full_check=check, lock=True)
     probes = ControllerProbes(ops, store)
     pending = fence.pending()
     if fence.released() or (pending is not None and pending.get("step") == "release"):
@@ -2068,7 +2071,7 @@ def activate(plan_path, ops, spec_path=None, crash=None, activation_path=None):
                               "record: it is retained, never replaced, and this needs an owner decision")
         seal_release(journal, plan, read_only)  # step 2: verified, or guarded and journaled
         seal_release(journal, plan, read_only=True)  # and verified again across that durable record
-        store, owner, fence = maintenance(journal, plan, ops)
+        store, owner, fence = maintenance(journal, plan, ops, lock=True)
         probes = ControllerProbes(ops, store)
         acquire(owner, store, probes)  # step 3: new-release writers drained and refused (`partial`)
         by_name = {t["name"]: t for t in plan["targets"]}
