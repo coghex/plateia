@@ -447,7 +447,9 @@ class BootstrapPublicationTests(ActivationCase):
         real, calls = activate_release.fsync_dir, []
 
         def fsync_dir(p):
-            if isinstance(p, int) and os.path.samestat(os.fstat(p), os.stat(self.state)):
+            # the first sync of the chat-state directory once the record is linked: the post-link boundary
+            if isinstance(p, int) and os.path.samestat(os.fstat(p), os.stat(self.state)) \
+                    and self.record_path().exists():
                 calls.append(p)
                 if len(calls) == 1:
                     raise Crash("killed after the link, before the directory sync")
