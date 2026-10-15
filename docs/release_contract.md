@@ -158,7 +158,8 @@ that #19 leaves unchanged.
   format names that digest excludes, plus one marker row,
   `designation-bootstrap/1`, for a format the shipped code reads and never
   writes. The excluded names also cover #24's `maintenance` (below),
-  #27's `request-line` and #32's `request-store`.
+  #27's `request-line`, #32's `request-store`, and #31's
+  `owner-led-scopes`, `owner-design-deferred` and `owner-led-private`.
 - **What is not done:** `chat-config` is never excluded, and the pin is
   never weakened (#21 amendment 7's review). The builder and its privacy scan are
 unchanged. Staging's

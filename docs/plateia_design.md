@@ -2646,6 +2646,49 @@ The same review kept the merged #29 declaration pin
 (`UNCHANGED_DECLARATIVE = d58c3a44…`, which covers `chat-config`'s `covers`
 text), with `designation-bootstrap` excluded and marker-covered.
 
+### D-77. OWNER-2 captures owner-led routing from fixed working-copy sources (#31)
+
+Owner decisions, 2026-10-14 and 2026-10-15 (#31 amendments 1 to 3, each
+approved by #31's canonical issue review).
+
+- **An exception to D-19, for #31 only (amendment 1, 2026-10-14).** D-19
+  captures only from a committed baseline. The owner-led routing code was
+  never committed in the skills repository, so #31 captures it from the
+  working copy over skills `HEAD` `2420054`
+  (`2420054f342a3ea5de5ecda10d364cabf6ea016b`). `provenance.json` records
+  each working-copy source's sha256, and `drift_check.py` reports a file
+  that matches its recorded working-copy bytes as a working copy, never as
+  a carried commit. The same amendment adds the activation test fixtures
+  (O-1) and the working-copy provenance tooling (O-2). Production
+  activation admission is unchanged.
+- **Five fixed sources (amendment 2, 2026-10-14).** The capture takes exact
+  bytes, checked by sha256:
+  - the pre-change `chat-bridge` (`2292a8b4…`), of which only the owner-led
+    hunks are ported;
+  - the unchanged `chat/SKILL.md`, `owner_design.py` and its two tests.
+
+  Later, unrelated edits to the live tree are left out: another project's
+  routing and an identity-conflict repair. The live `chat-bridge` therefore
+  stays reported as genuine drift until a later capture issue.
+- **One private file, failing closed (amendment 3, 2026-10-15).** The
+  source's private constants (the one legacy scope, and the protected
+  workspace and surface ids) are never committed. They are read on each
+  use from one read-only file, `$CHAT_STATE/owner-led-private.json`
+  (`owner-led-private/1`), which the owner creates and the code never
+  writes. A missing or invalid file turns owner-led routing off for every
+  post the hook evaluates:
+  - posts get ordinary delivery;
+  - existing owner-led records stay unchanged on disk;
+  - the evidence names only `missing` or `invalid`.
+
+  `acknowledge()` is called by the project-manager reconcile, never by the
+  bridge. Its writes, including the project manager's own `handoff.md`, are
+  declared under the `owner-design-deferred` format and made inside its own
+  writer-admission section.
+- **Still gated.** Nothing is installed or activated. The three new formats
+  are not admitted by `activation.json`. Creating the live private file and
+  adding the second owner account (#29) each need a separate owner approval.
+
 ## Open questions
 
 ### Q-1. Where is the durable handoff, and what is its command identity?
