@@ -142,7 +142,18 @@ class PrivateFileTests(Base):
             deferred.read_private()
         self.assertEqual(caught.exception.reason, "invalid")
 
+    def clear_private_path(self):
+        """Leave nothing behind that the shared reset_state() (which removes only regular files, in the order the
+        filesystem lists them) could miss: a dangling link would make the next test's file unreadable."""
+        path = PRIVATE_PATH()
+        if path.is_dir() and not path.is_symlink():
+            path.rmdir()
+        else:
+            path.unlink(missing_ok=True)
+        (chatlib.STATE_DIR / "elsewhere.json").unlink(missing_ok=True)
+
     def test_a_path_that_is_not_a_regular_file_is_invalid_and_never_blocks(self):
+        self.addCleanup(self.clear_private_path)
         def alarm(*_):
             raise AssertionError("the read blocked")
         previous = signal.signal(signal.SIGALRM, alarm)
