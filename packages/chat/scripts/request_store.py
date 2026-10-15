@@ -11,7 +11,8 @@ Opening. An existing requests.db is classified read-only before anything opens i
 bridge's BootstrapStore.preflight does for outbox.db: the file is new only when none of requests.db, -wal,
 -shm and -journal exists, or an empty requests.db has none of them; a sidecar without a non-empty
 requests.db is ambiguous evidence. A non-empty file must be SQLite in WAL mode, with no rollback journal,
-whose tables and meta rows are this store's. Anything else is refused with a named reason and every byte
+whose tables and meta rows are this store's and which passes SQLite's integrity check of every page and index,
+run on the private copy. Anything else, a corrupt page included, is refused with a named reason and every byte
 kept (Refused): the authority then runs, and only the request operations are refused (#32 decision 4).
 During the bridge's activated start, the pinned state root's identity is checked immediately before and
 after the pathname-based open (#21 amendment 7): a changed root is RootChanged, which fails the whole start.
@@ -36,6 +37,11 @@ What is recorded, per execution key (request ID and revision):
 After a restart, a started key with no outcome is `unknown` and stays so until a reconciliation; nothing
 ever takes it over. A refusal of a well-formed operation (a wrong actor, a stale generation, an unverified
 verdict, a conflicting reuse...) is recorded before the reply, with the key's record unchanged.
+
+Replies are bounded (delivery_store.REPLY_MAX is 64 KiB, and a committed mutation must always be answerable and
+replayable): the immutable registration fields are bounded when registered (a refusal that commits nothing),
+a key's view shows the latest RECONCILIATIONS_SHOWN of its reconciliations with their total, and a lookup shows
+one revision in full or a summary of the latest REVISIONS_SHOWN. Everything stays in requests.db (D-10).
 
 The guarantee covers only callers that check the claim and its start before their side effects (D-11): the
 declared agent IDs are cooperative, like writer admission's same-user boundary, and guard against mistakes,
@@ -72,7 +78,15 @@ OUTCOMES = ("no_effect", "effect")
 LIVE = ("claimed", "started", "unknown")      # a key with a live claim
 STARTED = ("started", "unknown")              # a start with no recorded outcome
 TERMINAL = ("superseded", "reconciled")
-LOOKUP_REFUSALS = 20  # the latest refusals a lookup shows per request ID
+# Bounds on what a reply carries, so that every committed mutation can be answered and replayed within the
+# authority's reply cap (delivery_store.REPLY_MAX, 64 KiB) however long a key's history grows. A wire string is
+# bounded by its JSON-encoded size, not its length: a character outside ASCII is up to twelve escaped bytes.
+MAX_ACTORS = 8          # permitted claimants, and named successors, per key (request_v1.MAX_COLLECTION)
+MAX_REASONS = 16        # verdict reasons per key
+RECONCILIATIONS_SHOWN = 8   # the latest reconciliations a key's view shows (all stay in requests.db, D-10)
+REVISIONS_SHOWN = 16    # the latest revisions a lookup of a request ID summarizes
+LOOKUP_REFUSALS = 10    # the latest refusals a lookup shows per request ID
+DETAIL_MAX = 300        # a refusal's detail, ASCII-escaped
 
 SCHEMA = """
 CREATE TABLE meta (name TEXT PRIMARY KEY, value TEXT);
@@ -109,9 +123,15 @@ class RootChanged(Exception):
 
 # --- what a request operation must be, before any of it is used -------------------------------------------------
 
+def _wire(value, limit):
+    """Whether `value` is a string of at most `limit` characters whose JSON form (two quotes, and any non-ASCII
+    character escaped) is at most `limit` + 2 bytes: what keeps a reply's size bounded."""
+    return isinstance(value, str) and 0 < len(value) <= limit and len(json.dumps(value)) <= limit + 2
+
+
 def _name(value):
     """An agent ID, account or room: a non-empty string without spaces, commas or control characters."""
-    return (isinstance(value, str) and 0 < len(value) <= 200
+    return (_wire(value, 200)
             and not any(c.isspace() or c == "," or ord(c) < 32 or ord(c) == 127 for c in value))
 
 
@@ -120,7 +140,7 @@ def _count(value, low):
 
 
 def _text(value, limit):
-    return isinstance(value, str) and 0 < len(value) <= limit and "\x00" not in value
+    return _wire(value, limit) and "\x00" not in value
 
 
 _REQUEST_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -136,15 +156,17 @@ def request_error(r):
         if not _text(r.get("line"), request_v1.MAX_LINE_BYTES):
             return "invalid request line"
         if not (isinstance(verdict, dict) and verdict.get("status") in VERDICTS
-                and isinstance(verdict.get("reasons"), list) and all(_text(x, 200) for x in verdict["reasons"])
+                and isinstance(verdict.get("reasons"), list) and len(verdict["reasons"]) <= MAX_REASONS
+                and all(_text(x, 200) for x in verdict["reasons"])
                 and (verdict.get("authority") is None or _text(verdict["authority"], 200))):
             return "invalid verdict"
         if not (_name(r.get("room")) and _name(r.get("decision_maker"))):
             return "invalid room or decision-maker"
         claimants, successors = r.get("claimants"), r.get("successors", [])
-        if not (isinstance(claimants, list) and claimants and all(_name(x) for x in claimants)
-                and isinstance(successors, list) and all(_name(x) for x in successors)):
-            return "invalid claimants or successors"
+        if not (isinstance(claimants, list) and 0 < len(claimants) <= MAX_ACTORS and all(_name(x) for x in claimants)
+                and isinstance(successors, list) and len(successors) <= MAX_ACTORS
+                and all(_name(x) for x in successors)):
+            return f"invalid claimants or successors (one to {MAX_ACTORS} claimants, at most {MAX_ACTORS} successors)"
         return None if _name(r.get("agent")) else "invalid agent"
     if not (_text(r.get("req_id"), 128) and _REQUEST_ID.fullmatch(r["req_id"])):
         return "invalid request ID"
@@ -273,8 +295,17 @@ class RequestStore:
             try:
                 tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 meta = dict(con.execute("SELECT name, value FROM meta").fetchall()) if "meta" in tables else {}
+                if tables == TABLES and meta.get("schema") == FORMAT and meta.get("writer_model") == WRITER_MODEL:
+                    # this store's tables are not enough: every page and index is checked here, on the copy,
+                    # before the original is opened for writing, which would otherwise record `unknown` into it
+                    problems = [r[0] for r in con.execute("PRAGMA integrity_check")]
+                    if problems != ["ok"]:
+                        raise Refused("requests.db failed its integrity check, so it is corrupt: "
+                                      + str(problems[0])[:200])
             finally:
                 con.close()
+        except sqlite3.DatabaseError as err:  # malformed pages raise as they are read
+            raise Refused(f"requests.db is corrupt or not readable as SQLite ({err})") from None
         except (OSError, sqlite3.Error) as err:
             raise Refused(f"requests.db can't be read to classify it ({err})") from None
         finally:
@@ -414,14 +445,18 @@ class RequestStore:
         return self.con is not None and self._row(request_id, rev) is not None
 
     def view(self, row):
-        """A key's record as a reply carries it. The fence token is never shown here."""
+        """A key's record as a reply carries it, bounded whatever its history: the immutable registration fields
+        are bounded when they are registered, and the reconciliations are the latest RECONCILIATIONS_SHOWN of
+        `reconciliations_total`, all of which stay in requests.db. The fence token is never shown here."""
         if row is None:
             return None
         k = (row["request_id"], row["rev"])
         acc = self.con.execute("SELECT * FROM acceptances WHERE request_id = ? AND rev = ?", k).fetchone()
         claim = self._claim_row(row) if row["generation"] else None
-        recs = self.con.execute("SELECT * FROM reconciliations WHERE request_id = ? AND rev = ? ORDER BY generation",
-                                k).fetchall()
+        total = self.con.execute("SELECT count(*) FROM reconciliations WHERE request_id = ? AND rev = ?",
+                                 k).fetchone()[0]
+        recs = reversed(self.con.execute("SELECT * FROM reconciliations WHERE request_id = ? AND rev = ? ORDER BY"
+                                         " generation DESC LIMIT ?", (*k, RECONCILIATIONS_SHOWN)).fetchall())
         return {
             "request_id": row["request_id"], "rev": row["rev"], "digest": row["digest"], "state": row["state"],
             "verdict": {"status": row["verdict"], "reasons": json.loads(row["reasons"]), "authority": row["authority"]},
@@ -434,22 +469,36 @@ class RequestStore:
                                                  "authority_epoch": claim["epoch"],
                                                  "started": claim["started_at"] is not None,
                                                  "start_epoch": claim["start_epoch"]},
+            "reconciliations_total": total,
             "reconciliations": [{"generation": r["generation"], "outcome": r["outcome"], "agent": r["agent"],
                                  "evidence": r["evidence"]} for r in recs],
         }
 
+    @staticmethod
+    def summary(row):
+        """One revision, compactly: what a lookup of a request ID lists. Its full view is the lookup of that rev."""
+        return {"request_id": row["request_id"], "rev": row["rev"], "digest": row["digest"],
+                "state": row["state"], "generation": row["generation"], "superseded_by": row["superseded_by"]}
+
     def lookup(self, r):
-        """`lookup`: every revision of the request ID (or the one named), read-only."""
+        """`lookup`, read-only and bounded. With a `rev`: that revision's full view. Without: a summary of each of
+        the latest REVISIONS_SHOWN revisions of the request ID (`keys_total` counts them all), oldest first. Either
+        way, the latest LOOKUP_REFUSALS refusals recorded for the request ID."""
         with self.read_tx():
-            q, args = "SELECT * FROM requests WHERE request_id = ?", [r["req_id"]]
             if r.get("rev") is not None:
-                q, args = q + " AND rev = ?", args + [r["rev"]]
-            keys = [self.view(row) for row in self.con.execute(q + " ORDER BY rev", args).fetchall()]
+                row = self._row(r["req_id"], r["rev"])
+                keys, total = ([self.view(row)] if row is not None else []), int(row is not None)
+            else:
+                total = self.con.execute("SELECT count(*) FROM requests WHERE request_id = ?",
+                                         (r["req_id"],)).fetchone()[0]
+                keys = [self.summary(row) for row in reversed(self.con.execute(
+                    "SELECT * FROM requests WHERE request_id = ? ORDER BY rev DESC LIMIT ?",
+                    (r["req_id"], REVISIONS_SHOWN)).fetchall())]
             refusals = [{"rev": x["rev"], "op": x["op"], "agent": x["agent"], "reason": x["reason"],
                          "detail": x["detail"]} for x in reversed(self.con.execute(
                             "SELECT * FROM refusals WHERE request_id = ? ORDER BY id DESC LIMIT ?",
                             (r["req_id"], LOOKUP_REFUSALS)).fetchall())]
-        return "ok", {"keys": keys, "refusals": refusals}
+        return "ok", {"keys": keys, "keys_total": total, "refusals": refusals}
 
     # --- transitions: each runs in one requests.db transaction ---
 
@@ -461,6 +510,7 @@ class RequestStore:
             return getattr(self, "_" + r["op"])(r, epoch, post)
 
     def _refuse(self, r, epoch, reason, detail, row=None, result="refused", request_id=None, rev=None):
+        detail = detail.encode("ascii", "backslashreplace").decode()[:DETAIL_MAX]  # bounded on the wire
         self.con.execute("INSERT INTO refusals (request_id, rev, op, agent, reason, detail, refused_at, epoch)"
                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                          (request_id or r.get("req_id"), rev or r.get("rev"), r["op"], r.get("agent"), reason,

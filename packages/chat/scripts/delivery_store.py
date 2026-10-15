@@ -2903,6 +2903,7 @@ class Authority:
 
     def _unavailable(self):
         why = self.requests.why or "requests.db is not open yet: it opens at the first request mutation admitted"
+        why = why.encode("ascii", "backslashreplace").decode()[:request_store.DETAIL_MAX]  # bounded on the wire
         return "refused", {"refusal": {"reason": "request-store-unavailable", "detail": why, "recorded": False}}
 
     def _mutate_request(self, request):

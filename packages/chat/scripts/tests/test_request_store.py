@@ -645,6 +645,188 @@ class ForeignFileTests(RequestCase):
         self.assertFalse([p for p in self.chatlib.STATE_DIR.iterdir() if p.name.startswith(".request-store")])
 
 
+class CorruptDataTests(RequestCase):
+    """Review 1, P1: a requests.db whose schema looks like this store's but whose data or index pages are corrupt
+    is preserved byte for byte, however it is damaged; the authority runs, every request operation is refused with a
+    named reason, and outbox operations continue (owner decision 4). Classification checks the whole database's
+    integrity on the private copy, before any writable open of the original."""
+
+    def populated(self):
+        """A registered, claimed and started key, then the authority closed: a clean requests.db on disk."""
+        self.register()
+        self.start(self.claim())
+        self.authority.close()
+        return self.chatlib.STATE_DIR / "requests.db"
+
+    @staticmethod
+    def pages(path):
+        """(page size, {table or index name: root page}) read from a copy, never from the file itself."""
+        copy = path.with_name("requests-copy.db")
+        copy.write_bytes(path.read_bytes())
+        try:
+            con = sqlite3.connect(str(copy))
+            try:
+                size = con.execute("PRAGMA page_size").fetchone()[0]
+                roots = dict(con.execute("SELECT name, rootpage FROM sqlite_master WHERE rootpage > 0").fetchall())
+            finally:
+                con.close()
+        finally:
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                Path(str(copy) + suffix).unlink(missing_ok=True)
+        return size, roots
+
+    def assertDegraded(self, before, why):
+        self.assertTrue(self.authority.running, "the bridge's authority runs")
+        self.assertIsNone(self.authority.requests.con)
+        self.assertIn(why, self.authority.requests.why)
+        for reply in (self.register(), self.lookup(), self.claim(), self.register(bridge=True)):
+            self.assertEqual(reply["result"], "refused")
+            self.assertEqual(reply["refusal"]["reason"], "request-store-unavailable")
+            self.assertIn(why, reply["refusal"]["detail"], "a named reason")
+            self.assertFalse(reply["refusal"]["recorded"])
+        self.assertEqual(self.client().call("create", self.writer(), **self.create_args("a" * 32))["result"], "ok",
+                         "posts, acks and notices are unaffected")
+        self.authority.close()
+        self.assertEqual(self.store_files(), before, "every byte kept, no sidecar and no classification copy left")
+
+    def test_a_corrupt_data_page_is_kept_byte_for_byte_and_refuses_only_request_operations(self):
+        path = self.populated()
+        size, roots = self.pages(path)
+        for name in ("requests", "claims", "refusals", "meta"):
+            with self.subTest(table=name):
+                self.fresh()
+                path = self.populated()
+                data = bytearray(path.read_bytes())
+                data[(roots[name] - 1) * size] = 0xFF  # the page's type byte: no longer a b-tree page
+                path.write_bytes(bytes(data))
+                before = self.store_files()
+                self.authority = self.new_authority()
+                self.assertDegraded(before, "requests.db")
+
+    def test_a_page_that_reads_but_fails_its_integrity_check_is_refused_too(self):
+        """Not every damaged page raises when read: this one (a leaf with its cells dropped) reads, and the index
+        no longer agrees with the table. Only the integrity check sees it."""
+        path = self.populated()
+        size, roots = self.pages(path)
+        data = bytearray(path.read_bytes())
+        offset = (roots["claims"] - 1) * size
+        self.assertEqual(data[offset], 0x0D, "a table leaf")
+        data[offset + 3:offset + 5] = b"\x00\x00"  # its cell count: now none
+        path.write_bytes(bytes(data))
+        before = self.store_files()
+        self.authority = self.new_authority()
+        self.assertDegraded(before, "integrity")
+
+
+class ReplyBoundTests(RequestCase):
+    """Review 1, P2: every reply stays within REPLY_MAX however long a key's history, on both transports, so that
+    a committed mutation can always be answered and replayed (including a claim and its fence). A key's wire view
+    shows a bounded window of its reconciliations; its immutable registration metadata is bounded before it
+    commits; `lookup` shows a bounded window of revisions and refusals, and any one revision in full."""
+
+    EVIDENCE = "invented evidence: the target shows no review. " * 21  # 987 characters, within the 1000 limit
+
+    def astral(self, i, n=16):
+        """A name at the encoded bound: sixteen astral characters, each six escaped bytes twice over on the wire."""
+        return chr(0x1F600 + i) * n
+
+    def history(self, bridge, cycles, agent=SOLVER):
+        """claim, start and reconcile `no_effect` the key `cycles` times; every reply must be usable."""
+        for cycle in range(cycles):
+            claimed = self.claim(agent, bridge=bridge)
+            self.assertEqual(claimed["result"], "ok", (cycle, claimed))
+            started = self.start(claimed, agent=agent, bridge=bridge)
+            self.assertEqual(started["result"], "ok", (cycle, started))
+            reconciled = self.op("reconcile", bridge=bridge, req_id=rid(), rev=1, agent=agent,
+                                 generation=claimed["key"]["generation"], outcome="no_effect", evidence=self.EVIDENCE)
+            self.assertEqual(reconciled["result"], "ok", (cycle, reconciled))
+
+    def size(self, reply):
+        return len(self.ds.encode_frame(reply, 1 << 30))
+
+    def test_replies_stay_within_the_cap_after_a_history_that_crosses_it_on_both_transports(self):
+        for bridge in (False, True):
+            with self.subTest(bridge=bridge):
+                self.fresh()
+                self.assertEqual(self.register(bridge=bridge)["result"], "ok")
+                self.history(bridge, 70)
+                kept = self.authority.requests.con.execute("SELECT sum(length(evidence)) FROM reconciliations"
+                                                           ).fetchone()[0]
+                self.assertGreater(kept, self.ds.REPLY_MAX, "the retained history alone is over the reply cap")
+                self.assertEqual(self.authority.requests.con.execute("SELECT count(*) FROM reconciliations"
+                                                                     ).fetchone()[0], 70, "and all of it is kept")
+                again = self.op("reconcile", bridge=bridge, req_id=rid(), rev=1, agent=SOLVER, generation=70,
+                                outcome="no_effect", evidence=self.EVIDENCE)
+                self.assertEqual((again["result"], again["outcome"]), ("replay", "no_effect"))
+                self.assertEqual(self.register(bridge=bridge)["result"], "replay")
+                one = self.lookup(rev=1, bridge=bridge)
+                every = self.lookup(bridge=bridge)
+                for reply in (again, one, every):
+                    self.assertLess(self.size(reply), self.ds.REPLY_MAX)
+                shown = one["keys"][0]
+                self.assertEqual((shown["generation"], shown["reconciliations_total"]), (70, 70))
+                self.assertEqual([r["generation"] for r in shown["reconciliations"]],
+                                 list(range(70 - self.ds.request_store.RECONCILIATIONS_SHOWN + 1, 71)),
+                                 "the latest window, oldest first")
+                # the next claim commits, and its fence comes back; a lost reply is answered again with the same one
+                claimed = self.claim(bridge=bridge)
+                self.assertEqual((claimed["result"], claimed["key"]["generation"]), ("ok", 71))
+                lost = self.claim(bridge=bridge)
+                self.assertEqual((lost["result"], lost["fence"]), ("replay", claimed["fence"]))
+                self.assertEqual(self.start(claimed, bridge=bridge)["result"], "ok")
+
+    def test_oversized_immutable_metadata_is_refused_before_it_commits(self):
+        names = [f"alp-solver-{i}" for i in range(9)]
+        cases = {
+            "400 claimants": dict(claimants=[f"alp-solver-{i}" for i in range(400)]),
+            "nine claimants": dict(claimants=names),
+            "nine successors": dict(successors=names),
+            "seventeen verdict reasons": dict(verdict=dict(VERIFIED, reasons=[f"reason-{i}" for i in range(17)])),
+            "a name over 200 characters": dict(room="#" + "r" * 200),
+            "a name whose encoding is over the bound": dict(decision_maker=self.astral(0, 17)),
+            "a verdict authority over the bound": dict(verdict=dict(VERIFIED, authority="a" * 201)),
+            "a reason over the bound": dict(verdict=dict(VERIFIED, reasons=["r" * 201])),
+        }
+        for label, over in cases.items():
+            for bridge in (False, True):
+                with self.subTest(case=label, bridge=bridge):
+                    reply = self.register(bridge=bridge, **over)
+                    self.assertEqual(reply["result"], "refused")
+                    self.assertNotIn("refusal", reply, "malformed: nothing recorded")
+                    self.assertEqual(self.lookup()["keys"], [], "nothing committed")
+                    self.assertEqual(self.refusals(), [])
+        self.assertEqual(self.authority.requests.con.execute("SELECT count(*) FROM requests").fetchone()[0], 0)
+
+    def test_the_largest_valid_registration_and_history_still_fit_every_reply(self):
+        """Every immutable field at its bound, in the widest encoding, and a history past the window: the biggest
+        reply of each operation is still under the cap, with room to spare."""
+        claimants = [self.astral(i) for i in range(8)]
+        args = dict(room=self.astral(20), decision_maker=self.astral(21), agent=self.astral(22),
+                    claimants=claimants, successors=[self.astral(30 + i) for i in range(8)],
+                    verdict=dict(VERIFIED, authority="a" * 200, reasons=[self.astral(40 + i, 16) for i in range(16)]))
+        biggest = 0
+        for bridge in (False, True):
+            with self.subTest(bridge=bridge):
+                self.fresh()
+                registered = self.register(bridge=bridge, **args)
+                self.assertEqual(registered["result"], "ok")
+                owner = claimants[0]
+                for cycle in range(self.ds.request_store.RECONCILIATIONS_SHOWN + 4):
+                    claimed = self.claim(owner, bridge=bridge)
+                    self.start(claimed, agent=owner, bridge=bridge)
+                    reconciled = self.op("reconcile", bridge=bridge, req_id=rid(), rev=1, agent=owner,
+                                         generation=claimed["key"]["generation"], outcome="no_effect",
+                                         evidence=chr(0x1F600) * 83)  # 996 bytes encoded, at the bound
+                    self.assertEqual(reconciled["result"], "ok", (cycle, reconciled))
+                    biggest = max(biggest, self.size(reconciled))
+                for reply in (self.claim(owner, bridge=bridge), self.claim(claimants[1], bridge=bridge),
+                              self.register(bridge=bridge, **args), self.lookup(rev=1, bridge=bridge),
+                              self.lookup(bridge=bridge)):
+                    self.assertIn(reply["result"], ("ok", "replay", "conflict"))
+                    biggest = max(biggest, self.size(reply))
+        self.assertLess(biggest, self.ds.REPLY_MAX // 2, "at least half the cap is left")
+
+
 class AdmissionTests(RequestCase):
     """Writer admission 4.4 to 4.5 and 6.4 for the request operations, on both paths: the client's (handle) and
     the bridge's in-process one (run_request). `lookup` is answered in every state with no section and no write;
