@@ -570,7 +570,10 @@ object, at most `FRAME_MAX` for a request and `REPLY_MAX` for a reply.
   restates it;
 - `conflict`: the guard failed, and nothing changed;
 - `refused`: the request was invalid, of an unknown version, or from the
-  wrong peer, and no transaction ran;
+  wrong peer, and no transaction ran. For a request-store operation (#32),
+  it is either a refusal recorded in `requests.db` before the reply
+  (`refusal.recorded` true), or one naming why the request store is
+  unavailable (`refusal.recorded` false);
 - `busy`: `QUEUE_MAX` was reached, and no transaction ran;
 - `error`: the transaction failed. Whether it committed is **unknown**, and
   the client treats the reply as missing.
