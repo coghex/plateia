@@ -2836,6 +2836,8 @@ class Authority:
     def _request_problem(self, request, peer_pid=None):
         """Why a request-store operation is refused as malformed, or None."""
         writer = request.get("writer")
+        if not request_store.request_id_ok(request.get("request_id")):
+            return "invalid request_id"  # the frame's own ID is echoed in the reply: bounded before anything commits
         if not valid_writer(writer, optional=request["op"] in request_store.READ_OPS):
             return "no valid writer"
         problem = request_store.request_error(request)

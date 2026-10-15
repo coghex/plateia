@@ -718,6 +718,153 @@ class CorruptDataTests(RequestCase):
         self.assertDegraded(before, "integrity")
 
 
+class ExistingFileTests(RequestCase):
+    """Review 2, P1, and the whole class (A): every path from a start to a writable open or a schema creation of
+    requests.db. Any existing non-empty file is checked for integrity on the private copy first; one that fails is
+    kept byte for byte, and so is anything that is not entirely this store's. Only a file that does not exist, a
+    zero-byte one, or a database that holds nothing at all (confirmed by that check) is made into a store."""
+
+    populated = CorruptDataTests.populated
+    pages = staticmethod(CorruptDataTests.pages)
+    assertDegraded = CorruptDataTests.assertDegraded
+
+    def install(self, make):
+        """The state directory with no store files, then `make(path)` writing requests.db there."""
+        self.authority.close()
+        for name in STORE_FILES:
+            (self.chatlib.STATE_DIR / name).unlink(missing_ok=True)
+        path = self.chatlib.STATE_DIR / "requests.db"
+        make(path)
+        return path
+
+    def assertKept(self, why=None):
+        before = self.store_files()
+        self.authority = self.new_authority()
+        self.assertDegraded(before, why or "requests.db")
+
+    def test_a_schema_root_page_emptied_to_a_valid_leaf_is_corrupt_not_new(self):
+        """The review's reproduction: page 1's b-tree emptied while every other page is kept. No table reads, so
+        the file looked new and was re-initialized, forgetting a registered, claimed and started key."""
+        path = self.populated()
+        size, _ = self.pages(path)
+        data = bytearray(path.read_bytes())
+        self.assertEqual(data[100], 0x0D, "page 1 is a table leaf")
+        data[101:108] = b"\x00\x00\x00\x00" + (size % 65536).to_bytes(2, "big") + b"\x00"  # no cells, no free block
+        path.write_bytes(bytes(data))
+        before = self.store_files()
+        self.authority = self.new_authority()
+        self.assertDegraded(before, "integrity")
+
+    def test_no_shape_of_existing_file_is_written_unless_it_passes_the_check_on_its_copy(self):
+        def valid(path, statements=(), wal=True):
+            con = sqlite3.connect(str(path), isolation_level=None)
+            con.execute("PRAGMA journal_mode=WAL" if wal else "PRAGMA journal_mode=DELETE")
+            for statement in statements:
+                con.execute(statement)
+            con.close()
+
+        def renamed(path):
+            # this store's schema, with one table under another name
+            schema = self.ds.request_store.SCHEMA.replace("CREATE TABLE refusals", "CREATE TABLE refused")
+            con = sqlite3.connect(str(path), isolation_level=None)
+            con.execute("PRAGMA journal_mode=WAL")
+            for statement in schema.split(";"):
+                if statement.strip():
+                    con.execute(statement)
+            con.execute("INSERT INTO meta VALUES ('schema', 'request-store/1'), ('writer_model', 'bridge-exclusive/1')")
+            con.close()
+
+        def missing(path):
+            con = sqlite3.connect(str(path), isolation_level=None)
+            con.execute("PRAGMA journal_mode=WAL")
+            for statement in self.ds.request_store.SCHEMA.split(";"):
+                if statement.strip() and "TABLE refusals" not in statement:
+                    con.execute(statement)
+            con.execute("INSERT INTO meta VALUES ('schema', 'request-store/1'), ('writer_model', 'bridge-exclusive/1')")
+            con.close()
+
+        def mangle(offset, value):
+            def make(path):
+                valid(path, ["CREATE TABLE meta (name TEXT PRIMARY KEY, value TEXT)",
+                             "INSERT INTO meta VALUES ('schema', 'request-store/1')"])
+                data = bytearray(path.read_bytes())
+                data[offset:offset + len(value)] = value
+                path.write_bytes(bytes(data))
+            return make
+
+        def truncated(keep):
+            def make(path):
+                valid(path, ["CREATE TABLE meta (name TEXT PRIMARY KEY, value TEXT)",
+                             "INSERT INTO meta VALUES ('schema', 'request-store/1')"])
+                path.write_bytes(path.read_bytes()[:keep])
+            return make
+        cases = {
+            "ten bytes of garbage": lambda p: p.write_bytes(b"invented 10"),
+            "a hundred bytes of header and nothing after": truncated(100),
+            "cut inside page 1": truncated(2000),
+            "a zero page size": mangle(16, b"\x00\x00"),
+            "an impossible page size": mangle(16, b"\x00\x07"),
+            "a changed text encoding": mangle(56, b"\x00\x00\x00\x09"),
+            "a database size in the header over the file's": mangle(28, b"\x7f\xff\xff\xff"),
+            "this store's tables with one under another name": renamed,
+            "this store's tables with one missing": missing,
+            "a table-less database holding a view": lambda p: valid(p, ["CREATE VIEW v AS SELECT 1 AS x"]),
+            "a foreign table": lambda p: valid(p, ["CREATE TABLE notes (x)", "INSERT INTO notes VALUES (1)"]),
+            "a database in rollback-journal mode": lambda p: valid(p, ["CREATE TABLE meta (name TEXT)"], wal=False),
+        }
+        for label, make in cases.items():
+            with self.subTest(case=label):
+                self.fresh()
+                self.install(make)
+                self.assertKept()
+
+    def test_only_a_missing_a_zero_byte_or_a_confirmed_empty_file_becomes_a_store(self):
+        def empty_wal(path):
+            con = sqlite3.connect(str(path), isolation_level=None)
+            con.execute("PRAGMA journal_mode=WAL")  # a start that stopped before its schema left this
+            con.close()
+
+        def emptied_after_use(path):
+            con = sqlite3.connect(str(path), isolation_level=None)
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("CREATE TABLE gone (x)")
+            con.execute("DROP TABLE gone")
+            con.close()
+        for label, make in {"no file": lambda p: None, "a zero-byte file": lambda p: p.write_bytes(b""),
+                            "an empty WAL database": empty_wal,
+                            "a database whose only table was dropped": emptied_after_use}.items():
+            with self.subTest(case=label):
+                self.fresh()
+                self.install(make)
+                self.authority = self.new_authority()
+                self.assertIsNotNone(self.authority.requests.con, label)
+                self.assertEqual(self.register()["result"], "ok")
+
+    def test_every_open_goes_through_the_classification(self):
+        """The one place requests.db is opened for writing is RequestStore._open, after preflight; the deferred
+        open (after a bound start, or a refused one) is the same call."""
+        import ast
+        import inspect
+        calls = [(n.lineno, ast.unparse(n.args[0])) for n in ast.walk(ast.parse(inspect.getsource(
+            self.ds.request_store))) if isinstance(n, ast.Call) and ast.unparse(n.func) == "sqlite3.connect"]
+        self.assertEqual([c[1] for c in calls], ["str(self.state / name / NAME)", "str(self.path)"],
+                         "the classification copy, and the store: no other connection is made")
+        real, seen = self.ds.request_store.RequestStore.preflight, []
+        self.authority.close()
+        for name in STORE_FILES:
+            (self.chatlib.STATE_DIR / name).unlink(missing_ok=True)
+
+        def preflight(store, root_fd=None):
+            seen.append(1)
+            return real(store, root_fd)
+        with mock.patch.object(self.ds.request_store.RequestStore, "preflight", preflight):
+            self.authority = self.new_authority()
+            self.assertEqual(len(seen), 1, "at the start")
+            self.authority.requests.close()
+            self.assertEqual(self.register()["result"], "ok", "the deferred open")
+            self.assertEqual(len(seen), 2)
+
+
 class ReplyBoundTests(RequestCase):
     """Review 1, P2: every reply stays within REPLY_MAX however long a key's history, on both transports, so that
     a committed mutation can always be answered and replayed (including a claim and its fence). A key's wire view
@@ -825,6 +972,124 @@ class ReplyBoundTests(RequestCase):
                     self.assertIn(reply["result"], ("ok", "replay", "conflict"))
                     biggest = max(biggest, self.size(reply))
         self.assertLess(biggest, self.ds.REPLY_MAX // 2, "at least half the cap is left")
+
+
+class PersistedSizeTests(RequestCase):
+    """Review 2, P2, and the whole class (B): every field of every request, required or optional, that can be
+    persisted and later returned in any reply (a registration, an acceptance, a claim, a start, a reconciliation, a
+    refusal, a lookup) is bounded or dropped before it commits, so no committed state can push a reply past
+    REPLY_MAX on either transport. Each field of each operation is replaced, in turn, by an oversized or ill-typed
+    value, on both transports; afterwards every reply that could carry it is still readable."""
+
+    BIG = "x" * 70000
+
+    def send(self, bridge, **request):
+        frame = {"v": self.ds.PROTOCOL, "request_id": "r" + os.urandom(8).hex(),
+                 "writer": self.writer(BRIDGE_PID if bridge else CLIENT_PID), **request}
+        try:
+            return self.ds.LocalTransport(self.authority, bridge=bridge).exchange(frame)
+        except ValueError:  # the reply was over the cap: the property under test
+            return "OVERSIZE"
+
+    def bases(self, n):
+        return {
+            "register": dict(op="register", agent="sam", line=line(n), verdict=dict(VERIFIED), room="#alpha",
+                             decision_maker=MANAGER, claimants=[SOLVER], successors=["pat"]),
+            "accept": dict(op="accept", req_id=rid(n), rev=1, msgid="srv-gone", agent="sam"),
+            "claim": dict(op="claim", req_id=rid(n), rev=1, agent=SOLVER),
+            "start": dict(op="start", req_id=rid(n), rev=1, agent=SOLVER, generation=1, fence="f" * 32),
+            "reconcile": dict(op="reconcile", req_id=rid(n), rev=1, agent=SOLVER, generation=1, outcome="no_effect",
+                              evidence="invented evidence"),
+            "lookup": dict(op="lookup", req_id=rid(n), rev=1),
+        }
+
+    def mutations(self, base):
+        """Every one-field change of `base` to an oversized or ill-typed value, with a label."""
+        values = [self.BIG, [self.BIG], [f"a-{i}" for i in range(400)], 10 ** 30, {"k": self.BIG}]
+        for field in base:
+            if field == "op":
+                continue
+            for value in values:
+                yield f"{field}={type(value).__name__}", dict(base, **{field: value})
+        yield "an extra field", dict(base, junk=self.BIG)
+        if isinstance(base.get("verdict"), dict):
+            for field in ("status", "reasons", "authority"):
+                for value in values:
+                    verdict = dict(base["verdict"], **{field: value})
+                    yield f"verdict.{field}={type(value).__name__}", dict(base, verdict=verdict)
+        yield "a frame request_id over the bound", dict(base, request_id=self.BIG)
+
+    def rows_stored(self):
+        con = self.authority.requests.con
+        return [con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                for table in ("requests", "acceptances", "claims", "reconciliations", "refusals")]
+
+    def assertReadable(self, n, label):
+        """Everything a reply could show of request n is still within the cap, on both transports."""
+        for bridge in (False, True):
+            base = self.bases(n)
+            for reply in (self.send(bridge, op="lookup", req_id=rid(n)),
+                          self.send(bridge, op="lookup", req_id=rid(n), rev=1),
+                          self.send(bridge, **base["register"]), self.send(bridge, **base["claim"])):
+                self.assertNotEqual(reply, "OVERSIZE", (label, bridge))
+                self.assertIsNotNone(reply, (label, bridge))
+                self.assertLess(len(self.ds.encode_frame(reply, 1 << 30)), self.ds.REPLY_MAX, (label, bridge))
+
+    def test_no_field_of_any_operation_can_make_a_committed_reply_unreadable(self):
+        for bridge in (False, True):
+            self.fresh()
+            self.assertEqual(self.send(bridge, **self.bases(1)["register"])["result"], "ok")
+            n = 1
+            for op in ("register", "accept", "claim", "start", "reconcile", "lookup"):
+                for label, request in self.mutations(self.bases(1)[op]):
+                    if op == "register":
+                        n += 1  # a fresh key each time: if it were to commit oversized, it would show
+                        request = dict(request, line=line(n)) if "line" not in label else request
+                    with self.subTest(op=op, change=label, bridge=bridge):
+                        before = self.rows_stored()
+                        reply = self.send(bridge, **request)
+                        if "request_id" in label:  # its refusal echoes the ID, so it is not readable; nothing commits
+                            self.assertEqual(self.rows_stored(), before)
+                        else:
+                            self.assertNotEqual(reply, "OVERSIZE")
+                        self.assertReadable(1, f"{op} {label}")
+                        if op == "register":
+                            self.assertReadable(n, f"{op} {label}")
+            rows = self.authority.requests.con.execute(
+                "SELECT max(length(agent)), max(length(detail)), max(length(reason)) FROM refusals").fetchone()
+            self.assertLessEqual(rows[0] or 0, 200)
+            self.assertLessEqual(rows[1] or 0, self.ds.request_store.DETAIL_MAX)
+
+    def test_the_reviews_reproduction_an_acceptance_with_an_oversized_agent_commits_nothing(self):
+        for bridge in (False, True):
+            with self.subTest(bridge=bridge):
+                self.fresh()
+                self.register(bridge=bridge)
+                reply = self.send(bridge, op="accept", req_id=rid(), rev=1, msgid="srv-gone", agent="x" * 70000)
+                self.assertEqual((reply["result"], reply["detail"]), ("refused", "invalid agent"))
+                self.assertNotIn("refusal", reply)
+                self.assertEqual(self.refusals(), [], "nothing recorded")
+                self.assertReadable(1, "oversized acceptance agent")
+                self.restart_bridge()
+                self.assertReadable(1, "after a restart")
+
+    def test_a_long_refusal_history_of_the_widest_names_cannot_make_a_lookup_unreadable(self):
+        wide = chr(0x1F600) * 16  # 194 bytes on the wire
+        for bridge in (False, True):
+            with self.subTest(bridge=bridge):
+                self.fresh()
+                self.register(bridge=bridge, claimants=[SOLVER])
+                for i in range(60):
+                    agent = chr(0x1F600 + i) * 16
+                    claim = self.send(bridge, op="claim", req_id=rid(), rev=1, agent=agent)
+                    self.assertEqual(claim["result"], "refused")
+                    self.send(bridge, op="accept", req_id=rid(), rev=1, msgid="m" * 128, agent=agent)
+                recorded = self.authority.requests.con.execute("SELECT count(*) FROM refusals").fetchone()[0]
+                self.assertEqual(recorded, 120)
+                shown = self.send(bridge, op="lookup", req_id=rid(), rev=1)
+                self.assertEqual(len(shown["refusals"]), self.ds.request_store.LOOKUP_REFUSALS)
+                self.assertLess(len(self.ds.encode_frame(shown, 1 << 30)), self.ds.REPLY_MAX // 2)
+        self.assertEqual(len(wide.encode("ascii", "backslashreplace")), 160)
 
 
 class AdmissionTests(RequestCase):

@@ -135,8 +135,11 @@ def _name(value):
             and not any(c.isspace() or c == "," or ord(c) < 32 or ord(c) == 127 for c in value))
 
 
+MAX_NUMBER = 999_999_999  # a revision or a generation: request/v1's nine digits (request_v1.MAX_INT_DIGITS)
+
+
 def _count(value, low):
-    return isinstance(value, int) and not isinstance(value, bool) and value >= low
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= MAX_NUMBER
 
 
 def _text(value, limit):
@@ -174,6 +177,8 @@ def request_error(r):
         return None if r.get("rev") is None or _count(r.get("rev"), 1) else "invalid revision"
     if not _count(r.get("rev"), 1):
         return "invalid revision"
+    if r.get("agent") is not None and not _name(r["agent"]):  # optional on acceptance, and recorded with a refusal
+        return "invalid agent"
     if op == "accept":
         return None if _text(r.get("msgid"), 128) else "invalid message ID"
     if not _name(r.get("agent")):
@@ -185,6 +190,11 @@ def request_error(r):
     if op == "reconcile" and not (r.get("outcome") in OUTCOMES and _text(r.get("evidence"), 1000)):
         return "invalid reconciliation"
     return None
+
+
+def request_id_ok(value):
+    """The frame's own `request_id` (a client's random hex, echoed in the reply): a bounded string."""
+    return _wire(value, 128)
 
 
 def names_request(text, request_id):
@@ -293,15 +303,17 @@ class RequestStore:
                     shutil.copyfileobj(src, dst)
             con = sqlite3.connect(str(self.state / name / NAME), isolation_level=None)
             try:
+                # Every page and index is checked here, on the copy, before the original is accepted as this
+                # store's or treated as new (opened for writing, it would be rewritten: a schema made, or a
+                # start recorded `unknown`). A schema that reads as empty is not enough to be new either:
+                # a damaged root page leaves the other pages orphaned, which only this check sees.
+                problems = [r[0] for r in con.execute("PRAGMA integrity_check")]
+                if problems != ["ok"]:
+                    raise Refused("requests.db failed its integrity check, so it is corrupt: "
+                                  + str(problems[0])[:200])
+                objects = con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
                 tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 meta = dict(con.execute("SELECT name, value FROM meta").fetchall()) if "meta" in tables else {}
-                if tables == TABLES and meta.get("schema") == FORMAT and meta.get("writer_model") == WRITER_MODEL:
-                    # this store's tables are not enough: every page and index is checked here, on the copy,
-                    # before the original is opened for writing, which would otherwise record `unknown` into it
-                    problems = [r[0] for r in con.execute("PRAGMA integrity_check")]
-                    if problems != ["ok"]:
-                        raise Refused("requests.db failed its integrity check, so it is corrupt: "
-                                      + str(problems[0])[:200])
             finally:
                 con.close()
         except sqlite3.DatabaseError as err:  # malformed pages raise as they are read
@@ -315,8 +327,9 @@ class RequestStore:
             os.close(tmp)
             with contextlib.suppress(OSError):
                 os.rmdir(where, **kw)
-        if not tables:
-            return "new"  # a WAL database with nothing committed: what a start that stopped before its schema left
+        if not objects:
+            return "new"  # a WAL database that the check confirms holds nothing: what a start that stopped before
+            # its schema left. A table-less database with a view, an index or a trigger is not that.
         if tables != TABLES:
             raise Refused("requests.db was made by other code: its tables are not this store's")
         if meta.get("schema") != FORMAT or meta.get("writer_model") != WRITER_MODEL:
@@ -377,7 +390,7 @@ class RequestStore:
         try:
             with self.tx():
                 names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                if not names:
+                if not con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
                     for statement in SCHEMA.split(";"):
                         if statement.strip():
                             con.execute(statement)
@@ -511,9 +524,10 @@ class RequestStore:
 
     def _refuse(self, r, epoch, reason, detail, row=None, result="refused", request_id=None, rev=None):
         detail = detail.encode("ascii", "backslashreplace").decode()[:DETAIL_MAX]  # bounded on the wire
+        agent = r.get("agent") if _name(r.get("agent")) else None  # only a bounded name is ever recorded
         self.con.execute("INSERT INTO refusals (request_id, rev, op, agent, reason, detail, refused_at, epoch)"
                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                         (request_id or r.get("req_id"), rev or r.get("rev"), r["op"], r.get("agent"), reason,
+                         (request_id or r.get("req_id"), rev or r.get("rev"), r["op"], agent, reason,
                           detail, self.clock(), epoch))
         return result, {"refusal": {"reason": reason, "detail": detail, "recorded": True}, "key": self.view(row)}
 
