@@ -94,19 +94,43 @@ def ops(bridge=None, writers="default", producers="default"):
 
 _BUILT = {}
 
+# The three formats #31 (OWNER-2) adds to release.json. #21's transition (activation.json) admits none of them,
+# so the activation's success fixture is built without them, and the real release is shown refused instead.
+OWNER_LED_FORMATS = ("owner-led-scopes", "owner-design-deferred", "owner-led-private")
 
-def built_release():
-    """#19's real release (its release.json), built once per test process from an invented repository and
-    shared by every activation test class: tests only read it (each stages its own copy), and a build per class
-    cost about four seconds each on CI."""
-    if not _BUILT:
+
+def admitted_release_spec(path):
+    """The checkout's release.json without the OWNER-2 formats: the formats #21's transition admits, as #19's
+    release declared them. Everything else is the real declaration, so every activation test keeps its meaning."""
+    spec = json.loads((_support.RELEASE / "release.json").read_text(encoding="utf-8"))
+    spec["formats"] = [f for f in spec["formats"] if f["name"] not in OWNER_LED_FORMATS]
+    path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+    return path
+
+
+def _build(key, spec_name=None):
+    if key not in _BUILT:
         tmp = tempfile.TemporaryDirectory(prefix="plateia-activation-release-")
         atexit.register(tmp.cleanup)
         root = Path(os.path.realpath(tmp.name))
         repo, _ = make_repo(root)
-        release, _ = build_release.build(repo, root / "releases")
-        _BUILT.update(release=release, manifest=build_release.verify(release))
-    return _BUILT["release"], _BUILT["manifest"]
+        spec = admitted_release_spec(root / spec_name) if spec_name else build_release.SPEC_PATH
+        release, _ = build_release.build(repo, root / "releases", spec_path=spec)
+        _BUILT[key] = (release, build_release.verify(release))
+    return _BUILT[key]
+
+
+def built_release():
+    """#19's release, built once per test process from an invented repository and shared by every activation
+    test class: tests only read it (each stages its own copy), and a build per class cost about four seconds
+    each on CI. It is built from release.json without the OWNER-2 formats (#31, O-1), which the transition does
+    not admit; owner_led_release() is the checkout's whole release.json."""
+    return _build("admitted", "release-admitted.json")
+
+
+def owner_led_release():
+    """The checkout's own release.json, OWNER-2 formats included, built once per test process."""
+    return _build("owner-led")
 
 
 class ActivationCase(unittest.TestCase):
@@ -284,6 +308,26 @@ class AdmissionTests(ActivationCase):
         self.assertEqual(admitted, ["boot-id", "delivery-records", "designation-bootstrap", "maintenance", "outbox",
                                     "outbox-authority", "outbox-db", "request-line", "tcp-sockets"])
         self.assertEqual(_staging.snapshot_tree(self.home), self.before)
+
+    def test_the_owner_led_release_is_refused_by_default_and_under_the_existing_transition(self):
+        """#31 (OWNER-2): the checkout's whole release.json declares three formats #21's transition does not
+        admit. activation.json and stage_release.py are unchanged, so staging refuses exactly those three,
+        with or without the transition; it is the fixture, not the admission, that leaves them out."""
+        release, manifest = owner_led_release()
+        names = {f["name"] for f in manifest["formats"]}
+        self.assertTrue(set(OWNER_LED_FORMATS) <= names)
+        self.assertFalse(set(OWNER_LED_FORMATS) & {f["name"] for f in self.manifest["formats"]},
+                         "the success fixture is built without them")
+        spec = stage_release.load_spec(self.spec)[0]
+        transition = activate_release.load_activation()["transition"]
+        self.assertFalse(set(OWNER_LED_FORMATS) & (set(transition["added"]) | set(transition["changed"])),
+                         "activation.json admits none of them")
+        by_default = {r[1] for r in stage_release.compatibility(manifest, spec) if r[0] == "refused"}
+        self.assertTrue(set(OWNER_LED_FORMATS) <= by_default, by_default)
+        under_transition = {r[1] for r in stage_release.compatibility(manifest, spec, transition) if r[0] == "refused"}
+        self.assertEqual(under_transition, set(OWNER_LED_FORMATS), "refused under #21's transition, and nothing else")
+        report = stage_release.preflight(release, None, self.spec)
+        self.assertTrue(set(OWNER_LED_FORMATS) <= {line.split(":", 1)[0] for line in report["refused"]})
 
     def test_the_transition_admits_no_other_format_change(self):
         spec = stage_release.load_spec(self.spec)[0]
