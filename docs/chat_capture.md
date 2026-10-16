@@ -14,6 +14,7 @@ commit, per-file hashes, and every change with its reason.
 | --- | --- | --- |
 | PLT-9 | #11 | The identity and transport core: `chatlib`, `identities`, `binding`, `runstore`, `role_colors`, `pchat`, `agentcli`, `receipt_experiment` (D-69), the test-isolation guard and their tests |
 | PLT-15 | #12 | The bridge: `chat-bridge`, `rotate-logs`, their tests, the bridge-dependent `test_receipt_experiment.py`, and `chat/SKILL.md` (D-24) |
+| OWNER-2 | #31 | Owner-led quiet routing: `owner_design.py` and its two tests, the owner-led hunks of `chat-bridge`, and the owner-led guidance in `chat/SKILL.md`, from fixed working-copy sources (D-77) |
 
 Both slices capture from baseline `c572bad`
 (`c572bad60b06f262d11a7175f52fd62f23257241`), committed on the skills
@@ -143,6 +144,31 @@ Plateia-only file added with #19:
 Not captured, by design: `install-identities` is excluded from every capture
 (D-20).
 
+## Migration map (#31, OWNER-2)
+
+Issue #31 captures from the working copy over skills `HEAD` `2420054`
+(`2420054f342a3ea5de5ecda10d364cabf6ea016b`), not from a committed baseline:
+D-77 is #31's exception to D-19. Each source's sha256 is recorded in
+`provenance.json`. No source has a committed baseline.
+
+| Source path | Plateia path | Source | Capture |
+| --- | --- | --- | --- |
+| `chat/scripts/owner_design.py` | `packages/chat/scripts/owner_design.py` | working copy | changed: invented values; the legacy scope and protected ids come from the private file (below) |
+| `chat/scripts/tests/test_owner_design.py` | `packages/chat/scripts/tests/test_owner_design.py` | working copy | changed: invented values; the tests that load the project-manager `reconcile` and `nudge-managers` scripts, which plateia doesn't carry, are left out and listed in `provenance.json` `changes` |
+| `chat/scripts/tests/test_owner_led.py` | `packages/chat/scripts/tests/test_owner_led.py` | working copy | changed: invented values |
+| `chat/scripts/chat-bridge` | `packages/chat/scripts/chat-bridge` | pre-change bytes (`2292a8b4…`) | changed: only the owner-led hunks are ported |
+| `chat/SKILL.md` | `packages/chat/SKILL.md` | working copy | changed: only the owner-led guidance is ported |
+
+Plateia-only files added with #31:
+
+- `owner-led-private.json.example`, with invented values. The code never
+  reads it.
+- `tests/test_owner_led_private.py` covers the private file:
+  - valid, missing and each invalid case;
+  - protected workspaces and surfaces;
+  - fail-closed routing;
+  - reading the file on each use.
+
 ## Running the tests
 
 From the repository root, as `build-test` runs them on Python 3.10 and 3.14:
@@ -183,7 +209,22 @@ never as "no drift".
 
 A file that matches the commit carried in for it is still reported, as
 `changed (matches carried commit <commit>)`.
+A file at its recorded working-copy bytes (#31, D-77) is reported as a
+working copy, never as a carried commit.
 
 At PLT-9's capture (2026-10-08) the live tree reported no drift. At PLT-15's
 capture (2026-10-08) it reported one difference, `chat/SKILL.md`, changed
 (matches carried commit `8ff325e`), and nothing else.
+
+At #31's capture (2026-10-15T23:25Z, read-only) it exited `1`. Of 22
+captured paths, 11 differed:
+- `SKILL.md`, `owner_design.py`, `test_owner_design.py` and `test_owner_led.py`
+  were reported as working copy;
+- `chat-bridge` was reported as changed against its recorded owner-led source
+  (`2292a8b4…`), because it holds later, uncaptured edits;
+- `identities.py` and `role_colors.py` were reported as changed: uncaptured
+  edits;
+- four paths were reported as added and uncaptured: an identity-conflict
+  module and its test, and another project's routing module and its test.
+
+A later capture issue covers those edits and additions.
