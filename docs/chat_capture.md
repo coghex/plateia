@@ -210,7 +210,9 @@ never as "no drift".
 A file that matches the commit carried in for it is still reported, as
 `changed (matches carried commit <commit>)`.
 A file at its recorded working-copy bytes (#31, D-77) is reported as a
-working copy, never as a carried commit.
+working copy, never as a carried commit. Any other bytes, including the
+baseline or a carried commit, are reported as changed from it, naming the
+recorded hash (`source_sha256` in `--json`), and the exit status is 1.
 
 At PLT-9's capture (2026-10-08) the live tree reported no drift. At PLT-15's
 capture (2026-10-08) it reported one difference, `chat/SKILL.md`, changed
