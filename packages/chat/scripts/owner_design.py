@@ -334,13 +334,15 @@ def record(entry, scope=None, private=None):
 
 
 def snapshot(project):
+    """The project's pending receipts, or None. A pure read: it writes nothing (no lock file, no directory),
+    so maintenance never needs to refuse it. Every writer replaces the record whole and atomically (_atomic),
+    so a read sees the record before or after a change, never a part of one."""
     if not STATE.exists():
         return None
-    with _locked():
-        state = copy.deepcopy(_read())
-        state["pending"] = [e for e in state["pending"] if e["scope"]["project"] == project]
-        state["project"] = project
-        return state if state["pending"] else None
+    state = copy.deepcopy(_read())
+    state["pending"] = [e for e in state["pending"] if e["scope"]["project"] == project]
+    state["project"] = project
+    return state if state["pending"] else None
 
 
 def _groups(snapshot):

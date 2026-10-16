@@ -298,7 +298,9 @@ class WorkingCopyTests(DriftCase):
         rc, result = self.run_check()
         self.assertEqual(self.drift(result, "core.py")["kind"], "working copy")
         (self.scripts / "core.py").write_bytes(carried)
-        self.assertEqual(self.drift(self.run_check()[1], "core.py")["detail"], "matches carried commit 1111111")
+        item = self.drift(self.run_check()[1], "core.py")
+        self.assertEqual((item["kind"], item["source_sha256"]), ("changed", digest(self.SOURCES["core.py"])))
+        self.assertNotIn("carried", item["detail"], "a carried commit's bytes do not explain a recorded working copy")
 
     def test_a_later_change_is_still_drift_for_a_baseline_file_and_a_new_one(self):
         for rel in ("core.py", "owner.py"):
@@ -312,9 +314,14 @@ class WorkingCopyTests(DriftCase):
                 (self.scripts / rel).write_bytes(self.SOURCES[rel])
         self.assertEqual(self.drift(self.run_check()[1], "owner.py")["kind"], "working copy")
 
-    def test_a_file_back_at_its_baseline_is_no_drift(self):
-        (self.scripts / "core.py").write_bytes(FILES["core.py"][0])
-        self.assertNotIn("demo/scripts/core.py", [d["path"] for d in self.run_check()[1]["drift"]])
+    def test_a_file_back_at_its_baseline_is_still_changed_from_its_working_copy(self):
+        (self.scripts / "core.py").write_bytes(FILES["core.py"][0])  # the historical baseline's bytes
+        item = self.drift(self.run_check()[1], "core.py")
+        self.assertEqual(item["kind"], "changed")
+        self.assertEqual(item["source_sha256"], digest(self.SOURCES["core.py"]))
+        self.assertIn(digest(self.SOURCES["core.py"])[:12], item["detail"])
+        self.assertIn(digest(FILES["core.py"][0])[:12], item["detail"])
+        self.assertNotIn("matches", item["detail"])
 
     def test_a_missing_file_is_reported_for_both_kinds(self):
         for rel, detail in (("core.py", "baseline file is gone"), ("owner.py", "recorded working-copy file is gone")):
@@ -385,6 +392,52 @@ class WorkingCopyTests(DriftCase):
         self.assertIn("unknown ownership: an entry the provenance doesn't list: demo/scripts/extra.py", problems)
         self.assertNotIn("unknown ownership: an entry the provenance doesn't list: demo/scripts/owner.py", problems)
         self.assertIn("demo/scripts/owner.py", observed["files"])
+
+
+class WorkingCopyClassificationTests(DriftCase):
+    """One working-copy entry on an otherwise identical tree, so the exit status is the entry's alone: only bytes
+    equal to the recorded working copy are explained, whatever else the record holds."""
+
+    SOURCE = b"print('core, working copy')\n"
+    CARRIED = b"print('carried')\n"
+
+    def setUp(self):
+        super().setUp()
+        entry = self.provenance["captured"][0]
+        self.assertEqual(entry["baseline_path"], "demo/scripts/core.py")
+        entry.update(source_commit="1" * 40, effective_sha256=digest(self.CARRIED),
+                     working_copy={"head": HEAD, "sha256": digest(self.SOURCE), "mode": "100644"})
+        self.path.write_text(json.dumps(self.provenance))
+
+    def classify(self, body):
+        (self.scripts / "core.py").write_bytes(body)
+        rc, result = self.run_check()
+        return rc, [(d["kind"], d.get("source_sha256") == digest(self.SOURCE), d["detail"]) for d in result["drift"]]
+
+    def test_only_the_recorded_working_copy_explains_the_file(self):
+        rc, drift = self.classify(self.SOURCE)
+        self.assertEqual((rc, [d[0] for d in drift]), (1, ["working copy"]))
+        for name, body in (("the baseline", FILES["core.py"][0]), ("a carried commit", self.CARRIED),
+                           ("anything else", b"print('other')\n")):
+            with self.subTest(name):
+                rc, drift = self.classify(body)
+                self.assertEqual(rc, 1, f"{name} is drift from the recorded working copy, never exit 0")
+                self.assertEqual([(kind, named) for kind, named, _ in drift], [("changed", True)])
+                self.assertNotIn("carried", drift[0][2])
+                self.assertNotIn("matches", drift[0][2])
+
+    def test_the_baseline_alone_is_no_drift_without_a_working_copy(self):
+        del self.provenance["captured"][0]["working_copy"]
+        self.path.write_text(json.dumps(self.provenance))
+        self.assertEqual(self.classify(FILES["core.py"][0]), (0, []))
+        rc, drift = self.classify(self.CARRIED)
+        self.assertEqual((rc, drift[0][0], drift[0][2]), (1, "changed", "matches carried commit 1111111"))
+
+    def test_a_working_copy_equal_to_the_baseline_explains_the_baseline(self):
+        self.provenance["captured"][0]["working_copy"]["sha256"] = digest(FILES["core.py"][0])
+        self.path.write_text(json.dumps(self.provenance))
+        self.assertEqual(self.classify(FILES["core.py"][0]), (0, []))
+        self.assertEqual(self.classify(self.SOURCE)[0], 1)
 
 
 class ExclusionTests(unittest.TestCase):

@@ -16,7 +16,8 @@ uncommitted in the skills repository over a named HEAD when it was captured
 sha256 is kept apart from the baseline's and from the sanitized file's. An entry
 with no baseline at all (a file the baseline never had) must record one. A live
 file that matches the recorded working copy is reported as `working copy`, never
-as a carried commit; any other difference from it is still drift.
+as a carried commit; any other bytes, even the baseline's or a carried commit's,
+are reported as changed from it, naming its hash.
 
 It is read-only: it lists, stats, reads and resolves links, never writes to
 the tree, and reports differences instead of fixing them. Paths are printed
@@ -169,26 +170,26 @@ def check(tree: Path, provenance: dict, hasher=None) -> dict:
         except OSError as e:
             errors.append({"path": rel, "error": e.strerror or str(e)})
             continue
-        held = working is not None and digest == working["sha256"] and (base is None or digest != base["sha256"])
-        if held:
-            drift.append({"path": rel, "kind": "working copy", "source_sha256": working["sha256"],
-                          "detail": f"matches recorded working copy over HEAD {working['head'][:7]} "
-                                    f"(sha256 {digest[:12]})"})
-        elif base is None or digest != base["sha256"]:
-            carried = (base is not None and entry.get("effective_sha256") not in (None, base["sha256"])
+        held = working is not None and digest == working["sha256"]
+        if working is not None:
+            # A recorded working copy is the only content that explains this file. Equal to it, it is reported
+            # as such (nothing at all when it also equals the baseline); anything else, including the baseline's
+            # or a carried commit's bytes, is a change from it and is never "no drift" or a carried match.
+            if held and (base is None or digest != base["sha256"]):
+                drift.append({"path": rel, "kind": "working copy", "source_sha256": working["sha256"],
+                              "detail": f"matches recorded working copy over HEAD {working['head'][:7]} "
+                                        f"(sha256 {digest[:12]})"})
+            elif not held:
+                drift.append({"path": rel, "kind": "changed", "source_sha256": working["sha256"],
+                              "detail": f"sha256 {working['sha256'][:12]} -> {digest[:12]}; differs from the "
+                                        f"recorded working copy over HEAD {working['head'][:7]}"})
+        elif digest != base["sha256"]:
+            carried = (entry.get("effective_sha256") not in (None, base["sha256"])
                        and digest == entry["effective_sha256"])
             source = str(entry.get("source_commit") or "")[:7]
-            if carried:
-                item = {"path": rel, "kind": "changed", "detail": f"matches carried commit {source}".rstrip()}
-            else:
-                start = base["sha256"] if base else working["sha256"]
-                detail = f"sha256 {start[:12]} -> {digest[:12]}"
-                item = {"path": rel, "kind": "changed", "detail": detail}
-                if working:
-                    item["detail"] += (f"; recorded working copy over HEAD {working['head'][:7]} "
-                                       f"is sha256 {working['sha256'][:12]}")
-                    item["source_sha256"] = working["sha256"]
-            drift.append(item)
+            drift.append({"path": rel, "kind": "changed",
+                          "detail": (f"matches carried commit {source}".rstrip() if carried
+                                     else f"sha256 {base['sha256'][:12]} -> {digest[:12]}")})
         want = working["mode"] if held or base is None else base["mode"]
         if mode_of(st) != want:
             drift.append({"path": rel, "kind": "mode changed", "detail": f"{want} -> {mode_of(st)}"})

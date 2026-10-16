@@ -507,7 +507,7 @@
         "mode": "100644"
       },
       "capture": "changed",
-      "sha256": "4ea1d4386b627375b4bc0c3c52941d654fa17b4ac952cdce8e659485735505a3",
+      "sha256": "a783142a5da87bd8dd5fcc70df4f38dc28ba84cf11d5170506253a3c3b389eaa",
       "changes": [
         {
           "change": "Every owner comparison uses #29's rule (chatlib.owner_identity): enrollment requires an account the server verified that is the configured `owner` or an exact entry of `owner_accounts`, replacing the `verified` check and `entry.get(\"from\") != cfg.get(\"owner\")`. The scope's authority.owner is the canonical owner, and authority.account holds the raw verified account when it differs. With `owner_accounts` absent the enrolled record is the source's, byte for byte; an unverified post whose nick equals the owner was already refused by the source's `verified is True` check and still is.",
@@ -532,6 +532,10 @@
         {
           "change": "The module docstring and function docstrings describe the private file; `import delivery_store` and the standard-library imports it needs are added. Behaviour is otherwise the source's.",
           "reason": "The owner's decision of 2026-10-14 and its amendments 3 (2026-10-15) and 2 (2026-10-14): #31 captures owner-led routing into this public repository."
+        },
+        {
+          "change": "snapshot(), which the project manager's reconcile calls and the bridge never does, is a pure read: it no longer takes the receipt lock, so it creates no lock file and no directory. Every writer replaces the record whole and atomically, so a read sees it before or after a change.",
+          "reason": "Review 1 of PR #34 (the lock's O_CREAT was a $CHAT_STATE write outside any writer-admission section, docs/writer_admission.md 3.2): an external read needs no section, so it must write nothing."
         }
       ]
     },

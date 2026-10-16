@@ -595,11 +595,12 @@ class AdmissionTests(admission.BridgeHoldCase, Base):
                 self.status("a")
                 captured = self.snapshot()
                 handoff = self.handoff.read_bytes()
+                Path(str(deferred.STATE) + ".lock").unlink()  # even the lock file is not created while held
                 owner = self.hold_in(state)
-                before = (owner_led_bytes(), self.handoff.read_bytes())
+                before = (owner_led_bytes(), self.handoff.read_bytes(), snapshot(chatlib.STATE_DIR))
                 with self.assertRaises(deferred.MaintenanceHeld):
                     deferred.acknowledge(captured, self.pm)
-                self.assertEqual((owner_led_bytes(), self.handoff.read_bytes()), before)
+                self.assertEqual((owner_led_bytes(), self.handoff.read_bytes(), snapshot(chatlib.STATE_DIR)), before)
                 self.assertEqual(self.handoff.read_bytes(), handoff)
                 self.assertIsNotNone(self.snapshot(), "the receipts stay pending")
                 if owner is None:
@@ -609,6 +610,34 @@ class AdmissionTests(admission.BridgeHoldCase, Base):
                 deferred.acknowledge(captured, self.pm)
                 self.assertIsNone(self.snapshot())
                 self.assertEqual(self.handoff.read_text().count("- OWNER-MANAGED"), 1)
+
+    def test_snapshot_is_a_pure_read_under_every_maintenance_state(self):
+        """The manager-side snapshot() takes no section, so it must write nothing: with a record on disk and the
+        lock file missing it neither creates the lock nor anything else, held or not, and still reads."""
+        lock = Path(str(deferred.STATE) + ".lock")
+        for state in (None, "partial", "full", "unknown"):
+            with self.subTest(state=state):
+                self.fresh()
+                self.owner_fixture()
+                self.enroll()
+                self.status("a")
+                lock.unlink()
+                owner = self.hold_in(state) if state else None
+                before = snapshot(chatlib.STATE_DIR)
+                taken = self.snapshot()
+                self.assertEqual([e["msgid"] for e in taken["pending"]], ["a"], "it still reads the record")
+                self.assertFalse(lock.exists())
+                self.assertEqual(snapshot(chatlib.STATE_DIR), before, "files, directories and bytes are unchanged")
+                if state == "unknown":
+                    self.paths.maintenance.unlink()
+                elif owner is not None:
+                    owner.release()
+
+    def test_snapshot_of_nothing_creates_nothing(self):
+        before = snapshot(chatlib.STATE_DIR)
+        self.assertIsNone(deferred.snapshot("gamma"))
+        self.assertEqual(snapshot(chatlib.STATE_DIR), before)
+        self.assertFalse(Path(str(deferred.STATE) + ".lock").exists())
 
     def test_acknowledge_writes_only_inside_its_own_section(self):
         self.enroll()
