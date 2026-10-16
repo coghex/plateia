@@ -114,6 +114,15 @@ class BuildTests(BuildCase):
             r"maintenance\.json": ("maintenance", True, True),
             # #27: the request/v1 line is parsed and encoded by a library nothing calls yet, so it is both
             r'FORMAT = "request/v1"': ("request-line", True, True),
+            # #31: owner-led routing (owner_design.py). The scopes record and the deferred receipts are read and
+            # written by the bridge; the project manager's handoff.md is written only by acknowledge(), and is
+            # declared under the deferred-receipt format (write true); the legacy schema is read; the private
+            # file is read on every use and never written (the designation-bootstrap/1 precedent: write null)
+            r'"owner-led-scopes-v1"': ("owner-led-scopes", True, True),
+            r'SCHEMA = "owner-led-deferred-v2"': ("owner-design-deferred", True, True),
+            r'LEGACY_SCHEMA = "owner-design-deferred-v1"': ("owner-design-deferred", True, True),
+            r'"handoff\.md"': ("owner-design-deferred", True, True),
+            r'PRIVATE_NAME = "owner-led-private\.json"': ("owner-led-private", True, False),
             # #32: the request store, which only the outbox authority opens, reads and writes
             r"requests\.db": ("request-store", True, True),
         }
@@ -455,13 +464,16 @@ class RefusalTests(BuildCase):
 # format entries (the second to fifth amendments of #19, acceptance 11), the
 # maintenance format (#24: writer admission, read and written, maintenance/1),
 # the designation-bootstrap format (#21: read only, designation-bootstrap/1),
-# the request-line format (#27: request/v1, read and written) and the request-store
-# format (#32: request-store/1, read and written). The digest also
+# the request-line format (#27: request/v1, read and written), the request-store
+# format (#32: request-store/1, read and written) and the three owner-led formats
+# (#31: owner-led-scopes and owner-design-deferred, read and written; owner-led-private,
+# read only, owner-led-private/1). The digest also
 # covers the one declared text change of #29: the chat-config entry's `covers` now names the
 # optional `owner_accounts` key, with its read and write identifiers unchanged.
 UNCHANGED_DECLARATIVE = "d58c3a44135efadd8664821ae384a7eee024afbf886ad75a666f3a479281bbae"
 CHANGED_BY_19 = {"outbox", "delivery-records", "outbox-db", "outbox-authority", "boot-id", "tcp-sockets",
-                 "designation-bootstrap", "maintenance", "request-line", "request-store"}
+                 "designation-bootstrap", "maintenance", "request-line", "request-store",
+                 "owner-led-scopes", "owner-design-deferred", "owner-led-private"}
 GENERATED = ("release", "source", "builder", "build_interpreter", "artifacts")
 
 

@@ -10,6 +10,15 @@ every captured file that changed, went missing or changed type, mode or symlink
 target, and every other path that was added. It compares symlink targets
 without following them.
 
+A captured entry may also record a `working_copy`: the bytes of a file that was
+uncommitted in the skills repository over a named HEAD when it was captured
+(docs/plateia_design.md D-19, the owner's 2026-10-14 exception for #31). Its
+sha256 is kept apart from the baseline's and from the sanitized file's. An entry
+with no baseline at all (a file the baseline never had) must record one. A live
+file that matches the recorded working copy is reported as `working copy`, never
+as a carried commit; any other bytes, even the baseline's or a carried commit's,
+are reported as changed from it, naming its hash.
+
 It is read-only: it lists, stats, reads and resolves links, never writes to
 the tree, and reports differences instead of fixing them. Paths are printed
 relative to SKILLS_TREE.
@@ -52,14 +61,29 @@ def load_provenance(path: Path) -> dict:
     prefix = monitored["root"].rstrip("/") + "/"
     for entry in captured:
         base = entry.get("baseline") if isinstance(entry, dict) else None
-        if (not isinstance(base, dict) or not isinstance(entry.get("baseline_path"), str)
-                or not entry["baseline_path"].startswith(prefix)
-                or base.get("type") not in ("file", "symlink")
-                or (base["type"] == "file" and not (isinstance(base.get("sha256"), str)
-                                                    and base.get("mode") in ("100644", "100755")))
-                or (base["type"] == "symlink" and not isinstance(base.get("target"), str))):
+        working = entry.get("working_copy") if isinstance(entry, dict) else None
+        if (not isinstance(entry.get("baseline_path"), str) or not entry["baseline_path"].startswith(prefix)
+                or (working is not None and not _working_copy_ok(working))
+                or (base is None and working is None)  # nothing to hold the file to
+                or (base is not None and (not isinstance(base, dict)
+                                          or base.get("type") not in ("file", "symlink")
+                                          or (base["type"] == "file" and not (isinstance(base.get("sha256"), str)
+                                                                              and base.get("mode") in MODES))
+                                          or (base["type"] == "symlink" and not isinstance(base.get("target"), str))))
+                or (base is not None and base["type"] == "symlink" and working is not None)):
             raise BadProvenance(f"malformed captured entry: {entry!r}")
     return data
+
+
+MODES = ("100644", "100755")
+
+
+def _working_copy_ok(working) -> bool:
+    return (isinstance(working, dict) and isinstance(working.get("head"), str)
+            and len(working["head"]) == 40 and all(c in "0123456789abcdef" for c in working["head"])
+            and isinstance(working.get("sha256"), str) and len(working["sha256"]) == 64
+            and all(c in "0123456789abcdef" for c in working["sha256"])
+            and working.get("mode") in MODES)
 
 
 def excluded(rel: str, patterns: list[str]) -> bool:
@@ -106,6 +130,9 @@ def check(tree: Path, provenance: dict, hasher=None) -> dict:
     drift, errors = [], []
     result = {"baseline": provenance.get("baseline"), "monitored": root_rel,
               "captured": len(provenance["captured"]), "drift": drift, "errors": errors}
+    heads = sorted({e["working_copy"]["head"] for e in provenance["captured"] if e.get("working_copy")})
+    if heads:
+        result["working_copy_heads"] = heads
     if not tree.is_dir():
         errors.append({"path": ".", "error": "the skills tree is not a directory"})
         return result
@@ -117,17 +144,18 @@ def check(tree: Path, provenance: dict, hasher=None) -> dict:
     for entry in provenance["captured"]:
         expected[entry["baseline_path"]] = entry
     for rel, entry in sorted(expected.items()):
-        base, path = entry["baseline"], tree / rel
+        base, working, path = entry["baseline"], entry.get("working_copy"), tree / rel
+        gone = f"baseline {base['type']} is gone" if base else "recorded working-copy file is gone"
         try:
             st = path.lstat()
         except FileNotFoundError:
-            drift.append({"path": rel, "kind": "missing", "detail": f"baseline {base['type']} is gone"})
+            drift.append({"path": rel, "kind": "missing", "detail": gone})
             continue
         except OSError as e:
             errors.append({"path": rel, "error": e.strerror or str(e)})
             continue
         try:
-            if base["type"] == "symlink":
+            if base and base["type"] == "symlink":
                 if not stat.S_ISLNK(st.st_mode):
                     drift.append({"path": rel, "kind": "type changed",
                                   "detail": f"symlink to {base['target']} -> {describe(path, st)}"})
@@ -142,14 +170,29 @@ def check(tree: Path, provenance: dict, hasher=None) -> dict:
         except OSError as e:
             errors.append({"path": rel, "error": e.strerror or str(e)})
             continue
-        if digest != base["sha256"]:
-            carried = entry.get("effective_sha256") not in (None, base["sha256"]) and digest == entry["effective_sha256"]
+        held = working is not None and digest == working["sha256"]
+        if working is not None:
+            # A recorded working copy is the only content that explains this file. Equal to it, it is reported
+            # as such (nothing at all when it also equals the baseline); anything else, including the baseline's
+            # or a carried commit's bytes, is a change from it and is never "no drift" or a carried match.
+            if held and (base is None or digest != base["sha256"]):
+                drift.append({"path": rel, "kind": "working copy", "source_sha256": working["sha256"],
+                              "detail": f"matches recorded working copy over HEAD {working['head'][:7]} "
+                                        f"(sha256 {digest[:12]})"})
+            elif not held:
+                drift.append({"path": rel, "kind": "changed", "source_sha256": working["sha256"],
+                              "detail": f"sha256 {working['sha256'][:12]} -> {digest[:12]}; differs from the "
+                                        f"recorded working copy over HEAD {working['head'][:7]}"})
+        elif digest != base["sha256"]:
+            carried = (entry.get("effective_sha256") not in (None, base["sha256"])
+                       and digest == entry["effective_sha256"])
             source = str(entry.get("source_commit") or "")[:7]
             drift.append({"path": rel, "kind": "changed",
                           "detail": (f"matches carried commit {source}".rstrip() if carried
                                      else f"sha256 {base['sha256'][:12]} -> {digest[:12]}")})
-        if mode_of(st) != base["mode"]:
-            drift.append({"path": rel, "kind": "mode changed", "detail": f"{base['mode']} -> {mode_of(st)}"})
+        want = working["mode"] if held or base is None else base["mode"]
+        if mode_of(st) != want:
+            drift.append({"path": rel, "kind": "mode changed", "detail": f"{want} -> {mode_of(st)}"})
 
     pending = [monitored]
     while pending:
@@ -187,6 +230,8 @@ def check(tree: Path, provenance: dict, hasher=None) -> dict:
 def render(result: dict) -> str:
     lines = [f"drift check: {result['captured']} captured files under {result['monitored']}/ "
              f"against baseline {str(result['baseline'])[:12]}"]
+    for head in result.get("working_copy_heads", []):
+        lines.append(f"  working-copy sources are uncommitted bytes over skills HEAD {head[:12]}")
     lines += [f"  {d['kind']:22} {d['path']}  ({d['detail']})" for d in result["drift"]]
     lines += [f"  error                  {e['path']}  ({e['error']})" for e in result["errors"]]
     if result["errors"]:

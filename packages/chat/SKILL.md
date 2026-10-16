@@ -86,6 +86,45 @@ pchat channels
   original in the receiving manager's wake-up (`authority verified` or `NOT
   verified`). A verified delegation needs acceptance like the owner's own
   request. See `project-manager`.
+
+Owner-led quiet routing keeps a manager from relaying work the owner is already
+doing with a worker directly. Unaddressed `status` posts from a verified worker
+whose exact run the owner enrolled are logged and durably deferred, not rung to
+the manager. The next normal manager invocation reconciles the deferred range
+once and records it in the owner-work handoff, without relaying choices back to
+the owner already participating. The rule lives in `scripts/owner_design.py`; a
+different request, session, channel, explicit request/question/blocker/completion,
+addressed post or reply keeps normal routing. This leaves Stop/inbox,
+review-liveness, authentication and permission hooks intact.
+Owner-led quiet routing is enabled for the projects listed in
+`ENABLED_PROJECTS` in `scripts/owner_design.py`. A verified owner
+`[request ID] @worker ...` post in that worker's request channel durably records
+its exact project, request, channel, worker, session and surface as direct owner
+participation. "The owner" is the one canonical owner: a server-verified account
+that is the configured `owner` or an exact entry of the private `owner_accounts`
+list, never a nickname or a claim in the text. The request itself keeps its
+normal delivery. Only subsequent unaddressed `status` receipts matching that
+active binding are saved/coalesced without a manager ring. Ordinary
+manager/assistant dispatches, background reviewers and historical or retired
+bindings do not enroll workers. An owner working directly in a terminal needs a
+separately verified exact ownership record; never infer it from a project name
+or an owner-authorized manager job. Ownership records live in
+`owner-led-scopes.json` beside the durable receipt state. A new request or
+changed session/surface does not inherit an old scope. Explicit requests,
+questions, blockers, completions, replies and named recipients retain normal
+delivery. Storage/ownership validation failures fall back to normal routing,
+with original receipts preserved. No input, draft, hook-trust or manager control
+is performed by this rule.
+
+The rule needs one private file, `owner-led-private.json` in the chat state
+directory, which the owner creates and no command writes: one earlier
+(legacy) owner-led scope, and the workspaces and surfaces that are never
+enrolled or bound. It is read on every use. Missing or invalid, owner-led
+routing is off: nothing is enrolled or bound, existing records are left as they
+are, every post keeps its ordinary delivery, and a post's `receipt_routing`
+shows that owner-led routing is off and whether the file was missing or
+invalid. Owner-led routing never enrolls a protected workspace or a held
+surface listed there.
 - **Timing reservations:** use the shared
   [acquire/release protocol](../project-manager/references/timing-reservation.md).
   Ordinary manager messages request quiescence with a reservation ID, owner and

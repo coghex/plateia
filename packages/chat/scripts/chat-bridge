@@ -97,6 +97,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chatlib  # noqa: E402
 import delivery_store  # noqa: E402
 import identities  # noqa: E402
+import owner_design  # noqa: E402
 import receipt_experiment  # noqa: E402
 
 PM_STATE = Path.home() / ".local" / "state" / "project-manager"
@@ -1721,17 +1722,33 @@ def handle(msg, cfg, record, deliveries, acks, replayed=False):
         kind = POST_TYPE.match(text)
         interrupt = text.lstrip().startswith("!!") or bool(kind and kind.group(1) == "interrupt")
         agents = identities.read_registry().get("agents", {})
-        suppress_manager = False
+        suppress_manager, owner_led_off = False, {}
+        try:
+            # Owner-led quiet routing: the private file is read for this post, inside this message's section.
+            owner_scope, off = owner_design.hook(entry, project, agents, named, cfg)
+            if owner_scope:
+                suppress_manager = True  # durable (hook recorded it) before delivery is omitted or the log advances
+                entry["receipt_routing"] = {"classification": "owner_design_deferred",
+                                            "manager_ring": "deferred", "request": owner_scope["request"]}
+            elif off:  # a fixed token, never anything from the file
+                owner_led_off = {"owner_led": "off", "owner_led_reason": off}
+        except (OSError, ValueError, TypeError) as error:
+            log(f"owner-design deferral unavailable: {type(error).__name__}; normal routing retained")
         if project and receipt_experiment.enabled():
-            suppress_manager = (sender not in authority
-                                and receipt_experiment.routine_review_start(entry, project, agents))
+            review_suppressed = (sender not in authority
+                                 and receipt_experiment.routine_review_start(entry, project, agents))
             # The original receipt remains in its channel log, even when its
             # redundant manager ring is omitted. No provider output is copied.
-            entry["receipt_routing"] = {
-                "experiment": receipt_experiment.EXPERIMENT,
-                "classification": "routine_review_start" if suppress_manager else "existing_delivery",
-                "manager_ring": "suppressed" if suppress_manager else "unchanged",
-            }
+            if not suppress_manager:
+                entry["receipt_routing"] = {
+                    **owner_led_off,
+                    "experiment": receipt_experiment.EXPERIMENT,
+                    "classification": "routine_review_start" if review_suppressed else "existing_delivery",
+                    "manager_ring": "suppressed" if review_suppressed else "unchanged",
+                }
+            suppress_manager = suppress_manager or review_suppressed
+        if owner_led_off and "receipt_routing" not in entry:
+            entry["receipt_routing"] = owner_led_off
         unreachable, interrupted = False, set()
         for name in sorted(named - authority - {"chatbridge"}):
             # The owner and assistants reach a named agent directly, not via its manager;

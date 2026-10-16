@@ -94,20 +94,26 @@ def ops(bridge=None, writers="default", producers="default"):
 
 _BUILT = {}
 COLLAB_2 = ("request-store",)  # #32's format, which #21's transition does not admit
+# The three formats #31 (OWNER-2) adds to release.json. #21's transition (activation.json) admits none of them
+# either, so the success fixture is built without them too, and the real release is shown refused instead.
+OWNER_LED_FORMATS = ("owner-led-scopes", "owner-design-deferred", "owner-led-private")
+UNADMITTED = COLLAB_2 + OWNER_LED_FORMATS
 
 
 def activation_release_spec(path):
-    """The checkout's release.json without COLLAB-2's request-store format (#32's owner amendment 1), as
-    _staging.baseline_release_spec leaves out what the live tools don't use for test_stage: the release #21's
-    transition admits. The checkout's own release is refused (Collab2ReleaseTests)."""
+    """The checkout's release.json without COLLAB-2's request-store format (#32's owner amendment 1) and the
+    OWNER-2 formats (#31, O-1), as _staging.baseline_release_spec leaves out what the live tools don't use for
+    test_stage: the release #21's transition admits. Everything else is the real declaration, so every
+    activation test keeps its meaning. The checkout's own release is refused (Collab2ReleaseTests and
+    OwnerLedReleaseTests)."""
     spec = json.loads((_support.RELEASE / "release.json").read_text(encoding="utf-8"))
-    spec["formats"] = [f for f in spec["formats"] if f["name"] not in COLLAB_2]
+    spec["formats"] = [f for f in spec["formats"] if f["name"] not in UNADMITTED]
     path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
     return path
 
 
 def built_release(spec=True):
-    """#19's release (release.json without COLLAB-2's format; with `spec=False`, the checkout's release.json as
+    """#19's release (release.json without COLLAB-2's and OWNER-2's formats; with `spec=False`, the checkout's release.json as
     it is), built once per test process from an invented repository and shared by every activation test class:
     tests only read it (each stages its own copy), and a build per class cost about four seconds each on CI."""
     if spec not in _BUILT:
@@ -416,11 +422,43 @@ class Collab2ReleaseTests(ActivationCase):
         self.assertNotIn("request-store", transition["added"])
         spec = stage_release.load_spec(self.spec)[0]
         refused = {r[1] for r in stage_release.compatibility(manifest, spec, transition) if r[0] == "refused"}
-        self.assertEqual(refused, {"request-store"}, "the one format #21's transition does not admit")
+        self.assertEqual(refused, set(UNADMITTED), "the formats #21's transition does not admit: COLLAB-2's and OWNER-2's")
         plan = activate_release.make_plan(release, self.dest, self.root, ACCOUNTS, self.ops, spec_path=self.spec)
         path = self.where / "activation-plan-collab-2.json"
         activate_release.save_plan(plan, path)
         with self.assertRaisesRegex(Refused, "request-store"):
+            self.staged(path)
+        self.assertFalse(os.path.lexists(self.dest), "nothing staged")
+        self.assertEqual(_staging.snapshot_tree(self.home), self.before)
+
+
+class OwnerLedReleaseTests(ActivationCase):
+    """#31 (OWNER-2): the checkout's whole release.json declares three formats #21's transition does not admit."""
+
+    def test_the_owner_led_release_is_refused_by_default_and_under_the_existing_transition(self):
+        """#31 (OWNER-2): the checkout's whole release.json declares three formats #21's transition does not
+        admit (and COLLAB-2's request-store, which Collab2ReleaseTests covers). activation.json and
+        stage_release.py are unchanged, so staging refuses them, with or without the transition, through a
+        plan bound to the release too; it is the fixture, not the admission, that leaves them out."""
+        release, manifest = built_release(spec=False)
+        names = {f["name"] for f in manifest["formats"]}
+        self.assertTrue(set(OWNER_LED_FORMATS) <= names)
+        self.assertFalse(set(OWNER_LED_FORMATS) & {f["name"] for f in self.manifest["formats"]},
+                         "the success fixture is built without them")
+        spec = stage_release.load_spec(self.spec)[0]
+        transition = activate_release.load_activation()["transition"]
+        self.assertFalse(set(OWNER_LED_FORMATS) & (set(transition["added"]) | set(transition["changed"])),
+                         "activation.json admits none of them")
+        by_default = {r[1] for r in stage_release.compatibility(manifest, spec) if r[0] == "refused"}
+        self.assertTrue(set(OWNER_LED_FORMATS) <= by_default, by_default)
+        under_transition = {r[1] for r in stage_release.compatibility(manifest, spec, transition) if r[0] == "refused"}
+        self.assertEqual(under_transition, set(UNADMITTED), "refused under #21's transition: OWNER-2's and COLLAB-2's")
+        report = stage_release.preflight(release, None, self.spec)
+        self.assertTrue(set(OWNER_LED_FORMATS) <= {line.split(":", 1)[0] for line in report["refused"]})
+        plan = activate_release.make_plan(release, self.dest, self.root, ACCOUNTS, self.ops, spec_path=self.spec)
+        path = self.where / "activation-plan-owner-led.json"
+        activate_release.save_plan(plan, path)
+        with self.assertRaisesRegex(Refused, "owner-led-scopes|owner-design-deferred|owner-led-private"):
             self.staged(path)
         self.assertFalse(os.path.lexists(self.dest), "nothing staged")
         self.assertEqual(_staging.snapshot_tree(self.home), self.before)
