@@ -2109,7 +2109,7 @@ managers on every flush.
 Owner decision, 2026-10-09, relayed by the plateia manager. It refines D-72's
 repair after PR #20's review found four defects. All four came from outbox
 state split across several files and processes. The design is in
-[chat_outbox_state.md](chat_outbox_state.md); its section 11 gives the same
+[chat_outbox_state.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/chat_outbox_state.md); its section 11 gives the same
 decisions.
 
 - **One SQLite authority.** All outbox delivery state of plateia's copy lives
@@ -2158,7 +2158,7 @@ decisions.
   activation stay excluded. No rollback compatibility across `outbox-db/1`
   is claimed: that is a breaking state migration, reserved for activation's
   owner checkpoint and recovery plan. The details are in
-  [chat_outbox_state.md](chat_outbox_state.md) section 10.1.
+  [chat_outbox_state.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/chat_outbox_state.md) section 10.1.
   - **Requirement 12.** It is satisfied by D-72 and this decision; no further
     D-number is created for it.
 - **The bridge is the only outbox authority (owner decision, 2026-10-10).**
@@ -2192,7 +2192,7 @@ decisions.
     There is no further round.
 
   The design is revision 6 of
-  [chat_outbox_state.md](chat_outbox_state.md), sections 2.4, 6.4, 7.3 and
+  [chat_outbox_state.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/chat_outbox_state.md), sections 2.4, 6.4, 7.3 and
   10.1. **This decision approves the design, its scope and its review only.**
   Implementation, code, tests and the `release.json` edit still need their
   own owner decision.
@@ -2230,7 +2230,7 @@ decisions.
     is one of them.
 
   The design is revision 7 of
-  [chat_outbox_state.md](chat_outbox_state.md), sections 3.3, 6.3, 6.4, I-12
+  [chat_outbox_state.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/chat_outbox_state.md), sections 3.3, 6.3, 6.4, I-12
   and 10.1. **This decision approves the specification, the design and their
   review only.** Implementation, code, tests and the `release.json` edit
   still need their own owner decision.
@@ -2261,13 +2261,13 @@ decisions.
     used, four remaining.
 
   The design is revision 8 of
-  [chat_outbox_state.md](chat_outbox_state.md), section 10.1 and section 11,
+  [chat_outbox_state.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/chat_outbox_state.md), section 10.1 and section 11,
   decision 9. **This decision approves the specification, the design and
   that test-support scope only.** Implementation, code, tests and the
   `release.json` edit still need their own owner decision.
 - **Implementation (owner decision, 2026-10-10, 13:39 UTC).** The owner
   approved implementing revision 8 of
-  [chat_outbox_state.md](chat_outbox_state.md) on pull request #20, within the
+  [chat_outbox_state.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/chat_outbox_state.md) on pull request #20, within the
   scope its approval lists:
   - the chat runtime, with `delivery_store.py`, and its tests;
   - provenance and the guidance;
@@ -2308,7 +2308,7 @@ decisions.
 
   It supersedes #19's exclusion of wake-up and recovery semantics only for
   this interrupt-specific durability correction. The design is revision 9 of
-  [chat_outbox_state.md](chat_outbox_state.md), section 3.7, section 6.3 and
+  [chat_outbox_state.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/chat_outbox_state.md), section 3.7, section 6.3 and
   tests 41–48. **This decision approves the scope change and its review.**
   Merging and activation still need their own owner decisions.
 
@@ -2545,7 +2545,7 @@ implement the design; #24 implements the chat package's side. #24's canonical re
   consistent with the design and needs no additional owner decision, provided
   the format is declared as it is: `maintenance` is **read and written**
   `maintenance/1`, replacing the design's `write: null`, and
-  [writer_admission.md](writer_admission.md) (sections 3.2, 10.1 and 10.2) says
+  [writer_admission.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/writer_admission.md) (sections 3.2, 10.1 and 10.2) says
   so. Ordinary writers still only read the record. G-3 is not waived.
 - **Contract changes.** The eight changes to #19's contract in the design's
   section 11 are implemented (G-4 is closed). With the chat package's part of
@@ -2557,10 +2557,10 @@ implement the design; #24 implements the chat package's side. #24's canonical re
 - **Documents.** The documentation lands through `docs-push`, linked from the
   pull request; `SKILL.md` and its guidance test go with the code.
 
-The design is [writer_admission.md](writer_admission.md). It proposes
+The design is [writer_admission.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/writer_admission.md). It proposes
 changes to #19's and #21's contracts, enumerated there (its sections 9.2, 10
-and 11) and summarized in [chat_outbox_state.md](chat_outbox_state.md)
-section 2.4.6 and [release_staging.md](release_staging.md#writer-admission-23-24-integrated-by-amendment-4).
+and 11) and summarized in [chat_outbox_state.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/chat_outbox_state.md)
+section 2.4.6 and [release_staging.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/release_staging.md#writer-admission-23-24-integrated-by-amendment-4).
 #19's changes (its section 11) are implemented by #24, as above. #21's
 (its sections 9.2, 10 and 12) are approved by the owner's decision of
 2026-10-13 below (G-3), and take effect with PR #22's merge. Its
@@ -2620,7 +2620,7 @@ Merge, deployment, the live activation and the cutover stay separately gated;
 retirement by reboot (G-1), the unmanaged-launcher inventory (G-2) and the
 rollback mode (G-9) stay the owner's undecided gates. The rework also fixes
 PR #22's four remaining review blockers (code review 6112483129). The
-contract is [release_staging.md](release_staging.md#activation-plt-14-21).
+contract is [release_staging.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/release_staging.md#activation-plt-14-21).
 
 ### D-76. A stable chat-state root during startup and maintenance
 
@@ -2637,7 +2637,7 @@ requirement instead.
   change.
 - **The bound.** A deliberate same-user replacement during one path-based
   SQLite call or socket bind may land that call's effect before detection.
-  It is excluded, as in [writer_admission.md](writer_admission.md) section
+  It is excluded, as in [writer_admission.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/writer_admission.md) section
   13 and D-71.
 - **What is ruled out.** No working-directory change, custom SQLite VFS, new
   dependency, or permission or security setting.
@@ -2688,6 +2688,27 @@ approved by #31's canonical issue review).
 - **Still gated.** Nothing is installed or activated. The three new formats
   are not admitted by `activation.json`. Creating the live private file and
   adding the second owner account (#29) each need a separate owner approval.
+
+### D-78. The chat skill stays in the skills repository; the capture is retired
+
+Owner decision, 2026-10-19. The chat code is owned by the skills repository
+(`~/.codex/skills/chat`), not plateia. This supersedes D-7 and D-15 for the
+chat code, and the capture and packaging work built on them: D-19 to D-27,
+D-69 to D-77, PLT-9, PLT-11, PLT-12, PLT-14, PLT-15, #19, #21, #24, #27, #29,
+#31 and #32.
+
+- `packages/chat`, `packages/release` and their documents (`chat_capture`,
+  `chat_outbox_state`, `chat_outbox_test_matrix`, `release_contract`,
+  `release_staging`, `writer_admission`) were removed. Links to them above
+  point at `b59aeaf`, the last commit that had them.
+- Two standalone changes were ported to the skills repository (`7fb720c`):
+  D-70's whole-log message-ID deduplication, and the check that every `pchat`
+  subcommand and option the guidance names exists.
+- The never-activated work was not ported: the outbox authority (D-72,
+  D-73), the guarded format cutover (D-74), writer admission (D-75, D-76) and
+  the COLLAB-2 request store. The live chat keeps its own outbox and its
+  re-post fix. Reviving any of it starts from `b59aeaf` as a change to the
+  skills repository.
 
 ## Open questions
 
@@ -3258,11 +3279,11 @@ the PR.
     launch digest D.
   - **The bridge's start:** S1, S2, S3 or UNKNOWN, judged before any
     database commit
-    ([chat_outbox_state.md](chat_outbox_state.md#241-startup-and-the-exclusive-opener)).
+    ([chat_outbox_state.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/chat_outbox_state.md#241-startup-and-the-exclusive-opener)).
   - **Admission:** an explicit admission API in the stager
-    ([release_staging.md](release_staging.md#activation-plt-14-21)).
+    ([release_staging.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/release_staging.md#activation-plt-14-21)).
     Default preflight stays strict, and the declaration pin is unchanged
-    ([release_contract.md](release_contract.md)).
+    ([release_contract.md](https://github.com/coghex/plateia/blob/b59aeaf/docs/release_contract.md)).
 
 ### PLT-10. Expose one shared chat API with compatible non-web entry points
 
