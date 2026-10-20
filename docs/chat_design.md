@@ -319,8 +319,8 @@ posts links through chat (D-3); inline rendering does not replace that
 transport contract.
 
 This settles composition behavior and the allowed delivery sequence, not
-the complete issue boundaries. D-18 settles upload failure; upload timing,
-limits and retention remain open.
+the complete issue boundaries. D-18 settles upload failure and D-19 settles
+upload timing; limits and retention remain open.
 
 ### D-18. Keep the whole message unsent when an image upload fails
 
@@ -330,6 +330,16 @@ in the composer so the owner can retry or remove the image. Show the failure;
 do not silently post only the text or a broken image link.
 
 This applies to both D-17's placeholder-link and inline-image stages.
+
+### D-19. Upload on paste; post only on Send
+
+Owner decision 2026-10-20, relayed by the project manager as an authenticated
+reply: accept P-12. Start uploading an image as soon as it is pasted, while
+the owner finishes typing. The message is posted to chat only on Send.
+An uploaded image is not itself a sent message.
+
+This applies to both image delivery stages. Cleanup of uploads from
+abandoned drafts remains to be specified.
 
 ## Proposals
 
@@ -395,10 +405,16 @@ or removal available.
 
 ### P-12. Upload pasted images while the owner finishes typing
 
-For Q-6, recommend starting the upload when the image is pasted, while the
-owner continues writing. Posting to chat still requires Send. This can
-reduce the wait at Send, but means an abandoned draft may leave an uploaded
-image; cleanup of unused uploads needs a retention rule.
+Resolved by D-19. Upload starts on paste while typing continues; posting
+still requires Send.
+
+### P-13. Keep sent images for as long as their message logs
+
+For Q-6, recommend retaining images referenced by sent messages for as long
+as those messages' logs are kept, including after the room is archived.
+Closing a room would not break its image links. This requires storage to
+grow with retained conversation history; unused draft uploads can have a
+separate cleanup rule.
 
 ## Open questions
 
@@ -456,7 +472,8 @@ ship first, followed by inline rendering within milestone 1.
 
 **Upload failure resolved by D-18:** keep the whole message unsent for retry
 or image removal.
-Next settle upload timing (P-12). Remaining: PNG paste on
+**Upload timing resolved by D-19:** upload on paste, post only on Send.
+Next settle sent-image retention (P-13). Remaining: PNG paste on
 phone and desktop, limits, link access, inline sizing, attachment lifetime
 and preserved logs. Plateia stores images; shared chat records their links.
 
@@ -523,6 +540,8 @@ phone and desktop. Verify the early placeholder-link stage and the final
 inline-image stage separately; milestone 1 is not complete at the placeholder.
 In both stages, an upload failure must retain the whole unsent message and
 offer retry or image removal, without posting text alone or a broken link.
+Verify that pasting begins the upload while typing can continue, and that a
+completed upload alone never posts a message.
 
 ## Delivery plan
 
