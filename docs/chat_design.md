@@ -15,8 +15,9 @@ concrete precondition
 
 - [ ] EPIC. Deliver milestone 1: working chat on phone and desktop
 
-No child slices are defined yet. Room ownership and the remaining material
-choices must be settled before dependency ordering and issue boundaries.
+No child slices are defined yet. Room ownership is settled by D-8; lifecycle
+and the remaining material choices precede dependency ordering and issue
+boundaries.
 
 ## Epic contract
 
@@ -43,7 +44,7 @@ Read-only checks on 2026-10-20:
 | `docs/vision.md` at `228159c` | The owner accepted working chat as milestone 1, including posting, history, room users and pasted PNG images. |
 | `README.md`, `packages/routine_inbox/`, repository file inventory | There is no web application. The routine inbox is the only package; it is not an existing browser chat backend. |
 | `docs/plateia_design.md`, D-78; retirement PR #35 | The skills repository owns chat. Plateia's captured chat and release packages were removed. Retired outbox-authority and request-store designs are not live capabilities. |
-| Skills repository, `chat/SKILL.md` | Current guidance still describes request channels. This differs from V-2's issue/PR room model and requires an owner decision on where to reconcile it. |
+| Skills repository, `chat/SKILL.md` | Current guidance still describes request channels. D-8 settles reconciliation in the owner's global skills when room implementation is reached; the live guidance has not changed. |
 | Skills repository, `chat/scripts/chatlib.py`, `post` | Posting authenticates an account and handles IRC message formatting. Its result is a line count; its public signature has no caller-supplied logical operation ID. This alone does not establish browser retry safety. |
 | Skills repository, `chat/scripts/chat-bridge`, `project_for`, `handle` | Routing uses project channel names/prefixes. Ordinary direct agent delivery is restricted by sender category, unlike V-6's any-agent communication. Queuing precedes logging, with crash replay permitted. These are integration gaps, not evidence that the new contract is implemented. |
 | Skills repository, `chat/SKILL.md`, identity and delivery sections | Stable identities, session discovery, history, outbox, delivery and acceptance machinery exist. Their exact guarantees and usable interface require focused verification before designing the web adapter. IRC login alone is not presence evidence. |
@@ -106,10 +107,11 @@ Deferring delivery indicators does not defer durable delivery, duplicate-work
 prevention or visible unresolved failures. Browser push belongs to milestone
 2; the milestone 1 failure-reporting contract must still be settled.
 
-## Decisions already made by the owner
+## Decisions
 
-These entries restate accepted source decisions. They are not new approvals
-of mechanisms or delivery slices.
+D-1 through D-7 restate accepted source decisions. D-8 records the owner's
+answer in this design conversation. None approves unspecified mechanisms or
+delivery slices.
 
 ### D-1. Deliver working chat together
 
@@ -162,36 +164,53 @@ framework and how to evaluate it, and discuss image upload/display. PNG is
 required. No candidate, prototype exercise or upload mechanism is selected
 by this document.
 
+### D-8. Standardize issue/PR rooms through the owner's global skills, at the room implementation step
+
+Owner decision 2026-10-20, direct answer in this design conversation resolving
+Q-1: issue/PR rooms become the standard room model. The design includes an
+owner-specific global skill change in the skills repository, so the owner's
+agents and interfaces use the same convention across projects. Plateia
+displays that shared model rather than maintaining its own request-room
+mapping.
+
+Make the skill change when implementation reaches the room-model work, not
+now and not as an advance prerequisite for unrelated milestone work.
+The eventual delivery plan must include this change explicitly alongside the
+affected room work and identify any necessary shared-service changes under
+V-13. Exact skill files, migration and service mechanisms remain to be
+designed. This decision does not authorize live changes during design.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
 
-For Q-1, recommend changing the canonical chat skill and shared services to
-understand issue/PR work rooms, with plateia displaying that shared model.
-Requests would remain distinct records within a work room rather than
-determine its lifetime.
+Resolved by D-8, with the owner's timing correction: include the global skill
+change when room implementation is reached. The separate plateia mapping
+alternative was not selected. Request records within a room and migration
+details still need their own contracts.
 
-This keeps terminal and web views consistent and lets room lifecycle and log
-preservation work while plateia is down (V-13). The consequence is an explicit
-skills-repository prerequisite and migration design for existing request
-rooms. This proposal does not authorize editing those skills or config.
+### P-2. Open a work room when conversation or work first needs it
 
-The alternative is for plateia to map request rooms onto issue/PR rooms.
-That leaves two room models to reconcile and risks making lifecycle behavior
-depend on the web application. No option is approved yet.
+For Q-2's opening rule, recommend creating an issue room at its first
+discussion or work, including issue review, rather than automatically for
+every filed issue. A standalone PR gets its room when discussion or work
+first needs one. This keeps untouched backlog items from filling the room
+list while giving active work a room before implementation starts.
+
+This affects room discovery, creation and the owner's global skill change.
+It does not settle closure, reopening or multi-PR associations.
 
 ## Open questions
 
 ### Q-1. Where does the new room model live?
 
-Change canonical chat guidance/services to issue/PR rooms (P-1), or have
-plateia map existing request rooms to work rooms? Owner decision required
-first: it determines room contracts, migration responsibility and subsequent
-slice boundaries.
+**Resolved by D-8.** Issue/PR rooms are the standard shared model; include an
+owner-specific global skill change when the room-model work is implemented.
 
 ### Q-2. What is a work room's exact lifecycle?
 
-After Q-1: settle issue-only work before a PR exists, PR closure without
+First settle when a room opens (P-2). Then settle issue-only work before a PR
+exists, PR closure without
 merge, issue/PR reopening, replacement or multiple PRs, existing grouped
 request rooms, and work without a tracker item. Settle how closure preserves
 a complete file log despite outages or late posts, and how completion or
@@ -252,6 +271,9 @@ behavior here.
 
 No child slices yet. Define stable `CHAT-N` entries and mirror them in
 Processing status after blocking choices are settled. Each must identify its
-owning repository, dependencies and a reviewable outcome. The owner explicitly
+owning repository, dependencies and a reviewable outcome. Include D-8's
+owner-specific global skill change with the room-model work; do not make
+changing the live convention an advance prerequisite for unrelated work.
+The owner explicitly
 approves readiness before issue processing, and each tracker artifact gets
 separate signoff. The project manager runs filed-issue reviews.
