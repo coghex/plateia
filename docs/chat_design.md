@@ -87,6 +87,10 @@ the left, a wider users column on the right, and the conversation in the
 middle taking most of the screen. On phone, room and user lists open through
 buttons (D-28).
 
+Scrolling up loads older messages without moving the owner's reading
+position. New arrivals leave that position alone; “Jump to latest” returns
+to the bottom. When already at the bottom, follow new messages (D-39).
+
 Pasting an image inserts it directly into the message being written. The
 owner sees it inline while finishing the message, before pressing Send.
 There is no separate image-preview dialog or caption step. An early slice
@@ -765,6 +769,17 @@ limits. It does not establish that the existing sender supports the full
 size under D-34/D-36's deadline and at-most-once requirements. D-37's shared
 contract must provide that support.
 
+### D-39. Keep the reader's place while loading history
+
+Owner decision 2026-10-20. Scrolling up loads older messages and preserves
+the visible reading position. While the owner is reading earlier messages,
+new arrivals leave that position alone. “Jump to latest” returns to the
+bottom; when already at the bottom, follow new messages automatically.
+Use the same behavior on phone and desktop.
+
+This is milestone-1 history navigation. It does not add unread counts,
+mention badges or milestone-2 notification features.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -961,12 +976,16 @@ with a warning before submission when exceeded and no silent truncation.
 
 ### P-30. Preserve the reading position while loading older messages
 
-For Q-7's conversation behavior, recommend loading older messages when the
-owner scrolls up, keeping the visible reading position stable. While the
-owner is reading earlier messages, new arrivals do not move the view. A
-“Jump to latest” button returns to the newest message; when already at the
-bottom, follow new messages automatically. Use the same behavior on phone
-and desktop. This does not add milestone-2 unread counts or mention badges.
+Resolved by D-39: scroll up loads older messages, new arrivals preserve the
+reader's place, and “Jump to latest” returns to the bottom on both layouts.
+
+### P-31. Selecting a user adds a mention to the current draft
+
+To implement V-6's user selection, recommend inserting the selected user's
+`@handle` at the cursor in the current room's draft and focusing the composer.
+Preserve existing text and images; selection does not replace the draft,
+change rooms or send anything. The owner can finish editing and use the
+normal Send action. Apply the same behavior from the phone user list.
 
 ## Open questions
 
@@ -1049,7 +1068,8 @@ if missing. Q-3 must establish that guarantee at the publication boundary.
 breaks preserved and explicit transport grouping, never time-based merging.
 **Message size resolved by D-38:** 64 KiB of text, with a warning before
 Send when exceeded; retain the draft rather than submitting or truncating.
-Distinguish server acceptance from
+Settle how selecting a user starts an addressed message without losing an
+existing draft (P-31). Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
 Settle how undelivered messages remain visible and how the owner is notified
 before browser push exists.
@@ -1092,8 +1112,9 @@ Plateia stores images; shared chat records their links.
 in real chat slices. D-26/D-27 settle the delegated build/editor/toolchain/CI
 choices. **Layout resolved by D-28:** narrow rooms left, wider users right,
 chat taking most of the desktop screen; room/user lists behind buttons on
-phone. P-30 proposes history loading and scroll behavior. Reconcile the
-earlier browser trust boundary with posting and attachments.
+phone. **History scrolling resolved by D-39:** load older on scroll-up,
+preserve the reader's place on new arrivals, and provide “Jump to latest”.
+Reconcile the earlier browser trust boundary with posting and attachments.
 
 ### Q-8. How should existing rooms be archived and migrated?
 
@@ -1232,6 +1253,12 @@ multibyte characters and attachment links. Over-limit content must remain
 in the draft with a warning and no send attempt; client and server must
 agree on the byte count. Supported-size messages still need complete,
 at-most-once publication under the send-deadline contract.
+
+Check D-39 on phone and desktop: loading older pages and receiving new
+messages must preserve the visible message and reading position. Include
+images finishing their load above the viewport. “Jump to latest” returns
+to the bottom, and automatic following resumes there without adding unread
+counts or mention badges.
 
 ## Delivery plan
 
