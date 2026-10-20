@@ -319,8 +319,17 @@ posts links through chat (D-3); inline rendering does not replace that
 transport contract.
 
 This settles composition behavior and the allowed delivery sequence, not
-the complete issue boundaries. Upload timing, failure handling, limits and
-retention remain to be settled.
+the complete issue boundaries. D-18 settles upload failure; upload timing,
+limits and retention remain open.
+
+### D-18. Keep the whole message unsent when an image upload fails
+
+Owner decision 2026-10-20, relayed by the project manager as an authenticated
+reply: accept P-11. If an image upload fails, keep the whole message unsent
+in the composer so the owner can retry or remove the image. Show the failure;
+do not silently post only the text or a broken image link.
+
+This applies to both D-17's placeholder-link and inline-image stages.
 
 ## Proposals
 
@@ -381,10 +390,15 @@ The owner permits a placeholder-link slice before the inline-image slice.
 
 ### P-11. Keep the message unsent if its image upload fails
 
-For Q-6, recommend keeping the whole message in the composer if an image
-cannot be uploaded. Show the failure and let the owner retry or remove the
-image before sending. Do not silently send only the text or a broken link.
-This rule would apply to both the placeholder-link and inline-image stages.
+Resolved by D-18. Upload failure keeps the whole message unsent, with retry
+or removal available.
+
+### P-12. Upload pasted images while the owner finishes typing
+
+For Q-6, recommend starting the upload when the image is pasted, while the
+owner continues writing. Posting to chat still requires Send. This can
+reduce the wait at Send, but means an abandoned draft may leave an uploaded
+image; cleanup of unused uploads needs a retention rule.
 
 ## Open questions
 
@@ -440,7 +454,9 @@ present missing evidence as idle or current.
 while typing before Send; no separate preview step. A placeholder link may
 ship first, followed by inline rendering within milestone 1.
 
-Next settle upload failure (P-11). Remaining: upload timing, PNG paste on
+**Upload failure resolved by D-18:** keep the whole message unsent for retry
+or image removal.
+Next settle upload timing (P-12). Remaining: PNG paste on
 phone and desktop, limits, link access, inline sizing, attachment lifetime
 and preserved logs. Plateia stores images; shared chat records their links.
 
@@ -505,6 +521,8 @@ Image composition checks must cover PNG paste while writing a message,
 continuing to type with the image visible, and posting only on Send, on
 phone and desktop. Verify the early placeholder-link stage and the final
 inline-image stage separately; milestone 1 is not complete at the placeholder.
+In both stages, an upload failure must retain the whole unsent message and
+offer retry or image removal, without posting text alone or a broken link.
 
 ## Delivery plan
 
