@@ -51,6 +51,7 @@ Read-only checks on 2026-10-20:
 | Skills repository, `chat/scripts/chat-bridge`, `project_for`, `handle` | Routing uses project channel names/prefixes. Ordinary direct agent delivery is restricted by sender category, unlike V-6's any-agent communication. Queuing precedes logging, with crash replay permitted. These are integration gaps, not evidence that the new contract is implemented. |
 | Skills repository, `chat/SKILL.md`, identity and delivery sections | Stable identities, session discovery, history, outbox, delivery and acceptance machinery exist. Their exact guarantees and usable interface require focused verification before designing the web adapter. IRC login alone is not presence evidence. |
 | GitHub issue inventory, `coghex/plateia` | No open issues on 2026-10-20. Earlier foundation epic #10 and collaboration epic #26 are closed; neither is an open milestone 1 tracker. Recheck overlap before readiness. |
+| `.github/workflows/ci.yml`, refreshed 2026-10-20 | Python 3.10/3.14 tests feed an always-running `build-test` aggregate that rejects any non-success dependency. There is no frontend package or Node build yet. D-27 extends this existing gate. |
 
 The brief identifies general and project testing rooms as not yet configured.
 This design does not inspect or publish private configuration. Creating those
@@ -174,8 +175,9 @@ duplicate work; unresolved failures and incomplete actions remain visible.
 
 Owner decision 2026-10-20, V-3/V-12: the owner and designer settle the page
 framework and how to evaluate it, and discuss image upload/display. PNG is
-required. No candidate, prototype exercise or upload mechanism is selected
-by this document.
+required. At that point no candidate or upload mechanism was selected.
+D-17/D-19 subsequently settle image composition/upload timing, and D-25
+settles Svelte and validation in real chat slices.
 
 ### D-8. Standardize issue/PR rooms through the owner's global skills, at the room implementation step
 
@@ -406,6 +408,110 @@ create a separate offline slice, offline send queue or extra machinery for
 it. This does not weaken V-12's existing guarantees for requests already
 submitted or acknowledged.
 
+### D-25. Use Svelte with Python, validated in real chat slices
+
+Owner decision 2026-10-20, relayed by the project manager as an authenticated
+answer to Q-7: use Svelte for the page. The owner rejected React as overkill.
+Python remains the server. Validate the choice in the real phone/desktop
+chat slices; no separate comparative prototype exercise is required.
+
+The owner instructed the designer to settle the Svelte build setup and
+editor integration and record the Node/npm toolchain, dependency pinning
+and CI build step. D-26/D-27 record those technical selections under that
+instruction. No installation or implementation is authorized in this session.
+
+### D-26. Build a client-only Svelte/Vite page with a Tiptap composer
+
+Design selection 2026-10-20 under D-25's explicit instruction:
+
+- Use plain Svelte 5 with Vite and TypeScript in `web/`. The build produces
+  `web/dist/` HTML, JavaScript and CSS, served by the Python application on
+  the same origin as its API. Node is a development/build dependency, not
+  a second production server. Development servers bind to localhost.
+- Use the official `@sveltejs/vite-plugin-svelte`. SvelteKit's client-only
+  static mode is viable, but its routing/loading conventions are unnecessary
+  for the current chat page. Room URL and browser-history handling still
+  need a small explicit contract.
+- Use Tiptap 3's open-source core and ProseMirror packages through a Svelte
+  component: create the editor on mount, track editor transactions, and
+  destroy it on unmount. Enable only the message schema needed for text,
+  paragraphs/line breaks, undo and image/link nodes; this does not add a
+  document-formatting feature set.
+- Handle pasted image files through plateia's upload API. Insert an
+  attachment at the paste position and update that same attachment when
+  upload completes; subsequent typing must not move or duplicate it. Use
+  the same attachment identity in D-17's link-first and inline stages.
+  The later image node uses inline rendering.
+- Store a versioned draft representation rather than arbitrary editor HTML.
+  Convert messages to text and image links at the chat boundary. The exact
+  serialization and input validation are still Q-3 contracts.
+
+These are design choices, not tested implementation claims. Svelte documents
+[direct Vite builds](https://svelte.dev/docs/svelte/getting-started)
+and [SvelteKit static SPA builds](https://svelte.dev/docs/kit/single-page-apps).
+Tiptap documents [Svelte lifecycle integration](https://tiptap.dev/docs/editor/getting-started/install/svelte)
+and an [inline image node](https://tiptap.dev/docs/editor/extensions/nodes/image);
+the image extension displays images but does not implement uploading.
+No paid editor service or cloud collaboration service is needed.
+
+### D-27. Pin the frontend toolchain and include its build in `build-test`
+
+Design selection 2026-10-20 under D-25's explicit instruction. Starting
+versions, checked read-only against publisher release/registry metadata:
+
+| Tool or dependency | Selected version |
+| --- | --- |
+| Node.js, LTS line | 24.22.0 |
+| npm, bundled with that Node release | 11.19.1 |
+| Svelte | 5.57.2 |
+| Vite | 8.3.4 |
+| `@sveltejs/vite-plugin-svelte` | 7.3.1 |
+| TypeScript | 6.0.3 |
+| `svelte-check` | 4.7.7 |
+| Tiptap core, ProseMirror package and image extension | 3.32.0 |
+
+The Svelte plugin's declared peers accept the selected Svelte/Vite versions.
+`svelte-check` 4.7.7 declares TypeScript 5/6 support, so TypeScript 7 is not
+selected. This is a manifest compatibility check; a real locked install and
+build must pass in the first frontend PR.
+
+Record Node's exact version in `web/.node-version`, npm's exact version in
+`web/package.json` (`packageManager`), and verify both versions in CI.
+Pin direct dependencies to exact versions without `^` or `~`; pin any
+additional Tiptap schema packages to the same release. Commit
+`web/package-lock.json` with transitive versions and integrity hashes.
+Use `npm ci` for clean installs. Do not use floating `latest`, implicit
+global tools or peer-dependency bypass flags in the build.
+
+The first frontend code slice adds a `web` job to the existing CI workflow:
+
+1. Check out the code; set up the exact Node version from the file and
+   verify the bundled npm version.
+2. In `web/`, run `npm ci`, then `npm run check` (Svelte and TypeScript
+   checking), then `npm run build` (`vite build`).
+3. Include `web` in `build-test.needs`, alongside the existing Python
+   tests. The aggregate must fail for a failed, cancelled or skipped web
+   job. Preserve the PR/master triggers and read-only permissions.
+
+Use the same commands locally. Keep `node_modules/` and generated `web/dist/`
+out of git; serve the output of the exact checked source build. Add focused
+browser/editor tests with the interaction slices they verify, rather than
+claiming a successful bundle proves mobile paste, draft recovery or history
+behavior. Dependency updates are explicit code changes with regenerated
+lockfiles and the same checks. Recheck releases at implementation if a
+compatibility or security issue requires changing these starting pins.
+
+Evidence: [Node release index](https://nodejs.org/dist/index.json),
+[Svelte metadata](https://registry.npmjs.org/svelte/5.57.2),
+[Vite metadata](https://registry.npmjs.org/vite/8.3.4),
+[plugin metadata](https://registry.npmjs.org/@sveltejs/vite-plugin-svelte/7.3.1),
+[TypeScript metadata](https://registry.npmjs.org/typescript/6.0.3),
+[`svelte-check` metadata](https://registry.npmjs.org/svelte-check/4.7.7),
+[Tiptap core metadata](https://registry.npmjs.org/@tiptap/core/3.32.0),
+and [image extension metadata](https://registry.npmjs.org/@tiptap/extension-image/3.32.0).
+The [npm CI contract](https://docs.npmjs.com/cli/v11/commands/npm-ci/)
+requires a matching lockfile and does not rewrite dependency manifests.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -509,11 +615,10 @@ composer, no separate slice or extra offline machinery.
 
 ### P-18. Choose React with Vite from a short comparison, then validate real chat
 
-For Q-7, recommend React with Vite for the browser page, served by the Python
-backend. Evaluate the choice through the actual phone/desktop chat slices:
-live/history continuity, draft recovery, inline image composition and
-responsive layout. A framework does not supply V-12's durable delivery
-contract; that remains shared-service and backend work.
+Framework recommendation rejected by D-25: the owner chose Svelte because
+React was overkill. The real-chat evaluation method was accepted.
+The comparison below is retained as the basis of that discussion, not the
+current recommendation. D-26/D-27 specify the selected setup.
 
 This is a design recommendation based on official documentation reviewed on
 2026-10-20, not a measured prototype result:
@@ -529,14 +634,15 @@ Sources: [React's build-tool guidance](https://react.dev/learn/build-a-react-app
 [Svelte overview](https://svelte.dev/docs/svelte/overview), and
 [htmx documentation](https://htmx.org/docs/).
 React's guidance cautions that a build-tool-only setup leaves application
-conventions to the project; this recommendation accepts that tradeoff for a
-Python-backed chat client. Tiptap is evidence of an integration option,
-not an editor-library decision.
+conventions to the project. The selected Svelte setup is recorded above;
+framework selection is no longer open.
 
-Proposed evaluation method: use this written comparison for the owner's
-selection, then verify real chat on phone and desktop during delivery.
-Do not add a separate three-framework prototype exercise. Both the framework
-choice and this evaluation method remain for owner signoff.
+### P-19. Use three columns on desktop and panels on phone
+
+For Q-7's layout, recommend rooms on the left, the conversation in the middle
+and users on the right. On a phone, show the conversation and open the room
+and user lists through buttons. Both layouts expose the same features.
+This is a proposal; exact sizing and visual styling remain open.
 
 ## Open questions
 
@@ -612,9 +718,9 @@ Plateia stores images; shared chat records their links.
 
 ### Q-7. Which page framework, evaluation method and browser layout?
 
-P-18 proposes React with Vite, selected from the written comparison and
-verified in real chat slices. The owner must approve the framework and
-evaluation method. Layout remains open. Reconcile the earlier browser trust
+**Framework and evaluation resolved by D-25:** Svelte with Python, validated
+in real chat slices. D-26/D-27 settle the delegated build/editor/toolchain/CI
+choices. Next settle layout (P-19). Reconcile the earlier browser trust
 boundary with posting and attachments.
 
 ### Q-8. How should existing rooms be archived and migrated?
@@ -697,6 +803,9 @@ owner-specific global skill change with the room-model work; do not make
 changing the live convention an advance prerequisite for unrelated work.
 Keep D-24's disconnected behavior within normal composer work; it does not
 drive slice boundaries or add offline machinery.
+The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
+dependency pins and web CI job feeding `build-test`. Keep implementation
+in normal isolated code worktrees; this document does not install tools.
 Include D-16's design-agent use of general in that change, with no dedicated
 design-room slice or conversation migration. General's live provisioning
 remains the owner's action.
@@ -709,8 +818,8 @@ Discard existing design rooms during that rollout without saved logs.
 Image sequencing from D-17: first deliver pasted-image insertion as a
 placeholder link in the message; then deliver inline image display,
 including in the message being composed. Both are milestone 1 work. Record
-their final issue boundaries and dependencies once the upload contract and
-page framework are settled.
+their final issue boundaries and dependencies once the remaining upload
+contract is settled; D-25/D-26 have settled the page framework and editor.
 Include image preservation in the archive contract from the first image
 slice; placeholder links do not defer D-20's storage obligations.
 Apply D-21's upload-time cap in that first slice too; inline rendering is
