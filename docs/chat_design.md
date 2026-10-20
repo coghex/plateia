@@ -404,7 +404,8 @@ of interrupted uploads remain to be designed. Cross-device draft
 synchronization is not part of this decision.
 
 D-32/D-33 exclude failed-send entries from persistence and retain only one
-temporary failure for retry. Do not treat that entry as another saved draft.
+temporary failure for retry. D-36 also excludes unconfirmed submissions
+from browser persistence. Neither is another saved draft.
 
 ### D-24. Keep disconnected drafting minimal
 
@@ -619,10 +620,10 @@ remains minimal; send recovery is a required, fully tested contract.
 The owner delegated the countdown duration. Design selection: **10 seconds
 per send attempt**, measured from dispatch with a monotonic clock; display
 the rounded-up remaining seconds, clamped at zero. Reconnects and background
-tab suspension do not restart that attempt's deadline. Ten seconds is a
-feedback deadline, not an assertion that a network operation must finish
-within ten seconds. At expiry, the authoritative check/cancel may itself
-be delayed; D-35 settles its presentation.
+tab suspension do not restart that attempt's deadline. D-36 strengthens
+this from a browser feedback deadline to an expiry carried by the send and
+enforced by the server. The status/check response can still arrive later;
+D-35 settles its presentation while the original page remains open.
 
 The server contract requires an atomic check-and-cancel operation, not a
 separate read followed by cancellation. Cancellation must also cover an ID
@@ -660,6 +661,36 @@ Continue recovery when connectivity returns. Elapsed time alone never
 turns this state into failure or enables retry. A later authoritative
 answer settles it immediately. This is the V-12 unknown state, not a
 milestone-2 delivery-progress indicator.
+
+### D-36. Do not restore unconfirmed sends; enforce expiry on the server
+
+Owner decision 2026-10-20. Unconfirmed sends do not reappear after a reload.
+Persist nothing about them in the browser: no pending-message content,
+ID, deadline or recovery entry. Send still clears the saved draft at once
+(D-33). Unsubmitted drafts remain covered by D-23.
+
+Each send carries its deadline. The server refuses to post an attempt that
+reaches it after that deadline. After reload, once the deadline has passed,
+the message must either be in the room's history or never be posted. If
+missing, the owner retypes it. There is no automatic reconstruction or
+resubmission of the discarded local entry. D-35's countdown and unknown
+state apply only while that entry remains in the current page.
+
+This supersedes P-27. It does not remove server-side cancellation and
+deduplication records required by D-34. The deadline belongs to a send
+attempt; an explicit retry in the still-open page retains the logical ID
+and has its own deadline. The expired original attempt must remain unable
+to post, even after a retry is authorized.
+
+The promised history-or-never outcome is stronger than checking a timestamp
+only on HTTP arrival. Q-3 must cover requests queued before expiry, IRC
+publication in flight at expiry, server restart, clock disagreement and
+history lag. Expiry must work without a surviving browser to request
+cancellation. A stale or incomplete history view cannot prove a message
+missing: retyping safely depends on an authoritative history result that
+includes every post committed before the cutoff. These are implementation
+obligations of the accepted outcome, not capabilities established in the
+existing sender. Resolve them before claiming this contract is deliverable.
 
 ## Proposals
 
@@ -840,18 +871,19 @@ seconds and the wording is “unconfirmed: awaiting server”.
 
 ### P-27. Recover unconfirmed submissions after a same-device reload
 
-For Q-4, recommend retaining an unresolved submission's ID, room, content,
-attachment references and deadline on the same device so a reload restores
-the pending message and checks that same ID. This is a pending submission,
-not a draft: recovery never blindly submits it as a new message. Preserve
-the deadline across reload rather than restarting the countdown.
+Rejected by D-36. No browser persistence or restoration of unconfirmed
+sends. Each attempt instead carries a server-enforced deadline; after
+reload and expiry, the owner uses history and retypes a missing message.
 
-On confirmed posting, reconcile with the canonical conversation record
-and remove the local pending copy. On confirmed cancellation, remove the
-persisted pending copy and leave only D-32/D-33's temporary failed entry
-for retry in the current window. A later reload does not restore that
-failure. This proposal does not persist confirmed failures, sync pending
-messages across devices or introduce an offline send queue.
+### P-28. Keep long text as one visible message
+
+For Q-4, recommend preserving line breaks and presenting a long text post
+as one message in the web conversation. Any necessary IRC transport
+splitting stays behind the shared chat boundary; it must not create
+independent web messages or repeated agent instructions. Do not silently
+truncate text. Transport limits, safe maximum size and all-or-nothing
+publication within D-36's expiry contract must be resolved under Q-3
+before defining the implementation slice.
 
 ## Open questions
 
@@ -892,8 +924,11 @@ is distinguished from a delayed original request, and how the IRC boundary
 proves posting or cancellation across crashes and lost acknowledgements.
 The current PONG/text-match sender does not satisfy this. This is a required
 shared-chat change and a design-readiness gate, not work to hide in a
-browser retry handler. Settle in-flight reload recovery separately from
-D-32's prohibition on persisting failed message entries.
+browser retry handler. D-36 rejects browser recovery storage: expiry must
+work after the browser disappears. Establish deadline clock semantics,
+the final publication cutoff and complete history through that cutoff,
+including pending IRC writes and a lagging bridge. An HTTP arrival-time
+check alone does not establish the accepted history-or-never guarantee.
 
 ### Q-4. What are the posting and recovery interactions?
 
@@ -916,7 +951,11 @@ retry with at-most-once posting. The delegated duration is 10 seconds.
 **Unanswered deadline check resolved by D-35:** keep “sending... (0)” for
 five more seconds, then small grey “unconfirmed: awaiting server”; no retry
 until confirmed cancellation, and normal display on confirmed posting.
-Still settle in-flight reload recovery (P-27) and long-message handling.
+**Reload behavior resolved by D-36:** no persistence or reappearance of
+unconfirmed sends; the server enforces the deadline carried by each attempt.
+After expiry, a message is in history or will never post; the owner retypes
+if missing. Q-3 must establish that guarantee at the publication boundary.
+Still settle long-message handling (P-28).
 Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
 Settle how undelivered messages remain visible and how the owner is notified
@@ -1066,6 +1105,16 @@ the text; a confirmed cancellation permits the red retry icon, subject to
 the single-failure rule. Waiting longer alone must never manufacture either
 outcome.
 
+D-36 checks must reload or close the browser before confirmation and prove
+there is no persisted pending content, ID, deadline or restored entry.
+Unsubmitted drafts must still survive. Delay the original request past
+expiry with no browser left to cancel it, and verify it never posts. Also
+cover requests received before expiry but queued or writing to IRC when
+the deadline passes, clock skew, restart and delayed history ingestion.
+Verify the history-or-never result from authoritative history, not a stale
+browser cache or a missing bridge-log entry. A same-ID retry with a fresh
+attempt deadline must not reactivate an expired original attempt.
+
 Draft recovery checks must retain text and images across room switches and
 reloads on the same device, including drafts whose uploads are interrupted
 or have failed. Cleanup must not remove saved-draft attachments.
@@ -1089,6 +1138,8 @@ work and network-fault coverage before the web sender can claim safe retry.
 Resolve Q-3's publication boundary and attempt-fencing contract before
 defining those slices. Do not defer it as a low-priority local-network edge
 case or add an offline send queue.
+Include D-36's server-enforced expiry and history completeness in that
+contract. Do not add browser pending-send storage or reload restoration.
 Exclude D-30's optional current-task line and setting from all milestone-1
 slices; retain only the milestone-2 note.
 The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
