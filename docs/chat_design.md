@@ -383,6 +383,18 @@ screenshots may require cropping before paste. Input decoding and processing
 need separate resource limits; the stored-file cap is not a total memory
 budget.
 
+### D-23. Keep each room's unfinished message on the same device
+
+Owner decision 2026-10-20, relayed by the project manager as an authenticated
+reply: accept P-16. Each room retains its unfinished message, including
+images, across room switches and page reloads on the same device.
+
+Successfully sending or explicitly discarding a draft clears it. Draft
+storage must preserve its attachments; unused-upload cleanup must not remove
+images still belonging to a saved draft. The storage mechanism and recovery
+of interrupted uploads remain to be designed. Cross-device draft
+synchronization is not part of this decision.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -476,14 +488,19 @@ the owner-approved numeric limits.
 
 ### P-16. Keep a draft for each room on the same device
 
-For Q-4, recommend retaining each room's unfinished message when switching
-rooms or reloading the page on the same device, including its image
-attachments. This lets the owner return to a message without composing it
-again. Sending or explicitly discarding the draft clears it.
+Resolved by D-23. Each room keeps its unfinished message and images across
+room switches and reloads on the same device.
 
-This proposes same-device draft recovery, not cross-device synchronization.
-The storage mechanism and recovery of interrupted image uploads remain to
-be designed. Unsent drafts remain distinct from acknowledged chat requests.
+### P-17. Allow drafting offline, with Send disabled until reconnection
+
+For Q-4, recommend allowing the owner to keep writing a draft while the page
+is disconnected, but disabling Send until it reconnects. Do not queue new
+offline sends to post automatically later. This avoids delivering an
+instruction after the situation may have changed.
+
+This concerns new sends while known to be offline. A send interrupted after
+submission still needs durable lookup and safe retry under V-12; it must
+not be treated as definitely unsent merely because the connection dropped.
 
 ## Open questions
 
@@ -520,8 +537,9 @@ the skills repository. Do not revive retired packages by inference.
 
 ### Q-4. What are the posting and recovery interactions?
 
-Next settle per-room draft recovery (P-16). Also settle acknowledgement,
-disconnected sending, uncertain outcomes,
+**Draft recovery resolved by D-23:** keep each room's unfinished message and
+images across switches and reloads on the same device.
+Next settle disconnected sending (P-17). Also settle acknowledgement, uncertain outcomes,
 safe retry and long-message handling. Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
 Settle how undelivered messages remain visible and how the owner is notified
@@ -621,6 +639,9 @@ In both stages, an upload failure must retain the whole unsent message and
 offer retry or image removal, without posting text alone or a broken link.
 Verify that pasting begins the upload while typing can continue, and that a
 completed upload alone never posts a message.
+Draft recovery checks must retain text and images across room switches and
+reloads on the same device, including drafts whose uploads are interrupted
+or have failed. Cleanup must not remove saved-draft attachments.
 Archive checks must show that the conversation and its image files are
 preserved together, that references still resolve, and that a missing image
 cannot be silently treated as a fully verified archive.
