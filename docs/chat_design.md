@@ -109,8 +109,8 @@ prevention or visible unresolved failures. Browser push belongs to milestone
 
 ## Decisions
 
-D-1 through D-7 restate accepted source decisions. D-8 records the owner's
-answer in this design conversation. None approves unspecified mechanisms or
+D-1 through D-7 restate accepted source decisions. D-8 onward record the
+owner's answers in this design conversation. None approves unspecified mechanisms or
 delivery slices.
 
 ### D-1. Deliver working chat together
@@ -180,6 +180,16 @@ affected room work and identify any necessary shared-service changes under
 V-13. Exact skill files, migration and service mechanisms remain to be
 designed. This decision does not authorize live changes during design.
 
+### D-9. Create work rooms on first use
+
+Owner decision 2026-10-20, direct answer in this design conversation:
+create an issue or standalone-PR work room when discussion or work first
+needs it, including issue review. Filing a tracker item alone does not
+create a room. This resolves Q-2's opening rule and accepts P-2.
+
+The opening rule belongs in D-8's shared room-model work and global skill
+change. Closure, reopening and associations still need their own contracts.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -191,14 +201,20 @@ details still need their own contracts.
 
 ### P-2. Open a work room when conversation or work first needs it
 
-For Q-2's opening rule, recommend creating an issue room at its first
-discussion or work, including issue review, rather than automatically for
-every filed issue. A standalone PR gets its room when discussion or work
-first needs one. This keeps untouched backlog items from filling the room
-list while giving active work a room before implementation starts.
+Resolved by D-9. Automatic room creation for every filed tracker item was
+not selected; untouched backlog items need not fill the room list.
 
-This affects room discovery, creation and the owner's global skill change.
-It does not settle closure, reopening or multi-PR associations.
+### P-3. Close an issue-only room when its issue closes
+
+For the next part of Q-2, recommend closing a room whose issue closes without
+ever having a PR, and preserving its log in a file. This covers abandoned,
+duplicate or discussion-only issues without leaving their rooms open forever.
+V-2 already requires closure when a PR closes; this proposal supplies the
+missing trigger for work that never has a PR.
+
+This affects shared lifecycle detection and file preservation. It does not
+settle issues with multiple or replacement PRs, reopening, or the mechanics
+of safely completing the archive.
 
 ## Open questions
 
@@ -209,9 +225,9 @@ owner-specific global skill change when the room-model work is implemented.
 
 ### Q-2. What is a work room's exact lifecycle?
 
-First settle when a room opens (P-2). Then settle issue-only work before a PR
-exists, PR closure without
-merge, issue/PR reopening, replacement or multiple PRs, existing grouped
+**Opening resolved by D-9:** create on first use, including issue review.
+Next settle closure of an issue that never has a PR (P-3), then PR closure
+without merge, issue/PR reopening, replacement or multiple PRs, existing grouped
 request rooms, and work without a tracker item. Settle how closure preserves
 a complete file log despite outages or late posts, and how completion or
 failure of preservation becomes visible. No archive browser in this milestone.
