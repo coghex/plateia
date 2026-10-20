@@ -48,6 +48,7 @@ Read-only checks on 2026-10-20:
 | `docs/plateia_design.md`, D-78; retirement PR #35 | The skills repository owns chat. Plateia's captured chat and release packages were removed. Retired outbox-authority and request-store designs are not live capabilities. |
 | Skills repository, `chat/SKILL.md` | Current guidance still describes request channels. D-8 settles reconciliation in the owner's global skills when room implementation is reached; the live guidance has not changed. |
 | Skills repository, `chat/scripts/chatlib.py`, `post` | Posting authenticates an account and handles IRC message formatting. Its result is a line count; its public signature has no caller-supplied logical operation ID. This alone does not establish browser retry safety. |
+| Skills repository, `chat/scripts/chatlib.py`, `_round`, `already_posted`, refreshed 2026-10-20 | The sender waits for a PONG after writing IRC messages. Retry reconciliation matches account/text/time in local logs; partially landed posts may be retried whole. There is no message-ID check-and-cancel API. This does not meet D-34's at-most-once contract. |
 | Skills repository, `chat/scripts/chat-bridge`, `project_for`, `handle` | Routing uses project channel names/prefixes. Ordinary direct agent delivery is restricted by sender category, unlike V-6's any-agent communication. Queuing precedes logging, with crash replay permitted. These are integration gaps, not evidence that the new contract is implemented. |
 | Skills repository, `chat/SKILL.md`, identity and delivery sections | Stable identities, session discovery, history, outbox, delivery and acceptance machinery exist. Their exact guarantees and usable interface require focused verification before designing the web adapter. IRC login alone is not presence evidence. |
 | GitHub issue inventory, `coghex/plateia` | No open issues on 2026-10-20. Earlier foundation epic #10 and collaboration epic #26 are closed; neither is an open milestone 1 tracker. Recheck overlap before readiness. |
@@ -411,10 +412,11 @@ Owner decision 2026-10-20, relayed by the project manager as an authenticated
 reply: allow typing while disconnected, with Send disabled until
 reconnection. Treat this as a low-priority edge case.
 
-Handle it within the normal composer and connection-state behavior. Do not
-create a separate offline slice, offline send queue or extra machinery for
-it. This does not weaken V-12's existing guarantees for requests already
-submitted or acknowledged.
+Handle disconnected typing within normal composer and connection-state
+behavior, without an offline send queue. D-34 supersedes the low-priority
+framing for messages already submitted: send deadlines, authoritative
+check/cancel and safe retry require proper design and network-fault coverage.
+Local deployment is not a reason to weaken those guarantees.
 
 ### D-25. Use Svelte with Python, validated in real chat slices
 
@@ -576,9 +578,9 @@ after a reload. This decision does not remove V-12's durability requirement
 for requests the shared service has already acknowledged. D-33 settles the
 saved-draft transition and when the temporary failed entry is removed.
 
-The owner did not approve the proposed “Checking” state. Its label and
-uncertain-outcome behavior remain open; do not implement that label as an
-accepted choice.
+The owner did not approve the proposed “Checking” state. D-34 instead
+requires a countdown below an unconfirmed message and an authoritative
+server check at its deadline.
 
 ### D-33. Clear the draft on Send and retain only one temporary failure
 
@@ -592,6 +594,50 @@ This refines D-23 and D-32. Unsubmitted drafts still survive room switches
 and reloads; failed sends do not. A disabled Send action does not submit or
 clear a draft. The rule concerns temporary failed-send feedback, not the
 durable record of requests the shared service has already acknowledged.
+
+### D-34. Resolve send deadlines by message ID at the server
+
+Owner decision 2026-10-20. Each message has a browser-created ID. When
+confirmation is missing, show small grey “sending... (N)” text below the
+message, counting down to a fixed deadline. At zero, ask the server about
+that ID:
+
+- If posted, display the message normally. A late confirmation does not
+  justify hiding a message already in the conversation record.
+- If not posted, the server cancels the pending submission before returning
+  that result. Late arrival of the original request cannot then post it.
+  Only after that authoritative result does the browser show the red retry
+  icon, subject to D-33's single-failure rule.
+- Retry uses the same logical message ID. It must post at most once,
+  including when requests, responses or retries are delayed or repeated.
+
+Design for real latency, lost replies, reconnects and late requests even
+though deployment is local. This supersedes D-24's minimal treatment of
+send recovery and P-25's indefinite plain sending text. Disconnected typing
+remains minimal; send recovery is a required, fully tested contract.
+
+The owner delegated the countdown duration. Design selection: **10 seconds
+per send attempt**, measured from dispatch with a monotonic clock; display
+the rounded-up remaining seconds, clamped at zero. Reconnects and background
+tab suspension do not restart that attempt's deadline. Ten seconds is a
+feedback deadline, not an assertion that a network operation must finish
+within ten seconds. At expiry, the authoritative check/cancel may itself
+be delayed; its presentation is proposed in P-26.
+
+The server contract requires an atomic check-and-cancel operation, not a
+separate read followed by cancellation. Cancellation must also cover an ID
+whose original request has not arrived yet. Durable cancellation and
+deduplication metadata are distinct from D-32's unsaved failed-message UI;
+they must survive service restarts to reject late requests. They are not a
+saved failure conversation or an automatic retry queue.
+
+An explicit retry must be distinguishable from delayed delivery of the
+cancelled attempt while retaining the same logical ID. The protocol must
+fence the old attempt and serialize retry, cancellation and publication.
+A local timeout, missing bridge log entry, or successful socket write is
+not authoritative proof of the IRC publication outcome. Q-3 must establish
+that proof at the actual publication boundary; do not claim the existing
+sender already provides it or substitute text matching for message IDs.
 
 ## Proposals
 
@@ -746,12 +792,11 @@ below the message, then a red exclamation mark on failure that retries when
 clicked. Failed entries are not persisted. The proposed “Not sent” text is
 superseded by the icon; “Checking” was not approved.
 
-Still proposed: normal display after durable server acceptance, without
-claiming recipient acceptance; lookup of uncertain submissions before retry;
-reuse of submission identity to prevent duplicates; and visible delivery
-errors discovered after durable acceptance. These are minimal submission
-and error feedback, not milestone 2's full receipt display. Exact shared
-lookup and recovery contracts belong in Q-3.
+D-34 now settles normal display on confirmed posting, authoritative
+lookup/cancellation and reuse of the message ID on retry. Posting does not
+claim recipient acceptance. Visible delivery errors discovered after posting
+still need a contract. These requirements do not introduce milestone 2's
+full receipt display. Exact shared recovery contracts belong in Q-3.
 
 ### P-24. Clear the saved draft when Send submits it
 
@@ -761,15 +806,19 @@ failure. Unsubmitted drafts remain saved; failed sends do not.
 
 ### P-25. Keep “sending...” while an uncertain submission is checked
 
-For Q-4's remaining uncertain-outcome presentation, recommend retaining
-D-32's small grey “sending...” text while the shared service checks whether
-the original submission arrived. Do not add a separate “Checking” label.
-Resolve to the normal message on confirmed acceptance, or the red retry
-icon on confirmed failure, subject to D-33's single-failure rule. Do not
-interpret a lost reply as proof of failure or resend blindly. This remains
-minimal recovery within the normal posting slice, not an offline queue
-or a separate milestone (D-24). Shared lookup, duplicate prevention and
-recovery across reloads still need the Q-3 contract.
+Superseded by D-34's countdown, authoritative check/cancel and same-ID
+retry. A plain sending label without a deadline was not selected.
+
+### P-26. Keep the countdown at zero until the server can confirm the outcome
+
+If the server cannot be reached at the deadline, recommend keeping the
+small grey “sending... (0)” text and checking again on reconnection. Do not
+show the red failure icon or enable retry until the server confirms
+cancellation. If the server is still resolving whether IRC accepted the
+message, the same rule applies: uncertainty is not confirmed failure.
+Show a posted message normally as soon as authoritative evidence arrives.
+This is a proposal for the remaining wait, not permission to post a
+cancelled attempt or to ignore D-34's deadline check.
 
 ## Open questions
 
@@ -804,12 +853,21 @@ identity, mention routing, delivery failure facts and presence. Verify the
 canonical source before specifying changes. New workflow behavior belongs in
 the skills repository. Do not revive retired packages by inference.
 
+D-34 requires browser-created IDs, atomic check/cancel, durable rejection
+of late cancelled attempts and explicit same-ID retry. Specify how a retry
+is distinguished from a delayed original request, and how the IRC boundary
+proves posting or cancellation across crashes and lost acknowledgements.
+The current PONG/text-match sender does not satisfy this. This is a required
+shared-chat change and a design-readiness gate, not work to hide in a
+browser retry handler. Settle in-flight reload recovery separately from
+D-32's prohibition on persisting failed message entries.
+
 ### Q-4. What are the posting and recovery interactions?
 
 **Draft recovery resolved by D-23:** keep each room's unfinished message and
 images across switches and reloads on the same device.
-**Disconnected behavior resolved by D-24:** keep typing, disable Send,
-and keep this a minimal edge case within normal chat delivery.
+**Disconnected drafting resolved by D-24:** keep typing and disable Send.
+D-34 supersedes the minimal framing for submitted messages.
 **Keyboard submission resolved by D-31:** desktop Enter sends,
 Shift+Enter adds a line; phone Return adds a line and Send posts.
 **Sending and failure presentation resolved by D-32:** small grey
@@ -819,9 +877,11 @@ are not persisted.
 **Saved-draft transition and failure lifetime resolved by D-33:** Send
 clears the draft immediately; only one failed send is shown, cleared by any
 later message, including a newer failure.
-Still settle acknowledgement, uncertain outcomes (P-25 proposes retaining
-“sending...” instead of the unapproved “Checking” label), safe retry (P-23) and
-long-message handling. Distinguish server acceptance from
+**Deadline and retry resolved by D-34:** countdown, authoritative server
+check/cancel, normal display if posted, retry icon if cancelled, same-ID
+retry with at-most-once posting. The delegated duration is 10 seconds.
+Still settle the wait when the outcome check cannot finish (P-26), in-flight
+reload recovery and long-message handling. Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
 Settle how undelivered messages remain visible and how the owner is notified
 before browser push exists.
@@ -950,6 +1010,19 @@ Check D-33: Send clears the saved draft immediately, a later message removes
 the previous failed entry, and a newer failure replaces it rather than
 creating a second retry entry. A removed failure must not reappear as a
 saved draft or a persisted failure after reload.
+
+Deadline tests must use delayed, lost, duplicated and reordered requests
+and responses, not just localhost success. Cover cancellation reaching the
+server before the original send; publication racing cancellation; a posted
+message whose reply is lost; repeated cancellation calls; a retry arriving
+before a delayed original attempt; duplicate retry calls; and service
+restart after posting or cancellation. Assert at most one IRC post and
+at most one resulting agent action, with no publication by cancelled old
+attempts. Test countdown expiry during tab suspension and reconnect without
+resetting its deadline. No red failure icon may falsely describe a posted
+or unresolved message. Include delayed IRC confirmation and bridge-log lag:
+absence from a local log is not proof of cancellation.
+
 Draft recovery checks must retain text and images across room switches and
 reloads on the same device, including drafts whose uploads are interrupted
 or have failed. Cleanup must not remove saved-draft attachments.
@@ -967,8 +1040,12 @@ Processing status after blocking choices are settled. Each must identify its
 owning repository, dependencies and a reviewable outcome. Include D-8's
 owner-specific global skill change with the room-model work; do not make
 changing the live convention an advance prerequisite for unrelated work.
-Keep D-24's disconnected behavior within normal composer work; it does not
-drive slice boundaries or add offline machinery.
+Keep D-24's disconnected typing within normal composer work. D-34's
+deadline/check/cancel/retry contract requires explicit shared-chat delivery
+work and network-fault coverage before the web sender can claim safe retry.
+Resolve Q-3's publication boundary and attempt-fencing contract before
+defining those slices. Do not defer it as a low-priority local-network edge
+case or add an offline send queue.
 Exclude D-30's optional current-task line and setting from all milestone-1
 slices; retain only the milestone-2 note.
 The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
