@@ -1,5 +1,11 @@
 # Collaboration foundations design
 
+**Status: superseded, 2026-10-20.** D-78 (owner decision 2026-10-19, in
+`docs/plateia_design.md`) keeps the chat code in the skills repository, so
+plateia no longer builds this design. The owner closed #26 as not planned on
+2026-10-20. The decisions below stay as a record. The code they built on can
+be recovered at `b59aeaf`.
+
 This design states how plateia could make requests between the owner,
 assistants, managers and workers safe to repeat and accountable. It covers
 what a logical request is, who may ask, when a request counts as accepted and
