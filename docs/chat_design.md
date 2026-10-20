@@ -25,7 +25,7 @@ boundaries.
   post as the owner, address agents, see room users and share pasted images
   from both a phone and a desktop browser.
 - **Done when:** all milestone 1 room types support that experience;
-  closed work-room logs are preserved in files; PNG sharing works; and the
+  closed issue/PR work-room logs are preserved in files; PNG sharing works; and the
   five V-12 guarantees hold through connection loss and process restarts.
   The concrete acceptance scenarios follow the decisions below.
 - **Users and operators:** one owner; the existing shared chat services and
@@ -89,8 +89,9 @@ In scope:
   and the existing `#chat-test` room.
 - Live reading, posting and history as one milestone.
 - File preservation of closed work-room logs.
-- A one-time archive/migration step for existing rooms before adopting the
-  new room model (D-12); selection and preservation rules remain to be settled.
+- A one-time cleanup before adopting the new room model: archive completed
+  work rooms, retain active/permanent rooms, and discard existing design
+  rooms without saved logs (D-12/D-13/D-16).
 - Each room's user list, role colors, and agent idle/working/waiting pips.
 - Pasted image sharing with PNG support at minimum.
 - V-12 reliability, a Python server, localhost listening and access through
@@ -226,36 +227,26 @@ migration only as an open question; that was not a concrete rollout step.
 
 The delivery plan must explicitly account for this work alongside D-8's
 global skill change. This is a design requirement, not an instruction to
-archive live rooms now. D-13 settles which rooms to archive or retain;
+archive live rooms now. D-13 settles which rooms to archive, retain or discard;
 preservation and how active work carries forward still need an agreed
 contract (Q-8). It does not require milestone 2's archive browser.
 
-### D-13. Archive completed legacy work; retain active, permanent and uncertain rooms
+### D-13. Archive completed work rooms; discard existing design rooms
 
-Owner decision 2026-10-20, direct answers in this design conversation:
-accept P-5's selection rule, with these completion criteria:
+Owner decision 2026-10-20, amended by the owner's later answer:
 
-- Implementation work is finished when its PR is closed out. Where a room
-  covers several PRs, unfinished associated work keeps it active, consistent
-  with D-11.
-- For existing legacy designer rooms only, designer work is finished when
-  all its issues are approved. A completed design draft alone is not this
-  endpoint. D-16 rejects future design rooms: this cleanup criterion never
-  closes the general room when one design finishes.
+- Archive completed implementation rooms after saving and verifying their
+  logs. Finished means the PR is closed out; a room covering several PRs
+  remains active while any associated PR is open.
+- Keep active implementation rooms and permanent main/general/testing rooms.
+  Bring uncertain cases to the owner.
+- Discard all existing design rooms at rollout, whether their work is
+  finished or not. Do not migrate their conversations or save or verify
+  their logs. This replaces the earlier all-issues-approved cleanup rule.
 
-Archive completed work rooms only after their logs are preserved and
-verified. Keep active work rooms and permanent main/general/testing rooms.
-Bring uncertain cases to the owner; age, silence or an ended agent session
-does not prove completion. This is the initial legacy-room cleanup rule;
-D-10 still governs closure of new issue rooms that never have a PR.
-Active legacy designer-room migration to general is still open under Q-8;
-retaining active rooms is not a decision to preserve dedicated design rooms
-as a future convention.
-
-The inventory and archive files are private runtime data, never committed
-to this public repository. The shared archive mechanism and migration
-procedure belong with D-8's room work. No live cleanup is performed during
-this design.
+The design-room exception does not change issue/PR log preservation or
+D-10's issue-without-PR rule. Inventory and archive files stay private.
+Nothing live changes now.
 
 ### D-14. Archived rooms leave active lists and reject new posts until reopened
 
@@ -268,6 +259,7 @@ This is shared room behavior, not merely a hidden row in plateia. The
 implementation must account for other chat clients. The transition into
 that state, already-queued messages and reopening still need contracts;
 this decision does not claim existing IRC tools implement them.
+D-13's discarded design rooms are an explicit exception to log preservation.
 
 ### D-15. Show a grey room title while closure is being verified
 
@@ -281,29 +273,28 @@ keep the room visible with its title grey. Show unresolved delivery or
 archive problems rather than claiming closure succeeded. Once closure is
 verified, mark it archived and remove it from active lists under D-14.
 
-This applies to normal closure and the initial cleanup. An outage can keep
+This applies to normal closure and rooms being archived in the initial
+cleanup; discarded design rooms require no saved or verified log (D-13).
+An outage can keep
 a finished-work room visibly closing for longer; already accepted messages
 must not be lost. The exact posting barrier, history completeness evidence
 and recovery protocol still need a technical contract.
 
 ### D-16. Design agents use general chat; no dedicated design rooms
 
-Owner decision 2026-10-20, relayed by the project manager as an authenticated
-reply and confirmed in this design conversation: reject P-8. Design agents
-use the system-wide general room, including work before issues exist.
-There is no dedicated design-room lifecycle in the new model.
+Owner decision 2026-10-20, including the later clarification relayed by the
+project manager: design agents use the system-wide general room. No design
+rooms. Discard existing design rooms at rollout without migrating their
+conversations or saving their logs (D-13). P-8 and P-9 are rejected.
 
 General remains a permanent room. Completion of an individual design does
 not close it. Its existing mention-only routing still applies: unmentioned
 posts remain in the room without dispatch. D-8's owner-specific global skill
 change must include this convention.
 
-D-13's all-issues-approved criterion remains applicable only to cleanup of
-existing legacy designer rooms, not as a reason to create new ones.
 The general room does not exist yet; this design session continues in its
 assigned existing channel for now. Provisioning general remains the owner's
-live configuration action. No room is created, migrated or archived by this
-decision during design work.
+live configuration action. Nothing live changes now.
 
 ## Proposals
 
@@ -331,10 +322,9 @@ until the last open PR closes. The board is not a prerequisite.
 
 ### P-5. Archive completed legacy work rooms and retain active or permanent rooms
 
-Resolved by D-13, with the owner's completion criteria: closed-out PRs for
-implementation work, or all issues approved for existing legacy designer
-rooms only. D-16 rejects future design rooms. Active and permanent rooms
-stay; uncertain rooms require owner disposition.
+Resolved by D-13 as amended: archive completed implementation rooms, retain
+active/permanent rooms, and ask about uncertain ones. Existing design rooms
+are discarded at rollout without saved logs.
 
 ### P-6. Archived rooms leave the active list and stop accepting posts
 
@@ -354,15 +344,16 @@ design rooms under this proposal.
 
 ### P-9. Move active legacy design conversations to general at rollout
 
-For Q-8, recommend moving active legacy design conversations to general once
-that room is configured and usable, then archiving their former rooms with
-verified logs. That closure would be recorded as migration, not completion
-of the design; outstanding work and issue approvals remain outstanding.
+Rejected by D-13/D-16: discard existing design rooms at rollout. No
+conversation migration, completion check or saved log is needed.
 
-The alternative is to finish each existing design in its current room and
-archive it at D-13's completion endpoint, while only new design sessions use
-general. This timing choice is still open. The present session continues in
-its assigned channel until the owner directs the transition.
+### P-10. Preview pasted images before sending
+
+For Q-6, recommend that pasting an image adds a preview to the composer.
+The owner can add text or remove the image, then press Send to post it.
+Pasting alone does not publish anything. This applies on phone and desktop;
+PNG is the required initial format. Upload timing, size limits and retention
+remain separate questions.
 
 ## Open questions
 
@@ -382,7 +373,8 @@ log and reject new posts until reopened.
 **Closing resolved by D-15:** keep the title grey until accepted posts are
 settled and the file archive is verified; keep unresolved problems visible.
 **Design conversations resolved by D-16:** use permanent general chat;
-no dedicated design rooms.
+no dedicated design rooms. Existing design rooms are discarded at rollout
+without conversation migration or saved logs.
 Remaining: PR closure without merge, issue/PR reopening, replacement PRs,
 and other work without a tracker item. Existing rooms, including grouped request
 rooms, are addressed under Q-8. Settle how closure preserves
@@ -413,7 +405,7 @@ present missing evidence as idle or current.
 
 ### Q-6. How should images be uploaded, displayed and retained?
 
-Discuss PNG paste on phone and desktop, preview/send behavior, upload failure,
+First settle preview/send behavior (P-10). Discuss PNG paste on phone and desktop, upload failure,
 limits, link access, inline sizing, attachment lifetime and preserved logs.
 Plateia stores images; shared chat records their links. No further choice
 has been made.
@@ -427,13 +419,11 @@ Reconcile the earlier browser trust boundary with posting and attachments.
 ### Q-8. How should existing rooms be archived and migrated?
 
 D-12 requires an explicit initial archive/migration step.
-**Selection resolved by D-13:** archive completed work rooms after preserving
-and verifying logs; retain active/permanent rooms and ask the owner about
-uncertain ones. Completion means closed-out PRs for implementation work or
-all issues approved for existing legacy designer rooms only. D-16 places
-future design conversations in general. Choose when active legacy design
-conversations move there (P-9); the current reporting channel stays in use
-for now.
+**Selection resolved by D-13:** archive completed implementation rooms after
+saving and verifying logs; retain active/permanent rooms and ask about
+uncertain ones. Completed means closed-out PRs. Discard existing design rooms
+at rollout without migration or saved logs; new design conversations use
+general (D-16). The current reporting channel stays in use for now.
 
 **Archived behavior resolved by D-14:** leave active lists and reject new
 posts until reopened, retaining the file log.
@@ -443,7 +433,8 @@ problems visible until verified closure.
 Still specify archive completeness and verification,
 active-room mapping (including grouped or unlinked
 request rooms), interruption/retry behavior and the rollout sequence.
-Preserve conversation history and references. Do not assume existing JSONL
+For rooms being archived, preserve conversation history and references.
+Discarded design rooms are exempt. Do not assume existing JSONL
 files alone prove a complete archive, or that removing a room from a client
 is archiving it.
 
@@ -463,13 +454,14 @@ Verify localhost binding and the browser boundary with synthetic requests.
 Exact tests and fixtures follow the approved contracts rather than inventing
 behavior here.
 
-The initial migration also needs synthetic examples of closed-out PR work,
-legacy designer work with all issues approved, incomplete PR/design work, permanent
-rooms and ambiguous legacy rooms. Show that archived records survive and
-active work remains reachable.
+The initial cleanup needs synthetic examples of closed-out PR work,
+incomplete implementation work, existing design rooms, permanent rooms and
+ambiguous rooms. Show that archived work records survive, active
+implementation work remains reachable, and design rooms are discarded
+without conversation migration or saved logs.
 Verify that new design conversations use general, that completing a design
-never closes general, and that legacy-room migration preserves outstanding
-work rather than declaring it complete.
+never closes general, and that discarding a design room does not mark
+unfinished tracker work complete.
 
 Closing-state scenarios must show the grey room title until verification
 succeeds, preserve already-accepted posts, and leave failures visible rather
@@ -483,12 +475,13 @@ owning repository, dependencies and a reviewable outcome. Include D-8's
 owner-specific global skill change with the room-model work; do not make
 changing the live convention an advance prerequisite for unrelated work.
 Include D-16's design-agent use of general in that change, with no dedicated
-design-room slice. General must be available before design conversations
-are moved there; its live provisioning remains the owner's action.
-Include D-12's initial archive/migration as an explicit rollout step before
+design-room slice or conversation migration. General's live provisioning
+remains the owner's action.
+Include D-12's initial cleanup as an explicit rollout step before
 adopting the new room model. Its selection and preservation contract (Q-8)
 must be settled before defining the affected slice and execution procedure;
 it is not postponed to milestone 2's archive browser.
+Discard existing design rooms during that rollout without saved logs.
 The owner explicitly
 approves readiness before issue processing, and each tracker artifact gets
 separate signoff. The project manager runs filed-issue reviews.
