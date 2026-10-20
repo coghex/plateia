@@ -736,8 +736,8 @@ Only a complete logical message may be presented or routed as the submitted
 instruction. Missing, repeated, interleaved or replayed parts must not
 create partial instructions, duplicates or merged independent posts.
 
-Capability negotiation, maximum supported size, any equivalent fallback
-and multi-batch completion must be settled together with D-36's publication
+Capability negotiation, support for D-38's approved size limit, any equivalent
+fallback and multi-batch completion must be settled together with D-36's publication
 deadline. Plain line fallback cannot silently weaken the guarantee.
 These changes belong in shared chat; plateia consumes the grouped contract
 behind its IRC boundary rather than inventing its own grouping heuristic.
@@ -747,6 +747,23 @@ defines batch framing, concat tags, completion and negotiated limits;
 [Ergo's changelog](https://github.com/ergochat/ergo/blob/master/CHANGELOG.md)
 records support for `draft/multiline`. The extension still uses draft names;
 implementation must negotiate the actual supported capabilities.
+
+### D-38. Limit each message to 64 KiB of text
+
+Owner decision 2026-10-20. Approve a 64 KiB per-message text limit, with a
+warning before Send if exceeded. The limit is 65,536 bytes of UTF-8 message
+content, including serialized attachment links as specified in P-29. Image
+files themselves retain D-22's separate limits.
+
+Check the complete serialized text before submission. If over the limit,
+show a clear warning and retain the draft for editing; do not submit or
+silently truncate it. An over-limit attempt does not clear the saved draft
+or start a send deadline. The server enforces the same limit.
+
+This is the logical message limit, independent of individual IRC batch
+limits. It does not establish that the existing sender supports the full
+size under D-34/D-36's deadline and at-most-once requirements. D-37's shared
+contract must provide that support.
 
 ## Proposals
 
@@ -939,13 +956,17 @@ posts or exact preservation at their boundaries.
 
 ### P-29. Limit a logical message to 64 KiB of text
 
-For the remaining long-message size choice, recommend at most 65,536 bytes
-of UTF-8 message content, including serialized attachment links. This is
-roughly 65,000 English characters, fewer for multibyte text. Count the
-serialized content before submission, show a clear over-limit warning and
-retain the draft rather than sending or truncating it. This is a proposed
-application limit, not Ergo's current batch limit and not a claim that the
-existing sender can publish that size atomically within the deadline.
+Resolved by D-38: 65,536 bytes of UTF-8 content per logical message,
+with a warning before submission when exceeded and no silent truncation.
+
+### P-30. Preserve the reading position while loading older messages
+
+For Q-7's conversation behavior, recommend loading older messages when the
+owner scrolls up, keeping the visible reading position stable. While the
+owner is reading earlier messages, new arrivals do not move the view. A
+“Jump to latest” button returns to the newest message; when already at the
+bottom, follow new messages automatically. Use the same behavior on phone
+and desktop. This does not add milestone-2 unread counts or mention badges.
 
 ## Open questions
 
@@ -1026,7 +1047,8 @@ After expiry, a message is in history or will never post; the owner retypes
 if missing. Q-3 must establish that guarantee at the publication boundary.
 **Long-message presentation resolved by D-37:** one web message with line
 breaks preserved and explicit transport grouping, never time-based merging.
-Still settle the message-size limit (P-29).
+**Message size resolved by D-38:** 64 KiB of text, with a warning before
+Send when exceeded; retain the draft rather than submitting or truncating.
 Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
 Settle how undelivered messages remain visible and how the owner is notified
@@ -1070,8 +1092,8 @@ Plateia stores images; shared chat records their links.
 in real chat slices. D-26/D-27 settle the delegated build/editor/toolchain/CI
 choices. **Layout resolved by D-28:** narrow rooms left, wider users right,
 chat taking most of the desktop screen; room/user lists behind buttons on
-phone. Reconcile the earlier browser trust boundary with posting and
-attachments.
+phone. P-30 proposes history loading and scroll behavior. Reconcile the
+earlier browser trust boundary with posting and attachments.
 
 ### Q-8. How should existing rooms be archived and migrated?
 
@@ -1204,6 +1226,12 @@ post and one instruction dispatch, with no merging of separate posts or
 partial dispatch when a fragment is absent. Missing multiline capability
 must exercise the specified equivalent contract or an explicit refusal,
 never heuristic joining. Existing 10-test evidence is a baseline only.
+
+Verify D-38 at 65,535, 65,536 and 65,537 serialized UTF-8 bytes, including
+multibyte characters and attachment links. Over-limit content must remain
+in the draft with a warning and no send attempt; client and server must
+agree on the byte count. Supported-size messages still need complete,
+at-most-once publication under the send-deadline contract.
 
 ## Delivery plan
 
