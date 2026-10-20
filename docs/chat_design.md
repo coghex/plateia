@@ -80,8 +80,10 @@ not silently inherit its former epic or delivery order.
 The owner chooses a project and room, sees the conversation and its users,
 reads earlier messages and posts without changing devices or opening a
 terminal. Selecting a user starts an addressed message. The same features
-are available on phone and desktop; layout and interaction details remain
-to be discussed.
+are available on phone and desktop. Desktop has a narrow rooms column on
+the left, a wider users column on the right, and the conversation in the
+middle taking most of the screen. On phone, room and user lists open through
+buttons (D-28).
 
 Pasting an image inserts it directly into the message being written. The
 owner sees it inline while finishing the message, before pressing Send.
@@ -512,6 +514,18 @@ and [image extension metadata](https://registry.npmjs.org/@tiptap/extension-imag
 The [npm CI contract](https://docs.npmjs.com/cli/v11/commands/npm-ci/)
 requires a matching lockfile and does not rewrite dependency manifests.
 
+### D-28. Give the conversation most of the screen
+
+Owner decision 2026-10-20. Use a Discord-like desktop arrangement: a narrow
+rooms column on the left, a wider users column on the right, and the chat
+in the middle taking most of the screen. The relative widths are deliberate:
+rooms are narrower than users, and chat remains the largest column.
+
+On phone, show the conversation with buttons to open the room and user
+lists. Preserve the same features on both layouts. Exact pixel widths and
+the responsive breakpoint are implementation details to validate with real
+chat content and resized windows, within these proportions.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -639,10 +653,21 @@ framework selection is no longer open.
 
 ### P-19. Use three columns on desktop and panels on phone
 
-For Q-7's layout, recommend rooms on the left, the conversation in the middle
-and users on the right. On a phone, show the conversation and open the room
-and user lists through buttons. Both layouts expose the same features.
-This is a proposal; exact sizing and visual styling remain open.
+Resolved by D-28, including the owner's width clarification: narrow rooms,
+wider users, and chat taking most of the desktop screen. Phone lists open
+through buttons.
+
+### P-20. Use simple status dots beside the existing role colors
+
+For Q-5, recommend grey for idle, green for working and amber for waiting
+on the owner. Keep the existing chat role colors: manager purple, solver
+orange, reviewer red, designer yellow, guide blue, assistant green and
+owner cyan. Humans and assistants have no status dot, as V-4 requires.
+
+Provide a readable status label as well as color, available on phone and
+desktop. Missing or stale evidence must be labelled unknown or stale;
+neither is idle. This proposal selects the visual palette only, not the
+source or freshness rules still open in Q-5.
 
 ## Open questions
 
@@ -720,8 +745,10 @@ Plateia stores images; shared chat records their links.
 
 **Framework and evaluation resolved by D-25:** Svelte with Python, validated
 in real chat slices. D-26/D-27 settle the delegated build/editor/toolchain/CI
-choices. Next settle layout (P-19). Reconcile the earlier browser trust
-boundary with posting and attachments.
+choices. **Layout resolved by D-28:** narrow rooms left, wider users right,
+chat taking most of the desktop screen; room/user lists behind buttons on
+phone. Reconcile the earlier browser trust boundary with posting and
+attachments.
 
 ### Q-8. How should existing rooms be archived and migrated?
 
@@ -757,6 +784,11 @@ history/live continuity; correct project and general-room routing; no
 duplicate work after retry; acknowledgement durability; automatic recovery;
 honest presence freshness; durable unresolved errors; preserved room logs;
 and image failures that cannot masquerade as a sent message.
+
+Check D-28 with realistic synthetic room/user names and conversation content
+at desktop and phone sizes and while resizing: rooms narrower than users,
+chat taking most of the desktop screen, and both lists reachable through
+buttons on phone without losing the current conversation or its draft.
 
 Verify shared delivery and room lifecycle with the plateia process stopped.
 Verify localhost binding and the browser boundary with synthetic requests.
