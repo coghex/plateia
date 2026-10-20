@@ -262,6 +262,23 @@ implementation must account for other chat clients. The transition into
 that state, already-queued messages and reopening still need contracts;
 this decision does not claim existing IRC tools implement them.
 
+### D-15. Show a grey room title while closure is being verified
+
+Owner decision 2026-10-20, relayed by the project manager as an authenticated
+reply to the closing-state question and confirmed in this design conversation:
+accept P-7, with a grey room title while closing.
+
+Stop accepting new submissions, settle messages already durably accepted
+for posting, then preserve and verify the final log. Until that succeeds,
+keep the room visible with its title grey. Show unresolved delivery or
+archive problems rather than claiming closure succeeded. Once closure is
+verified, mark it archived and remove it from active lists under D-14.
+
+This applies to normal closure and the initial cleanup. An outage can keep
+a finished-work room visibly closing for longer; already accepted messages
+must not be lost. The exact posting barrier, history completeness evidence
+and recovery protocol still need a technical contract.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -299,19 +316,21 @@ until reopened; their verified file logs remain preserved.
 
 ### P-7. Finish archiving before removing a room from the active list
 
-Recommend an explicit closing state: stop accepting new submissions, settle
-messages already durably accepted for posting, then preserve and verify the
-final log before marking the room archived and removing it from active lists.
-Already accepted messages must not disappear because the closure trigger
-arrived first.
+Resolved by D-15: settle already-accepted posts and verify the archive before
+removing the room. The owner added a grey room title during closing.
 
-If pending messages or archive verification cannot be resolved, show the room
-as closing with the unresolved problem, rather than claiming it is archived.
-This may leave a completed-work room visible longer during an outage.
-It applies to both normal closure and the initial cleanup, through shared
-services. The exact posting barrier, history completeness evidence and
-recovery protocol remain implementation-contract work after this behavior
-is approved.
+### P-8. Keep a topic room for design work before its issues exist
+
+For Q-2's work-without-a-tracker-item case, recommend a dedicated topic room
+for a design session, retained through issue drafting and approval, then
+archived when all of that design's issues are approved. Subsequent issue/PR
+implementation uses the standard work rooms.
+
+This would extend D-13's legacy designer-room completion rule to future
+design sessions and keep a design conversation together before there are
+tracker items to attach it to. It is a proposed addition to the issue/PR
+room convention, requiring owner approval of the scope and global skill
+guidance. D-13 alone does not authorize new topic rooms.
 
 ## Open questions
 
@@ -328,8 +347,10 @@ owner-specific global skill change when the room-model work is implemented.
 last open PR closes.
 **Archived behavior resolved by D-14:** leave active lists, retain the file
 log and reject new posts until reopened.
+**Closing resolved by D-15:** keep the title grey until accepted posts are
+settled and the file archive is verified; keep unresolved problems visible.
 Remaining: PR closure without merge, issue/PR reopening, replacement PRs,
-and work without a tracker item. Existing rooms, including grouped request
+and work without a tracker item (P-8 addresses design sessions). Existing rooms, including grouped request
 rooms, are addressed under Q-8. Settle how closure preserves
 a complete file log despite outages or late posts, and how completion or
 failure of preservation becomes visible. No archive browser in this milestone.
@@ -379,8 +400,10 @@ all issues approved for designer work.
 
 **Archived behavior resolved by D-14:** leave active lists and reject new
 posts until reopened, retaining the file log.
-Next settle the closing transition and already-accepted posts (P-7).
-Then specify archive completeness and verification,
+**Closing transition resolved by D-15:** block new submissions, settle
+already-accepted posts and verify the archive; keep the title grey and
+problems visible until verified closure.
+Still specify archive completeness and verification,
 active-room mapping (including grouped or unlinked
 request rooms), interruption/retry behavior and the rollout sequence.
 Preserve conversation history and references. Do not assume existing JSONL
@@ -407,6 +430,10 @@ The initial migration also needs synthetic examples of closed-out PR work,
 designer work with all issues approved, incomplete PR/design work, permanent
 rooms and ambiguous legacy rooms. Show that archived records survive and
 active work remains reachable.
+
+Closing-state scenarios must show the grey room title until verification
+succeeds, preserve already-accepted posts, and leave failures visible rather
+than prematurely removing the room.
 
 ## Delivery plan
 
