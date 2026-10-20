@@ -190,6 +190,18 @@ create a room. This resolves Q-2's opening rule and accepts P-2.
 The opening rule belongs in D-8's shared room-model work and global skill
 change. Closure, reopening and associations still need their own contracts.
 
+### D-10. Close and preserve rooms for issues that close without a PR
+
+Owner decision 2026-10-20, direct answer in this design conversation:
+when an issue closes without ever having a PR, close its work room and
+preserve its log in a file. This accepts P-3 and resolves that part of Q-2.
+The rule applies to existing work rooms; it does not create a room merely
+to close it for an unused tracker item.
+
+This complements V-2's PR-close rule. Shared lifecycle detection and file
+preservation must implement it with D-8's room-model work. Archive completion,
+reopening and multiple-PR cases remain separate design questions.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -206,15 +218,21 @@ not selected; untouched backlog items need not fill the room list.
 
 ### P-3. Close an issue-only room when its issue closes
 
-For the next part of Q-2, recommend closing a room whose issue closes without
-ever having a PR, and preserving its log in a file. This covers abandoned,
-duplicate or discussion-only issues without leaving their rooms open forever.
-V-2 already requires closure when a PR closes; this proposal supplies the
-missing trigger for work that never has a PR.
+Resolved by D-10. Issues that close without ever having a PR do not leave
+their work rooms permanently active; their logs are preserved.
 
-This affects shared lifecycle detection and file preservation. It does not
-settle issues with multiple or replacement PRs, reopening, or the mechanics
-of safely completing the archive.
+### P-4. Keep a shared issue room open until its last open PR closes
+
+For Q-2's multiple-PR case, recommend that an issue's associated PRs share
+its work room, and that closure waits until none of those PRs remains open.
+For example, if invented issue #41 has PRs #57 and #58, closing #57 leaves
+the room open while #58 is still open.
+
+This preserves one conversation for the issue and avoids closing a room
+while associated work remains active. It clarifies V-2's singular PR-close
+rule for multiple PRs and requires an explicit owner decision before it is
+treated as the closure contract. Association detection and stale tracker
+state also need a contract; the board is not a prerequisite.
 
 ## Open questions
 
@@ -226,8 +244,9 @@ owner-specific global skill change when the room-model work is implemented.
 ### Q-2. What is a work room's exact lifecycle?
 
 **Opening resolved by D-9:** create on first use, including issue review.
-Next settle closure of an issue that never has a PR (P-3), then PR closure
-without merge, issue/PR reopening, replacement or multiple PRs, existing grouped
+**Issue closure without any PR resolved by D-10:** close and preserve the log.
+Next settle multiple PRs (P-4), then PR closure
+without merge, issue/PR reopening, replacement PRs, existing grouped
 request rooms, and work without a tracker item. Settle how closure preserves
 a complete file log despite outages or late posts, and how completion or
 failure of preservation becomes visible. No archive browser in this milestone.
