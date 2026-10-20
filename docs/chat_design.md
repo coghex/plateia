@@ -81,7 +81,9 @@ not silently inherit its former epic or delivery order.
 
 The owner chooses a project and room, sees the conversation and its users,
 reads earlier messages and posts without changing devices or opening a
-terminal. Selecting a user starts an addressed message. The same features
+terminal. For milestone 1, selecting a user inserts their `@handle` into the
+current draft and focuses the composer, preserving text and images (D-40).
+The same features
 are available on phone and desktop. Desktop has a narrow rooms column on
 the left, a wider users column on the right, and the conversation in the
 middle taking most of the screen. On phone, room and user lists open through
@@ -780,6 +782,19 @@ Use the same behavior on phone and desktop.
 This is milestone-1 history navigation. It does not add unread counts,
 mention badges or milestone-2 notification features.
 
+### D-40. Selecting a user inserts a mention into the current draft
+
+Owner decision 2026-10-20, scoped to milestone 1. Selecting a user inserts
+their `@handle` at the cursor in the current draft and focuses the message
+box, keeping existing text and images. It does not replace the draft,
+change rooms or send anything. The owner finishes editing and uses the
+normal Send action. Apply this from the desktop user list and the phone
+user panel alike.
+
+This settles the milestone-1 interaction only. Later milestones may revisit
+it; this decision does not introduce a separate conversation or user-detail
+workflow.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -981,11 +996,22 @@ reader's place, and “Jump to latest” returns to the bottom on both layouts.
 
 ### P-31. Selecting a user adds a mention to the current draft
 
-To implement V-6's user selection, recommend inserting the selected user's
-`@handle` at the cursor in the current room's draft and focusing the composer.
-Preserve existing text and images; selection does not replace the draft,
-change rooms or send anything. The owner can finish editing and use the
-normal Send action. Apply the same behavior from the phone user list.
+Resolved by D-40 for milestone 1: insert the selected user's `@handle` into
+the current draft and focus the composer without losing text or images.
+
+### P-32. Keep an agent-delivery error attached to a posted message
+
+For Q-4's remaining delivery-failure presentation, recommend showing
+“Delivery failed: <reason>” beside a message when shared chat confirms it
+was posted but could not be delivered to its addressed agent. Keep that
+error visible until shared delivery evidence resolves it, including after
+room switches or reloads. Later messages do not erase it. The shared
+service owns the durable failure and recovery; plateia displays those facts.
+
+This does not reuse D-32/D-33's temporary failed-send entry or resubmit the
+posted message as a new instruction. It adds no queued/delivered/accepted
+progress display or browser push. It is the proposed presentation of V-12's
+unresolved delivery failures after successful posting.
 
 ## Open questions
 
@@ -1068,11 +1094,12 @@ if missing. Q-3 must establish that guarantee at the publication boundary.
 breaks preserved and explicit transport grouping, never time-based merging.
 **Message size resolved by D-38:** 64 KiB of text, with a warning before
 Send when exceeded; retain the draft rather than submitting or truncating.
-Settle how selecting a user starts an addressed message without losing an
-existing draft (P-31). Distinguish server acceptance from
+**User selection resolved by D-40 for milestone 1:** insert the user's
+`@handle` and focus the current draft, retaining text and images.
+Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
-Settle how undelivered messages remain visible and how the owner is notified
-before browser push exists.
+Settle how undelivered messages remain visible (P-32) and how the owner is
+notified before browser push exists.
 
 ### Q-5. How are room membership and session status presented?
 
@@ -1259,6 +1286,11 @@ messages must preserve the visible message and reading position. Include
 images finishing their load above the viewport. “Jump to latest” returns
 to the bottom, and automatic following resumes there without adding unread
 counts or mention badges.
+
+Check D-40 with empty and nonempty drafts, including images: selecting a
+user inserts the correct stable handle, preserves existing content and
+focuses the composer without sending or switching rooms. Cover both the
+desktop list and phone panel. This is milestone-1 behavior only.
 
 ## Delivery plan
 
