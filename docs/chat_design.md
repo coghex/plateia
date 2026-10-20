@@ -550,6 +550,15 @@ without removing milestone 1's real session presence, role colors or
 idle/working/waiting dots. No milestone-1 slice includes the task-line
 setting or its presentation.
 
+### D-31. Enter sends on desktop; phone uses the Send button
+
+Owner decision 2026-10-20. On desktop, Enter sends the message and
+Shift+Enter adds a new line. On phone, Return adds a new line and tapping
+Send posts the message. Keep the Send button available on desktop too.
+Keyboard submission uses the same upload-readiness and connection rules
+as the button. Confirming a character through an input method must not
+accidentally send the message.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -693,12 +702,25 @@ milestone-1 scope and slices; the default remains open for milestone 2.
 
 ### P-22. Use Enter to send on desktop and the Send button on phone
 
-For Q-4, recommend Enter to send and Shift+Enter to insert a new line on
-desktop. On phone, the on-screen keyboard's Return inserts a new line and
-the Send button posts the message. Keep the Send button available on both.
-Keyboard submission follows the same upload-readiness and connection rules
-as the button; it never bypasses them. Text composition with an input
-method must not send a message while a character is being confirmed.
+Resolved by D-31: Enter sends and Shift+Enter adds a line on desktop;
+phone Return adds a line and the Send button posts.
+
+### P-23. Show sending and failed messages in the conversation
+
+For Q-4, recommend showing a submitted message in the conversation with
+“Sending” until the server acknowledges durable acceptance. After acceptance,
+show it normally; this does not claim a recipient has read or accepted it.
+If submission definitely fails, keep the message visible with “Not sent”
+and a Retry action. An uncertain outcome stays marked “Checking” while the
+shared service looks up the original submission; it is not called failed
+or blindly sent again. Retry preserves the original submission identity so
+it cannot duplicate the message or start the same work twice.
+
+An error discovered after durable acceptance stays attached to that message
+as a delivery failure; it must not falsely say the original post was never
+sent. This is minimal submission/error feedback required by V-12, not
+milestone 2's queued/delivered/recipient-accepted progress display. Exact
+shared-service lookup and recovery contracts still belong in Q-3.
 
 ## Open questions
 
@@ -739,8 +761,10 @@ the skills repository. Do not revive retired packages by inference.
 images across switches and reloads on the same device.
 **Disconnected behavior resolved by D-24:** keep typing, disable Send,
 and keep this a minimal edge case within normal chat delivery.
-Still settle keyboard submission (P-22), acknowledgement, uncertain outcomes,
-safe retry and long-message handling. Distinguish server acceptance from
+**Keyboard submission resolved by D-31:** desktop Enter sends,
+Shift+Enter adds a line; phone Return adds a line and Send posts.
+Still settle acknowledgement, uncertain outcomes, safe retry (P-23) and
+long-message handling. Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
 Settle how undelivered messages remain visible and how the owner is notified
 before browser push exists.
@@ -857,6 +881,9 @@ In both stages, an upload failure must retain the whole unsent message and
 offer retry or image removal, without posting text alone or a broken link.
 Verify that pasting begins the upload while typing can continue, and that a
 completed upload alone never posts a message.
+Check D-31's desktop Enter/Shift+Enter and phone Return/Send behavior,
+including input-method composition and attempts to submit while an image
+upload is unfinished or the connection is unavailable.
 Draft recovery checks must retain text and images across room switches and
 reloads on the same device, including drafts whose uploads are interrupted
 or have failed. Cleanup must not remove saved-draft attachments.
