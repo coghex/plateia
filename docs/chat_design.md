@@ -622,7 +622,7 @@ the rounded-up remaining seconds, clamped at zero. Reconnects and background
 tab suspension do not restart that attempt's deadline. Ten seconds is a
 feedback deadline, not an assertion that a network operation must finish
 within ten seconds. At expiry, the authoritative check/cancel may itself
-be delayed; its presentation is proposed in P-26.
+be delayed; D-35 settles its presentation.
 
 The server contract requires an atomic check-and-cancel operation, not a
 separate read followed by cancellation. Cancellation must also cover an ID
@@ -638,6 +638,28 @@ A local timeout, missing bridge log entry, or successful socket write is
 not authoritative proof of the IRC publication outcome. Q-3 must establish
 that proof at the actual publication boundary; do not claim the existing
 sender already provides it or substitute text matching for message IDs.
+
+### D-35. Mark an unanswered deadline check as unconfirmed
+
+Owner decision 2026-10-20. At the send deadline, keep small grey
+“sending... (0)” text while awaiting the server's authoritative result.
+There is no retry action. After a few more unanswered seconds, replace
+that text with an explicit unknown state, still without retry. Once the
+server confirms posting, show the message normally; once it confirms
+cancellation, show the red exclamation retry mark under D-32/D-33.
+
+The owner delegated wording and delay. Design selection: **5 seconds after
+the 10-second deadline**, replace the text with **“unconfirmed: awaiting
+server”**. This is 15 seconds after dispatch, not five seconds after each
+reconnect or status request. Keep the same small grey placement below the
+message. The wording reports missing confirmation without claiming a slow
+server is necessarily unreachable. It also applies while the server is
+resolving an uncertain IRC publication outcome.
+
+Continue recovery when connectivity returns. Elapsed time alone never
+turns this state into failure or enables retry. A later authoritative
+answer settles it immediately. This is the V-12 unknown state, not a
+milestone-2 delivery-progress indicator.
 
 ## Proposals
 
@@ -811,14 +833,25 @@ retry. A plain sending label without a deadline was not selected.
 
 ### P-26. Keep the countdown at zero until the server can confirm the outcome
 
-If the server cannot be reached at the deadline, recommend keeping the
-small grey “sending... (0)” text and checking again on reconnection. Do not
-show the red failure icon or enable retry until the server confirms
-cancellation. If the server is still resolving whether IRC accepted the
-message, the same rule applies: uncertainty is not confirmed failure.
-Show a posted message normally as soon as authoritative evidence arrives.
-This is a proposal for the remaining wait, not permission to post a
-cancelled attempt or to ignore D-34's deadline check.
+Resolved by D-35 with the owner's refinement: keep the zero countdown
+briefly, then show an explicit unconfirmed state until the server answers.
+No retry before confirmed cancellation. The selected extra delay is five
+seconds and the wording is “unconfirmed: awaiting server”.
+
+### P-27. Recover unconfirmed submissions after a same-device reload
+
+For Q-4, recommend retaining an unresolved submission's ID, room, content,
+attachment references and deadline on the same device so a reload restores
+the pending message and checks that same ID. This is a pending submission,
+not a draft: recovery never blindly submits it as a new message. Preserve
+the deadline across reload rather than restarting the countdown.
+
+On confirmed posting, reconcile with the canonical conversation record
+and remove the local pending copy. On confirmed cancellation, remove the
+persisted pending copy and leave only D-32/D-33's temporary failed entry
+for retry in the current window. A later reload does not restore that
+failure. This proposal does not persist confirmed failures, sync pending
+messages across devices or introduce an offline send queue.
 
 ## Open questions
 
@@ -880,8 +913,11 @@ later message, including a newer failure.
 **Deadline and retry resolved by D-34:** countdown, authoritative server
 check/cancel, normal display if posted, retry icon if cancelled, same-ID
 retry with at-most-once posting. The delegated duration is 10 seconds.
-Still settle the wait when the outcome check cannot finish (P-26), in-flight
-reload recovery and long-message handling. Distinguish server acceptance from
+**Unanswered deadline check resolved by D-35:** keep “sending... (0)” for
+five more seconds, then small grey “unconfirmed: awaiting server”; no retry
+until confirmed cancellation, and normal display on confirmed posting.
+Still settle in-flight reload recovery (P-27) and long-message handling.
+Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
 Settle how undelivered messages remain visible and how the owner is notified
 before browser push exists.
@@ -1022,6 +1058,13 @@ attempts. Test countdown expiry during tab suspension and reconnect without
 resetting its deadline. No red failure icon may falsely describe a posted
 or unresolved message. Include delayed IRC confirmation and bridge-log lag:
 absence from a local log is not proof of cancellation.
+
+Check D-35's transition at 15 seconds after dispatch, including a suspended
+tab and repeated unsuccessful reconnects. The zero countdown must become
+the unconfirmed text without enabling retry. A late posted result removes
+the text; a confirmed cancellation permits the red retry icon, subject to
+the single-failure rule. Waiting longer alone must never manufacture either
+outcome.
 
 Draft recovery checks must retain text and images across room switches and
 reloads on the same device, including drafts whose uploads are interrupted
