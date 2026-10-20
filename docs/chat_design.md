@@ -26,7 +26,8 @@ boundaries.
   post as the owner, address agents, see room users and share pasted images
   from both a phone and a desktop browser.
 - **Done when:** all milestone 1 room types support that experience;
-  closed issue/PR work-room logs are preserved in files; PNG sharing works; and the
+  closed issue/PR conversations and their images are preserved together;
+  PNG sharing works; and the
   five V-12 guarantees hold through connection loss and process restarts.
   The concrete acceptance scenarios follow the decisions below.
 - **Users and operators:** one owner; the existing shared chat services and
@@ -95,7 +96,7 @@ In scope:
 - A system-wide general room, including design-agent conversations (D-16),
   and the existing `#chat-test` room.
 - Live reading, posting and history as one milestone.
-- File preservation of closed work-room logs.
+- File preservation of closed work-room logs with their images (D-20).
 - A one-time cleanup before adopting the new room model: archive completed
   work rooms, retain active/permanent rooms, and discard existing design
   rooms without saved logs (D-12/D-13/D-16).
@@ -286,6 +287,8 @@ An outage can keep
 a finished-work room visibly closing for longer; already accepted messages
 must not be lost. The exact posting barrier, history completeness evidence
 and recovery protocol still need a technical contract.
+D-20 requires the archive to include the conversation's images; verification
+must cover those images as well as the log before closure succeeds.
 
 ### D-16. Design agents use general chat; no dedicated design rooms
 
@@ -320,7 +323,8 @@ transport contract.
 
 This settles composition behavior and the allowed delivery sequence, not
 the complete issue boundaries. D-18 settles upload failure and D-19 settles
-upload timing; limits and retention remain open.
+upload timing; D-20 settles sent-image retention. Limits and unused-upload
+cleanup remain open.
 
 ### D-18. Keep the whole message unsent when an image upload fails
 
@@ -340,6 +344,19 @@ An uploaded image is not itself a sent message.
 
 This applies to both image delivery stages. Cleanup of uploads from
 abandoned drafts remains to be specified.
+
+### D-20. Retain and archive images alongside their conversations
+
+Owner decision 2026-10-20, relayed by the project manager as an authenticated
+reply: accept P-13, and archive a room's images alongside its conversation.
+Keep sent images for as long as their message logs. A room archive must
+preserve the image files with the conversation, not just links to disposable
+uploads. Image references must remain usable after archiving.
+
+This is part of milestone 1 file preservation, not deferred to the milestone
+2 archive browser. D-15's verification includes the images. The archive
+format and how retained links resolve still need a technical contract.
+Unused draft uploads are a separate cleanup question.
 
 ## Proposals
 
@@ -410,11 +427,15 @@ still requires Send.
 
 ### P-13. Keep sent images for as long as their message logs
 
-For Q-6, recommend retaining images referenced by sent messages for as long
-as those messages' logs are kept, including after the room is archived.
-Closing a room would not break its image links. This requires storage to
-grow with retained conversation history; unused draft uploads can have a
-separate cleanup rule.
+Resolved by D-20. Keep sent images as long as their logs and archive the
+image files alongside the conversation.
+
+### P-14. Fit inline images to the conversation; open full size on selection
+
+For Q-6, recommend displaying large images at a size that fits the chat
+column on phone and desktop, preserving their proportions. A tap or click
+opens the full-size image. This changes display size, not the retained
+original file.
 
 ## Open questions
 
@@ -473,9 +494,11 @@ ship first, followed by inline rendering within milestone 1.
 **Upload failure resolved by D-18:** keep the whole message unsent for retry
 or image removal.
 **Upload timing resolved by D-19:** upload on paste, post only on Send.
-Next settle sent-image retention (P-13). Remaining: PNG paste on
-phone and desktop, limits, link access, inline sizing, attachment lifetime
-and preserved logs. Plateia stores images; shared chat records their links.
+**Retention resolved by D-20:** keep sent images as long as their logs and
+archive them alongside the conversation.
+Next settle inline sizing (P-14). Remaining: PNG paste on phone and desktop,
+limits, link access, unused-upload cleanup and archive mechanics.
+Plateia stores images; shared chat records their links.
 
 ### Q-7. Which page framework, evaluation method and browser layout?
 
@@ -500,6 +523,8 @@ problems visible until verified closure.
 Still specify archive completeness and verification,
 active-room mapping (including grouped or unlinked
 request rooms), interruption/retry behavior and the rollout sequence.
+Include the conversation's images in the archive and its verification
+(D-20).
 For rooms being archived, preserve conversation history and references.
 Discarded design rooms are exempt. Do not assume existing JSONL
 files alone prove a complete archive, or that removing a room from a client
@@ -542,6 +567,9 @@ In both stages, an upload failure must retain the whole unsent message and
 offer retry or image removal, without posting text alone or a broken link.
 Verify that pasting begins the upload while typing can continue, and that a
 completed upload alone never posts a message.
+Archive checks must show that the conversation and its image files are
+preserved together, that references still resolve, and that a missing image
+cannot be silently treated as a fully verified archive.
 
 ## Delivery plan
 
@@ -564,6 +592,8 @@ placeholder link in the message; then deliver inline image display,
 including in the message being composed. Both are milestone 1 work. Record
 their final issue boundaries and dependencies once the upload contract and
 page framework are settled.
+Include image preservation in the archive contract from the first image
+slice; placeholder links do not defer D-20's storage obligations.
 
 The owner explicitly
 approves readiness before issue processing, and each tracker artifact gets
