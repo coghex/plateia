@@ -395,15 +395,15 @@ Owner decision 2026-10-20, relayed by the project manager as an authenticated
 reply: accept P-16. Each room retains its unfinished message, including
 images, across room switches and page reloads on the same device.
 
-Successfully sending or explicitly discarding a draft clears it. Draft
+As clarified by D-33, Send clears the saved draft immediately; explicitly
+discarding a draft also clears it. Draft
 storage must preserve its attachments; unused-upload cleanup must not remove
 images still belonging to a saved draft. The storage mechanism and recovery
 of interrupted uploads remain to be designed. Cross-device draft
 synchronization is not part of this decision.
 
-D-32 later excludes failed-send entries from persistence. The transition
-from a saved draft to a submitted message is still open under Q-4/P-24;
-do not treat the failed entry itself as another saved draft.
+D-32/D-33 exclude failed-send entries from persistence and retain only one
+temporary failure for retry. Do not treat that entry as another saved draft.
 
 ### D-24. Keep disconnected drafting minimal
 
@@ -573,12 +573,25 @@ mark retries the send.
 Failed sends are temporary local entries for retry, not saved or persisted
 conversation records. Their contents must not be restored as failed entries
 after a reload. This decision does not remove V-12's durability requirement
-for requests the shared service has already acknowledged. The interaction
-with saved drafts in D-23 still needs an explicit transition rule (P-24).
+for requests the shared service has already acknowledged. D-33 settles the
+saved-draft transition and when the temporary failed entry is removed.
 
 The owner did not approve the proposed “Checking” state. Its label and
 uncertain-outcome behavior remain open; do not implement that label as an
 accepted choice.
+
+### D-33. Clear the draft on Send and retain only one temporary failure
+
+Owner decision 2026-10-20. Send clears the saved draft immediately. At most
+one failed send is shown in the app's chat window. Any subsequent message
+clears the previous failure, even when the newer message also fails: the
+newer failure replaces it. There is no saved failure list or backlog of
+retry entries.
+
+This refines D-23 and D-32. Unsubmitted drafts still survive room switches
+and reloads; failed sends do not. A disabled Send action does not submit or
+clear a draft. The rule concerns temporary failed-send feedback, not the
+durable record of requests the shared service has already acknowledged.
 
 ## Proposals
 
@@ -742,14 +755,21 @@ lookup and recovery contracts belong in Q-3.
 
 ### P-24. Clear the saved draft when Send submits it
 
-To reconcile D-23 and D-32, recommend clearing the saved draft when Send
-actually submits its contents. Keep the submitted snapshot in the current
-app window for sending feedback or retry, without saving a failed copy.
-An unfinished message that has not been submitted remains a saved draft.
-An unavailable Send action, including an unfinished or failed image upload,
-does not submit or clear that draft. Handling a reload before the submission
-outcome is known remains part of the uncertainty contract in Q-4; this
-proposal does not authorize dropping an acknowledged request.
+Resolved by D-33, with the owner's additional rule: only one temporary
+failure is shown, and any subsequent message clears it, including a newer
+failure. Unsubmitted drafts remain saved; failed sends do not.
+
+### P-25. Keep “sending...” while an uncertain submission is checked
+
+For Q-4's remaining uncertain-outcome presentation, recommend retaining
+D-32's small grey “sending...” text while the shared service checks whether
+the original submission arrived. Do not add a separate “Checking” label.
+Resolve to the normal message on confirmed acceptance, or the red retry
+icon on confirmed failure, subject to D-33's single-failure rule. Do not
+interpret a lost reply as proof of failure or resend blindly. This remains
+minimal recovery within the normal posting slice, not an offline queue
+or a separate milestone (D-24). Shared lookup, duplicate prevention and
+recovery across reloads still need the Q-3 contract.
 
 ## Open questions
 
@@ -796,8 +816,11 @@ Shift+Enter adds a line; phone Return adds a line and Send posts.
 “sending...” below the message; failed messages remain temporarily in the
 app with a red exclamation mark that retries when clicked. Failed entries
 are not persisted.
-Still settle the saved-draft transition (P-24), acknowledgement, uncertain
-outcomes (including the unapproved “Checking” label), safe retry (P-23) and
+**Saved-draft transition and failure lifetime resolved by D-33:** Send
+clears the draft immediately; only one failed send is shown, cleared by any
+later message, including a newer failure.
+Still settle acknowledgement, uncertain outcomes (P-25 proposes retaining
+“sending...” instead of the unapproved “Checking” label), safe retry (P-23) and
 long-message handling. Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
 Settle how undelivered messages remain visible and how the owner is notified
@@ -923,6 +946,10 @@ and retry through that icon on both phone and desktop. Failed entries must
 not be persisted or restored on reload. Check this separately from saved
 unfinished drafts and acknowledged requests; their different lifecycles
 must not silently erase either durability guarantee.
+Check D-33: Send clears the saved draft immediately, a later message removes
+the previous failed entry, and a newer failure replaces it rather than
+creating a second retry entry. A removed failure must not reappear as a
+saved draft or a persisted failure after reload.
 Draft recovery checks must retain text and images across room switches and
 reloads on the same device, including drafts whose uploads are interrupted
 or have failed. Cleanup must not remove saved-draft attachments.
