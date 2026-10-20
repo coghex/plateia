@@ -323,8 +323,8 @@ transport contract.
 
 This settles composition behavior and the allowed delivery sequence, not
 the complete issue boundaries. D-18 settles upload failure and D-19 settles
-upload timing; D-20 settles sent-image retention. Limits and unused-upload
-cleanup remain open.
+upload timing; D-20 settles sent-image retention and D-22 sets stored-image
+limits. Input/processing limits and unused-upload cleanup remain open.
 
 ### D-18. Keep the whole message unsent when an image upload fails
 
@@ -363,12 +363,25 @@ Unused draft uploads are a separate cleanup question.
 Owner decision 2026-10-20, relayed by the project manager as an authenticated
 reply: shrink large images on upload to a fixed size or memory limit, not
 the current chat-column width. Do not retain high-resolution originals.
-The designer must propose the actual limit for owner approval.
+D-22 records the approved limits.
 
 Display the stored image proportionally within the chat column. A tap or
 click opens that stored, capped image at full size. Resizing the window
 changes display size, not the stored image. D-20's retention and archive
 rules apply to this capped version.
+
+### D-22. Cap each stored image at 1280 pixels and 1 MiB
+
+Owner decision 2026-10-20, relayed by the project manager as an authenticated
+reply: accept P-15's caps. The longest side is at most 1280 pixels, with
+proportions preserved and no upscaling. The encoded file is at most 1 MiB
+(1,048,576 bytes); shrink further if necessary to meet both limits.
+
+Store and archive only the capped image. These limits are independent of
+window size and apply from the first image slice. Fine text in large
+screenshots may require cropping before paste. Input decoding and processing
+need separate resource limits; the stored-file cap is not a total memory
+budget.
 
 ## Proposals
 
@@ -450,17 +463,7 @@ version. Retaining the high-resolution original was rejected.
 
 ### P-15. Store images up to 1280 pixels on the longest side and 1 MiB
 
-Propose both limits for each stored image:
-
-- Longest side at most 1280 pixels, preserving proportions without upscaling.
-- Encoded file at most 1 MiB (1,048,576 bytes). If encoding at that size
-  exceeds the byte cap, reduce dimensions further until both limits hold.
-- Store and archive only the capped version. A conversion failure follows
-  D-18: keep the whole message unsent.
-
-These are proposed product defaults, not measured optimal values. They keep
-files small and allow ordinary screenshots; fine text in a large screenshot
-may require cropping before paste. They do not depend on window size.
+Resolved by D-22. The owner approved both limits, shrinking further if needed.
 A square 1280-pixel image uses 6.25 MiB for one four-byte-per-pixel buffer;
 that arithmetic is not a bound on total upload-processing memory.
 
@@ -469,7 +472,18 @@ their own technical contract: shrinking the output does not bound decoding
 the input. [Pillow's image documentation](https://pillow.readthedocs.io/en/stable/reference/Image.html)
 documents proportional thumbnail sizing and separate input pixel-count
 checks. It is feasibility evidence, not a library selection or a source for
-the proposed numeric limits.
+the owner-approved numeric limits.
+
+### P-16. Keep a draft for each room on the same device
+
+For Q-4, recommend retaining each room's unfinished message when switching
+rooms or reloading the page on the same device, including its image
+attachments. This lets the owner return to a message without composing it
+again. Sending or explicitly discarding the draft clears it.
+
+This proposes same-device draft recovery, not cross-device synchronization.
+The storage mechanism and recovery of interrupted image uploads remain to
+be designed. Unsent drafts remain distinct from acknowledged chat requests.
 
 ## Open questions
 
@@ -506,7 +520,8 @@ the skills repository. Do not revive retired packages by inference.
 
 ### Q-4. What are the posting and recovery interactions?
 
-Settle acknowledgement, drafts, disconnected sending, uncertain outcomes,
+Next settle per-room draft recovery (P-16). Also settle acknowledgement,
+disconnected sending, uncertain outcomes,
 safe retry and long-message handling. Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
 Settle how undelivered messages remain visible and how the owner is notified
@@ -533,7 +548,9 @@ archive them alongside the conversation.
 **Display and storage policy resolved by D-21:** fit display to the column,
 cap stored images independently on upload, and open the capped image at full
 size on tap/click. No retained high-resolution originals.
-Next approve the numeric caps (P-15). Remaining: PNG paste on phone and desktop,
+**Stored-image limits resolved by D-22:** longest side at most 1280 pixels
+and file at most 1 MiB, shrinking further as needed.
+Remaining: PNG paste on phone and desktop,
 input/processing limits, link access, unused-upload cleanup and archive mechanics.
 Plateia stores images; shared chat records their links.
 
