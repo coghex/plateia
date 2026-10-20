@@ -358,6 +358,18 @@ This is part of milestone 1 file preservation, not deferred to the milestone
 format and how retained links resolve still need a technical contract.
 Unused draft uploads are a separate cleanup question.
 
+### D-21. Cap stored images on upload; fit their display to the column
+
+Owner decision 2026-10-20, relayed by the project manager as an authenticated
+reply: shrink large images on upload to a fixed size or memory limit, not
+the current chat-column width. Do not retain high-resolution originals.
+The designer must propose the actual limit for owner approval.
+
+Display the stored image proportionally within the chat column. A tap or
+click opens that stored, capped image at full size. Resizing the window
+changes display size, not the stored image. D-20's retention and archive
+rules apply to this capped version.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -432,10 +444,32 @@ image files alongside the conversation.
 
 ### P-14. Fit inline images to the conversation; open full size on selection
 
-For Q-6, recommend displaying large images at a size that fits the chat
-column on phone and desktop, preserving their proportions. A tap or click
-opens the full-size image. This changes display size, not the retained
-original file.
+Resolved by D-21 with the owner's correction: fit display to the column,
+but cap the stored image independently on upload. Tap/click opens the capped
+version. Retaining the high-resolution original was rejected.
+
+### P-15. Store images up to 1280 pixels on the longest side and 1 MiB
+
+Propose both limits for each stored image:
+
+- Longest side at most 1280 pixels, preserving proportions without upscaling.
+- Encoded file at most 1 MiB (1,048,576 bytes). If encoding at that size
+  exceeds the byte cap, reduce dimensions further until both limits hold.
+- Store and archive only the capped version. A conversion failure follows
+  D-18: keep the whole message unsent.
+
+These are proposed product defaults, not measured optimal values. They keep
+files small and allow ordinary screenshots; fine text in a large screenshot
+may require cropping before paste. They do not depend on window size.
+A square 1280-pixel image uses 6.25 MiB for one four-byte-per-pixel buffer;
+that arithmetic is not a bound on total upload-processing memory.
+
+The incoming file-byte/pixel limits and processing-memory budget still need
+their own technical contract: shrinking the output does not bound decoding
+the input. [Pillow's image documentation](https://pillow.readthedocs.io/en/stable/reference/Image.html)
+documents proportional thumbnail sizing and separate input pixel-count
+checks. It is feasibility evidence, not a library selection or a source for
+the proposed numeric limits.
 
 ## Open questions
 
@@ -496,8 +530,11 @@ or image removal.
 **Upload timing resolved by D-19:** upload on paste, post only on Send.
 **Retention resolved by D-20:** keep sent images as long as their logs and
 archive them alongside the conversation.
-Next settle inline sizing (P-14). Remaining: PNG paste on phone and desktop,
-limits, link access, unused-upload cleanup and archive mechanics.
+**Display and storage policy resolved by D-21:** fit display to the column,
+cap stored images independently on upload, and open the capped image at full
+size on tap/click. No retained high-resolution originals.
+Next approve the numeric caps (P-15). Remaining: PNG paste on phone and desktop,
+input/processing limits, link access, unused-upload cleanup and archive mechanics.
 Plateia stores images; shared chat records their links.
 
 ### Q-7. Which page framework, evaluation method and browser layout?
@@ -570,6 +607,9 @@ completed upload alone never posts a message.
 Archive checks must show that the conversation and its image files are
 preserved together, that references still resolve, and that a missing image
 cannot be silently treated as a fully verified archive.
+Check stored dimensions and file size against the approved caps independently
+of viewport width. Resizing the window changes only display; opening and
+archiving use the capped version, with no retained high-resolution original.
 
 ## Delivery plan
 
@@ -594,6 +634,8 @@ their final issue boundaries and dependencies once the upload contract and
 page framework are settled.
 Include image preservation in the archive contract from the first image
 slice; placeholder links do not defer D-20's storage obligations.
+Apply D-21's upload-time cap in that first slice too; inline rendering is
+the later presentation change.
 
 The owner explicitly
 approves readiness before issue processing, and each tracker artifact gets
