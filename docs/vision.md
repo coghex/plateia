@@ -1,7 +1,7 @@
 # Plateia vision and design guardrails
 
-**Status: accepted by the owner on 2026-10-02.** This is the heading that
-`$guide` reviews against.
+**Status: accepted by the owner on 2026-10-02, with web scope amendments
+accepted on 2026-10-20.** This is the heading that `$guide` reviews against.
 
 Plateia is the owner's workplace for running software projects with AI
 agents: a chat server in the spirit of Discord, plus a board of issue and
@@ -33,12 +33,24 @@ owner's whole workflow, should each take one script and a few minutes.
 
 ### V-2. Each project is a server, and its rooms are hashtags
 
-Each project appears as its own server, and each server's rooms are its chat
-channels: the project's main room plus one room per request (owner decision
-2026-10-02). A room shows the conversation as it happens, including every
-manager and worker post, and the owner can post in any room. Rooms for
-finished requests fold into an archive and are never deleted: the chat is the
-project's record, and the whole archive is searchable.
+Each project appears as its own server, and its rooms are chat channels.
+Every project has a main room, with work rooms associated with issues and
+their pull requests, or with standalone pull requests, replacing the
+original one-room-per-request plan (owner decision 2026-10-20). A room shows
+the conversation as it happens, including every manager and worker post,
+and the owner can post in any room.
+
+When a pull request closes, its work room closes and its log is preserved,
+so the reasoning behind past work remains available. Milestone 1 preserves
+these logs in files; browsing and searching the archive arrive in milestone
+2 (owner decision 2026-10-20). Detailed room lifecycle rules belong in the
+design document.
+
+There is also a system-wide general room for work outside a project and
+coordination between the agents doing it. Projects can have testing rooms
+for coordination between testing and analysis agents; the testing workflow
+itself remains to be designed. The existing `#chat-test` room remains for
+developing and testing chat (owner decision 2026-10-20).
 
 ### V-3. IRC is the backbone, behind one boundary
 
@@ -50,6 +62,10 @@ Everything only a web page can do is built over IRC rather than beside it:
   and replays them with history (verified 2026-10-02);
 - images are stored by plateia, posted as links and shown inline;
 - presence is worked out from the real agent sessions, not IRC logins.
+
+Milestone 1 includes pasted image sharing, supporting at least PNG. The
+owner will discuss the upload and display design with the designer agent
+when that work is taken up (owner decision 2026-10-20).
 
 All IRC-specific code sits behind one boundary, so replacing IRC later would
 mean swapping that layer without touching agents or the interface.
@@ -63,6 +79,13 @@ session first appears, made from the project, its role and a number (for
 example `alpha-solver-12`), and a live status: what it is working on, idle, or
 waiting on the owner. A session that ends leaves the room.
 
+From milestone 1, each room has its own IRC-style list of all users in that
+room. The system-wide general room lists all active agents across projects,
+alongside its human users and assistants. Usernames are colored by role.
+Agents have a colored status pip indicating idle, working or waiting; human
+users and assistants appear without a pip (owner decision 2026-10-20). The
+exact palette belongs in the web design.
+
 ### V-5. Chat is the only way plateia acts
 
 Everything plateia does to the system is a chat message posted as the owner
@@ -74,11 +97,22 @@ agents do the work.
 
 ### V-6. Any agent can be addressed directly
 
-A plain post in a room goes to the project's manager, which decides what to
-dispatch. A post that @-mentions an agent's handle goes straight to that
-session (owner decision 2026-10-02). For example, `@alpha-solver-12
-/autosolve 41` runs that command in that session. Selecting a user in the room
-starts such a message.
+A plain post in a project room goes to the project's manager, which decides
+what to dispatch. A post that @-mentions an agent's handle goes straight to
+that session (owner decision 2026-10-02). For example, `@alpha-solver-12
+/autosolve 41` requests that command in that session. Selecting a user in
+the room starts such a message.
+
+In the system-wide general room, a post is directed only to the users it
+@-mentions. An untagged post remains in the room without being dispatched to
+anyone. Any agent can address any other user, including agents from another
+project (owner decision 2026-10-20).
+
+Plateia handles communication, not authority. Delivering a message does not
+grant its sender authority over its recipient or authorize the requested
+action. Agents apply the owner's authority rules when deciding how to act;
+Plateia does not enforce the hierarchy through messaging restrictions
+(owner decision 2026-10-20).
 
 A direct message follows the same contract as a request to a manager:
 
@@ -86,11 +120,14 @@ A direct message follows the same contract as a request to a manager:
   the agent reads it at its next opportunity. It is never typed into a prompt
   that holds a half-written message. The agent accepts it the way a manager
   accepts a request, and the room shows which of the three states each
-  message has reached.
+  message has reached. The visible queued/delivered/accepted indicators
+  arrive in milestone 2 (owner decision 2026-10-20).
 - **Same claims, same gates.** Work started this way takes the same claims
   and passes the same reviews as any other, so a manager can see it and never
-  dispatches the same task twice. It needs no manager approval; the manager
-  learns of it from the record and from the board.
+  dispatches the same task twice. Plateia adds no manager-approval step to
+  message delivery; agents apply the owner's authority rules to the work
+  itself (owner decision 2026-10-20). The manager learns of it from the
+  record and from the board when available.
 - **No silent loss.** If the session ends while a message to it is still
   queued, the message is marked undelivered in its room and the owner is
   notified (V-9).
@@ -194,9 +231,10 @@ requests (see [AGENTS.md](../AGENTS.md)).
 
 Being trustworthy matters more than being small, so plateia is built on
 mature, fully featured, open-source tools (owner decision 2026-10-02). The
-server is Python, like the rest of the owner's tooling. The page framework is
-chosen by building the same small prototype in several candidates and
-comparing them (owner decision pending). What the owner can rely on:
+server is Python, like the rest of the owner's tooling. The page framework
+and how to evaluate candidates remain for the owner to settle with the
+designer during design work; this vision does not prescribe a prototype
+comparison (owner decision 2026-10-20). What the owner can rely on:
 
 - requests plateia has acknowledged survive restarts;
 - interrupted connections recover on their own;
@@ -221,10 +259,42 @@ it is added to those shared pieces, not built into the web application.
 
 ## Mid-term scope
 
+### Milestones
+
+**Milestone 1: working chat** (owner decision 2026-10-20). Reading, posting
+and conversation history are designed and delivered together, on both phone
+and desktop. The first real milestone is a usable chatroom, not a read-only
+viewer. There is no deadline that requires splitting reading from posting.
+The room types in V-2 are included: project main rooms, issue/PR rooms,
+project testing rooms, the system-wide general room and `#chat-test`.
+Issue/PR room logs are preserved in files when the rooms close. The
+IRC-style user list, role colors and agent status pips described in V-4 are
+included, as is pasted image sharing with at least PNG support (V-3).
+
+**Milestone 2: archive access and attention indicators** (owner decision
+2026-10-20). Add browsing of closed-room logs, archive search, browser push
+notifications (V-9), room indicators for messages unread by the owner,
+highlighted mentions of the owner, and visible queued/delivered/accepted
+message states (V-6). The owner's unread state is separate from delivery to
+an agent. Deferring these indicators does not defer V-12's reliability
+requirements.
+
+Disk caching of older messages for the chat interface is not required for
+milestone 1; its design remains to be discussed, separately from preserving
+closed-room logs.
+
+**The board follows working chat** (owner decision 2026-10-20). V-7 and V-8
+remain the direction for the board, but it is not part of milestone 1. Its
+milestone placement and that of the remaining features below are not yet
+settled.
+
+### First full version
+
 Plateia's first full version includes:
 
 - **Chat:**
-  - one server per project, with its rooms and live chat;
+  - project servers, work and testing rooms, and general and chat-testing
+    rooms as described in V-2, with live chat and conversation history;
   - search across the whole archive;
   - agent presence with status;
   - direct messages to agents;
