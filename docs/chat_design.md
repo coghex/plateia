@@ -395,6 +395,17 @@ images still belonging to a saved draft. The storage mechanism and recovery
 of interrupted uploads remain to be designed. Cross-device draft
 synchronization is not part of this decision.
 
+### D-24. Keep disconnected drafting minimal
+
+Owner decision 2026-10-20, relayed by the project manager as an authenticated
+reply: allow typing while disconnected, with Send disabled until
+reconnection. Treat this as a low-priority edge case.
+
+Handle it within the normal composer and connection-state behavior. Do not
+create a separate offline slice, offline send queue or extra machinery for
+it. This does not weaken V-12's existing guarantees for requests already
+submitted or acknowledged.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -493,14 +504,39 @@ room switches and reloads on the same device.
 
 ### P-17. Allow drafting offline, with Send disabled until reconnection
 
-For Q-4, recommend allowing the owner to keep writing a draft while the page
-is disconnected, but disabling Send until it reconnects. Do not queue new
-offline sends to post automatically later. This avoids delivering an
-instruction after the situation may have changed.
+Resolved by D-24, with the owner's scope limit: minimal behavior inside the
+composer, no separate slice or extra offline machinery.
 
-This concerns new sends while known to be offline. A send interrupted after
-submission still needs durable lookup and safe retry under V-12; it must
-not be treated as definitely unsent merely because the connection dropped.
+### P-18. Choose React with Vite from a short comparison, then validate real chat
+
+For Q-7, recommend React with Vite for the browser page, served by the Python
+backend. Evaluate the choice through the actual phone/desktop chat slices:
+live/history continuity, draft recovery, inline image composition and
+responsive layout. A framework does not supply V-12's durable delivery
+contract; that remains shared-service and backend work.
+
+This is a design recommendation based on official documentation reviewed on
+2026-10-20, not a measured prototype result:
+
+| Candidate | Fit for this chat design | Tradeoff |
+| --- | --- | --- |
+| React with Vite | React documents a client-only Vite setup; Tiptap documents a React editor integration. My assessment: a practical fit for the composer, draft state and live conversation. | Vite is a build tool, not a complete application framework; routing and data-fetching conventions still need explicit choices. |
+| Svelte | Compiled UI components suit an interactive page. It remains a viable alternative; Tiptap also lists Svelte integration. | It still needs editor integration, persistence and the same Python/shared-chat contracts. No evidence here establishes a reliability advantage over React. |
+| Python templates with htmx | HTML response swaps fit server-rendered views and ordinary forms. | My assessment: the inline image editor and persistent drafts would still require a substantial browser component, making this a less direct fit for the accepted composer. |
+
+Sources: [React's build-tool guidance](https://react.dev/learn/build-a-react-app-from-scratch),
+[Tiptap's React integration](https://tiptap.dev/docs/editor/getting-started/install/react),
+[Svelte overview](https://svelte.dev/docs/svelte/overview), and
+[htmx documentation](https://htmx.org/docs/).
+React's guidance cautions that a build-tool-only setup leaves application
+conventions to the project; this recommendation accepts that tradeoff for a
+Python-backed chat client. Tiptap is evidence of an integration option,
+not an editor-library decision.
+
+Proposed evaluation method: use this written comparison for the owner's
+selection, then verify real chat on phone and desktop during delivery.
+Do not add a separate three-framework prototype exercise. Both the framework
+choice and this evaluation method remain for owner signoff.
 
 ## Open questions
 
@@ -539,7 +575,9 @@ the skills repository. Do not revive retired packages by inference.
 
 **Draft recovery resolved by D-23:** keep each room's unfinished message and
 images across switches and reloads on the same device.
-Next settle disconnected sending (P-17). Also settle acknowledgement, uncertain outcomes,
+**Disconnected behavior resolved by D-24:** keep typing, disable Send,
+and keep this a minimal edge case within normal chat delivery.
+Still settle acknowledgement, uncertain outcomes,
 safe retry and long-message handling. Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
 Settle how undelivered messages remain visible and how the owner is notified
@@ -574,9 +612,10 @@ Plateia stores images; shared chat records their links.
 
 ### Q-7. Which page framework, evaluation method and browser layout?
 
-Settle these with the owner. Evaluate against the actual chat interactions,
-Python boundary and V-12; do not assume a required three-prototype comparison.
-Reconcile the earlier browser trust boundary with posting and attachments.
+P-18 proposes React with Vite, selected from the written comparison and
+verified in real chat slices. The owner must approve the framework and
+evaluation method. Layout remains open. Reconcile the earlier browser trust
+boundary with posting and attachments.
 
 ### Q-8. How should existing rooms be archived and migrated?
 
@@ -656,6 +695,8 @@ Processing status after blocking choices are settled. Each must identify its
 owning repository, dependencies and a reviewable outcome. Include D-8's
 owner-specific global skill change with the room-model work; do not make
 changing the live convention an advance prerequisite for unrelated work.
+Keep D-24's disconnected behavior within normal composer work; it does not
+drive slice boundaries or add offline machinery.
 Include D-16's design-agent use of general in that change, with no dedicated
 design-room slice or conversation migration. General's live provisioning
 remains the owner's action.
