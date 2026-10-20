@@ -88,6 +88,8 @@ In scope:
 - A system-wide general room and the existing `#chat-test` room.
 - Live reading, posting and history as one milestone.
 - File preservation of closed work-room logs.
+- A one-time archive/migration step for existing rooms before adopting the
+  new room model (D-12); selection and preservation rules remain to be settled.
 - Each room's user list, role colors, and agent idle/working/waiting pips.
 - Pasted image sharing with PNG support at minimum.
 - V-12 reliability, a Python server, localhost listening and access through
@@ -202,6 +204,30 @@ This complements V-2's PR-close rule. Shared lifecycle detection and file
 preservation must implement it with D-8's room-model work. Archive completion,
 reopening and multiple-PR cases remain separate design questions.
 
+### D-11. Associated PRs share the issue room; close it after the last open PR closes
+
+Owner decision 2026-10-20, direct answer in this design conversation:
+an issue's associated PRs share its room. Keep that room open while any of
+those PRs remains open; close it and preserve its log when the last open PR
+closes. This accepts P-4 and clarifies V-2's PR-close rule for multiple PRs.
+
+For invented issue #41 with PRs #57 and #58, closing #57 does not close the
+room while #58 is open. Reliable association detection and stale tracker
+state handling remain to be specified.
+
+### D-12. Include archiving existing rooms before adopting the new room model
+
+Owner decision 2026-10-20, direct request in this design conversation:
+the plan must include an initial archive/migration step for existing rooms,
+before adopting the new room model. Previously this document mentioned
+migration only as an open question; that was not a concrete rollout step.
+
+The delivery plan must explicitly account for this work alongside D-8's
+global skill change. This is a design requirement, not an instruction to
+archive live rooms now. Which rooms to archive or retain, how to preserve
+their records, and how active work carries forward need an agreed contract
+(Q-8). It does not require milestone 2's archive browser.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -223,16 +249,22 @@ their work rooms permanently active; their logs are preserved.
 
 ### P-4. Keep a shared issue room open until its last open PR closes
 
-For Q-2's multiple-PR case, recommend that an issue's associated PRs share
-its work room, and that closure waits until none of those PRs remains open.
-For example, if invented issue #41 has PRs #57 and #58, closing #57 leaves
-the room open while #58 is still open.
+Resolved by D-11. Associated PRs share the issue room, which remains open
+until the last open PR closes. The board is not a prerequisite.
 
-This preserves one conversation for the issue and avoids closing a room
-while associated work remains active. It clarifies V-2's singular PR-close
-rule for multiple PRs and requires an explicit owner decision before it is
-treated as the closure contract. Association detection and stale tracker
-state also need a contract; the board is not a prerequisite.
+### P-5. Archive completed legacy work rooms and retain active or permanent rooms
+
+For Q-8, recommend a one-time inventory separating completed work rooms,
+active work rooms and permanent rooms. Archive completed work rooms after
+preserving and verifying their logs; retain active work and permanent
+main/general/testing rooms. Unclear rooms go to the owner for disposition,
+rather than treating age or silence as proof that work is finished.
+
+This lets the new model start with a useful active-room list without
+disrupting work in progress. The inventory and archive files are private
+runtime data, never committed to this public repository. The shared
+archive mechanism and migration procedure belong with D-8's room work;
+publication of this proposal performs no cleanup.
 
 ## Open questions
 
@@ -245,9 +277,11 @@ owner-specific global skill change when the room-model work is implemented.
 
 **Opening resolved by D-9:** create on first use, including issue review.
 **Issue closure without any PR resolved by D-10:** close and preserve the log.
-Next settle multiple PRs (P-4), then PR closure
-without merge, issue/PR reopening, replacement PRs, existing grouped
-request rooms, and work without a tracker item. Settle how closure preserves
+**Multiple PRs resolved by D-11:** share the issue room and close after the
+last open PR closes.
+Remaining: PR closure without merge, issue/PR reopening, replacement PRs,
+and work without a tracker item. Existing rooms, including grouped request
+rooms, are addressed under Q-8. Settle how closure preserves
 a complete file log despite outages or late posts, and how completion or
 failure of preservation becomes visible. No archive browser in this milestone.
 
@@ -286,6 +320,19 @@ Settle these with the owner. Evaluate against the actual chat interactions,
 Python boundary and V-12; do not assume a required three-prototype comparison.
 Reconcile the earlier browser trust boundary with posting and attachments.
 
+### Q-8. How should existing rooms be archived and migrated?
+
+D-12 requires an explicit initial archive/migration step. First settle
+selection: archive completed work rooms while retaining active and permanent
+rooms, with uncertain cases brought to the owner (P-5)?
+
+Then specify archive completeness and verification, the meaning of a closed
+room in IRC and clients, active-room mapping (including grouped or unlinked
+request rooms), interruption/retry behavior and the rollout sequence.
+Preserve conversation history and references. Do not assume existing JSONL
+files alone prove a complete archive, or that removing a room from a client
+is archiving it.
+
 ## Verification strategy
 
 Use invented projects, accounts, messages, tracker items and images. Never
@@ -302,6 +349,10 @@ Verify localhost binding and the browser boundary with synthetic requests.
 Exact tests and fixtures follow the approved contracts rather than inventing
 behavior here.
 
+The initial migration also needs synthetic examples of completed, active,
+permanent and ambiguous legacy rooms, with evidence that archived records
+survive and active work remains reachable.
+
 ## Delivery plan
 
 No child slices yet. Define stable `CHAT-N` entries and mirror them in
@@ -309,6 +360,10 @@ Processing status after blocking choices are settled. Each must identify its
 owning repository, dependencies and a reviewable outcome. Include D-8's
 owner-specific global skill change with the room-model work; do not make
 changing the live convention an advance prerequisite for unrelated work.
+Include D-12's initial archive/migration as an explicit rollout step before
+adopting the new room model. Its selection and preservation contract (Q-8)
+must be settled before defining the affected slice and execution procedure;
+it is not postponed to milestone 2's archive browser.
 The owner explicitly
 approves readiness before issue processing, and each tracker artifact gets
 separate signoff. The project manager runs filed-issue reviews.
