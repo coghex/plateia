@@ -250,6 +250,18 @@ to this public repository. The shared archive mechanism and migration
 procedure belong with D-8's room work. No live cleanup is performed during
 this design.
 
+### D-14. Archived rooms leave active lists and reject new posts until reopened
+
+Owner decision 2026-10-20, direct answer in this design conversation:
+accept P-6. A successfully archived room disappears from active room lists
+and stops accepting new posts until reopened. Its verified log remains
+preserved in files. Archive browsing remains milestone 2.
+
+This is shared room behavior, not merely a hidden row in plateia. The
+implementation must account for other chat clients. The transition into
+that state, already-queued messages and reopening still need contracts;
+this decision does not claim existing IRC tools implement them.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -282,15 +294,24 @@ permanent rooms stay; uncertain rooms require owner disposition.
 
 ### P-6. Archived rooms leave the active list and stop accepting posts
 
-For Q-8's archive behavior, recommend removing a successfully archived room
-from active room lists and preventing new posts until it is reopened.
-Its verified file log remains preserved. This gives closure a clear meaning
-and avoids conversations continuing beyond the saved archive.
+Resolved by D-14. Archived rooms leave active lists and reject new posts
+until reopened; their verified file logs remain preserved.
 
-This is a proposed behavior across shared chat and its clients, not a claim
-that the current IRC tools already implement it. The exact mechanism,
-handling of queued or late posts, and reopening contract must follow.
-Milestone 1 keeps the archive in files; archive browsing remains milestone 2.
+### P-7. Finish archiving before removing a room from the active list
+
+Recommend an explicit closing state: stop accepting new submissions, settle
+messages already durably accepted for posting, then preserve and verify the
+final log before marking the room archived and removing it from active lists.
+Already accepted messages must not disappear because the closure trigger
+arrived first.
+
+If pending messages or archive verification cannot be resolved, show the room
+as closing with the unresolved problem, rather than claiming it is archived.
+This may leave a completed-work room visible longer during an outage.
+It applies to both normal closure and the initial cleanup, through shared
+services. The exact posting barrier, history completeness evidence and
+recovery protocol remain implementation-contract work after this behavior
+is approved.
 
 ## Open questions
 
@@ -305,6 +326,8 @@ owner-specific global skill change when the room-model work is implemented.
 **Issue closure without any PR resolved by D-10:** close and preserve the log.
 **Multiple PRs resolved by D-11:** share the issue room and close after the
 last open PR closes.
+**Archived behavior resolved by D-14:** leave active lists, retain the file
+log and reject new posts until reopened.
 Remaining: PR closure without merge, issue/PR reopening, replacement PRs,
 and work without a tracker item. Existing rooms, including grouped request
 rooms, are addressed under Q-8. Settle how closure preserves
@@ -354,8 +377,10 @@ and verifying logs; retain active/permanent rooms and ask the owner about
 uncertain ones. Completion means closed-out PRs for implementation work or
 all issues approved for designer work.
 
-Next settle the meaning of an archived room in active lists and posting
-(P-6). Then specify archive completeness and verification,
+**Archived behavior resolved by D-14:** leave active lists and reject new
+posts until reopened, retaining the file log.
+Next settle the closing transition and already-accepted posts (P-7).
+Then specify archive completeness and verification,
 active-room mapping (including grouped or unlinked
 request rooms), interruption/retry behavior and the rollout sequence.
 Preserve conversation history and references. Do not assume existing JSONL
