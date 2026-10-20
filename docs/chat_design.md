@@ -526,6 +526,19 @@ lists. Preserve the same features on both layouts. Exact pixel widths and
 the responsive breakpoint are implementation details to validate with real
 chat content and resized windows, within these proportions.
 
+### D-29. Keep role colors and use grey, green and amber status dots
+
+Owner decision 2026-10-20. Agent status dots are grey for idle, green for
+working and amber for waiting on the owner, alongside the existing role
+colors. An amber waiting dot beside a yellow designer name is acceptable;
+the role and state do not need different hues.
+
+The role colors remain manager purple, solver orange, reviewer red,
+designer yellow, guide blue, assistant green and owner cyan. Human users
+and assistants have no status dot (V-4). Provide a readable status label
+as well as color on phone and desktop. Missing or stale evidence is not
+idle and must not acquire a grey idle dot by default.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -659,15 +672,16 @@ through buttons.
 
 ### P-20. Use simple status dots beside the existing role colors
 
-For Q-5, recommend grey for idle, green for working and amber for waiting
-on the owner. Keep the existing chat role colors: manager purple, solver
-orange, reviewer red, designer yellow, guide blue, assistant green and
-owner cyan. Humans and assistants have no status dot, as V-4 requires.
+Resolved by D-29, including acceptance of an amber waiting dot alongside a
+yellow designer name. Source and freshness contracts remain under Q-5.
 
-Provide a readable status label as well as color, available on phone and
-desktop. Missing or stale evidence must be labelled unknown or stale;
-neither is idle. This proposal selects the visual palette only, not the
-source or freshness rules still open in Q-5.
+### P-21. Show an agent's current task beneath its name
+
+For Q-5, recommend a short current-task line beneath each working agent's
+name in the user list. This makes V-4's account of what an agent is working
+on visible without opening another view. The phone user panel exposes the
+same information. Use the shared session's reported task; do not infer a
+task from the last chat message. No task evidence means no invented task.
 
 ## Open questions
 
@@ -716,10 +730,14 @@ before browser push exists.
 
 ### Q-5. How are room membership and session status presented?
 
+**Role and status colors resolved by D-29:** retain role colors, with grey
+idle, green working and amber waiting dots for agents. Human users and
+assistants have no dot. Similar role/dot hues are acceptable.
 Settle membership for project main/work/testing and chat-testing rooms,
-human/assistant presence sources, freshness rules, status explanations and
-the role/pip palette. Reconcile prior D-52 with this milestone and never
-present missing evidence as idle or current.
+human/assistant presence sources, freshness rules and status explanations.
+P-21 proposes showing the current task beneath each working agent's name.
+Reconcile prior D-52 with this milestone and never present missing evidence
+as idle or current.
 
 ### Q-6. How should images be uploaded, displayed and retained?
 
@@ -789,6 +807,11 @@ Check D-28 with realistic synthetic room/user names and conversation content
 at desktop and phone sizes and while resizing: rooms narrower than users,
 chat taking most of the desktop screen, and both lists reachable through
 buttons on phone without losing the current conversation or its draft.
+
+Check D-29 with each role and status, including an amber waiting dot beside
+a yellow designer name. Status must also be readable without relying on
+color; humans and assistants have no dot, and unknown evidence never
+appears as idle.
 
 Verify shared delivery and room lifecycle with the plateia process stopped.
 Verify localhost binding and the browser boundary with synthetic requests.
