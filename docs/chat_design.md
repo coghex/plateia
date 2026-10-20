@@ -15,8 +15,9 @@ concrete precondition
 
 - [ ] EPIC. Deliver milestone 1: working chat on phone and desktop
 
-No child slices are defined yet. Room ownership is settled by D-8; lifecycle
-and the remaining material choices precede dependency ordering and issue
+No child slices are fully defined yet. D-17 records the agreed image delivery
+sequence: placeholder link first, inline image later within milestone 1.
+Remaining material choices precede full dependency ordering and issue
 boundaries.
 
 ## Epic contract
@@ -79,6 +80,12 @@ reads earlier messages and posts without changing devices or opening a
 terminal. Selecting a user starts an addressed message. The same features
 are available on phone and desktop; layout and interaction details remain
 to be discussed.
+
+Pasting an image inserts it directly into the message being written. The
+owner sees it inline while finishing the message, before pressing Send.
+There is no separate image-preview dialog or caption step. An early slice
+may show a placeholder link in the message; a later milestone 1 slice
+replaces that display with the inline image (D-17).
 
 In scope:
 
@@ -296,6 +303,25 @@ The general room does not exist yet; this design session continues in its
 assigned existing channel for now. Provisioning general remains the owner's
 live configuration action. Nothing live changes now.
 
+### D-17. Paste images into the message; deliver the link before inline rendering
+
+Owner decision 2026-10-20, relayed by the project manager as an authenticated
+reply to the image question: pasting puts the image directly into the message
+being written. Show it inline while the owner finishes typing, before Send.
+There is no separate preview with an added-text step. Pasting does not send
+the message.
+
+Delivery may be split within milestone 1: an early slice inserts a
+placeholder link for the pasted image; a later slice turns that into the
+inline image. The placeholder is an intermediate presentation, not the
+completed milestone's image experience. Plateia still stores images and
+posts links through chat (D-3); inline rendering does not replace that
+transport contract.
+
+This settles composition behavior and the allowed delivery sequence, not
+the complete issue boundaries. Upload timing, failure handling, limits and
+retention remain to be settled.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -349,11 +375,16 @@ conversation migration, completion check or saved log is needed.
 
 ### P-10. Preview pasted images before sending
 
-For Q-6, recommend that pasting an image adds a preview to the composer.
-The owner can add text or remove the image, then press Send to post it.
-Pasting alone does not publish anything. This applies on phone and desktop;
-PNG is the required initial format. Upload timing, size limits and retention
-remain separate questions.
+Replaced by D-17's clarification: paste directly into the message and see
+the image inline before Send, with no separate preview or added-text step.
+The owner permits a placeholder-link slice before the inline-image slice.
+
+### P-11. Keep the message unsent if its image upload fails
+
+For Q-6, recommend keeping the whole message in the composer if an image
+cannot be uploaded. Show the failure and let the owner retry or remove the
+image before sending. Do not silently send only the text or a broken link.
+This rule would apply to both the placeholder-link and inline-image stages.
 
 ## Open questions
 
@@ -405,10 +436,13 @@ present missing evidence as idle or current.
 
 ### Q-6. How should images be uploaded, displayed and retained?
 
-First settle preview/send behavior (P-10). Discuss PNG paste on phone and desktop, upload failure,
-limits, link access, inline sizing, attachment lifetime and preserved logs.
-Plateia stores images; shared chat records their links. No further choice
-has been made.
+**Composition resolved by D-17:** paste into the message, visible inline
+while typing before Send; no separate preview step. A placeholder link may
+ship first, followed by inline rendering within milestone 1.
+
+Next settle upload failure (P-11). Remaining: upload timing, PNG paste on
+phone and desktop, limits, link access, inline sizing, attachment lifetime
+and preserved logs. Plateia stores images; shared chat records their links.
 
 ### Q-7. Which page framework, evaluation method and browser layout?
 
@@ -467,9 +501,14 @@ Closing-state scenarios must show the grey room title until verification
 succeeds, preserve already-accepted posts, and leave failures visible rather
 than prematurely removing the room.
 
+Image composition checks must cover PNG paste while writing a message,
+continuing to type with the image visible, and posting only on Send, on
+phone and desktop. Verify the early placeholder-link stage and the final
+inline-image stage separately; milestone 1 is not complete at the placeholder.
+
 ## Delivery plan
 
-No child slices yet. Define stable `CHAT-N` entries and mirror them in
+No fully specified child slices yet. Define stable `CHAT-N` entries and mirror them in
 Processing status after blocking choices are settled. Each must identify its
 owning repository, dependencies and a reviewable outcome. Include D-8's
 owner-specific global skill change with the room-model work; do not make
@@ -482,6 +521,13 @@ adopting the new room model. Its selection and preservation contract (Q-8)
 must be settled before defining the affected slice and execution procedure;
 it is not postponed to milestone 2's archive browser.
 Discard existing design rooms during that rollout without saved logs.
+
+Image sequencing from D-17: first deliver pasted-image insertion as a
+placeholder link in the message; then deliver inline image display,
+including in the message being composed. Both are milestone 1 work. Record
+their final issue boundaries and dependencies once the upload contract and
+page framework are settled.
+
 The owner explicitly
 approves readiness before issue processing, and each tracker artifact gets
 separate signoff. The project manager runs filed-issue reviews.
