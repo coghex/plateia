@@ -58,21 +58,11 @@ These hold until the vision says otherwise:
   topic.
 - The owner's assistants carry the owner's authority, as the project's
   manager policy defines.
-- Authorization carries across turns within a conversation. It doesn't carry
-  to a different kind of action; ask before anything outward-facing that wasn't
-  requested.
 
 ## Workflow
 
-- The default branch is `master`. Every change lands through a pull request
-  that passes the `review-approved` gate (`.github/workflows/review-gate.yml`)
-  and, once CI exists, `build-test`. The kanban pipeline's drainer merges
-  approved pull requests.
-- **Documentation** is tracked but never gated on CI or review. Land it on
-  `master` with `docs-push [-m "message"] <paths...>` from any worktree as soon
-  as it is ready, including documentation that goes with a code change: link
-  it from the pull request instead of committing it to the pull request's
-  branch. Markdown that tests read or agents execute is code and goes in the
-  pull request; `docs-push` refuses it and says why.
-- Keep pull requests focused: one issue per pull request unless the owner
-  groups them.
+The GitHub-project rules in the owner's global instructions apply. Specific to
+this repository: the default branch is `master`, and the drainer needs
+`reviewed:approve` and the `review-approved` gate
+(`.github/workflows/review-gate.yml`), plus `build-test` once CI exists. One
+issue per pull request unless the owner groups them.
