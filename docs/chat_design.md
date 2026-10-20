@@ -224,9 +224,31 @@ migration only as an open question; that was not a concrete rollout step.
 
 The delivery plan must explicitly account for this work alongside D-8's
 global skill change. This is a design requirement, not an instruction to
-archive live rooms now. Which rooms to archive or retain, how to preserve
-their records, and how active work carries forward need an agreed contract
-(Q-8). It does not require milestone 2's archive browser.
+archive live rooms now. D-13 settles which rooms to archive or retain;
+preservation and how active work carries forward still need an agreed
+contract (Q-8). It does not require milestone 2's archive browser.
+
+### D-13. Archive completed legacy work; retain active, permanent and uncertain rooms
+
+Owner decision 2026-10-20, direct answers in this design conversation:
+accept P-5's selection rule, with these completion criteria:
+
+- Implementation work is finished when its PR is closed out. Where a room
+  covers several PRs, unfinished associated work keeps it active, consistent
+  with D-11.
+- Designer work is finished when all its issues are approved. A completed
+  design draft alone is not this endpoint.
+
+Archive completed work rooms only after their logs are preserved and
+verified. Keep active work rooms and permanent main/general/testing rooms.
+Bring uncertain cases to the owner; age, silence or an ended agent session
+does not prove completion. This is the initial legacy-room cleanup rule;
+D-10 still governs closure of new issue rooms that never have a PR.
+
+The inventory and archive files are private runtime data, never committed
+to this public repository. The shared archive mechanism and migration
+procedure belong with D-8's room work. No live cleanup is performed during
+this design.
 
 ## Proposals
 
@@ -254,17 +276,21 @@ until the last open PR closes. The board is not a prerequisite.
 
 ### P-5. Archive completed legacy work rooms and retain active or permanent rooms
 
-For Q-8, recommend a one-time inventory separating completed work rooms,
-active work rooms and permanent rooms. Archive completed work rooms after
-preserving and verifying their logs; retain active work and permanent
-main/general/testing rooms. Unclear rooms go to the owner for disposition,
-rather than treating age or silence as proof that work is finished.
+Resolved by D-13, with the owner's completion criteria: closed-out PRs for
+implementation work, or all issues approved for designer work. Active and
+permanent rooms stay; uncertain rooms require owner disposition.
 
-This lets the new model start with a useful active-room list without
-disrupting work in progress. The inventory and archive files are private
-runtime data, never committed to this public repository. The shared
-archive mechanism and migration procedure belong with D-8's room work;
-publication of this proposal performs no cleanup.
+### P-6. Archived rooms leave the active list and stop accepting posts
+
+For Q-8's archive behavior, recommend removing a successfully archived room
+from active room lists and preventing new posts until it is reopened.
+Its verified file log remains preserved. This gives closure a clear meaning
+and avoids conversations continuing beyond the saved archive.
+
+This is a proposed behavior across shared chat and its clients, not a claim
+that the current IRC tools already implement it. The exact mechanism,
+handling of queued or late posts, and reopening contract must follow.
+Milestone 1 keeps the archive in files; archive browsing remains milestone 2.
 
 ## Open questions
 
@@ -322,12 +348,15 @@ Reconcile the earlier browser trust boundary with posting and attachments.
 
 ### Q-8. How should existing rooms be archived and migrated?
 
-D-12 requires an explicit initial archive/migration step. First settle
-selection: archive completed work rooms while retaining active and permanent
-rooms, with uncertain cases brought to the owner (P-5)?
+D-12 requires an explicit initial archive/migration step.
+**Selection resolved by D-13:** archive completed work rooms after preserving
+and verifying logs; retain active/permanent rooms and ask the owner about
+uncertain ones. Completion means closed-out PRs for implementation work or
+all issues approved for designer work.
 
-Then specify archive completeness and verification, the meaning of a closed
-room in IRC and clients, active-room mapping (including grouped or unlinked
+Next settle the meaning of an archived room in active lists and posting
+(P-6). Then specify archive completeness and verification,
+active-room mapping (including grouped or unlinked
 request rooms), interruption/retry behavior and the rollout sequence.
 Preserve conversation history and references. Do not assume existing JSONL
 files alone prove a complete archive, or that removing a room from a client
@@ -349,9 +378,10 @@ Verify localhost binding and the browser boundary with synthetic requests.
 Exact tests and fixtures follow the approved contracts rather than inventing
 behavior here.
 
-The initial migration also needs synthetic examples of completed, active,
-permanent and ambiguous legacy rooms, with evidence that archived records
-survive and active work remains reachable.
+The initial migration also needs synthetic examples of closed-out PR work,
+designer work with all issues approved, incomplete PR/design work, permanent
+rooms and ambiguous legacy rooms. Show that archived records survive and
+active work remains reachable.
 
 ## Delivery plan
 
