@@ -49,6 +49,7 @@ Read-only checks on 2026-10-20:
 | Skills repository, `chat/SKILL.md` | Current guidance still describes request channels. D-8 settles reconciliation in the owner's global skills when room implementation is reached; the live guidance has not changed. |
 | Skills repository, `chat/scripts/chatlib.py`, `post` | Posting authenticates an account and handles IRC message formatting. Its result is a line count; its public signature has no caller-supplied logical operation ID. This alone does not establish browser retry safety. |
 | Skills repository, `chat/scripts/chatlib.py`, `_round`, `already_posted`, refreshed 2026-10-20 | The sender waits for a PONG after writing IRC messages. Retry reconciliation matches account/text/time in local logs; partially landed posts may be retried whole. There is no message-ID check-and-cancel API. This does not meet D-34's at-most-once contract. |
+| Read-only Ergo capability probe, shared sender/bridge source and isolated multiline tests, 2026-10-20 | Ergo advertises `batch`, `message-tags` and `draft/multiline`. Shared chat negotiates multiline and joins each batch in live/history delivery. Ten selected existing tests pass. Oversized posts still become separate batch records without a common logical message ID; leading/trailing blank lines are stripped. See D-37 for the required gaps. No test messages were sent to live rooms. |
 | Skills repository, `chat/scripts/chat-bridge`, `project_for`, `handle` | Routing uses project channel names/prefixes. Ordinary direct agent delivery is restricted by sender category, unlike V-6's any-agent communication. Queuing precedes logging, with crash replay permitted. These are integration gaps, not evidence that the new contract is implemented. |
 | Skills repository, `chat/SKILL.md`, identity and delivery sections | Stable identities, session discovery, history, outbox, delivery and acceptance machinery exist. Their exact guarantees and usable interface require focused verification before designing the web adapter. IRC login alone is not presence evidence. |
 | GitHub issue inventory, `coghex/plateia` | No open issues on 2026-10-20. Earlier foundation epic #10 and collaboration epic #26 are closed; neither is an open milestone 1 tracker. Recheck overlap before readiness. |
@@ -692,6 +693,61 @@ includes every post committed before the cutoff. These are implementation
 obligations of the accepted outcome, not capabilities established in the
 existing sender. Resolve them before claiming this contract is deliverable.
 
+### D-37. Preserve long posts using explicit transport grouping
+
+Owner decision 2026-10-20. Long pasted text stays one message in the web
+chat, with its line breaks preserved. The transport must explicitly mark
+which IRC lines belong to that message, using IRCv3 multiline batches or
+an equivalent. Reassembly must never merge separate posts just because
+they share a sender, arrive close together or look like continuation text.
+Agent and terminal views can retain their line-oriented presentation;
+those displayed lines are not independent message identities.
+
+Verified support and limits on 2026-10-20:
+
+- Ergo advertises `batch`, `message-tags` and `draft/multiline` in a read-only
+  capability query. This establishes advertised support, not a live posting
+  or deadline test. No account login, room join or test post was needed.
+- Shared `chatlib.post` negotiates those capabilities, emits `BATCH` framing
+  and uses `draft/multiline-concat` for wrapped pieces of one text line.
+  The bridge's `join_multiline` and receive loop collect by batch reference
+  and process on the closing marker, including batches nested in history.
+- The existing `SendMultilineTests` and `MultilineTests` pass: 10 isolated
+  tests covering sending, live/history reassembly and related recovery.
+  They establish current behavior, not completion of the new contract.
+- `multiline_batches` splits text exceeding negotiated byte/line limits
+  into separate batches with added continuation text. Each is a separate
+  record; no logical message ID connects all parts. It also strips outer
+  blank lines and can alter whitespace at batch boundaries. Synthetic
+  read-only checks confirm ordinary paragraphs round-trip but outer blank
+  lines and oversized posts do not round-trip exactly.
+- If multiline is unavailable, the sender falls back to independent
+  `PRIVMSG` lines. That fallback cannot satisfy this web contract without
+  equivalent explicit grouping. The `post` docstring's unlimited single
+  batch claim is broader than the implementation.
+
+Required shared-contract changes: preserve the exact message text and
+line breaks; carry an authenticated logical identity through live delivery
+and history; distinguish ordered parts and completion if multiple batches
+are needed; and reconcile that identity with D-34's browser-created ID.
+Batch references alone are connection-scoped framing, not durable logical
+IDs. Never infer cross-batch membership from timing or continuation text.
+Only a complete logical message may be presented or routed as the submitted
+instruction. Missing, repeated, interleaved or replayed parts must not
+create partial instructions, duplicates or merged independent posts.
+
+Capability negotiation, maximum supported size, any equivalent fallback
+and multi-batch completion must be settled together with D-36's publication
+deadline. Plain line fallback cannot silently weaken the guarantee.
+These changes belong in shared chat; plateia consumes the grouped contract
+behind its IRC boundary rather than inventing its own grouping heuristic.
+
+Protocol evidence: the [IRCv3 multiline specification](https://ircv3.github.io/specs/extensions/multiline.html)
+defines batch framing, concat tags, completion and negotiated limits;
+[Ergo's changelog](https://github.com/ergochat/ergo/blob/master/CHANGELOG.md)
+records support for `draft/multiline`. The extension still uses draft names;
+implementation must negotiate the actual supported capabilities.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -877,13 +933,19 @@ reload and expiry, the owner uses history and retypes a missing message.
 
 ### P-28. Keep long text as one visible message
 
-For Q-4, recommend preserving line breaks and presenting a long text post
-as one message in the web conversation. Any necessary IRC transport
-splitting stays behind the shared chat boundary; it must not create
-independent web messages or repeated agent instructions. Do not silently
-truncate text. Transport limits, safe maximum size and all-or-nothing
-publication within D-36's expiry contract must be resolved under Q-3
-before defining the implementation slice.
+Resolved by D-37 with the explicit transport-grouping requirement.
+Verified existing multiline support does not yet cover oversized logical
+posts or exact preservation at their boundaries.
+
+### P-29. Limit a logical message to 64 KiB of text
+
+For the remaining long-message size choice, recommend at most 65,536 bytes
+of UTF-8 message content, including serialized attachment links. This is
+roughly 65,000 English characters, fewer for multibyte text. Count the
+serialized content before submission, show a clear over-limit warning and
+retain the draft rather than sending or truncating it. This is a proposed
+application limit, not Ergo's current batch limit and not a claim that the
+existing sender can publish that size atomically within the deadline.
 
 ## Open questions
 
@@ -930,6 +992,13 @@ the final publication cutoff and complete history through that cutoff,
 including pending IRC writes and a lagging bridge. An HTTP arrival-time
 check alone does not establish the accepted history-or-never guarantee.
 
+D-37 requires explicit logical grouping across any transport fragments,
+exact content preservation and the same identity in live delivery/history.
+Existing per-batch reassembly is insufficient for oversized posts. Define
+the relationship between browser IDs, durable message IDs, batch references
+and ordered parts; verify whole-message publication and expiry before
+dispatching an agent instruction.
+
 ### Q-4. What are the posting and recovery interactions?
 
 **Draft recovery resolved by D-23:** keep each room's unfinished message and
@@ -955,7 +1024,9 @@ until confirmed cancellation, and normal display on confirmed posting.
 unconfirmed sends; the server enforces the deadline carried by each attempt.
 After expiry, a message is in history or will never post; the owner retypes
 if missing. Q-3 must establish that guarantee at the publication boundary.
-Still settle long-message handling (P-28).
+**Long-message presentation resolved by D-37:** one web message with line
+breaks preserved and explicit transport grouping, never time-based merging.
+Still settle the message-size limit (P-29).
 Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
 Settle how undelivered messages remain visible and how the owner is notified
@@ -1124,6 +1195,15 @@ cannot be silently treated as a fully verified archive.
 Check stored dimensions and file size against the approved caps independently
 of viewport width. Resizing the window changes only display; opening and
 archiving use the capped version, with no retained high-resolution original.
+
+Long-message verification must cover exact leading, trailing and internal
+line breaks, Unicode split boundaries, negotiated byte/line limits, multiple
+batches, interleaved same-sender posts, repeated identical posts, truncated
+batches, reconnect and history replay. Assert one web message per logical
+post and one instruction dispatch, with no merging of separate posts or
+partial dispatch when a fragment is absent. Missing multiline capability
+must exercise the specified equivalent contract or an explicit refusal,
+never heuristic joining. Existing 10-test evidence is a baseline only.
 
 ## Delivery plan
 
