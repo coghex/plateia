@@ -112,6 +112,8 @@ Out of scope:
 
 - Milestone 2's archive browser/search, browser push, unread indicators,
   highlighted owner mentions and queued/delivered/accepted indicators.
+- A current-task line under agent names: optional milestone-2 setting,
+  with its default still undecided (D-30).
 - The board and its workflow, reactions, and tracker mini-cards.
 - Dedicated design rooms (rejected by D-16).
 - Designing testing-agent workflows, replacing IRC, or controlling sessions
@@ -539,6 +541,15 @@ and assistants have no status dot (V-4). Provide a readable status label
 as well as color on phone and desktop. Missing or stale evidence is not
 idle and must not acquire a grey idle dot by default.
 
+### D-30. Defer current-task lines to an optional milestone-2 setting
+
+Owner decision 2026-10-20. Do not show a current-task line beneath agent
+names in milestone 1. Note it only as an optional setting for milestone 2;
+its default is not decided. This narrows the initial presentation of V-4
+without removing milestone 1's real session presence, role colors or
+idle/working/waiting dots. No milestone-1 slice includes the task-line
+setting or its presentation.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -677,11 +688,17 @@ yellow designer name. Source and freshness contracts remain under Q-5.
 
 ### P-21. Show an agent's current task beneath its name
 
-For Q-5, recommend a short current-task line beneath each working agent's
-name in the user list. This makes V-4's account of what an agent is working
-on visible without opening another view. The phone user panel exposes the
-same information. Use the shared session's reported task; do not infer a
-task from the last chat message. No task evidence means no invented task.
+Deferred by D-30 to an optional milestone-2 setting. It is outside
+milestone-1 scope and slices; the default remains open for milestone 2.
+
+### P-22. Use Enter to send on desktop and the Send button on phone
+
+For Q-4, recommend Enter to send and Shift+Enter to insert a new line on
+desktop. On phone, the on-screen keyboard's Return inserts a new line and
+the Send button posts the message. Keep the Send button available on both.
+Keyboard submission follows the same upload-readiness and connection rules
+as the button; it never bypasses them. Text composition with an input
+method must not send a message while a character is being confirmed.
 
 ## Open questions
 
@@ -722,7 +739,7 @@ the skills repository. Do not revive retired packages by inference.
 images across switches and reloads on the same device.
 **Disconnected behavior resolved by D-24:** keep typing, disable Send,
 and keep this a minimal edge case within normal chat delivery.
-Still settle acknowledgement, uncertain outcomes,
+Still settle keyboard submission (P-22), acknowledgement, uncertain outcomes,
 safe retry and long-message handling. Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
 Settle how undelivered messages remain visible and how the owner is notified
@@ -735,7 +752,8 @@ idle, green working and amber waiting dots for agents. Human users and
 assistants have no dot. Similar role/dot hues are acceptable.
 Settle membership for project main/work/testing and chat-testing rooms,
 human/assistant presence sources, freshness rules and status explanations.
-P-21 proposes showing the current task beneath each working agent's name.
+**Current-task line deferred by D-30:** optional milestone-2 setting,
+excluded from milestone 1; no default selected.
 Reconcile prior D-52 with this milestone and never present missing evidence
 as idle or current.
 
@@ -858,6 +876,8 @@ owner-specific global skill change with the room-model work; do not make
 changing the live convention an advance prerequisite for unrelated work.
 Keep D-24's disconnected behavior within normal composer work; it does not
 drive slice boundaries or add offline machinery.
+Exclude D-30's optional current-task line and setting from all milestone-1
+slices; retain only the milestone-2 note.
 The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
 dependency pins and web CI job feeding `build-test`. Keep implementation
 in normal isolated code worktrees; this document does not install tools.
