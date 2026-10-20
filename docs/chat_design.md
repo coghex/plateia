@@ -401,6 +401,10 @@ images still belonging to a saved draft. The storage mechanism and recovery
 of interrupted uploads remain to be designed. Cross-device draft
 synchronization is not part of this decision.
 
+D-32 later excludes failed-send entries from persistence. The transition
+from a saved draft to a submitted message is still open under Q-4/P-24;
+do not treat the failed entry itself as another saved draft.
+
 ### D-24. Keep disconnected drafting minimal
 
 Owner decision 2026-10-20, relayed by the project manager as an authenticated
@@ -559,6 +563,23 @@ Keyboard submission uses the same upload-readiness and connection rules
 as the button. Confirming a character through an input method must not
 accidentally send the message.
 
+### D-32. Use quiet sending text and a temporary retry icon on failure
+
+Owner decision 2026-10-20. While sending, put small grey “sending...” text
+below the message, not in a bubble. On failure, keep the message in this
+app's chat window with a red exclamation mark. Clicking or tapping that
+mark retries the send.
+
+Failed sends are temporary local entries for retry, not saved or persisted
+conversation records. Their contents must not be restored as failed entries
+after a reload. This decision does not remove V-12's durability requirement
+for requests the shared service has already acknowledged. The interaction
+with saved drafts in D-23 still needs an explicit transition rule (P-24).
+
+The owner did not approve the proposed “Checking” state. Its label and
+uncertain-outcome behavior remain open; do not implement that label as an
+accepted choice.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -707,20 +728,28 @@ phone Return adds a line and the Send button posts.
 
 ### P-23. Show sending and failed messages in the conversation
 
-For Q-4, recommend showing a submitted message in the conversation with
-“Sending” until the server acknowledges durable acceptance. After acceptance,
-show it normally; this does not claim a recipient has read or accepted it.
-If submission definitely fails, keep the message visible with “Not sent”
-and a Retry action. An uncertain outcome stays marked “Checking” while the
-shared service looks up the original submission; it is not called failed
-or blindly sent again. Retry preserves the original submission identity so
-it cannot duplicate the message or start the same work twice.
+Partly resolved by D-32 with revised presentation: small grey “sending...”
+below the message, then a red exclamation mark on failure that retries when
+clicked. Failed entries are not persisted. The proposed “Not sent” text is
+superseded by the icon; “Checking” was not approved.
 
-An error discovered after durable acceptance stays attached to that message
-as a delivery failure; it must not falsely say the original post was never
-sent. This is minimal submission/error feedback required by V-12, not
-milestone 2's queued/delivered/recipient-accepted progress display. Exact
-shared-service lookup and recovery contracts still belong in Q-3.
+Still proposed: normal display after durable server acceptance, without
+claiming recipient acceptance; lookup of uncertain submissions before retry;
+reuse of submission identity to prevent duplicates; and visible delivery
+errors discovered after durable acceptance. These are minimal submission
+and error feedback, not milestone 2's full receipt display. Exact shared
+lookup and recovery contracts belong in Q-3.
+
+### P-24. Clear the saved draft when Send submits it
+
+To reconcile D-23 and D-32, recommend clearing the saved draft when Send
+actually submits its contents. Keep the submitted snapshot in the current
+app window for sending feedback or retry, without saving a failed copy.
+An unfinished message that has not been submitted remains a saved draft.
+An unavailable Send action, including an unfinished or failed image upload,
+does not submit or clear that draft. Handling a reload before the submission
+outcome is known remains part of the uncertainty contract in Q-4; this
+proposal does not authorize dropping an acknowledged request.
 
 ## Open questions
 
@@ -763,7 +792,12 @@ images across switches and reloads on the same device.
 and keep this a minimal edge case within normal chat delivery.
 **Keyboard submission resolved by D-31:** desktop Enter sends,
 Shift+Enter adds a line; phone Return adds a line and Send posts.
-Still settle acknowledgement, uncertain outcomes, safe retry (P-23) and
+**Sending and failure presentation resolved by D-32:** small grey
+“sending...” below the message; failed messages remain temporarily in the
+app with a red exclamation mark that retries when clicked. Failed entries
+are not persisted.
+Still settle the saved-draft transition (P-24), acknowledgement, uncertain
+outcomes (including the unapproved “Checking” label), safe retry (P-23) and
 long-message handling. Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
 Settle how undelivered messages remain visible and how the owner is notified
@@ -884,6 +918,11 @@ completed upload alone never posts a message.
 Check D-31's desktop Enter/Shift+Enter and phone Return/Send behavior,
 including input-method composition and attempts to submit while an image
 upload is unfinished or the connection is unavailable.
+Check D-32's small grey sending text below the message, red failure icon,
+and retry through that icon on both phone and desktop. Failed entries must
+not be persisted or restored on reload. Check this separately from saved
+unfinished drafts and acknowledged requests; their different lifecycles
+must not silently erase either durability guarantee.
 Draft recovery checks must retain text and images across room switches and
 reloads on the same device, including drafts whose uploads are interrupted
 or have failed. Cleanup must not remove saved-draft attachments.
