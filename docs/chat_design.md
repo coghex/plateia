@@ -52,6 +52,7 @@ Read-only checks on 2026-10-20:
 | Read-only Ergo capability probe, shared sender/bridge source and isolated multiline tests, 2026-10-20 | Ergo advertises `batch`, `message-tags` and `draft/multiline`. Shared chat negotiates multiline and joins each batch in live/history delivery. Ten selected existing tests pass. Oversized posts still become separate batch records without a common logical message ID; leading/trailing blank lines are stripped. See D-37 for the required gaps. No test messages were sent to live rooms. |
 | Upstream Ergo at `678d29d5442b00aa4ed79e86f9139443a3e1994a`, publication path | No caller-ID deduplication or per-message expiry check was found. P-36's server-patch proposal was rejected; D-45 changes the deadline to the single writer's decision cutoff. |
 | Installed Ergo 2.19.1, read-only capability/history checks for D-45 | Negotiated message tags, batches, multiline, echo-message, labeled-response, CHATHISTORY, server-time and account tags. History replay retained an existing client-only reply tag; repeated reads retained the same value. A mid-window server-msgid lookup succeeded. No tagged test message was posted, and no config/service change or restart was made. |
+| Ergo 2.19.1 source, follow-up recovery analysis | Channel delivery precedes history insertion; a history insertion error is logged without undoing delivery. Session logout does not wait for the old command loop to finish. P-39 records why these are insufficient proofs of safe cancellation after an uncertain write. No live fault was induced. |
 | Skills repository, `chat/scripts/chat-bridge`, `project_for`, `handle` | Routing uses project channel names/prefixes. Ordinary direct agent delivery is restricted by sender category, unlike V-6's any-agent communication. Queuing precedes logging, with crash replay permitted. These are integration gaps, not evidence that the new contract is implemented. |
 | Skills repository, `chat/SKILL.md`, identity and delivery sections | Stable identities, session discovery, history, outbox, delivery and acceptance machinery exist. Their exact guarantees and usable interface require focused verification before designing the web adapter. IRC login alone is not presence evidence. |
 | Shared `chat-bridge`, `Deliveries._record`, `_dead`, `accept`, `accepted`, and `pchat trace`, checked for D-41 | The bridge records attempts, dead letters and authenticated replies/acks. Delivery success and recipient acceptance are separate. Attempt records omit a structured recipient field; acceptance closes matching pending items, while late acknowledgements also have a separate record. `trace` renders request-oriented text, not a typed per-message/per-recipient outcome. A shared read contract is required for plateia. |
@@ -1265,6 +1266,9 @@ disconnect/restart settlement proof and 64 KiB multiline transport are
 still open technical gates. No assertion of completed at-most-once recovery
 follows from capability negotiation or these read-only history queries.
 The shared skills/service owns this protocol; plateia presents its results.
+P-39 records a further source-level gap: even a settled write can have reached
+recipients without a durable history entry. Absence needs completeness of
+recording as well as completion of the old writer.
 
 ### P-38. Mark reloaded history as syncing while a prior send is unsettled
 
@@ -1272,6 +1276,45 @@ Resolved by D-46 with the owner's time-limit condition: “Syncing history...”
 lasts at most 15 seconds from the room's first history request in a loaded
 page, then becomes “unconfirmed: awaiting history” until recovery completes.
 No pending message or retry entry is restored.
+
+### P-39. Keep irrecoverable send outcomes unconfirmed, or evaluate another server
+
+Read-only follow-up on Ergo 2.19.1 found an additional limit:
+
+- `Channel.SendSplitMessage` sends to member sessions before calling
+  `AddHistoryItem`. History-write errors are logged, without reversing
+  delivery. **Inference:** a crash between delivery and history insertion,
+  or an insertion failure, can leave a recipient with a message that history
+  does not contain. A later complete scan cannot prove it was never delivered.
+  [Delivery and history ordering](https://github.com/ergochat/ergo/blob/v2.19.1/irc/channel.go#L1343),
+  [history-write error handling](https://github.com/ergochat/ergo/blob/v2.19.1/irc/channel.go#L743).
+- A session's command loop executes handlers sequentially. An ordered reply
+  on the original connection can establish that its earlier handler returned,
+  but does not establish successful history persistence.
+  [Command loop](https://github.com/ergochat/ergo/blob/v2.19.1/irc/client.go#L681).
+- Native session logout calls `destroy`, which detaches/closes a session
+  without waiting for its command loop to finish. **Inference:** its success
+  reply alone is not a barrier against an already executing handler.
+  [Logout](https://github.com/ergochat/ergo/blob/v2.19.1/irc/nickserv.go#L1350),
+  [session destruction](https://github.com/ergochat/ergo/blob/v2.19.1/irc/client.go#L1310).
+
+No crash, logout or service change was performed. This is source evidence,
+not a reproduced live failure. It prevents claiming that an absent ID after
+reconnection or IRC restart always means cancelled. Single-writer ownership
+does not close a delivery-before-history gap.
+
+Recommend retaining the no-patch approach with an explicit limitation:
+when recording or settlement cannot be proven, the outcome may remain
+unconfirmed indefinitely, without retry or a claim that retyping is safe.
+D-46 still bounds the syncing presentation to 15 seconds; it does not impose
+a deadline for obtaining truth. Found complete IDs remain posted; an attempt
+known never to have been written can be cancelled. Lost confirmation plus
+missing history alone must never authorize a repeat write.
+
+This limitation needs owner signoff before treating P-37 as deliverable.
+If eventual posted-or-cancelled recovery is required for these cases, evaluate
+a different IRC server as D-45 directs. Never propose an Ergo patch. No
+replacement has been selected, and no live change is authorized.
 
 ## Open questions
 
@@ -1319,6 +1362,9 @@ and its unresolved settlement proof as a design-readiness gate. A missing
 bridge entry, elapsed timer or newly connected reader is not cancellation.
 P-36 is rejected: no IRC patch. If the installed server cannot support the
 contract, bring a different server choice to the owner.
+P-39 now asks whether permanently unconfirmed outcomes are acceptable when
+Ergo's history cannot establish what happened; otherwise evaluate another
+server. Do not hide this limitation behind the bounded syncing notice.
 
 D-37 requires explicit logical grouping across any transport fragments,
 exact content preservation and the same identity in live delivery/history.
