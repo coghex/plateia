@@ -188,6 +188,8 @@ fully featured open-source tools, listen only on localhost and serve through
 the private Tailscale network. Acknowledged requests survive restarts;
 connections recover; stale/unknown state is explicit; retries start no
 duplicate work; unresolved failures and incomplete actions remain visible.
+D-47/D-48 add the owner's explicit exception for dismissing unconfirmed-send
+notices while retaining the unresolved outcome in shared state.
 
 ### D-7. Leave framework selection and image details for discussion
 
@@ -1015,7 +1017,21 @@ the dismissal action or restore the original into the composer.
 This applies to the unconfirmed-send/history notices in D-35/D-46. D-42's
 posted-message agent-delivery error still clears only on agent acceptance;
 that error remains non-dismissible. D-36's prohibition on browser persistence
-of pending sends remains in force. P-40 proposes how dismissal survives reload.
+of pending sends remains in force. D-48 settles how dismissal survives reload.
+
+### D-48. Remember dismissed notices across reloads and devices
+
+Owner decision 2026-10-20. Accept P-40. The shared sender remembers dismissal
+with the unresolved send record, so that notice stays dismissed across
+reloads and on the owner's other devices. No pending-send or dismissal
+recovery data is persisted in the browser.
+
+Dismissal applies only to the particular unresolved send. New unconfirmed
+sends still show their own notices, including a fresh room-level notice
+where appropriate. Do not implement dismissal as a permanent mute for a
+room. The attempt record and its protection against duplicate writes remain;
+a later confirmed message appears normally in history. D-47's separation
+between hiding a notice and resolving the outcome continues to apply.
 
 ## Proposals
 
@@ -1351,13 +1367,26 @@ outcomes cannot authorize duplicate writes.
 
 ### P-40. Remember dismissal in the shared sender
 
-Recommend keeping a dismissal marker with the shared unresolved record,
-so a dismissed notice stays dismissed after reload and on the owner's other
-devices. This stores no pending-send data in the browser and does not erase
-the server's attempt record. Apply the marker only to that unresolved send;
-a new uncertain send gets its own notice, including a new room-level notice
-if needed. A late positive result still appears in history. This persistence
-choice awaits owner approval; D-47 already approves dismissal itself.
+Resolved by D-48: the shared sender remembers dismissal across reloads and
+devices. New uncertain sends retain their own notices; the unresolved
+record remains and a late positive result still appears in history.
+
+### P-41. Remove unused image uploads after a grace period
+
+Recommend deleting demonstrably unused uploads **24 hours after they become
+unreferenced**. Keep images referenced by saved drafts, current sends or
+retry entries, unresolved sends, posted messages and archived conversations.
+A draft does not expire merely because it has not been opened recently.
+
+Removing an image from a draft, replacing the draft or discarding a retry
+entry can release that reference; it cannot remove another reference to the
+same stored image. A pasted image uploaded before a crash must not be treated
+as unused merely because its browser is offline. Reconcile draft/upload
+references first; when reference state is unknown, retain the image.
+
+This is a proposed storage-cleanup rule, not a new browser workflow or a live
+cleanup action. The retention period needs owner approval. Exact reference
+registration and interrupted-upload recovery belong in the attachment contract.
 
 ## Open questions
 
@@ -1379,8 +1408,12 @@ settled and the file archive is verified; keep unresolved problems visible.
 **Design conversations resolved by D-16:** use permanent general chat;
 no dedicated design rooms. Existing design rooms are discarded at rollout
 without conversation migration or saved logs.
-Remaining: PR closure without merge, issue/PR reopening, replacement PRs,
-and other work without a tracker item. Existing rooms, including grouped request
+**Reopened issues already resolved:** prior `plateia_design.md` D-66 (owner
+decision 2026-10-08) reuses and unarchives the same room. Preserve that rule;
+this milestone's D-10/D-11 replace the earlier board-dependent closure trigger.
+D-11 and V-2 say PR closure, not only merge, so closed-unmerged PRs use the
+same closure rule. Remaining: PR reopening, replacement PRs, and other work
+without a tracker item. Existing rooms, including grouped request
 rooms, are addressed under Q-8. Settle how closure preserves
 a complete file log despite outages or late posts, and how completion or
 failure of preservation becomes visible. No archive browser in this milestone.
@@ -1452,9 +1485,9 @@ Q-3 must establish that settlement and history coverage.
 history catch-up. Neither notice restores a pending send or authorizes retry.
 **Unprovable outcome resolved by D-47:** keep Ergo; unconfirmed can persist
 indefinitely without retry. The owner may dismiss its notice; retyping and
-Send creates a new ID. P-40 asks whether dismissal is remembered by the shared
-sender across reloads and devices. Agent-delivery errors under D-42 remain
-non-dismissible.
+Send creates a new ID. **Dismissal persistence resolved by D-48:** the shared
+sender remembers it across reloads and devices; new uncertain sends get new
+notices. Agent-delivery errors under D-42 remain non-dismissible.
 **Long-message presentation resolved by D-37:** one web message with line
 breaks preserved and explicit transport grouping, never time-based merging.
 **Message size resolved by D-38:** 64 KiB of text, with a warning before
@@ -1477,12 +1510,20 @@ stay unchanged alongside the chat error; no new bridge notification work.
 **Role and status colors resolved by D-29:** retain role colors, with grey
 idle, green working and amber waiting dots for agents. Human users and
 assistants have no dot. Similar role/dot hues are acceptable.
-Settle membership for project main/work/testing and chat-testing rooms,
-human/assistant presence sources, freshness rules and status explanations.
+**Project membership already resolved by V-4/D-5:** every active session
+working on a project appears in that project's rooms, including manually
+opened sessions. General lists active agents across projects. Remaining:
+human/assistant presence sources, the shared chat-testing room's agent list,
+and presentation of status explanations.
 **Current-task line deferred by D-30:** optional milestone-2 setting,
 excluded from milestone 1; no default selected.
-Reconcile prior D-52 with this milestone and never present missing evidence
-as idle or current.
+**Freshness already resolved:** prior `plateia_design.md` D-52 (owner
+decision 2026-10-08) sets agent presence stale after 2 minutes and unknown
+after 10; chat reconnecting appears immediately, with stale after 1 minute
+without a bridge heartbeat and unknown after 5. Carry these defaults into
+the shared read contract. Stale values show their age; unknown values are
+not shown as current. Neither becomes idle or success merely as time passes.
+These thresholds describe evidence age, not D-35/D-46's shorter UI wait bounds.
 
 ### Q-6. How should images be uploaded, displayed and retained?
 
@@ -1503,6 +1544,8 @@ and file at most 1 MiB, shrinking further as needed.
 Remaining: PNG paste on phone and desktop,
 input/processing limits, link access, unused-upload cleanup and archive mechanics.
 Plateia stores images; shared chat records their links.
+P-41 proposes a 24-hour grace period for demonstrably unused uploads while
+protecting all draft/send/conversation references.
 
 ### Q-7. Which page framework, evaluation method and browser layout?
 
@@ -1512,7 +1555,12 @@ choices. **Layout resolved by D-28:** narrow rooms left, wider users right,
 chat taking most of the desktop screen; room/user lists behind buttons on
 phone. **History scrolling resolved by D-39:** load older on scroll-up,
 preserve the reader's place on new arrivals, and provide “Jump to latest”.
-Reconcile the earlier browser trust boundary with posting and attachments.
+Carry forward prior `plateia_design.md` D-64's browser trust boundary:
+localhost/Tailscale access, allowed Host and same-origin requests, the owner's
+configured identity, and protected mutating/streaming endpoints. Render chat
+as untrusted content; restrict links to http/https and safe new-tab behavior.
+Its JSON/custom-header mutation rule still applies. Specify the image-upload
+encoding within that boundary before defining the upload slice.
 
 ### Q-8. How should existing rooms be archived and migrated?
 
@@ -1655,6 +1703,11 @@ that no send, retry or outcome change occurs. Delayed original requests must
 remain fenced after dismissal. Retyping and Send must allocate a new ID;
 late confirmation of the original must remain independently visible in
 history. Dismissing this notice must not clear an agent-delivery error.
+Check D-48 with two browser sessions and a sender restart: dismissal remains
+remembered after reload and across devices without browser persistence.
+Create a new unresolved send in the same room and verify that its notice
+still appears. A stale dismissal request for the original must not hide the
+new notice or erase either send's recovery record.
 
 Draft recovery checks must retain text and images across room switches and
 reloads on the same device, including drafts whose uploads are interrupted
@@ -1725,8 +1778,8 @@ Include D-36/D-45's writer cutoff, logical ID in authoritative IRC history
 and complete history lookup in that contract. Apply D-47's accepted
 unconfirmed outcome when P-37 cannot prove settlement or recording. Do not
 add an IRC patch, browser pending-send storage or reload restoration.
-Include D-46's bounded room-level recovery notice and D-47's dismissal with
-history loading; settle P-40's dismissal persistence before that UI slice.
+Include D-46's bounded room-level recovery notice and D-47/D-48's remembered
+dismissal with history loading and the shared sender contract.
 Exclude D-30's optional current-task line and setting from all milestone-1
 slices; retain only the milestone-2 note.
 The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact

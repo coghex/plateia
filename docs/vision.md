@@ -240,7 +240,11 @@ comparison (owner decision 2026-10-20). What the owner can rely on:
 - interrupted connections recover on their own;
 - stale or unknown state is shown as stale or unknown, never as current;
 - retrying a request never starts duplicate work;
-- failures and incomplete actions stay visible until they are resolved.
+- failures and incomplete actions stay visible until they are resolved,
+  except that the owner may dismiss an unconfirmed-send notice without
+  resolving or retrying the send. The shared sender remembers that dismissal
+  across reloads and devices; new unconfirmed sends still show their own
+  notices (owner decision 2026-10-20; [chat design D-47/D-48](chat_design.md#d-47-keep-ergo-permit-dismissal-of-an-unprovable-send-notice)).
 
 ### V-13. Plateia is the face; the workflow lives beneath it
 
