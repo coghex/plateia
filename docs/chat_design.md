@@ -3819,6 +3819,137 @@ K-4 still needs the concrete IRC completion and restart-evidence
 contract before affected issue drafting. No database, service, archive or
 configuration is changed live by this proposal.
 
+### P-82. Confirm current IRC effects and recheck room state after reconnects
+
+Proposed K-4 completion/restart contract, not yet approved. A confirmed IRC
+operation proves its effect in the running server, not that the effect is
+durable across an Ergo crash. Use the receipts below, retain D-89's blocking
+rule for uncertain old commands, and reconcile room permissions and owner
+membership after reconnecting. This explicitly accepts the restart gap below;
+it does not introduce a server patch or automatic server restart.
+
+#### Command receipts and sequencing
+
+Before writing a lifecycle command, durably record its room, generation,
+acting account, connection identity, exact requested effect and write-start
+state in D-92's control store. Use a single room target and narrowly scoped
+effect per operation, rather than a multi-room command whose partial success
+is ambiguous. Serialize conflicting commands for that room across the
+moderator and owner connections. Keep unrelated rooms and archive I/O out of
+that serialization boundary.
+
+| Evidence | Meaning and permitted next step |
+| --- | --- |
+| Intent cancelled before any write could start | Confirmed non-dispatch; the obsolete operation cannot affect a new generation. |
+| Correlated result plus a completed, ordered read on the same uninterrupted command session | Record the actual applied or rejected effect and current state; later conflicting work may proceed after its own checks. |
+| Partial write, lost reply, connection break before completion proof, or crash before the receipt is durable | Unconfirmed execution; retain the operation and D-89's fence. No blind replay and no conflicting reopen. |
+| Matching state read on a new connection | Current observation only; it cannot settle an older possibly executing command. |
+
+For MODE, inspect the actual applied changes and then query channel modes;
+verify D-87's registration, account grants and current participant privileges
+before treating `+nm` as a posting block. A no-op mode request may have no
+change announcement; its ordered query can prove the requested current state.
+For PART, use the authenticated owner's own session, its correlated response
+and a complete subsequent self-membership read. An already-absent response
+can satisfy the desired absence after verification. Do not substitute another
+client's nick, an incomplete NAMES list or silence for account membership.
+JOIN likewise needs the bound account's response and verified membership.
+Correlate replies using negotiated labels where available, otherwise a
+strictly serialized command/read exchange; qualify either path against Ergo.
+Errors are interpreted per operation: a permission failure settles execution
+but does not satisfy the requested room state.
+
+An ordered read establishes that the earlier synchronous handler has
+returned. It is not proof that history or asynchronous persistence finished.
+Keep source connection/command IDs, parsed results and verification revisions
+in the durable receipt; the final D-92 publication checks those revisions.
+Invalidate the relevant verification on an observed conflicting event or
+connection loss. Concurrent outside actions can occur after any observation;
+report them as conflicts rather than claiming an atomic transaction with IRC.
+
+#### Evidence for the durability limit
+
+Ergo 2.19.1's session loop executes each command handler before reading the
+next command. Owner PART removes membership before returning; always-on
+membership changes schedule a separate writer. A completed ordered exchange
+therefore supports a current-state receipt, but not a durable membership
+receipt. [Ergo client implementation](https://github.com/ergochat/ergo/blob/v2.19.1/irc/client.go).
+
+Channel modes also use asynchronous writeback. In `Channel.performWrite`,
+serialization/storage failures are logged and dirty bits restored; locally
+shadowed error variables do not populate the named return value. Even a
+successful caller return must not be promoted to a disk-persistence proof.
+This is read-only source evidence, not a reproduced live failure.
+[Ergo channel implementation](https://github.com/ergochat/ergo/blob/v2.19.1/irc/channel.go).
+MODE applies changes before announcing them; the later ordered query concerns
+the running state, not a storage flush.
+[Ergo command handlers](https://github.com/ergochat/ergo/blob/v2.19.1/irc/handlers.go).
+
+#### Reconnect recovery and the accepted gap being proposed
+
+On bridge startup or loss of a relevant IRC connection, mark affected current
+observations unverified. Before resuming shared sends, joins or lifecycle
+completion, reconcile the durable registry with live ownership, grants,
+modes and account membership. Include archived registered work rooms in this
+event-driven state reconciliation; this is not an indefinite history watcher.
+Preserve their current verified archives and original closure/check deadlines.
+
+Where prior operations are settled and ownership/grants still match, issue
+new generation-checked operations to restore the registry's required posting
+mode and, for a still-closed room, repeat its owner cleanup when needed.
+Never part an owner from a newer open generation. Unexpected ownership,
+grants or evidence of a deliberate outside override goes to the manager;
+do not silently take over a channel or strip permissions. Missing channels
+or registration are also conflicts, not permission to recreate an archive's
+identity without reconciliation. New live setup still requires its existing
+owner confirmation.
+
+An old unconfirmed command remains blocked under D-89 even if a new query
+looks right. Recovery must obtain its completion/non-execution evidence, or
+verified evidence that the old server process and its handlers ended, then
+reconcile the current state. A local socket close, changed connection ID,
+matching state or elapsed time is not that proof. Evidence unavailable through
+the qualified adapter goes to the manager first; hands-on action remains the
+owner's call. Never restart Ergo or disconnect other clients automatically.
+
+**Proposed explicit limit:** after an Ergo crash, saved permissions or owner
+memberships may be older than their last confirmed running state. Until
+shared chat reconnects and repairs them, an archived room may temporarily
+allow direct IRC posts or show restored owner joins. Shared posting stays
+blocked while its state is unverified, but it cannot fence independent IRC
+clients during that gap. There is no promised time bound while the bridge or
+server is unavailable. Ordinary deliberate direct-client changes likewise
+remain observable external actions, not something plateia can transact away.
+
+Newly discovered posts follow D-88: reconcile history within the original
+24-hour window and on legitimate reopen, without extending the window on a
+restart. Posts arriving outside that window can remain absent from the
+archive until reopen. Report detected permission/membership conflicts and
+failed checks; preserve the archive rather than pretending it is invalid or
+that the room has legitimately reopened. During an unresolved close/reopen,
+use D-89's existing grey/blocked behavior and 15-second display bound.
+
+This qualifies D-87's posting block and D-71's completed membership cleanup
+as verified running-state guarantees, not crash-proof server persistence.
+The alternative, if this limit is unacceptable, is evaluating a different
+IRC server; never patch Ergo or silently claim a stronger guarantee.
+
+CHAT-18 implements operation receipts and reconnect reconciliation;
+CHAT-19/CHAT-20 use them for close/reopen, CHAT-21 displays the existing
+unverified/blocked states, and CHAT-23 qualifies the combined behavior.
+Keep the approved slice boundaries. Test lost/partial replies, no-op MODE,
+already-absent PART, concurrent outside joins/mode changes, stale generations,
+bridge restart before receipt commit, and isolated Ergo crashes before mode
+or always-on membership writeback. Verify no old command can affect a newly
+active generation and no outage restarts the history window. These fault
+tests have not run; activation requires their sanitized evidence.
+
+Acceptance would settle the IRC completion and restart-limit choice. Review
+the combined K-4 contract and cutover obligations before declaring that gate
+resolved; neither this proposal nor its approval calls the whole design ready.
+No live commands, configuration, database reads or server changes are
+authorized by this proposal.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -3882,6 +4013,8 @@ D-91 accepts P-80's fresh tracker observation and work-round transition
 contract, including first use and reopen history.
 D-92 accepts P-81's shared control store and immutable archive publication
 protocol. IRC completion evidence remains open.
+P-82 proposes current-state IRC receipts, reconnect reconciliation and an
+explicit crash-persistence gap; it awaits owner approval.
 
 ### Q-3. What interface separates plateia from shared chat?
 
