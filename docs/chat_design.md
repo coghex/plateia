@@ -1152,9 +1152,9 @@ an absent live IRC channel is not proof that no logical room exists. Preserve
 archived history and images, and do not bypass D-14's rejection of posts until
 reopening or D-51's reuse of an existing room. This does not authorize arbitrary
 room names, new room types or live configuration changes during design.
-Exact creation eligibility and the behavior of opening an archived room
-remain explicit follow-ups to settle within these rules. Define connection
-ownership and join/leave lifetime in the shared contract.
+Exact creation eligibility remains a follow-up (P-50). D-58 settles opening
+an archived room for milestone 1. Define connection ownership and join/leave
+lifetime in the shared contract.
 
 ### D-57. Include live assistants in every room without an IRC join
 
@@ -1167,6 +1167,19 @@ a session is live; stale or unknown evidence follows the existing freshness
 rules. The shared service supplies this information. Plateia does not inspect
 cmux or run session discovery itself. This presence rule does not change
 assistant authority, message routing or connection ownership.
+
+### D-58. Show an archive notice without joining, in milestone 1
+
+Owner decision 2026-10-21, explicitly scoped to **milestone 1**. Accept P-49.
+Opening an archived room through an old link shows **“This room is archived.”**
+without joining or reopening it. Do not offer Send or recreate a missing IRC
+channel for that archived room. Its log and images remain preserved; archive
+browsing remains milestone 2.
+
+This is the milestone-1 exception to D-56's normal open/join behavior. A room
+reactivated by reopened issue/PR work follows D-51 and can then be opened and
+joined normally. A room still closing follows D-15 until archive verification
+finishes. This decision does not settle milestone 2's archive-opening UI.
 
 ## Proposals
 
@@ -1558,15 +1571,31 @@ shared session evidence, without an IRC join or status dot.
 
 ### P-49. Opening an archived room does not reopen it
 
-Recommend that opening an archived room through an old link in milestone 1
-shows **“This room is archived.”**, without joining, recreating or reopening
-it. The log and images remain preserved; archive browsing is still milestone 2.
-Do not offer Send or silently create a new IRC channel for an archived room.
+Resolved by D-58 for milestone 1 only: show “This room is archived.” without
+joining, reopening or recreating the room. Preserve its log and images;
+archive browsing remains milestone 2.
 
-Reopened tracker work follows D-51 and makes the original room active again;
-opening it then joins normally under D-56. A closing room remains governed
-by D-15 until preservation is verified. This proposal specifies the archived
-case as an exception to D-56's normal open/join behavior and needs owner approval.
+### P-50. Create only rooms recognized by the shared room model
+
+Recommend that milestone 1 allow opening/creating only:
+
+- Permanent main, project-testing, general and chat-testing rooms already
+  named in the owner's shared configuration.
+- Work rooms tied to real issues or PRs in a configured project, using the
+  shared canonical room name and lifecycle. Associated PRs resolve to the
+  issue's room; standalone PRs have their own room.
+
+Do not provide freely named room creation. Selecting a tracker item or
+following its room link resolves a shared identity before opening; entering
+an arbitrary IRC name does not authorize creating it. An unknown tracker or
+lifecycle result must remain unresolved rather than inventing a new room.
+Existing legacy rooms follow the cutover/parked exceptions in D-44.
+
+This makes D-56's creation a first use of an eligible room, not a new room
+type or tracker action. It does not add rooms to live configuration; that
+remains the owner's rollout action. D-58 still applies to archived room
+identities, even if their IRC channel is absent. This eligibility rule awaits
+owner approval; exact canonical names belong in the shared room contract.
 
 ## Open questions
 
@@ -1579,9 +1608,9 @@ owner-specific global skill change when the room-model work is implemented.
 
 **Opening resolved by D-9:** create on first use, including issue review.
 **Opening from plateia resolved by D-56:** join as the owner and create if
-missing, within the shared room model. Still specify eligible room names
-and the result of opening an archived room without bypassing its lifecycle
-(P-49).
+missing, within the shared room model. P-50 proposes creation eligibility.
+**Archived links resolved by D-58 for milestone 1:** show “This room is
+archived.” without joining, reopening or creating a replacement room.
 **Issue closure without any PR resolved by D-10:** close and preserve the log.
 **Multiple PRs resolved by D-11:** share the issue room and close after the
 last open PR closes.
@@ -1821,6 +1850,12 @@ and show presence only after membership is established. Concurrent opens
 must converge on one shared room identity. Include failed joins and archived
 room records with no live channel; do not silently create a replacement
 conversation or enable posting to an archived room.
+Check D-58 with an old link to a verified archived room, both with and without
+a remaining IRC channel: display the exact archive notice, issue no join or
+creation request, and expose no Send action. Preserve the log and images.
+After tracker work legitimately reactivates the same room under D-51, opening
+it must follow D-56 normally. Do not treat a still-closing room as verified
+archived or add an archive browser to milestone 1.
 Check D-57 with a live assistant that has no IRC connection: it appears in
 every room, including project rooms, general and `#chat-test`, with the
 assistant role color and no dot. End its session and verify removal; a
@@ -2030,6 +2065,8 @@ browser and is not a gradual migration of every active room.
 Discard existing design rooms during that rollout without saved logs.
 Include D-51's reopening and replacement-PR behavior in the shared room
 lifecycle work, with history and images preserved through repeated closures.
+Include D-58's milestone-1 archived-link notice with room opening; it must
+consult shared lifecycle state before attempting to join or create a channel.
 Include D-52's main-room convention in the same shared/global skill change.
 
 Image sequencing from D-17: first deliver pasted-image insertion as a
