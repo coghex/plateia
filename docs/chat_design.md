@@ -1439,6 +1439,21 @@ The two 24-hour periods have different starting events: this one starts at
 room closure; unused-upload cleanup starts only when an image is provably
 unreferenced.
 
+### D-67. Add an image button alongside paste on phone and desktop
+
+Owner decision 2026-10-21. Accept P-57. Provide a small image button in the
+milestone-1 composer on both phone and desktop, opening the device's
+photo/file chooser. Insert the selected image into the current draft and
+begin uploading immediately, while the owner can continue typing. Post the
+message and image only on Send.
+
+The button and paste share one composition/upload path, preserving the
+current text and images. D-17's placeholder-link stage and later inline
+stage apply to both entry methods, as do D-18's whole-message upload-failure
+behavior, D-22's stored-image caps, D-23's draft persistence and D-49's
+reference tracking. There is no separate preview/caption screen or general
+file-sharing feature. Supported input formats remain to settle under P-58.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1882,17 +1897,29 @@ clears its gap marker without reopening or resending. No indefinite watcher.
 
 ### P-57. Offer an image button alongside pasting
 
-Recommend a small image button in the milestone-1 composer on phone and
-desktop, opening the device's file/photo chooser. This lets the owner select
-an image without copying it first. Pasting remains supported.
+Resolved by D-67, owner decision 2026-10-21. Phone and desktop both get an
+image button alongside paste, using the same draft and immediate upload;
+posting still happens only on Send.
 
-Both entry paths use the same upload and composition behavior: insert at the
-current draft position, begin upload immediately, show the image inline in
-the final milestone-1 experience, and post only on Send. Keep D-17's early
-placeholder-link slice and D-18/D-22's failure behavior and stored-image caps.
-This proposes an additional way to choose images, not general file sharing,
-a separate preview/caption screen or a change to retention. Owner approval
-is pending; supported input formats and processing limits remain to settle.
+### P-58. Support common still-image formats in milestone 1
+
+Recommend accepting PNG, JPEG, WebP and HEIC/HEIF still images through both
+paste and the image button. This covers screenshots and selected photos
+without requiring the owner to convert the file first. Store a normalized,
+capped still image under D-21/D-22 rather than retaining the original upload.
+Animation and video are outside this proposed milestone-1 format scope;
+unsupported inputs get a clear error while the draft remains intact, rather
+than silently losing their moving content. Owner approval is pending.
+
+Technical feasibility evidence, 2026-10-21: Pillow documents PNG, JPEG and
+WebP support; Pillow-Heif supplies HEIF decoding through libheif. HEIC support
+would therefore add a decoder dependency, with exact package pins and wheel
+compatibility for the project's Python/macOS/CI environments to verify before
+implementation. This is a candidate processing path, not a package selection,
+installation or claim of tested browser/device behavior.
+[Pillow formats](https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html),
+[Pillow-Heif](https://pillow-heif.readthedocs.io/en/stable/index.html),
+[installation and wheels](https://pillow-heif.readthedocs.io/en/latest/installation.html).
 
 ## Open questions
 
@@ -2093,9 +2120,10 @@ size on tap/click. No retained high-resolution originals.
 and file at most 1 MiB, shrinking further as needed.
 **Unused-upload cleanup resolved by D-49:** delete provably unreferenced
 uploads after 24 hours; keep needed images and uncertain cases.
-P-57 proposes an image button alongside pasting on phone and desktop.
-Remaining: PNG paste on phone and desktop,
-input/processing limits, link access and archive mechanics.
+**Image selection resolved by D-67:** image button alongside paste on phone
+and desktop, using the same draft and immediate upload, posting only on Send.
+P-58 proposes the supported still-image formats. Remaining: device paste and
+chooser validation, input/processing limits, link access and archive mechanics.
 Plateia stores images; shared chat records their links.
 
 ### Q-7. Which page framework, evaluation method and browser layout?
@@ -2295,6 +2323,12 @@ In both stages, an upload failure must retain the whole unsent message and
 offer retry or image removal, without posting text alone or a broken link.
 Verify that pasting begins the upload while typing can continue, and that a
 completed upload alone never posts a message.
+Check D-67's image button on phone and desktop with an existing text/image
+draft: choosing an image inserts into that draft and begins upload without
+sending; cancelling the chooser leaves the draft unchanged. Exercise the
+same upload failure, retry/removal, caps and draft persistence through paste
+and selection. Both entry methods must work in the placeholder-link slice
+and the completed inline-image experience.
 Check D-31's desktop Enter/Shift+Enter and phone Return/Send behavior,
 including input-method composition and attempts to submit while an image
 upload is unfinished or the connection is unavailable.
@@ -2488,6 +2522,9 @@ placeholder link in the message; then deliver inline image display,
 including in the message being composed. Both are milestone 1 work. Record
 their final issue boundaries and dependencies once the remaining upload
 contract is settled; D-25/D-26 have settled the page framework and editor.
+Include D-67's image button in the first image-composition slice, using the
+same upload and draft path as paste. Settle P-58's input format scope and
+decoder dependency before defining the image-processing slice.
 Include image preservation in the archive contract from the first image
 slice; placeholder links do not defer D-20's storage obligations.
 Apply D-21's upload-time cap in that first slice too; inline rendering is
