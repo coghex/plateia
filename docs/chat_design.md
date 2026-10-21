@@ -1724,6 +1724,20 @@ not a claim of completed browser/sleep/network integration tests. Those
 activation checks remain mandatory; a failure returns to the owner rather
 than silently weakening the contract or switching protocols.
 
+### D-80. Keep history on IRC, overlap boundary milliseconds and report incomplete ranges
+
+Owner decision 2026-10-21. Reject P-69. Do not read Ergo's database or add
+a dependency on its storage format. Use standard IRC CHATHISTORY with page
+bounds that include the boundary millisecond, deduplicating native/logical
+message IDs across the overlap.
+
+If more messages share a timestamp than a page can hold, return explicitly
+incomplete history rather than silently skipping them. Do not advance a
+coverage claim past a boundary that has not been exhausted. If this approach
+cannot meet K-1 within that accepted limitation, return the evidence to the
+owner as a new question; the rejected database reader is not a fallback.
+No change to Ergo, its configuration or its database is authorized here.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2496,52 +2510,16 @@ change or implementation was made during this evaluation.
 
 ### P-69. Read Ergo's persisted history through a versioned, read-only shared adapter
 
-Recommend allowing the shared chat library to read the installed Ergo
-SQLite history directly, behind its existing IRC boundary. Use that source
-for persisted-history paging and native/logical-ID lookup, while IRC remains
-the live transport and only publication path. Plateia consumes the normalized
-Python API; it neither opens Ergo's database nor implements its schema.
+Rejected by D-80, owner decision 2026-10-21. Keep history on standard IRC
+CHATHISTORY, include the boundary millisecond in adjacent pages, and
+deduplicate message IDs. Explicitly report an unexhausted boundary as
+incomplete history. Do not read Ergo's database or depend on its storage
+format. The original rejected proposal is retained in commit `dbf5a588f1`;
+it is not an alternative implementation path.
 
-This addresses the inspected IRC paging limitation recorded under K-1:
-native message-ID cursors become timestamp bounds and can skip tied rows.
-The database exposes a distinct history row ID as well as timestamp, native
-msgid, serialized item and room association. Those provide the inputs for
-stable ordering and exact lookup without an Ergo patch. Reading the actual
-persisted record also avoids treating a shared log's absence as proof that
-nothing posted. Existing D-47 uncertainty remains unchanged.
-
-The cost is a deliberate dependency on Ergo's storage format. Keep a
-versioned backend for the inspected release/schema, verify schema and record
-shape before reading, and refuse unsupported formats rather than guessing.
-The configured database location stays private, outside this repository.
-Use an ordinary read-only SQLite connection that sees the live WAL; do not
-use immutable-file mode for a changing database. Do not write tables, run
-migrations/checkpoints, change retention or administer Ergo through this
-reader. An unreadable or unsupported source is explicit unavailability,
-not an empty conversation or cancelled send.
-
-This proposal selects the read boundary, not a simplistic high-water-mark
-algorithm. The inspected `AddChannelItem` writes the base history row and room
-association separately. A joined row can therefore become readable after
-a larger row ID already exists. Exact history/live reconciliation must keep
-unresolved associations and late insertions visible; merely saving the
-largest joined ID would be unsafe. Snapshot, retention and restart behavior
-must be specified before the affected issues are drafted.
-[Ergo SQLite schema, writes and queries](https://github.com/ergochat/ergo/blob/v2.19.1/irc/sqlite/history.go),
-[history serialization](https://github.com/ergochat/ergo/blob/v2.19.1/irc/history/serialization.go).
-
-An IRC-only reader would retain less storage coupling, but cannot claim
-complete traversal at the verified ambiguous boundaries without another
-proven mechanism. Do not solve that by patching Ergo, silently skipping
-records, or declaring an unprovable send cancelled. Recommend the read-only
-adapter and explicit compatibility check rather than accepting that paging
-limitation for the normal history path.
-
-Owner approval is pending for this storage coupling. It affects K-1,
-especially CHAT-3/CHAT-6 and their archive consumers, without changing their
-approved slice boundaries. No live database read, configuration change or
-implementation is part of this proposal; source inspection and synthetic
-query evidence are the current basis.
+The K-1 overlap contract below applies the owner's selected approach and
+records source/model evidence. Source inspection of Ergo's query code is
+evidence about its IRC behavior, not permission to query its live storage.
 
 ## Open questions
 
@@ -3195,9 +3173,10 @@ D-75 resolves tracking and local skills delivery. D-68's HEIC question is a
 deliberately conditional verification gate, not a mandatory decoder dependency:
 stop and return evidence to the owner only if actual phone input remains HEIC.
 K-1's execution ownership is resolved by D-77, its native single-batch
-transport plan by D-78 and its clock protocol by D-79/P-68. Detailed API
-records and history/live contracts remain open; P-69 proposes the history
-read boundary. Transport activation still needs D-78's verification and
+transport plan by D-78, its clock protocol by D-79/P-68 and its IRC-only
+history read boundary by D-80. The overlap contract below makes D-80
+concrete; detailed API records and the history/live handoff remain open.
+Transport activation still needs D-78's verification and
 separately confirmed setup change; clock activation still needs actual-browser
 verification under P-68.
 K-2–K-4 remain open. No gate has been marked resolved by boundary approval
@@ -3252,7 +3231,7 @@ unknown-notice delay; tests must use D-79/P-68's selected heartbeat clock
 contract, not reset the timeout at HTTP receipt. No issue is ready from this
 table alone.
 
-### K-1 evidence: history cursors still need a complete ordering contract
+### K-1 evidence: strict cursors skip ties; overlapping milliseconds retain them
 
 Source inspection on 2026-10-21 found that Ergo 2.19.1's SQLite-backed
 `Between` resolves a native msgid to its timestamp, then queries with strict
@@ -3278,14 +3257,76 @@ is insufficient for the new coverage claim. Missing reference IDs, retention,
 query errors and reconnects must likewise remain distinguishable from an
 authoritatively completed available range.
 
-Next resolve a history reader with a stable total order and a provable
-history/live handoff, within the no-patch constraint. Do not treat adding an
-end-of-page flag or merely deduplicating overlaps as proof that every row was
-reachable. Any proposal to read Ergo's storage directly would introduce a
-versioned storage dependency; P-69 proposes that explicit design choice,
-which remains pending. Positive complete history evidence can still prove a
-send posted. Under D-47, absence after write-started remains insufficient to
-authorize retry regardless of how the paging question is settled.
+D-80 resolves the read boundary: use overlapping IRC queries and report an
+unexhausted boundary as incomplete. The rejected database reader in P-69 is
+not an alternative available to an implementer. Source inspection of server
+code does not authorize reading the live database.
+
+Further source inspection on 2026-10-21 found that the CHATHISTORY handler
+rounds an AFTER timestamp up to the next millisecond, while leaving a BEFORE
+timestamp unchanged. The backend then applies its strict comparison. Thus
+AFTER at the preceding millisecond still excludes a message exactly at the
+desired millisecond. BEFORE at the following millisecond includes the entire
+desired boundary, including its submillisecond records. LATEST returns the
+newest limited set, presented chronologically; the handler clamps requests
+to the configured maximum and supplies an end-of-pagination indication when
+a successful query returns fewer items than its effective limit.
+[CHATHISTORY handler](https://github.com/ergochat/ergo/blob/v2.19.1/irc/handlers.go).
+
+### K-1 overlap contract under D-80
+
+Use backward traversal for both older-history reads and reconnect catch-up:
+
+1. Start with `CHATHISTORY LATEST <room> * <limit>`, or resume the stored
+   opaque boundary for an older-page request. Establish the effective limit
+   from the server's advertised/configured maximum; a silently clamped limit
+   cannot be mistaken for exhaustion.
+2. Let `m` be the millisecond containing the oldest returned timestamp. The
+   next request is `CHATHISTORY BEFORE <room> timestamp=<m + 1 ms> <limit>`.
+   This deliberately repeats the whole boundary millisecond. Do not use
+   AFTER, the last native msgid, or AROUND to skip that overlap.
+3. Deduplicate native msgids and verified logical-ID aliases. Equal text,
+   equal timestamps and batch references never identify duplicate messages.
+   Count raw top-level history items for paging, including events and each
+   reconstructed multiline message once; count before deduplication.
+4. A full page that cannot move the oldest boundary strictly earlier may
+   be retried with a larger limit, up to the server maximum. If that maximum
+   still gives no progress or positive exhaustion evidence, return incomplete
+   history with the blocked boundary. Do not loop forever or advance past it.
+   This also covers distinct submillisecond timestamps within one wire
+   millisecond, and the ambiguous case of exactly one full page of ties.
+5. Only a successfully completed response batch with the server's positive
+   end indication establishes exhaustion. Crossing into an older millisecond
+   establishes that the preceding boundary was traversed for that query.
+   An empty set of *new* IDs after deduplication establishes neither fact.
+   Query errors, lost batches, changed capabilities or missing access leave
+   coverage incomplete. Never convert them into an empty successful history.
+
+Keep coverage separate from message evidence. A complete matching history
+record can establish that a send posted even if a different boundary is
+incomplete. A page cursor describes a room, query direction, boundary and
+coverage generation; it is not a promise of an immutable server snapshot or
+a globally unique timestamp order. Preserve returned order among ties without
+inventing an ordering authority from the lexical value of IDs.
+
+The end indication describes the history available to that IRC query, not
+proof that all previously delivered messages were durably recorded. Retention
+and the known delivery-before-history gap remain relevant. No negative
+history result after write-started authorizes retry under D-47. A history/live
+handoff must additionally cover live arrivals during the scan; merely reaching
+the end of an overlapping traversal does not establish that handoff.
+
+Design experiment, 2026-10-21: an in-memory SQLite model of the inspected
+strict BEFORE query used invented IDs, base limit three and maximum eight.
+Exact/submillisecond boundaries and repeated overlap returned every ID once;
+seven tied records completed, while eight or nine tied records stopped with
+explicit incompleteness at the full maximum rather than guessing. Five
+hundred generated histories with bounded timestamp density all completed
+with every ID exactly once. A separate predicate check reproduced AFTER's
+rounding exclusion and BEFORE's inclusion of the boundary. These are query
+model checks, not live Ergo, retention, concurrent-write or reconnect tests.
+They support selecting the overlap traversal within D-80's accepted limit;
+CHAT-3 still requires isolated-server integration evidence before activation.
 
 ### Stage checkpoints
 
