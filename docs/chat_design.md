@@ -18,7 +18,7 @@ concrete precondition
 ## Processing status
 
 - [x] EPIC. Deliver milestone 1: working chat on phone and desktop — [#36]
-- [ ] CHAT-1. Define the shared chat API records and compatibility contract
+- [x] CHAT-1. Define the shared chat API records and compatibility contract — [#37]
 - [ ] CHAT-2. Preserve one logical message across IRC multiline fragments
 - [ ] CHAT-3. Expose authoritative history with a gap-free live handoff
 - [ ] CHAT-4. Share owner IRC sessions and verified room membership
