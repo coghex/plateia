@@ -3663,6 +3663,147 @@ still needs the exact durable registry/archive publication contract and
 concrete IRC completion evidence. No live polling setup or tracker mutation
 is authorized by this proposal.
 
+### P-81. Publish immutable archive bundles through one durable shared control store
+
+Proposed K-4 persistence contract, not yet approved. Put the shared bridge's
+durable send/control records, room registry, lifecycle operations and change
+feed in one local SQLite database outside the repository. CHAT-5 establishes
+the durable send store; CHAT-18 adds room records and migrations to that
+store. This selects its storage backend without changing K-1's accepted
+external contract or implementing rooms in the early text slices.
+
+The bridge remains the sole mutation owner under D-77's process lock.
+Plateia and command-line consumers use the shared API; they do not edit
+tables. D-86's image catalog remains separately owned by plateia behind its
+local asset command. Neither the Ergo database nor the image catalog is
+attached as part of a claimed cross-store transaction.
+
+#### Durable records and transaction boundaries
+
+The shared store records stable room/item identities and associations;
+tracker observations and work-round checkpoints; desired/observed lifecycle
+generations; send admission and drain state; each IRC operation and its
+receipts; archive candidates and published revisions; unresolved gaps;
+owner-set/membership evidence; closure time and late-check deadline; and
+versioned change-feed entries. Keep record/schema versions and idempotent
+command IDs. Unknown versions, corrupt state and failed writes produce an
+explicit unavailable state, never an empty replacement registry.
+
+Use short transactions to change room admission and register sends against
+the same gate. Closing commits the nonaccepting gate before collecting the
+previously admitted attempts. A send racing that transition is either
+durably admitted to the drain set or rejected before any IRC write. Check
+the room generation and explicit drain authorization again at dispatch;
+already admitted attempts may finish under D-89, without admitting new ones.
+Keep slow tracker/history reads,
+image exports and IRC waits outside database transactions.
+
+Use SQLite rollback-journal mode (`DELETE`), `synchronous=EXTRA`, and
+`fullfsync=ON` on macOS; read back effective settings and verify filesystem
+support at deployment. Keep the database on local storage. Use the supported
+Python SQLite binding, with no additional database service. The transaction
+and file-flush guarantees rely on the operating system and storage honoring
+their contracts; qualification must not substitute a checksum or a successful
+rename for durable flushing.
+[SQLite atomic commit](https://www.sqlite.org/atomiccommit.html),
+[SQLite durability settings](https://www.sqlite.org/pragma.html#pragma_synchronous).
+
+#### One self-describing log per archive revision
+
+Each immutable archive directory contains one UTF-8 JSONL conversation log
+and the verified capped image copies it references. Its version-one records
+include a header with room/item identity, work round, lifecycle generation,
+snapshot time and D-88 coverage/limits; ordered logical messages with native
+aliases, authenticated sender facts, timestamps and exact text/line breaks;
+asset records with relative path, media type, dimensions, size and digest;
+and gap notes with later-confirmation annotations. A final record gives
+record counts and a digest of the preceding log bytes. The control store
+also records the complete file digest and verified image manifest.
+
+This is D-70's one structured format, without a plaintext transcript or an
+archive viewer. An agent can interpret the log and local images without
+the web process, SQLite access or a project-specific reader. The log states
+when its history snapshot was captured; it does not pretend that owner PART
+and final closure had already completed at that earlier instant. Actual
+closure time and its checking deadline belong to the lifecycle receipt.
+
+Paths are generated from opaque room/revision IDs beneath the configured
+private archive root. The browser never supplies paths. Reject traversal,
+unexpected symlinks and identity/digest conflicts. A new revision never
+overwrites a published file in place.
+
+#### Prepare, seal and publish
+
+1. Under the current close/correction generation, persist a candidate ID,
+   expected base archive revision and the room conversation/gap revision
+   being captured. Pin its full managed-image set through D-86 before export.
+2. Write the structured log and copied images into a private staging
+   directory on the same filesystem as the final archive location. Re-read
+   them, validate complete message/alias identities and counts, and verify
+   every referenced image's bytes against its manifest. Include D-65's
+   dismissed gaps; any other known missing evidence blocks completion.
+3. Flush the files and required directory metadata, then rename the sealed
+   directory to a unique immutable revision path and durably flush the
+   containing directory. Check failures explicitly. Same-filesystem rename
+   supplies atomic visibility, not an atomic transaction with SQLite.
+   [Python filesystem operations](https://docs.python.org/3.11/library/os.html#os.rename).
+4. Record the verified candidate and its hashes in the control database.
+   Only then may D-89's owner cleanup proceed. A prepared candidate is not
+   yet the room's authoritative closed state or current archive pointer.
+5. After required membership cleanup and D-91's fresh final tracker check,
+   use one short transaction to compare the current lifecycle generation,
+   association/observation and owner-set revisions, candidate/base revision,
+   and known conversation/gap coverage. If still valid, publish the archive
+   pointer, closed state, closure time, 24-hour deadline, gap markers and
+   change-feed event together. A mismatch retains the candidate and resumes
+   reconciliation; it cannot publish stale closure.
+
+A newly observed message or changed gap evidence before the final commit
+requires reconciliation of the candidate's coverage. Do not silently omit
+known evidence just because copying already finished. D-88 still governs
+previously unseen posts appearing after closure.
+
+For a correction, follow the same prepare/seal/verify sequence and compare
+the expected base revision before atomically replacing the current pointer
+and updating the relevant markers. Keep the original closure time/deadline;
+a correction is not another closure or a reopen. A superseded generation
+cannot overwrite a newer archive or remove newer unresolved gaps.
+
+#### Restart and retention
+
+On startup, reconcile durable candidate/operation records and filesystem
+artifacts before resuming lifecycle work. An unfinished staging directory
+is not an archive. A sealed directory without a publication receipt is a
+candidate that may be reverified, not proof that cleanup/closure completed.
+A committed pointer must name a complete verifiable bundle; missing or
+corrupt bytes become a visible recovery incident. Preserve any older verified
+revision without falsely declaring it a complete substitute for the lost
+newer one. Route recovery through D-89's manager-first path.
+
+Publish the associated feed entry in the same database transaction as its
+state change, so restart can replay it without inventing closure twice.
+Retain published archive revisions in milestone 1; there is no automatic
+archive-pruning policy. They are previous versions of the same structured
+record, with one current pointer, not competing conversation authorities.
+An unchanged late check needs only a control receipt, not another full copy.
+Keep uncertain staging/export pins until their lack of use is proved;
+D-49's 24-hour asset cleanup does not delete retained conversation archives.
+
+This makes cross-store completion an ordered, recoverable protocol rather
+than a distributed transaction. A crash may leave extra files or pins, but
+must not expose a half archive as complete. CHAT-18 owns the registry schema,
+CHAT-19 publication, CHAT-20 correction, and CHAT-15 the existing asset API;
+the approved slice boundaries remain. Verify interruption at every numbered
+boundary, disk-full/flush errors, missing/corrupt files, web-down export,
+simultaneous correction/reopen and stale candidates with invented data on
+the supported platforms. No durability fault test has been run for this
+proposal yet.
+
+Acceptance would settle the durable registry/archive publication contract.
+K-4 would still need the concrete IRC completion and restart-evidence
+contract before affected issue drafting. No database, service, archive or
+configuration is changed live by this proposal.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -3724,6 +3865,8 @@ D-90 accepts P-79's durable shared association registry, initial GitHub/workflow
 link evidence and manager-first conflict handling.
 D-91 accepts P-80's fresh tracker observation and work-round transition
 contract, including first use and reopen history.
+P-81 proposes the shared control store and immutable archive publication
+protocol; it awaits owner approval. IRC completion evidence remains open.
 
 ### Q-3. What interface separates plateia from shared chat?
 
