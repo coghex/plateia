@@ -44,9 +44,9 @@ concrete precondition
 
 These 23 slices follow D-74's approved stage order. D-76 approves their
 boundaries at `e6107c0663`, boundaries only. D-81 settles K-1's design
-contract; D-82 settles K-2's state mapping. Their integration checks remain
-required. K-3–K-4 remain contract
-gates before affected issue drafting. No tracker artifact has been filed; the
+contract; D-82 settles K-2's state mapping; D-86 settles K-3's image contract.
+Their integration checks remain required. K-4 remains a contract
+gate before affected issue drafting. No tracker artifact has been filed; the
 design is not ready for issue processing yet.
 
 ## Epic contract
@@ -1815,6 +1815,21 @@ The implementation and deployment checks remain required; nothing live
 changes now. K-3's remaining design work is the asset-reference/pinning/export
 contract, including archive operation while the web process is down.
 
+### D-86. Accept one image catalog and a local asset command
+
+Owner decision 2026-10-21. Accept P-75 as written at `54b0ba2a70`:
+plateia owns one durable image catalog outside the repository, with a
+versioned local asset command that operates while the web process is down.
+Use individual references, conservative 24-hour unused-image cleanup and
+verified archive copies. Shared chat owns send and archive lifecycle;
+ordinary text chat continues if the helper is unavailable, while affected
+image operations remain unresolved and retain their references.
+
+Together with D-83–D-85, this settles K-3's design contract. Its crash,
+concurrency, processing and deployment checks remain required. K-4 and
+whole-design readiness remain open; no implementation or live change is
+authorized by this decision.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2967,7 +2982,8 @@ open, as does K-4. The 23 slice boundaries stay unchanged.
 
 ### P-75. Keep one image catalog and expose local pin/export operations without the web process
 
-Proposed completion of K-3, not yet approved. Plateia owns the capped image
+Accepted by D-86, owner decision 2026-10-21, as written at `54b0ba2a70`.
+Plateia owns the capped image
 files and one durable SQLite asset catalog outside the repository. Shared
 chat owns send, message and room/archive lifecycle decisions. Both use a
 versioned local asset API; the browser never edits the catalog, and shared
@@ -3097,10 +3113,10 @@ two drafts sharing one asset, a lost upload reply, a direct IRC managed link,
 an unconfirmed send and a late archive correction. Missing evidence must keep
 the image and expose the failure, not silently complete cleanup or closure.
 
-Acceptance would settle the remaining K-3 design contract together with
-D-83–D-85, subject to its implementation and deployment checks. K-4 and
-whole-design readiness would remain open; no tracker artifact or live
-configuration change is authorized by this proposal.
+D-86 settles the remaining K-3 design contract together with D-83–D-85,
+subject to its implementation and deployment checks. K-4 and whole-design
+readiness remain open; no tracker artifact or live configuration change is
+authorized by this decision.
 
 ## Open questions
 
@@ -3313,8 +3329,9 @@ This qualifies D-23's draft recovery without retaining HD originals.
 D-84 accepts P-73's Pillow 13.0.0 and Python 3.11 minimum for the new web
 application, with the existing inbox compatibility preserved.
 D-85 accepts P-74's bounded JSON uploads, separate image worker and normalized
-output behavior. Asset references and archive export remain
-separate K-3 work, proposed in P-75's local catalog/pin/export contract.
+output behavior. D-86 accepts P-75's local catalog/pin/export contract and
+settles K-3. Image implementation and deployment checks remain required;
+K-4 still owns the room barrier and final archive lifecycle.
 
 **Composition resolved by D-17:** paste into the message, visible inline
 while typing before Send; no separate preview step. A placeholder link may
@@ -3757,7 +3774,7 @@ checks actually ran in CI versus locally; neither substitutes for the other.
 
 These gates separate settled contracts from unfinished design work; they
 are not permission to let implementers invent behavior. D-76 approves the
-dependency decomposition, while D-81/D-82 settle K-1/K-2's design contracts.
+dependency decomposition, while D-81/D-82/D-86 settle K-1/K-2/K-3's design contracts.
 Approved boundaries do not make the remaining contracts ready.
 Resolve each affected gate in this design before drafting that implementation
 issue. Bring any new user-visible behavior or serious ownership choice to the
@@ -3782,8 +3799,10 @@ Transport activation still needs D-78's verification and
 separately confirmed setup change; clock activation still needs actual-browser
 verification under P-68.
 D-82 settles K-2's design mapping, including automatic owner waits; its
-runtime-source checks remain. K-3/K-4 remain open. K-1/K-2 are resolved by
-explicit contract approval, not boundary approval or source inspection alone.
+runtime-source checks remain. D-86 settles K-3 through P-75 and D-83–D-85;
+its implementation and deployment checks remain. K-4 remains open. K-1–K-3
+are resolved by explicit contract approval, not boundary approval or source
+inspection alone.
 
 ### K-1 elaboration: identity and cancellation invariants
 
@@ -4143,7 +4162,7 @@ and no hook, live config or service was changed during these checks.
 - **Relevant decisions:** D-18–D-23, D-49, D-68, D-69.
 - **Acceptance signals:** Input/output limits and malformed-image failures are enforced. Drafts, retries, uncertain sends and archives protect assets across restart; only provably unused objects expire. No retained HD attachment and no unconditional HEIC dependency.
 - **Out of scope:** Inline rendering, archive UI and live data cleanup.
-- **Open questions / stop conditions:** K-3 / Q-6; D-83–D-85 settle interrupted-draft recovery, the pinned processor, upload encoding and resource bounds. Storage/reference ownership and archive export remain.
+- **Open questions / stop conditions:** K-3 is settled by D-83–D-86. Implement and verify P-75's catalog/reference/export contract and the approved processing bounds; do not treat approval as runtime qualification.
 
 ### CHAT-16. Compose image links through paste and the image button
 
@@ -4154,7 +4173,7 @@ and no hook, live config or service was changed during these checks.
 - **Relevant decisions:** D-17–D-19, D-23, D-33, D-38, D-49, D-67–D-69.
 - **Acceptance signals:** Both phone and desktop entry paths use the same durable draft/upload flow. Cancelled selection preserves the draft; failed uploads remain retryable/removable and image links count toward the text limit.
 - **Out of scope:** Inline images, external image fetching and retaining an HD source as a saved attachment.
-- **Open questions / stop conditions:** K-3 / Q-6; validate the exact pre-upload/failed-image reload representation.
+- **Open questions / stop conditions:** K-3 is settled. Verify D-83's unfinished-image reload behavior and P-75's draft/reference transitions.
 
 ### CHAT-17. Render managed images inline and verify phone formats
 
@@ -4187,7 +4206,7 @@ and no hook, live config or service was changed during these checks.
 - **Relevant decisions:** D-14, D-15, D-20, D-51, D-70, D-71.
 - **Acceptance signals:** Archives work with the web process stopped; missing history/images or failed writes cannot claim success. Other-client posts are covered by the barrier; interruption/reopen races preserve data and new joins. No plaintext transcript.
 - **Out of scope:** Dismissing uncertain outcomes, the late-send window, archive browser and live legacy deletion.
-- **Open questions / stop conditions:** K-3/K-4 / Q-2, Q-6, Q-8; prove posting barrier and cross-store verification before drafting.
+- **Open questions / stop conditions:** K-4 / Q-2, Q-8; settle posting barrier and cross-store completion before drafting. K-3's asset side is settled by D-86/P-75.
 
 ### CHAT-20. Close dismissed send gaps and reconcile bounded late history
 
