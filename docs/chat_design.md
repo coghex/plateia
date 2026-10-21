@@ -104,7 +104,7 @@ configuration change or service restart was performed.
 Retention after **all** IRC connections disappear is a separate setting:
 the installation uses opt-in always-on accounts. A read-only examination of
 the running process's datastore found that always-on is not enabled for every
-owner profile. P-54 proposes completing that setup later; multiclient support
+owner profile. D-64 requires completing that setup later; multiclient support
 alone is not proof of zero-connection retention. This check does not establish
 runtime join/part behavior through a live experiment or successful recovery
 after a server restart; those remain integration verification.
@@ -1354,8 +1354,28 @@ authenticate the shared service's connection as the selected account during
 registration so it attaches to the same identity. Keep this service lifetime
 independent of browser connections and the web application. No Ergo patch or
 replacement membership service is needed. Retention with no connected IRC
-clients is a separate always-on setting, tracked in P-54; do not silently
+clients is a separate always-on setting, settled by D-64; do not silently
 assume its current configuration satisfies that stronger recovery case.
+
+### D-64. Enable always-on for every owner account at setup
+
+Owner decision 2026-10-21. Accept P-54, applying it to every account in the
+canonical shared `owner` plus `owners` set. At plateia setup, enable Ergo
+always-on for any owner account that lacks it, including the phone profile.
+This retains only rooms the account has joined, even when every IRC client
+disconnects. It does not join additional rooms. Explicit PART still removes
+that account from the room across its clients, and old membership snapshots
+must not restore a completed leave.
+
+Apply the setting to owner accounts individually, not as a server-wide
+mandatory default. This approval does not extend always-on to agent or
+assistant accounts; any proposed extension needs a separate owner decision.
+Their presence continues to use real session records under D-5/D-57.
+
+This is an approved setup action, not an action performed during design.
+Verify both zero-client retention and restoration of persisted membership
+after an Ergo restart. Keep this membership setting separate from D-61's
+already completed owner-authority configuration.
 
 ## Proposals
 
@@ -1775,21 +1795,28 @@ the shared owner-configuration change is complete as of the owner's
 Resolved by D-63, owner decision 2026-10-21. Accounts remain logged in and
 joined behind the interface, sharing membership with their other IRC clients.
 The installed Ergo configuration and matching source support multiclient
-attachment; zero-connection retention is separately tracked in P-54.
+attachment; D-64 settles zero-connection retention for all owner accounts.
 
 ### P-54. Enable Ergo always-on for both owner profiles at setup
 
-Recommend enabling Ergo's existing always-on behavior for any owner profile
-that lacks it when this integration is set up. Then the account keeps its
-membership even if every IRC client, including the shared service, disconnects;
-Ergo also restores persisted membership when it restarts. Explicit PART still
-leaves the room everywhere and must not be undone by an old client-side list.
+Resolved by D-64, owner decision 2026-10-21. At setup, enable always-on for
+every owner account in the shared owner set, retaining only joined rooms.
+Agent and assistant accounts are excluded from this approval. No live change
+was made during design; the separate owner-authority setup is already complete.
 
-This is a proposed owner-authorized account-setting action at implementation
-setup, not a change made during design. It is separate from the completed
-shared-chat owner-authority change in D-61. The alternative is to rely on the
-shared service keeping an IRC connection alive, without server retention
-when the final connection is lost. Owner approval is pending.
+### P-55. Keep closure pending while a send remains unconfirmed
+
+Recommend retaining D-15's grey closing state when an accepted send still
+has an unprovable outcome under D-47, even if its notice was dismissed.
+Dismissal hides the send notice; it does not establish whether the final
+conversation archive is complete. Preserve available history, images and
+the unresolved send record while waiting, and explain why closure is pending.
+
+Because D-47 permits permanent uncertainty, this can keep a finished-work
+room closing indefinitely. The alternative would permit a completed archive
+that explicitly records the unresolved outcome and needs a policy for any
+later-discovered message. That exception to verified closure is not approved.
+Settle this interaction before specifying the archive completion protocol.
 
 ## Open questions
 
@@ -1812,8 +1839,9 @@ archived.” without joining, reopening or creating a replacement room.
 existing joins; every room page has Join/Leave, with Leave sending IRC PART.
 Archived pages keep Join unavailable under D-58.
 **Connection lifetime resolved by D-63:** closing the browser keeps the
-account joined; membership is shared with its other IRC clients. P-54 covers
-Ergo retention if every IRC client disconnects.
+account joined; membership is shared with its other IRC clients. D-64 requires
+Ergo always-on for every owner account, retaining only joined rooms if every
+IRC client disconnects.
 **Issue closure without any PR resolved by D-10:** close and preserve the log.
 **Multiple PRs resolved by D-11:** share the issue room and close after the
 last open PR closes.
@@ -1835,6 +1863,8 @@ room; design remains in general. Existing rooms, including grouped request
 rooms, are addressed under Q-8. Settle how closure preserves a complete file
 log despite outages or late posts, and how completion or
 failure of preservation becomes visible. No archive browser in this milestone.
+P-55 asks whether a permanently unconfirmed send keeps closure pending even
+after its notice is dismissed; do not infer archive completeness from dismissal.
 
 ### Q-3. What interface separates plateia from shared chat?
 
@@ -1949,7 +1979,7 @@ a missing room within the shared lifecycle.
 **Assistants resolved by D-57:** list live assistants in every room using
 shared session records, without an IRC join or status dot. Remaining:
 status explanations. D-63 settles connection lifetime and shared membership;
-P-54 covers retention with no connected IRC clients.
+D-64 settles owner-only retention with no connected IRC clients.
 **Switching/join/leave resolved by D-60:** keep joined rooms while switching;
 Join/Leave sends the corresponding IRC action.
 **Acting accounts resolved by D-61:** phone and desktop use their respective
@@ -2023,6 +2053,8 @@ posts until reopened, retaining the file log.
 already-accepted posts and verify the archive; keep the title grey and
 problems visible until verified closure.
 Still specify normal archive verification and interruption/retry behavior.
+P-55 carries the unresolved interaction between D-15's verified closure and
+D-47's potentially permanent send uncertainty.
 The manager owns D-44's concrete activation procedure and parked-room
 mapping. Do not reopen the rejected gradual-migration plan.
 Include the conversation's images in the archive and its verification
@@ -2117,8 +2149,11 @@ and stop the web application while the shared service continues: neither
 action should PART or log out the account. Reopening must reconcile with
 current IRC membership. Verify attachment during authenticated registration,
 including existing sessions; do not silently connect under a fallback nick.
-If P-54 is accepted, also verify zero-client retention, server-restart
-restoration and that a completed PART is not restored as a join. These are
+For D-64, also verify zero-client retention, server-restart restoration and
+that a completed PART is not restored as a join. Cover every configured owner,
+including an additional synthetic owner beyond the two browser profiles;
+setup must not change agent or assistant account settings or the server-wide
+default. Retention must not join rooms the account never joined. These are
 future isolated integration checks, not tests performed on the owner's rooms.
 
 Verify shared delivery and room lifecycle with the plateia process stopped.
@@ -2330,9 +2365,10 @@ Apply D-59's milestone-1 creation eligibility in that shared room contract.
 Include D-60's membership controls and persistent joins across view switches
 with room opening, backed by the shared IRC membership interface.
 Carry D-63's browser-independent sessions and cross-client membership into
-that interface, including updates from the owner's existing clients. P-54's
-always-on setup remains a separate pending choice, not a code workaround or
-another owner-authority configuration task.
+that interface, including updates from the owner's existing clients. Include
+D-64's approved always-on setup for all owner accounts, without extending it
+to agents or assistants. This is membership retention, not another
+owner-authority configuration task; no live change is made during design.
 Reuse D-61's completed shared multi-owner support (`7ce2401`) in the
 posting/membership slices, alongside D-62's browser binding and the shared
 sender's two-account integration. Do not add a redundant support slice or
