@@ -1107,7 +1107,28 @@ the list; uncertain evidence follows the established freshness rules.
 
 This changes the **list only**. It does not change routing or authority,
 add a testing workflow, or require each listed agent to hold an IRC connection.
-Human and assistant presence remains the separate question in P-45.
+Owner presence follows D-54; the remaining presentation and assistant rules
+are P-46/P-47/P-48.
+
+### D-54. Show the owner only from real logged-in room membership
+
+Owner decision 2026-10-21, correcting P-45. The owner appears in a room's
+user list only when logged in and joined to that room, based on real IRC
+membership of the configured owner accounts. Do not insert a self entry
+in every room merely because the owner opened the application.
+
+Different owner accounts can have different joined rooms. Read each account's
+actual membership; do not infer the phone's rooms from the desktop's rooms
+or treat account registration as a live login. Account mappings and live
+membership stay in private configuration/state; public examples use invented
+accounts. The owner retains the owner role color and has no status pip.
+
+The shared IRC boundary supplies membership and its freshness to plateia.
+Missing or stale evidence must not be shown as a current join. P-46 asks
+whether the accounts collapse into one displayed owner entry; P-47 asks
+whether opening a room joins it or only reads it. Neither follow-up is
+settled by this correction. Assistants still require a live session; P-48
+recommends whether an IRC join is additionally required.
 
 ## Proposals
 
@@ -1474,21 +1495,45 @@ do not change.
 
 ### P-45. Show the owner and live assistants in room user lists
 
-Recommend showing the owner in every room as the person using this single-owner
-application. This is a self entry, not an inference of human activity from
-the shared sender's IRC connection. Deduplicate the owner's devices into one
-identity. No human activity tracking is needed.
+Corrected by D-54: reject the automatic owner entry in every room. Use real
+logged-in membership of the owner accounts. The owner-account display,
+opening/joining behavior and assistant membership rule are separated below
+for one-at-a-time decisions. No status dots for owner or assistants remains
+approved under D-29.
 
-Show registered global assistants in every room while shared session evidence
-establishes that they have a live session. Registration alone is insufficient;
-an ended session leaves the list. Use the established stale/unknown handling
-when the source cannot establish current presence. Both owner and assistants
-retain their role colors and have no status pip, as already decided in D-29.
+### P-46. Combine joined owner accounts into one owner entry
 
-The shared service supplies assistant presence. Plateia must not run identity
-discovery or inspect cmux to invent it. This presence selection is proposed,
-not a claim that the current shared registry is already a complete presence
-API. It awaits owner approval.
+Recommend one displayed owner entry in a room if at least one configured
+owner account is logged in and joined there. If both accounts are present,
+show the owner once; if one leaves, keep the entry while the other remains.
+Remove it when neither is present, subject to explicit unknown/stale evidence.
+
+Keep the underlying account identities in the shared membership records and
+message attribution. This is display aggregation, not account merging or a
+change to authentication. It awaits owner approval; separate entries for the
+two accounts remain the alternative.
+
+### P-47. Settle whether opening a room joins it as the owner
+
+D-54 leaves two choices: opening a room joins it as the owner and therefore
+adds owner presence, or opening only reads history/live messages and does not
+join as the owner. Bring this as the next separate question after P-46.
+Do not accidentally decide it through a background history reader's joins.
+Connection ownership and join/leave lifetime must follow the selected rule.
+
+### P-48. Keep assistant presence based on live sessions
+
+Recommend listing registered global assistants in rooms while fresh shared
+session evidence establishes a live session, without additionally requiring
+an IRC join. This follows the real-session basis used for agents and avoids
+making a short-lived posting connection determine assistant availability.
+Ended sessions leave the list; uncertain evidence uses the existing freshness
+rules. Assistants retain their role color and no status pip.
+
+The shared service supplies this evidence; plateia does not inspect cmux or
+run identity discovery. Registration alone is insufficient. The live-session
+requirement stands; whether an IRC join is also required awaits the separate
+owner question after the two owner-account questions.
 
 ## Open questions
 
@@ -1619,8 +1664,10 @@ working on a project appears in that project's rooms, including manually
 opened sessions. General lists active agents across projects.
 **Shared chat-testing list resolved by D-53:** `#chat-test` also lists all
 active agents across projects; this changes the list only.
-Remaining: human/assistant presence selection (P-45) and presentation of
-status explanations.
+**Owner presence resolved by D-54:** actual logged-in IRC membership of
+the owner accounts, not an automatic entry in every room. Remaining:
+one or two owner entries (P-46), whether opening a room joins it (P-47),
+whether assistants also need an IRC join (P-48), and status explanations.
 **Current-task line deferred by D-30:** optional milestone-2 setting,
 excluded from milestone 1; no default selected.
 **Freshness already resolved:** prior `plateia_design.md` D-52 (owner
@@ -1720,6 +1767,13 @@ Check D-53 with synthetic active sessions from several projects: general and
 their project population. End a session and age its evidence to check both
 removal and stale/unknown handling. List membership must not create IRC
 connections, route messages or grant authority.
+Check D-54 with invented desktop and phone owner accounts joined to different
+rooms, an authenticated account not joined to the viewed room, and a registered
+but disconnected account. The owner must not appear from viewing a room
+without joining it or from another account's unrelated membership. Include PART/QUIT,
+reconnect and stale membership evidence; unknown must not look like a current
+join. Apply the eventual P-46/P-47 decisions separately to aggregation and
+room-opening behavior.
 
 Verify shared delivery and room lifecycle with the plateia process stopped.
 Verify localhost binding and the browser boundary with synthetic requests.
