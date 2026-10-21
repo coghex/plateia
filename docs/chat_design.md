@@ -1078,6 +1078,18 @@ Preserve history already archived; a stale closure operation must not hide
 the room after it has become active again. Subsequent closure follows the
 same D-10/D-11/D-15 lifecycle and preserves the continued conversation.
 
+### D-52. Use the main room for project work without an issue or PR
+
+Owner decision 2026-10-21. Accept P-43. Project work with no issue or PR
+uses the project's permanent main room. Do not open a temporary work room
+for it. Design conversations continue to use general under D-16.
+
+If an issue or PR later follows, use its work room on first use under D-9
+and link back to the earlier discussion. Keep the original messages in their
+original room, without copying or migrating the conversation. Include this
+convention in D-8's shared room-model and owner-specific global skill change
+when that work is implemented. It does not change live room use now.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1431,16 +1443,21 @@ by a stale closure operation.
 
 ### P-43. Use the project main room for work without a tracker item
 
-Recommend using the project's permanent main room for project work that has
-no issue or PR, without opening temporary request rooms. If it later becomes
-issue/PR work, start using that work room on first use under D-9; link back to
-the earlier main-room discussion without moving or copying its messages.
+Resolved by D-52: use the permanent project main room for work without an
+issue or PR; design remains in general. A later issue/PR room can link to
+the earlier discussion without moving or copying it.
 
-D-16 already places design conversations in general. Work outside a project
-and cross-project coordination also use general under V-2/V-6. Testing uses
-the permanent testing rooms within their existing scope. This proposal
-settles the remaining ordinary project-work case in D-8's shared room-model
-and global skill change, and awaits owner approval.
+### P-44. Show all active agents in the shared chat-testing room
+
+Recommend that the system-wide `#chat-test` room list all active agents
+across projects, as general does. Use the same shared session evidence,
+stable handles, role colors and agent status pips. Ending a session removes
+it; stale or unknown evidence follows the existing freshness rules.
+
+This defines the room's agent list only. It does not add testing workflow,
+grant authority, change message routing or require every displayed agent to
+maintain an IRC connection. Human and assistant presence sources remain a
+separate contract question. This agent-list choice awaits owner approval.
 
 ## Open questions
 
@@ -1468,10 +1485,10 @@ this milestone's D-10/D-11 replace the earlier board-dependent closure trigger.
 D-11 and V-2 say PR closure, not only merge, so closed-unmerged PRs use the
 same closure rule. **PR resumption resolved by D-51:** reopened and
 replacement PRs reuse their existing issue/PR room with history and images.
-P-43 proposes main-room use for project work without a tracker item. Existing
-rooms, including grouped request rooms, are addressed under Q-8. Settle how
-closure preserves
-a complete file log despite outages or late posts, and how completion or
+**Work without a tracker item resolved by D-52:** use the project's main
+room; design remains in general. Existing rooms, including grouped request
+rooms, are addressed under Q-8. Settle how closure preserves a complete file
+log despite outages or late posts, and how completion or
 failure of preservation becomes visible. No archive browser in this milestone.
 
 ### Q-3. What interface separates plateia from shared chat?
@@ -1571,6 +1588,7 @@ working on a project appears in that project's rooms, including manually
 opened sessions. General lists active agents across projects. Remaining:
 human/assistant presence sources, the shared chat-testing room's agent list,
 and presentation of status explanations.
+P-44 proposes showing all active agents across projects in `#chat-test`.
 **Current-task line deferred by D-30:** optional milestone-2 setting,
 excluded from milestone 1; no default selected.
 **Freshness already resolved:** prior `plateia_design.md` D-52 (owner
@@ -1693,6 +1711,10 @@ identity, messages and image references, including through another close.
 Race reopening with an in-progress archive: an old closure result must not
 hide the active room or discard its continued conversation. A tracker item
 that never had a room still creates one only on first use under D-9.
+Check D-52 with project work that has no tracker item: conversation stays in
+the main room without creating a temporary work room. If an issue/PR follows,
+its room links to the earlier discussion without duplicating messages.
+Design conversations still use general and do not create design rooms.
 
 Image composition checks must cover PNG paste while writing a message,
 continuing to type with the image visible, and posting only on Send, on
@@ -1864,6 +1886,7 @@ browser and is not a gradual migration of every active room.
 Discard existing design rooms during that rollout without saved logs.
 Include D-51's reopening and replacement-PR behavior in the shared room
 lifecycle work, with history and images preserved through repeated closures.
+Include D-52's main-room convention in the same shared/global skill change.
 
 Image sequencing from D-17: first deliver pasted-image insertion as a
 placeholder link in the message; then deliver inline image display,
