@@ -2799,6 +2799,50 @@ lost source bytes; preserve the draft throughout. K-3 remains open for the
 upload encoding, processor/pins, resource bounds and archive/export contract.
 K-4 remains open separately.
 
+### P-73. Use current Pillow with a Python 3.11 floor for the new web application
+
+Proposed for K-3, not yet approved. Use **Pillow 13.0.0** for server-side
+PNG/JPEG/WebP validation and shrinking, and require **Python 3.11 or newer**
+for the new web application. Qualify that application on Python 3.11 and
+3.14; use the existing local 3.14 runtime for deployment. The existing
+routine-inbox package retains its Python 3.10 floor and 3.10/3.14 CI matrix.
+This is a component-specific floor, not a repository-wide compatibility
+change or an instruction to upgrade the shared bridge.
+
+Evidence checked 2026-10-21: the repository has no existing web application
+or image dependency; `.github/workflows/ci.yml` currently tests only the
+inbox suite on 3.10/3.14. PyPI reports Pillow 13.0.0 as the current release
+with `Requires-Python >=3.11`; 12.3.0 requires >=3.10. Upstream's compatibility
+table confirms this split. The 13.0.0 release also documents decoder fixes,
+including JPEG decoding. Recommend the current release for the new image
+path instead of choosing an older major solely to reuse the inbox matrix.
+[Pillow compatibility](https://pillow.readthedocs.io/en/stable/installation/python-support.html),
+[Pillow 13 release notes](https://pillow.readthedocs.io/en/stable/releasenotes/13.0.0.html),
+[release metadata](https://pypi.org/pypi/Pillow/13.0.0/json).
+
+Pin the new web application's Pillow dependency exactly and commit the
+installation lock/requirements with hashes for the supported CI/deployment
+artifacts. Use a separate environment; neither shared chat nor the inbox
+imports Pillow merely to read a chat record or archive a capped image.
+Pillow's built-in format allowlist supplies PNG/JPEG/WebP; add no HEIC plugin
+unless D-68's actual phone verification triggers that separate decision.
+Do not silently downgrade Pillow to make a 3.10 install succeed. An unsupported
+interpreter fails with a clear version requirement before starting the app.
+
+CHAT-10 establishes the new backend's 3.11/3.14 checks. CHAT-15 adds its
+locked image dependency and image tests to those checks. Keep the existing
+inbox job and add the new backend job to `build-test.needs`; a failed,
+cancelled or skipped required job must fail the aggregate. Use the same
+dependency lock for local qualification and CI. Recheck the selected release
+at implementation for required fixes, documenting any pin update and running
+the same checks rather than using a floating version.
+
+This settles only the processor choice and the scoped Python compatibility
+contract if approved. It does not claim a dependency was installed or tested,
+or settle output encoding, processing budgets, storage/reference ownership or
+archive export. Those remain K-3 work; K-4 remains open. The 23 approved
+slice boundaries do not change.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -3007,6 +3051,8 @@ These thresholds describe evidence age, not D-35/D-46's shorter UI wait bounds.
 D-83 accepts P-72's capped-only image retention and the explicit reselection case
 when reload interrupts an image before a recoverable capped copy exists.
 This qualifies D-23's draft recovery without retaining HD originals.
+P-73 proposes Pillow 13.0.0 and a Python 3.11 minimum for the new web
+application, with the existing inbox compatibility preserved; it is pending.
 
 **Composition resolved by D-17:** paste into the message, visible inline
 while typing before Send; no separate preview step. A placeholder link may
