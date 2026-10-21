@@ -1860,6 +1860,21 @@ closure; known unconfirmed shared sends still require dismissal under D-65.
 No indefinite watcher or server patch is introduced. This settles K-4's
 archive semantics, not its remaining lifecycle and recovery protocol.
 
+### D-89. Keep reopening fenced until old cleanup is settled
+
+Owner decision 2026-10-21. Accept P-78 as written at `d1da5c1c59`:
+shared chat durably records close/reopen generations and operation receipts.
+Posting and joining remain blocked until conflicting older cleanup commands
+are settled. After 15 seconds of uncertainty, show the specified blocked
+message instead of an indefinite reopening indication. Never restart Ergo
+or forcibly disconnect a client automatically to recover.
+
+Recovery requests go to the project manager first. The manager escalates to
+the owner only when hands-on action is needed; this does not grant new live
+service authority. This settles the recovery behavior. K-4 still needs
+tracker associations/evidence, the persistent/archive-publication contract
+and concrete IRC completion evidence before affected issue drafting.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -3317,7 +3332,7 @@ history-write and interrupted-correction cases. No live change is authorized.
 
 ### P-78. Fence close/reopen work and keep uncertain cleanup visibly pending
 
-Proposed K-4 recovery rule, not yet approved. Keep a durable lifecycle record
+Accepted by D-89, owner decision 2026-10-21. Keep a durable lifecycle record
 for each stable room in shared chat, with a monotonically increasing
 generation, desired open/closed state, observed phase and outstanding
 operation receipts. Serialize lifecycle actions for that room. A reopen
@@ -3380,10 +3395,12 @@ change is unconfirmed.` A pending close uses the corresponding
 display, not the outcome. Recovery continues when evidence arrives; there
 is no dismissal that allows a conflicting reopen, and no automatic server
 restart or forced client disconnect. If existing interfaces cannot supply
-the proof, report the blocker for an owner-directed recovery action.
+the proof, report the blocker to the project manager first. The manager
+escalates to the owner only when hands-on action is needed, under existing
+live-action authority rules.
 
 This can delay a reopened issue's room after an outage. That is the explicit
-tradeoff being proposed, rather than letting an old cleanup affect new work.
+tradeoff accepted by D-89, preventing old cleanup from affecting new work.
 It does not promise that all direct IRC clients obey plateia's pending UI:
 shared chat reports real membership/modes and any outside change honestly.
 
@@ -3409,7 +3426,7 @@ reopen before dispatch, during a partial owner cleanup, after a lost command
 reply, during archive copy/publication and after process restart. Verify
 that delayed old jobs cannot change the newly active generation.
 
-Approval would settle this recovery behavior, not all of K-4. Tracker
+D-89 settles this recovery behavior, not all of K-4. Tracker
 association/evidence, exact persistent record and archive-publication
 contracts, and the adapter's concrete completion evidence remain to be
 resolved before affected issue drafting. No live operation is authorized.
@@ -3469,8 +3486,8 @@ account creation is confirmed with the owner at setup. K-4's archive barrier
 and completeness evidence remain open.
 D-88 accepts P-77's explicit history-snapshot limit with bounded late checks
 covering every client. The remaining close/reopen protocol is still K-4 work.
-P-78 proposes serialized durable generations and visibly blocked recovery
-when an old IRC mutation is unconfirmed; it awaits owner approval.
+D-89 accepts P-78's serialized durable generations and visibly blocked
+recovery when an old IRC mutation is unconfirmed, with manager-first recovery.
 
 ### Q-3. What interface separates plateia from shared chat?
 
