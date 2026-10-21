@@ -141,6 +141,10 @@ Out of scope:
   with its default still undecided (D-30).
 - The board and its workflow, reactions, and tracker mini-cards.
 - Dedicated design rooms (rejected by D-16).
+- Custom rooms with their own rules: an owner-requested future requirement,
+  deferred beyond milestone 1 with no target milestone or design selected
+  (D-59). The milestone-1 creation restriction is a shortcut, not a permanent
+  product limit.
 - Designing testing-agent workflows, replacing IRC, or controlling sessions
   directly from the web application.
 - Any live configuration, accounts, installation, schedules or service changes
@@ -1152,7 +1156,7 @@ an absent live IRC channel is not proof that no logical room exists. Preserve
 archived history and images, and do not bypass D-14's rejection of posts until
 reopening or D-51's reuse of an existing room. This does not authorize arbitrary
 room names, new room types or live configuration changes during design.
-Exact creation eligibility remains a follow-up (P-50). D-58 settles opening
+Creation eligibility for milestone 1 follows D-59. D-58 settles opening
 an archived room for milestone 1. Define connection ownership and join/leave
 lifetime in the shared contract.
 
@@ -1180,6 +1184,26 @@ This is the milestone-1 exception to D-56's normal open/join behavior. A room
 reactivated by reopened issue/PR work follows D-51 and can then be opened and
 joined normally. A room still closing follows D-15 until archive verification
 finishes. This decision does not settle milestone 2's archive-opening UI.
+
+### D-59. Limit creation for milestone 1; defer custom rooms and rules
+
+Owner decision 2026-10-21. Accept P-50 as a **milestone-1 shortcut only**.
+Plateia creates configured permanent rooms and work rooms for real issues/PRs
+using the shared room identity and lifecycle. It does not create freely named
+rooms in milestone 1. Associated PRs use their issue's room; standalone PRs
+have their own room. Existing parked legacy rooms retain D-44's exception.
+
+Resolve eligibility through shared configuration/tracker/lifecycle records
+before creation. Unknown evidence is not permission to invent a room, and
+an absent live channel does not erase an archived room identity. Keep D-58's
+archived-link behavior. Adding permanent rooms to live configuration remains
+the owner's rollout action, not an action performed during this design.
+
+**Deferred future requirement:** the owner wants custom rooms with their
+own rules. Record that intent without designing the rules, editor, storage,
+routing or implementation now. It is outside milestone 1, with no future
+milestone assigned. Do not turn this shortcut into a permanent restriction
+or add custom-room machinery to the milestone-1 slices.
 
 ## Proposals
 
@@ -1577,25 +1601,22 @@ archive browsing remains milestone 2.
 
 ### P-50. Create only rooms recognized by the shared room model
 
-Recommend that milestone 1 allow opening/creating only:
+Resolved by D-59 as a milestone-1 shortcut only: configured permanent rooms
+and real issue/PR rooms, with shared names and lifecycle rules. Custom rooms
+with their own rules are a deferred future requirement, not designed now.
 
-- Permanent main, project-testing, general and chat-testing rooms already
-  named in the owner's shared configuration.
-- Work rooms tied to real issues or PRs in a configured project, using the
-  shared canonical room name and lifecycle. Associated PRs resolve to the
-  issue's room; standalone PRs have their own room.
+### P-51. Switching rooms preserves existing joins
 
-Do not provide freely named room creation. Selecting a tracker item or
-following its room link resolves a shared identity before opening; entering
-an arbitrary IRC name does not authorize creating it. An unknown tracker or
-lifecycle result must remain unresolved rather than inventing a new room.
-Existing legacy rooms follow the cutover/parked exceptions in D-44.
+Recommend that switching the visible room changes the view without leaving
+rooms already joined. Opening the next eligible room joins it under D-56;
+the previous room keeps its real owner membership. Do not send an automatic
+IRC PART merely because the owner changes the visible room or project.
 
-This makes D-56's creation a first use of an eligible room, not a new room
-type or tracker action. It does not add rooms to live configuration; that
-remains the owner's rollout action. D-58 still applies to archived room
-identities, even if their IRC channel is absent. This eligibility rule awaits
-owner approval; exact canonical names belong in the shared room contract.
+This matches keeping multiple rooms joined in an IRC client. It does not
+fabricate membership when a connection has ended, and it does not authorize
+parting rooms or disconnecting other owner clients. Connection ownership and
+reconnect/leave lifetime remain shared-contract details. The room-switching
+rule awaits owner approval.
 
 ## Open questions
 
@@ -1608,7 +1629,10 @@ owner-specific global skill change when the room-model work is implemented.
 
 **Opening resolved by D-9:** create on first use, including issue review.
 **Opening from plateia resolved by D-56:** join as the owner and create if
-missing, within the shared room model. P-50 proposes creation eligibility.
+missing, within the shared room model.
+**Creation eligibility resolved by D-59 for milestone 1:** configured
+permanent rooms and real issue/PR rooms only. Custom rooms with their own
+rules are deferred future work, not designed here.
 **Archived links resolved by D-58 for milestone 1:** show “This room is
 archived.” without joining, reopening or creating a replacement room.
 **Issue closure without any PR resolved by D-10:** close and preserve the log.
@@ -1738,6 +1762,7 @@ a missing room within the shared lifecycle.
 **Assistants resolved by D-57:** list live assistants in every room using
 shared session records, without an IRC join or status dot. Remaining:
 status explanations and connection lifetime details supporting owner behavior.
+P-51 proposes keeping existing joins when switching the visible room.
 **Current-task line deferred by D-30:** optional milestone-2 setting,
 excluded from milestone 1; no default selected.
 **Freshness already resolved:** prior `plateia_design.md` D-52 (owner
@@ -1856,6 +1881,12 @@ creation request, and expose no Send action. Preserve the log and images.
 After tracker work legitimately reactivates the same room under D-51, opening
 it must follow D-56 normally. Do not treat a still-closing room as verified
 archived or add an archive browser to milestone 1.
+Check D-59 with configured permanent rooms, eligible issue/PR rooms, an
+arbitrary name, an unknown tracker result and an archived identity whose
+channel is absent. Only eligible milestone-1 rooms can be created; linked
+PRs resolve to the issue room and concurrent first opens cannot duplicate it.
+Retain the named parked-room exceptions. Do not add or test custom-room rules
+as a milestone-1 feature.
 Check D-57 with a live assistant that has no IRC connection: it appears in
 every room, including project rooms, general and `#chat-test`, with the
 assistant role color and no dot. End its session and verify removal; a
@@ -2068,6 +2099,9 @@ lifecycle work, with history and images preserved through repeated closures.
 Include D-58's milestone-1 archived-link notice with room opening; it must
 consult shared lifecycle state before attempting to join or create a channel.
 Include D-52's main-room convention in the same shared/global skill change.
+Apply D-59's milestone-1 creation eligibility in that shared room contract.
+Custom rooms and their own rules remain a deferred future requirement with
+no milestone-1 slice or speculative implementation.
 
 Image sequencing from D-17: first deliver pasted-image insertion as a
 placeholder link in the message; then deliver inline image display,
