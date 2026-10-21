@@ -2640,6 +2640,67 @@ design contract, subject to those implementation/activation checks and the
 independent K-2–K-4 gates. It does not call the whole design ready, approve
 issues or authorize a live change.
 
+### P-71. Make waiting on the owner explicit in shared agent status
+
+Proposed for K-2, not yet approved. Keep presence tied to real sessions and
+keep D-29's three colors. Use runtime evidence for working/idle, and add an
+explicit shared waiting record for an agent that stops for the owner's
+answer. A question in chat does not automatically mean the agent has stopped
+working; a terminal accepting input does not establish that either.
+
+| State | Required evidence | Presentation |
+| --- | --- | --- |
+| Working | A current, correctly bound runtime turn/activity observation, without a later stop or blocking input event. Registration and the fallback string `running` do not qualify. | Solid green dot. |
+| Idle | A confirmed end-of-turn/idle observation for the live session, with no active owner wait. Mere silence does not qualify. | Solid grey dot. |
+| Waiting on owner | The agent explicitly records that it has stopped for an owner answer, linked to the posted question; or a verified active runtime prompt specifically requires the owner's input. Generic `needsInput` without a verified reason does not qualify. | Solid amber dot. |
+| Unknown | Missing, conflicting, unsupported or too-old evidence; not a fourth guessed work state. | Hollow grey dot with an accessible “Status unknown” explanation. |
+
+The wait record belongs in shared chat, alongside its session-backed status
+projection. The agent records it through its authenticated identity; bind it
+to the logical session, live process generation, turn and question ID. Shared
+skill guidance tells agents to set it when they stop for an owner decision.
+Setting it while finishing the current turn arms the wait; a still-running
+turn stays green until it actually stops. At that point the active wait
+produces amber instead of idle. A verified blocking native prompt can produce
+amber within a turn because execution is blocked there.
+
+Clear the chat wait when that same session actually starts its next turn,
+or explicitly withdraws the wait. An owner reply arriving in IRC or a bridge
+delivery acknowledgement alone does not clear it: the agent may not yet have
+resumed. If the new turn still cannot proceed, it must explicitly establish
+another wait. Native prompt resolution follows its matching runtime event,
+not an unrelated chat reply. Old-generation waits cannot attach to a new
+process merely because it occupies the same tab or uses the same role name.
+This is state reporting, not a change to delivery, authority or acceptance.
+
+Keep the last state transition time separate from the time it was observed
+and from successful inventory time. Preserve the already-approved freshness
+defaults: stale after two minutes without a trustworthy refresh, unknown
+after ten. Stale known status keeps its last color with an explicit stale/age
+annotation; unknown uses the hollow dot. A fresh read of a defaulted or known
+unreliable lifecycle value cannot manufacture fresh working evidence. A
+successfully verified unchanged current state may refresh its observation;
+reading a historical hook event again may not. Assistants and owner accounts
+still have no status dot. No current-task line is added.
+
+Presence and activity remain independent. A successfully completed real
+inventory can remove an ended session. An inventory outage retains the last
+presence with stale/unknown evidence instead of treating every agent as gone.
+Conflicting placement, reused PIDs and missing hooks cannot transfer a state
+or wait to another session. Scope project agents, global lists, assistants and
+real owner membership exactly as already decided in D-5/D-53–D-57.
+
+CHAT-7 implements the normalization, wait record and shared skill guidance;
+CHAT-13 only renders the resulting facts. Verification must cover both agent
+brands, a question asked while still working, a stopped question waiting for
+an answer, an answer delivered before resumption, native prompt resolution,
+interrupts, missed hooks, session replacement and stale-source recovery.
+The source gaps below are required adapter checks, not permission to guess
+from terminal text in the web page or to patch cmux. If the installed runtime
+cannot supply a required trustworthy observation, expose unknown and return
+the gap before claiming that state works. K-2 remains open pending this
+choice and the resulting design review; K-3/K-4 remain separate gates.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -2803,6 +2864,10 @@ tracking and does not clear the original.
 stay unchanged alongside the chat error; no new bridge notification work.
 
 ### Q-5. How are room membership and session status presented?
+
+P-71 proposes the remaining K-2 state mapping and explicit owner-wait
+record. Its evidence is recorded under the delivery-plan contract gates;
+it is not yet an owner decision.
 
 **Role and status colors resolved by D-29:** retain role colors, with grey
 idle, green working and amber waiting dots for agents. Human users and
@@ -3454,6 +3519,41 @@ model checks, not live Ergo, retention, concurrent-write or reconnect tests.
 They support selecting the overlap traversal within D-80's accepted limit;
 CHAT-3 still requires isolated-server integration evidence before activation.
 
+### K-2 evidence: live identity is not current activity or an owner wait
+
+Read-only source checks, 2026-10-21:
+
+- Shared `chat/scripts/identities.py` derives live sessions from the process
+  inventory and cmux hook records. `hook_record` checks PID/start-time
+  consistency; `inventory` excludes known nonterminal processes and avoids
+  ambiguous placements. These are useful presence boundaries, not proof of
+  working or waiting. Its `agent_lifecycle` fallback is `running`, so a
+  missing hook must not become a green dot in the new projection.
+- The installed Codex wrapper injects session, prompt, stop and tool/permission
+  hooks, and explicitly allows launches to proceed when hooks are disabled
+  or injection fails. The installed Claude wrapper also injects hooks.
+  Presence therefore cannot imply that lifecycle instrumentation is working.
+- Shared `chat/scripts/chat-bridge` reads `surface.input_state`, including
+  `lifecycle` and `waiting_on_human`, to decide how to deliver messages.
+  Its interrupt path documents that lifecycle can remain running after Esc,
+  and uses terminal-specific evidence for that action. Existing bridge tests
+  model waiting and interruption for delivery; they do not establish the
+  accuracy of a user-list status projection. Those tests were inspected,
+  not rerun for this design step.
+- Upstream cmux documents stored session identity and the four lifecycle
+  values, but that does not establish that an arbitrary `needsInput` value
+  means an outstanding owner chat question. This is supporting documentation,
+  not a verification of every installed runtime transition.
+  [cmux agent hooks](https://github.com/manaflow-ai/cmux/blob/main/docs/agent-hooks.md).
+
+No existing explicit, question-linked owner-wait field was found in shared
+identity discovery. P-71 proposes that missing shared contract. Preserve
+source, session/process generation, reason, event time and observation time
+in the projection; preserve unknown instead of normalizing missing data to
+one of the three reassuring colors. Actual lifecycle integration remains a
+CHAT-7 verification obligation. No session was interrupted or reconfigured,
+and no hook, live config or service was changed during these checks.
+
 ### Stage checkpoints
 
 - **Stage 1, CHAT-1–CHAT-14:** usable text chat in existing rooms on phone
@@ -3477,7 +3577,7 @@ CHAT-3 still requires isolated-server integration evidence before activation.
 - **Relevant decisions:** D-2–D-6, D-37, D-41, D-61, D-75.
 - **Acceptance signals:** Synthetic producer/consumer fixtures round-trip exact text and identities; unsupported versions fail explicitly. The codecs match the reviewed K-1 operation/state contract; unknown versions cannot silently reinterpret data.
 - **Out of scope:** IRC connections, UI, room activation and a new IPC daemon.
-- **Open questions / stop conditions:** K-1 / Q-3; exact API execution and deadline contract must be reviewed first.
+- **Open questions / stop conditions:** K-1 design resolved by D-81; implement the accepted records and deadline contract. K-2–K-4 still gate their affected semantics; do not invent those in the codecs.
 
 ### CHAT-2. Preserve one logical message across IRC multiline fragments
 
@@ -3510,7 +3610,7 @@ CHAT-3 still requires isolated-server integration evidence before activation.
 - **Relevant decisions:** D-54–D-56, D-60–D-64, D-75.
 - **Acceptance signals:** Two clients share a synthetic account's joins/parts; another account stays independent. Browser/web-process closure does not part it. Setup verification covers owner-only always-on without applying live settings.
 - **Out of scope:** Issue/PR room creation policy, browser profile UI, changing owner authority or agent session records.
-- **Open questions / stop conditions:** K-1 / Q-3; session ownership and restart reconciliation contract. Live always-on setup remains a separate authorized operation.
+- **Open questions / stop conditions:** K-1 design resolved by D-81; verify the accepted session ownership and restart reconciliation contract. Live always-on setup remains a separate authorized operation.
 
 ### CHAT-5. Persist and fence logical send attempts before IRC writes
 
@@ -3521,7 +3621,7 @@ CHAT-3 still requires isolated-server integration evidence before activation.
 - **Relevant decisions:** D-33–D-36, D-45, D-47, D-48, D-61.
 - **Acceptance signals:** Competing writers, delayed old attempts, crash windows and repeated requests cannot produce a second write. Pre-write cancellation is durable; dismissal survives restart and does not change the outcome.
 - **Out of scope:** Ergo publication/history integration, browser pending-send storage and offline send queues.
-- **Open questions / stop conditions:** K-1 / Q-3; journal durability, fencing and cross-process clock semantics must be settled before this issue.
+- **Open questions / stop conditions:** K-1 design resolved by D-81; verify journal durability, fencing and D-79's clock contract rather than selecting new semantics.
 
 ### CHAT-6. Connect the shared sender to Ergo with conservative recovery
 
@@ -3554,7 +3654,7 @@ CHAT-3 still requires isolated-server integration evidence before activation.
 - **Relevant decisions:** D-41–D-43.
 - **Acceptance signals:** Only the intended recipient's acceptance clears its error; dead letters and late replies survive restart. Resent/redirected copies remain independent and existing phone alerts are unchanged.
 - **Out of scope:** New browser push, dismissal of delivery errors and milestone-2 progress indicators.
-- **Open questions / stop conditions:** Q-3; finalize aliases between native acknowledgement IDs and complete logical messages in K-1.
+- **Open questions / stop conditions:** K-1 design resolved by D-81; verify native acknowledgement aliases against complete logical messages and authenticated recipient identity.
 
 ### CHAT-9. Apply mention routing to complete logical messages
 
@@ -3576,7 +3676,7 @@ CHAT-3 still requires isolated-server integration evidence before activation.
 - **Relevant decisions:** D-6, D-25, D-61, D-62, D-75.
 - **Acceptance signals:** Synthetic requests reject arbitrary actors and invalid bindings; operations keep their original owner. API failures stay typed and static/API serving uses one protected origin.
 - **Out of scope:** Copied chat code, browser IRC credentials, new shared IPC daemon and live service installation.
-- **Open questions / stop conditions:** K-1 / Q-3 and Q-7; concrete adapter/execution and browser streaming contract before drafting.
+- **Open questions / stop conditions:** K-1 design resolved by D-81; consume P-70's accepted API/feed through the protected web boundary. Q-7's remaining page-level details stay separate.
 
 ### CHAT-11. Build the first text chat page with live history and composition
 
