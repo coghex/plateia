@@ -20,7 +20,7 @@ concrete precondition
 - [x] EPIC. Deliver milestone 1: working chat on phone and desktop — [#36]
 - [x] CHAT-1. Define the shared chat API records and compatibility contract — [#37]
 - [x] CHAT-2. Preserve one logical message across IRC multiline fragments — [#38]
-- [ ] CHAT-3. Expose authoritative history with a gap-free live handoff
+- [x] CHAT-3. Expose authoritative history with a gap-free live handoff — [#39]
 - [ ] CHAT-4. Share owner IRC sessions and verified room membership
 - [ ] CHAT-5. Persist and fence logical send attempts before IRC writes
 - [ ] CHAT-6. Connect the shared sender to Ergo with conservative recovery
