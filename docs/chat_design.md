@@ -50,6 +50,7 @@ Read-only checks on 2026-10-20:
 | Skills repository, `chat/scripts/chatlib.py`, `post` | Posting authenticates an account and handles IRC message formatting. Its result is a line count; its public signature has no caller-supplied logical operation ID. This alone does not establish browser retry safety. |
 | Skills repository, `chat/scripts/chatlib.py`, `_round`, `already_posted`, refreshed 2026-10-20 | The sender waits for a PONG after writing IRC messages. Retry reconciliation matches account/text/time in local logs; partially landed posts may be retried whole. There is no message-ID check-and-cancel API. This does not meet D-34's at-most-once contract. |
 | Read-only Ergo capability probe, shared sender/bridge source and isolated multiline tests, 2026-10-20 | Ergo advertises `batch`, `message-tags` and `draft/multiline`. Shared chat negotiates multiline and joins each batch in live/history delivery. Ten selected existing tests pass. Oversized posts still become separate batch records without a common logical message ID; leading/trailing blank lines are stripped. See D-37 for the required gaps. No test messages were sent to live rooms. |
+| Upstream Ergo at `678d29d5442b00aa4ed79e86f9139443a3e1994a`, `batchHandlerMultiline`, `dispatchMessageToTarget`, `Channel.SendSplitMessage` | A complete batch is dispatched to the channel; the inspected publication path has no caller-message-ID deduplication or per-message deadline check. This is upstream source evidence, not proof that the installed binary is identical. P-36 addresses the remaining publication-boundary gap. |
 | Skills repository, `chat/scripts/chat-bridge`, `project_for`, `handle` | Routing uses project channel names/prefixes. Ordinary direct agent delivery is restricted by sender category, unlike V-6's any-agent communication. Queuing precedes logging, with crash replay permitted. These are integration gaps, not evidence that the new contract is implemented. |
 | Skills repository, `chat/SKILL.md`, identity and delivery sections | Stable identities, session discovery, history, outbox, delivery and acceptance machinery exist. Their exact guarantees and usable interface require focused verification before designing the web adapter. IRC login alone is not presence evidence. |
 | Shared `chat-bridge`, `Deliveries._record`, `_dead`, `accept`, `accepted`, and `pchat trace`, checked for D-41 | The bridge records attempts, dead letters and authenticated replies/acks. Delivery success and recipient acceptance are separate. Attempt records omit a structured recipient field; acceptance closes matching pending items, while late acknowledgements also have a separate record. `trace` renders request-oriented text, not a typed per-message/per-recipient outcome. A shared read contract is required for plateia. |
@@ -1132,6 +1133,38 @@ Rejected by D-44 in favor of a clean cutover per project. Only parked
 issues/PRs explicitly named by the owner retain marked legacy rooms until
 completion; there is no general gradual migration of active work.
 
+### P-36. Add message-ID and deadline enforcement at the IRC publication boundary
+
+The Python/shared-chat sender can refuse an expired request before writing
+to IRC, but cannot retract bytes already in flight or queued at the IRC
+server. If it loses confirmation, a local journal or missing bridge log
+cannot establish whether IRC has published the message. Closing the socket
+does not prove that earlier bytes were not processed. These are the races
+D-34/D-36 require the design to handle, especially after browser reload.
+
+Read-only inspection of [Ergo's batch handler and dispatcher](https://github.com/ergochat/ergo/blob/678d29d5442b00aa4ed79e86f9139443a3e1994a/irc/handlers.go#L587)
+and [channel publication method](https://github.com/ergochat/ergo/blob/678d29d5442b00aa4ed79e86f9139443a3e1994a/irc/channel.go#L1343)
+found no expiry or caller-ID deduplication check on that path. Multiline
+framing supplies grouping, not the missing transactional send contract.
+The exact installed release and any applicable extension mechanism still
+need verification before implementation is specified.
+
+Recommend including server-side support at that boundary as a prerequisite:
+authenticate the sender, bind the logical ID to content and destination,
+reject expired/cancelled attempts at publication, persist a terminal outcome
+with the canonical message, and answer check/cancel/retry consistently
+across lost responses and restarts. An explicit retry keeps the logical ID
+but must not revive an expired earlier attempt. History must expose the
+same outcome so the browser can safely rely on D-36 after reload.
+
+This may require maintaining an Ergo patch, beyond the existing Python and
+skills changes. Its owning checkout, review/delivery path and exact atomic
+storage design are not settled. Do not assume that client-only tags or a
+Python lock implement these guarantees, or claim that a patch is already
+designed or validated. The owner must approve this scope before treating
+it as an accepted architecture. No server code, binary, configuration or
+running service changes during design.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -1176,6 +1209,8 @@ work after the browser disappears. Establish deadline clock semantics,
 the final publication cutoff and complete history through that cutoff,
 including pending IRC writes and a lagging bridge. An HTTP arrival-time
 check alone does not establish the accepted history-or-never guarantee.
+P-36 proposes the server-side publication support needed to close that gap;
+its added maintenance scope awaits the owner's decision.
 
 D-37 requires explicit logical grouping across any transport fragments,
 exact content preservation and the same identity in live delivery/history.
