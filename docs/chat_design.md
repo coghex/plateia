@@ -2855,6 +2855,99 @@ or settle output encoding, processing budgets, storage/reference ownership or
 archive export. Those remain K-3 work; K-4 remains open. The 23 approved
 slice boundaries do not change.
 
+### P-74. Bound each image job and retain only a normalized capped result
+
+Proposed for K-3, not yet approved. Process one image at a time in a separate,
+short-lived Pillow worker, with a **20-second processing deadline** and a
+**1-GiB worker resident-memory stop threshold**. Start the processing timer
+before opening the received image, not while the network upload is arriving.
+If the worker fails, exceeds the deadline or crosses the memory threshold,
+terminate that owned worker and report an upload failure under D-18/D-83.
+Do not weaken the cap, silently drop the attachment or post the remaining text.
+
+Admission covers body receipt and processing, so simultaneous requests cannot
+each allocate a maximum-sized body behind a single decoder queue. The page
+uploads its selected images in sequence while typing remains available; other
+concurrent requests receive an explicit busy result before their image body
+is admitted and keep their draft for retry. This is not an offline send queue.
+One admitted job is an application-wide limit across web processes, not one
+worker per HTTP request or browser. A slow image must not block chat reads,
+send commands or the bridge.
+
+The parent observes worker memory at least every 100 ms and stops it on a
+threshold crossing. This is a monitored stop threshold, **not a hard 1-GiB
+allocation ceiling**: sampling and termination can allow overshoot, and the
+web process's bounded request buffers are additional memory. Use enforceable
+OS limits where available, but do not assume that a Unix resource constant
+has identical enforcement on macOS and Linux. If monitoring cannot operate,
+fail the job instead of running without its budget. Qualification on the
+deployment Mac must measure peak worker/parent memory and termination delay;
+excessive overshoot returns for a revised budget/mechanism before activation.
+No resource-limit behavior has been experimentally verified in this design.
+
+#### Upload encoding within the accepted browser boundary
+
+Keep the existing JSON/custom-header mutation contract from
+`plateia_design.md` D-64: one image per same-origin authenticated JSON request,
+with a strict base64 byte string and the persisted upload/draft-slot IDs.
+Apply Host, Origin, account binding and the custom header before accepting
+the body. Do not add a multipart/form exception or an unauthenticated upload
+URL. Refuse compressed request bodies rather than introducing another
+unbounded expansion stage.
+
+The wire-body maximum is **28 MiB**, including JSON; the decoded source still
+must be at most **20 MiB**. A maximum source uses 27,962,028 base64 characters,
+leaving bounded room for the small envelope. Reject excessive body length
+while receiving, not after loading an unbounded request. Strictly decode and
+validate the expected fields; never trust MIME, extension or declared pixel
+count. Keep received originals in memory only, with no temporary-file spool
+or request-body logging. A replacement attachment gets a new upload ID;
+an old upload's delayed completion cannot replace the new draft slot.
+
+#### Normalization and saved representation
+
+Allow only PNG, JPEG and WebP stills. Check dimensions and the 50-million-pixel
+source cap before full decode, reject animation/multiple frames, and fully
+decode the selected image before accepting it. Apply EXIF orientation to the
+pixels, convert a valid embedded color profile to sRGB (otherwise use the
+format's supported default interpretation), and preserve transparency where
+the input supports it. Malformed required decoding/profile data is an upload
+failure, not a reason to retain the original. Re-encode a fresh 8-bit image,
+without source EXIF/GPS, comments or other ancillary metadata; any retained
+color declaration describes the normalized output only.
+
+Keep PNG as PNG, JPEG as JPEG and WebP as WebP. Use lossless PNG and a starting
+quality of 85 for JPEG/WebP. Fit within 1280 pixels without upscaling, then
+reduce dimensions further and re-encode until the encoded file is at most
+1 MiB. Do not crop, flatten alpha, retain an HD alternate or copy input bytes
+through unchanged. Bound the encode loop by strictly decreasing dimensions
+and the same worker deadline. Measure the final bytes/dimensions and decode
+the result successfully before atomically publishing it as a complete asset.
+Exact filter/encoder options are implementation details to verify on invented
+screenshots, photos, transparency and phone orientation cases.
+
+Pillow documents lazy identification before full loading, its configurable
+pixel warnings/errors, explicit format allowlists, supported encoders and
+EXIF transposition. These support the proposed sequence; they do not prove
+our time or memory budget. Python documents that resource-limit support is
+OS dependent. No new dependency beyond D-84 is selected by this proposal.
+[Pillow image API](https://pillow.readthedocs.io/en/stable/reference/Image.html),
+[format handling](https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html),
+[orientation](https://pillow.readthedocs.io/en/stable/reference/ImageOps.html#PIL.ImageOps.exif_transpose),
+[Python resource limits](https://docs.python.org/3/library/resource.html).
+
+CHAT-15 owns the bounded upload/worker/result contract; CHAT-16 uses its
+pending/busy/failure outcomes without losing the draft; CHAT-17 qualifies
+actual phone inputs, with HEIC still conditional under D-68. Verify boundary
+bytes/pixels, corrupted headers and compressed metadata, concurrent uploads,
+worker timeout/memory failure, parent exit and orphan-worker cleanup, lost
+responses, exact output caps and no original-file persistence. These checks
+use isolated invented inputs; no live service change is authorized here.
+
+Approval would settle K-3's upload encoding and processing behavior. The
+asset-reference/pinning/export contract and its web-down operation remain
+open, as does K-4. The 23 slice boundaries stay unchanged.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -3065,6 +3158,9 @@ when reload interrupts an image before a recoverable capped copy exists.
 This qualifies D-23's draft recovery without retaining HD originals.
 D-84 accepts P-73's Pillow 13.0.0 and Python 3.11 minimum for the new web
 application, with the existing inbox compatibility preserved.
+P-74 proposes bounded JSON uploads, the separate image worker and normalized
+output behavior. It is pending; asset references and archive export remain
+separate K-3 work.
 
 **Composition resolved by D-17:** paste into the message, visible inline
 while typing before Send; no separate preview step. A placeholder link may
