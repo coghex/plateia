@@ -1064,6 +1064,20 @@ present the exact proposed wording to the owner and obtain approval first.
 Do not infer that approval from a design answer or approval to record it here.
 This turn records the rule in this document; it does not change the vision.
 
+### D-51. Reopen the existing room when PR work resumes
+
+Owner decision 2026-10-21. Accept P-42. A reopened PR or a replacement PR
+for the same issue reopens that issue's existing room, preserving its
+conversation and images. A reopened standalone PR likewise reuses its
+original room. This matches the earlier reopened-issue rule and D-11's
+shared room for associated PRs; a new attempt does not create another room.
+
+If no room has existed, first-use creation still follows D-9. If closure is
+in progress, reconcile resumed work before completing the archive transition.
+Preserve history already archived; a stale closure operation must not hide
+the room after it has become active again. Subsequent closure follows the
+same D-10/D-11/D-15 lifecycle and preserves the continued conversation.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1411,17 +1425,22 @@ attachment contract.
 
 ### P-42. Reuse the room when PR work resumes
 
-Prior `plateia_design.md` D-66 already settles reopening an issue into its
-same room. Recommend the corresponding rule for PRs: reopening a standalone
-PR reopens its original room; reopening an associated PR or beginning work on
-a replacement PR for the same issue reuses that issue's room. Preserve the
-conversation and image references rather than creating a new room for each
-attempt. First-use creation under D-9 still applies if no room exists yet.
+Resolved by D-51: reopened and replacement PR work reuses the existing
+issue/PR room with its history and images. Resumed work must not be hidden
+by a stale closure operation.
 
-If closure is in progress, the shared room lifecycle must reconcile the
-resumed work before declaring closure complete. Retain already preserved
-history; a stale archive operation must not remove the now-active room from
-the active list. This proposal needs owner approval for the PR lifecycle rule.
+### P-43. Use the project main room for work without a tracker item
+
+Recommend using the project's permanent main room for project work that has
+no issue or PR, without opening temporary request rooms. If it later becomes
+issue/PR work, start using that work room on first use under D-9; link back to
+the earlier main-room discussion without moving or copying its messages.
+
+D-16 already places design conversations in general. Work outside a project
+and cross-project coordination also use general under V-2/V-6. Testing uses
+the permanent testing rooms within their existing scope. This proposal
+settles the remaining ordinary project-work case in D-8's shared room-model
+and global skill change, and awaits owner approval.
 
 ## Open questions
 
@@ -1447,10 +1466,11 @@ without conversation migration or saved logs.
 decision 2026-10-08) reuses and unarchives the same room. Preserve that rule;
 this milestone's D-10/D-11 replace the earlier board-dependent closure trigger.
 D-11 and V-2 say PR closure, not only merge, so closed-unmerged PRs use the
-same closure rule. P-42 proposes reuse for reopened and replacement PRs.
-Remaining: that PR rule and other work without a tracker item. Existing rooms,
-including grouped request
-rooms, are addressed under Q-8. Settle how closure preserves
+same closure rule. **PR resumption resolved by D-51:** reopened and
+replacement PRs reuse their existing issue/PR room with history and images.
+P-43 proposes main-room use for project work without a tracker item. Existing
+rooms, including grouped request rooms, are addressed under Q-8. Settle how
+closure preserves
 a complete file log despite outages or late posts, and how completion or
 failure of preservation becomes visible. No archive browser in this milestone.
 
@@ -1667,6 +1687,12 @@ unfinished tracker work complete.
 Closing-state scenarios must show the grey room title until verification
 succeeds, preserve already-accepted posts, and leave failures visible rather
 than prematurely removing the room.
+Check D-51 for reopening an associated PR, reopening a standalone PR, and
+starting a replacement PR for an issue whose room was archived. Preserve room
+identity, messages and image references, including through another close.
+Race reopening with an in-progress archive: an old closure result must not
+hide the active room or discard its continued conversation. A tracker item
+that never had a room still creates one only on first use under D-9.
 
 Image composition checks must cover PNG paste while writing a message,
 continuing to type with the image visible, and posting only on Send, on
@@ -1836,6 +1862,8 @@ exceptions and isolation of projects not yet switched. The manager owns
 the concrete rollout details; this is not postponed to milestone 2's archive
 browser and is not a gradual migration of every active room.
 Discard existing design rooms during that rollout without saved logs.
+Include D-51's reopening and replacement-PR behavior in the shared room
+lifecycle work, with history and images preserved through repeated closures.
 
 Image sequencing from D-17: first deliver pasted-image insertion as a
 placeholder link in the message; then deliver inline image display,
