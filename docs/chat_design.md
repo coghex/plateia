@@ -44,7 +44,8 @@ concrete precondition
 
 These 23 slices follow D-74's approved stage order. D-76 approves their
 boundaries at `e6107c0663`, boundaries only. D-81 settles K-1's design
-contract; its integration checks remain required. K-2–K-4 remain contract
+contract; D-82 settles K-2's state mapping. Their integration checks remain
+required. K-3–K-4 remain contract
 gates before affected issue drafting. No tracker artifact has been filed; the
 design is not ready for issue processing yet.
 
@@ -1755,6 +1756,23 @@ Integration and activation checks remain required; approval is not evidence
 that the implementation exists or passes them. K-2–K-4 remain open, the
 design stays exploring and no issue or live change is approved by this step.
 
+### D-82. Automatically arm owner waits from typed chat questions
+
+Owner decision 2026-10-21. Accept P-71 with automatic setting of the wait
+mark. When an agent posts through `pchat post --type question` mentioning
+an owner account, shared code records a wait bound to that agent's session
+and question. It becomes visible only when runtime evidence shows the turn
+has ended, and clears when the next turn actually starts. No extra manual
+status-setting step is required. An informal question without that type
+leaves the agent showing its runtime state.
+
+Verified owner-input prompts also count as waiting. Working/idle continue
+to require runtime evidence; missing or conflicting evidence uses a hollow
+grey unknown dot, distinct from solid grey idle. The rule belongs in shared
+skills, not the web page. P-71 below incorporates the correction. This
+settles K-2's design mapping; source-adapter verification remains required.
+K-3/K-4 and whole-design readiness remain open.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2642,33 +2660,41 @@ issues or authorize a live change.
 
 ### P-71. Make waiting on the owner explicit in shared agent status
 
-Proposed for K-2, not yet approved. Keep presence tied to real sessions and
+Resolved by D-82, owner decision 2026-10-21, with the automatic-setting
+correction incorporated below. The superseded manual-setting proposal is
+retained at `9ac091ac34`. Keep presence tied to real sessions and
 keep D-29's three colors. Use runtime evidence for working/idle, and add an
-explicit shared waiting record for an agent that stops for the owner's
-answer. A question in chat does not automatically mean the agent has stopped
-working; a terminal accepting input does not establish that either.
+automatically armed shared waiting record when an agent posts a typed
+question mentioning an owner. Posting the question does not immediately
+mean the agent has stopped working; runtime end-of-turn evidence activates
+the amber display. A terminal accepting input does not establish that either.
 
 | State | Required evidence | Presentation |
 | --- | --- | --- |
 | Working | A current, correctly bound runtime turn/activity observation, without a later stop or blocking input event. Registration and the fallback string `running` do not qualify. | Solid green dot. |
 | Idle | A confirmed end-of-turn/idle observation for the live session, with no active owner wait. Mere silence does not qualify. | Solid grey dot. |
-| Waiting on owner | The agent explicitly records that it has stopped for an owner answer, linked to the posted question; or a verified active runtime prompt specifically requires the owner's input. Generic `needsInput` without a verified reason does not qualify. | Solid amber dot. |
+| Waiting on owner | A wait automatically armed by an agent's `pchat post --type question` mentioning an owner, followed by confirmed end of that turn; or a verified active runtime prompt specifically requiring the owner's input. Generic `needsInput` without a verified reason does not qualify. | Solid amber dot. |
 | Unknown | Missing, conflicting, unsupported or too-old evidence; not a fourth guessed work state. | Hollow grey dot with an accessible “Status unknown” explanation. |
 
 The wait record belongs in shared chat, alongside its session-backed status
-projection. The agent records it through its authenticated identity; bind it
-to the logical session, live process generation, turn and question ID. Shared
-skill guidance tells agents to set it when they stop for an owner decision.
-Setting it while finishing the current turn arms the wait; a still-running
+projection. The shared posting path records it automatically through the
+agent's authenticated identity; bind it to the logical session, live process
+generation, turn and question ID. Resolve mentions against the canonical
+owner set, not one hardcoded account or a display-name match. Untyped
+questions and questions addressed only to another agent do not arm a wait.
+Arm it for the successfully posted question, not a failed local posting
+attempt. Correlate turn generations so late confirmation or replay of an old
+question cannot restore a wait cleared by a newer turn. No manual status
+command is needed. Arming it while finishing the current turn leaves a running
 turn stays green until it actually stops. At that point the active wait
 produces amber instead of idle. A verified blocking native prompt can produce
 amber within a turn because execution is blocked there.
 
-Clear the chat wait when that same session actually starts its next turn,
-or explicitly withdraws the wait. An owner reply arriving in IRC or a bridge
+Clear the chat wait when that same session actually starts its next turn.
+An owner reply arriving in IRC or a bridge
 delivery acknowledgement alone does not clear it: the agent may not yet have
-resumed. If the new turn still cannot proceed, it must explicitly establish
-another wait. Native prompt resolution follows its matching runtime event,
+resumed. A new typed question to an owner in the new turn arms another wait;
+an informal question does not. Native prompt resolution follows its matching runtime event,
 not an unrelated chat reply. Old-generation waits cannot attach to a new
 process merely because it occupies the same tab or uses the same role name.
 This is state reporting, not a change to delivery, authority or acceptance.
@@ -2690,16 +2716,19 @@ Conflicting placement, reused PIDs and missing hooks cannot transfer a state
 or wait to another session. Scope project agents, global lists, assistants and
 real owner membership exactly as already decided in D-5/D-53–D-57.
 
-CHAT-7 implements the normalization, wait record and shared skill guidance;
+CHAT-7 implements the normalization, automatic wait record and shared guidance;
 CHAT-13 only renders the resulting facts. Verification must cover both agent
 brands, a question asked while still working, a stopped question waiting for
 an answer, an answer delivered before resumption, native prompt resolution,
 interrupts, missed hooks, session replacement and stale-source recovery.
+Also cover both owner accounts, informal questions, peer-only questions,
+failed posts, duplicate confirmations and an old question replayed after a
+new turn has cleared its wait.
 The source gaps below are required adapter checks, not permission to guess
 from terminal text in the web page or to patch cmux. If the installed runtime
 cannot supply a required trustworthy observation, expose unknown and return
-the gap before claiming that state works. K-2 remains open pending this
-choice and the resulting design review; K-3/K-4 remain separate gates.
+the gap before claiming that state works. D-82 settles K-2's design mapping;
+these adapter checks remain implementation obligations. K-3/K-4 remain open.
 
 ## Open questions
 
@@ -2865,9 +2894,9 @@ stay unchanged alongside the chat error; no new bridge notification work.
 
 ### Q-5. How are room membership and session status presented?
 
-P-71 proposes the remaining K-2 state mapping and explicit owner-wait
-record. Its evidence is recorded under the delivery-plan contract gates;
-it is not yet an owner decision.
+**K-2 design mapping resolved by D-82:** P-71 incorporates automatic
+owner waits from typed questions and the accepted evidence/freshness rules.
+Its source-adapter checks remain required under the delivery-plan gates.
 
 **Role and status colors resolved by D-29:** retain role colors, with grey
 idle, green working and amber waiting dots for agents. Human users and
@@ -3345,9 +3374,10 @@ checks actually ran in CI versus locally; neither substitutes for the other.
 
 ### Contract gates before affected issue drafting
 
-These are explicit unfinished design work, not permission to let implementers
-invent behavior. D-76 approves the dependency decomposition but leaves these
-gates open; approved boundaries do not make unresolved contracts ready.
+These gates separate settled contracts from unfinished design work; they
+are not permission to let implementers invent behavior. D-76 approves the
+dependency decomposition, while D-81/D-82 settle K-1/K-2's design contracts.
+Approved boundaries do not make the remaining contracts ready.
 Resolve each affected gate in this design before drafting that implementation
 issue. Bring any new user-visible behavior or serious ownership choice to the
 owner; exact field spelling and test mechanics are implementation details.
@@ -3370,8 +3400,9 @@ and settles K-1's design contract.
 Transport activation still needs D-78's verification and
 separately confirmed setup change; clock activation still needs actual-browser
 verification under P-68.
-K-2–K-4 remain open. K-1 is resolved by explicit contract approval, not by
-boundary approval or source inspection alone; its runtime checks remain.
+D-82 settles K-2's design mapping, including automatic owner waits; its
+runtime-source checks remain. K-3/K-4 remain open. K-1/K-2 are resolved by
+explicit contract approval, not boundary approval or source inspection alone.
 
 ### K-1 elaboration: identity and cancellation invariants
 
@@ -3547,7 +3578,7 @@ Read-only source checks, 2026-10-21:
   [cmux agent hooks](https://github.com/manaflow-ai/cmux/blob/main/docs/agent-hooks.md).
 
 No existing explicit, question-linked owner-wait field was found in shared
-identity discovery. P-71 proposes that missing shared contract. Preserve
+identity discovery. D-82/P-71 specify that missing shared contract. Preserve
 source, session/process generation, reason, event time and observation time
 in the projection; preserve unknown instead of normalizing missing data to
 one of the three reassuring colors. Actual lifecycle integration remains a
@@ -3643,7 +3674,7 @@ and no hook, live config or service was changed during these checks.
 - **Relevant decisions:** D-5, D-28–D-30, D-53–D-55, D-57.
 - **Acceptance signals:** Ended sessions disappear after reliable inventory; outages preserve honest stale/unknown evidence. Waiting is not invented from registration or IRC login, and assistants have no status pip.
 - **Out of scope:** Current-task lines, new status semantics and browser-specific session discovery.
-- **Open questions / stop conditions:** K-2 / Q-5; verify authoritative evidence for all three agent states before defining mappings.
+- **Open questions / stop conditions:** K-2 design mapping resolved by D-82/P-71; verify the runtime adapters and automatic typed-question wait transitions before claiming all states work.
 
 ### CHAT-8. Expose durable per-recipient bridge delivery outcomes
 
@@ -3709,7 +3740,7 @@ and no hook, live config or service was changed during these checks.
 - **Relevant decisions:** D-28–D-30, D-40, D-53–D-64.
 - **Acceptance signals:** Phone panels and desktop columns share behavior. Changes from another IRC client appear correctly; a rerender does not undo Leave. Stale evidence cannot manufacture membership or idle status.
 - **Out of scope:** Current-task lines, archived-room controls and session scanning in the web app.
-- **Open questions / stop conditions:** K-2 / Q-5; consume the canonical state mapping from CHAT-7.
+- **Open questions / stop conditions:** K-2 design mapping resolved by D-82/P-71; consume verified canonical state facts from CHAT-7.
 
 ### CHAT-14. Display bridge-backed agent-delivery errors on messages
 
