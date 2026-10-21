@@ -1845,6 +1845,21 @@ owner at setup. No account or service is changed now. This settles K-4's
 permission ownership, not its in-flight post/archive race, tracker lifecycle,
 archive completion or reopen recovery.
 
+### D-88. Accept snapshot archives and bounded late checks from every client
+
+Owner decision 2026-10-21. Accept P-77 as written at `7119fa6f8c`:
+after freezing, archive the verified saved IRC history as a snapshot. Check
+for late posts from every client during the 24 hours after closure and again
+on legitimate reopen, incorporating verified late messages and their images.
+Each archive records its coverage and snapshot limitation.
+
+Accept that an unseen post saved after the checking window can remain
+missing until reopen, and that a post never saved to IRC history cannot be
+recovered by these scans. Known missing history or images still block
+closure; known unconfirmed shared sends still require dismissal under D-65.
+No indefinite watcher or server patch is introduced. This settles K-4's
+archive semantics, not its remaining lifecycle and recovery protocol.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -3212,7 +3227,7 @@ the owner at setup.
 
 ### P-77. Close from a verified history snapshot and check all clients for late posts
 
-Proposed K-4 archive semantics, not yet approved. After draining admitted
+Accepted by D-88, owner decision 2026-10-21. After draining admitted
 shared sends and verifying the moderator's posting block, archive the IRC
 history available at closure. Extend D-66's bounded reconciliation from
 named unconfirmed sends to **all ordinary conversation messages**, including
@@ -3286,7 +3301,7 @@ Neither an outage nor a restart extends the persisted 24-hour window; record
 missed checks and resume only while time remains. Genuine reopen performs
 another history reconciliation. An archived-link visit does not.
 
-The owner would be accepting this limit: an unseen message saved only after
+The owner accepts this limit: an unseen message saved only after
 the checking window can remain absent until reopen; a message never saved
 to IRC history cannot be recovered by these scans. This is why the archive
 describes its actual evidence rather than claiming all server-side work was
@@ -3353,8 +3368,8 @@ later-confirmed send within 24 hours after closure and on legitimate reopen.
 D-87 accepts P-76's shared moderator ownership of work-room IRC permissions;
 account creation is confirmed with the owner at setup. K-4's archive barrier
 and completeness evidence remain open.
-P-77 proposes an explicit history-snapshot limit with bounded late checks
-covering every client; it requires owner approval before dependent design.
+D-88 accepts P-77's explicit history-snapshot limit with bounded late checks
+covering every client. The remaining close/reopen protocol is still K-4 work.
 
 ### Q-3. What interface separates plateia from shared chat?
 
