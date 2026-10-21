@@ -52,6 +52,7 @@ Read-only checks on 2026-10-20:
 | Read-only Ergo capability probe, shared sender/bridge source and isolated multiline tests, 2026-10-20 | Ergo advertises `batch`, `message-tags` and `draft/multiline`. Shared chat negotiates multiline and joins each batch in live/history delivery. Ten selected existing tests pass. Oversized posts still become separate batch records without a common logical message ID; leading/trailing blank lines are stripped. See D-37 for the required gaps. No test messages were sent to live rooms. |
 | Skills repository, `chat/scripts/chat-bridge`, `project_for`, `handle` | Routing uses project channel names/prefixes. Ordinary direct agent delivery is restricted by sender category, unlike V-6's any-agent communication. Queuing precedes logging, with crash replay permitted. These are integration gaps, not evidence that the new contract is implemented. |
 | Skills repository, `chat/SKILL.md`, identity and delivery sections | Stable identities, session discovery, history, outbox, delivery and acceptance machinery exist. Their exact guarantees and usable interface require focused verification before designing the web adapter. IRC login alone is not presence evidence. |
+| Shared `chat-bridge`, `Deliveries._record`, `_dead`, `accept`, `accepted`, and `pchat trace`, checked for D-41 | The bridge records attempts, dead letters and authenticated replies/acks. Delivery success and recipient acceptance are separate. Attempt records omit a structured recipient field; acceptance closes matching pending items, while late acknowledgements also have a separate record. `trace` renders request-oriented text, not a typed per-message/per-recipient outcome. A shared read contract is required for plateia. |
 | GitHub issue inventory, `coghex/plateia` | No open issues on 2026-10-20. Earlier foundation epic #10 and collaboration epic #26 are closed; neither is an open milestone 1 tracker. Recheck overlap before readiness. |
 | `.github/workflows/ci.yml`, refreshed 2026-10-20 | Python 3.10/3.14 tests feed an always-running `build-test` aggregate that rejects any non-success dependency. There is no frontend package or Node build yet. D-27 extends this existing gate. |
 
@@ -795,6 +796,40 @@ This settles the milestone-1 interaction only. Later milestones may revisit
 it; this decision does not introduce a separate conversation or user-detail
 workflow.
 
+### D-41. Show posted-message delivery failures from the bridge's record
+
+Owner decision 2026-10-20. A message that was posted but cannot reach its
+addressed agent keeps a delivery error beside it until resolved, including
+across room switches and reloads. Later messages do not clear it.
+
+The error must come from the chat bridge's own delivery/acceptance record.
+Plateia must not guess from an idle session, elapsed time, lack of a reply
+or a missing record. If the required record cannot yet be read through the
+shared contract, add that capability in the skills repository under V-13.
+The owner also requires an explicit definition of resolution; P-33 brings
+that choice back for signoff rather than treating dismissal as acceptance.
+
+The shared code already records delivery attempts, terminal dead letters
+and authenticated replies/acknowledgements. A successful transport attempt
+is not necessarily recipient acceptance. The current attempt record lacks
+a structured recipient field, and the acceptance method removes matching
+pending items; later acknowledgements after dead-lettering must be joined
+with retained recipient evidence. The existing textual `pchat trace` output
+is not the structured interface plateia needs.
+
+Required skills-repository work: expose a typed outcome keyed by logical
+message and intended recipient, with failure reason, source evidence,
+freshness and resolution evidence. Preserve enough routing identity to
+reconcile late acceptance after a delivery leaves the pending queue and to
+distinguish several recipients of the same message. Do not infer success
+from removal from that queue. A missing or stale outcome is unknown/stale,
+not proof of delivery or resolution.
+
+This is distinct from D-32/D-33's temporary failed-send entry: the message
+is already in the conversation record. Its delivery error does not invite
+posting a duplicate instruction. Milestone-2 progress indicators and browser
+push remain out of scope.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1001,17 +1036,24 @@ the current draft and focus the composer without losing text or images.
 
 ### P-32. Keep an agent-delivery error attached to a posted message
 
-For Q-4's remaining delivery-failure presentation, recommend showing
-“Delivery failed: <reason>” beside a message when shared chat confirms it
-was posted but could not be delivered to its addressed agent. Keep that
-error visible until shared delivery evidence resolves it, including after
-room switches or reloads. Later messages do not erase it. The shared
-service owns the durable failure and recovery; plateia displays those facts.
+Approved with conditions in D-41: derive it from the bridge's own record,
+add any missing read capability in shared skills, and define what resolves
+the error explicitly. The resolution choice is P-33.
 
-This does not reuse D-32/D-33's temporary failed-send entry or resubmit the
-posted message as a new instruction. It adds no queued/delivered/accepted
-progress display or browser push. It is the proposed presentation of V-12's
-unresolved delivery failures after successful posting.
+### P-33. Resolve a delivery error when the intended agent accepts the message
+
+Recommend clearing a recipient's delivery error only when the bridge records
+authenticated acceptance by that intended recipient for the same logical
+message. For several recipients, acceptance resolves only that recipient's
+error; others remain. Preserve the failure and resolution evidence in the
+shared record even after the active error disappears.
+
+Under this proposal, dismissing a notice does not resolve delivery, and
+there is no browser action that turns a failed delivery into accepted work.
+A later unrelated reply, a successful socket write, the agent becoming
+online or a record disappearing from the pending queue is insufficient.
+The alternatives are owner dismissal as an explicit resolution, or either
+acceptance or dismissal. The owner has not selected between these yet.
 
 ## Open questions
 
@@ -1065,6 +1107,11 @@ the relationship between browser IDs, durable message IDs, batch references
 and ordered parts; verify whole-message publication and expiry before
 dispatching an agent instruction.
 
+D-41 requires a shared, typed per-message/per-recipient delivery outcome
+from the bridge's records. Include late acceptance after dead-lettering,
+structured recipient identity and freshness; plateia must not implement a
+parallel delivery-state inference engine over textual trace output.
+
 ### Q-4. What are the posting and recovery interactions?
 
 **Draft recovery resolved by D-23:** keep each room's unfinished message and
@@ -1098,8 +1145,11 @@ Send when exceeded; retain the draft rather than submitting or truncating.
 `@handle` and focus the current draft, retaining text and images.
 Distinguish server acceptance from
 recipient acceptance without importing milestone 2's full receipt display.
-Settle how undelivered messages remain visible (P-32) and how the owner is
-notified before browser push exists.
+**Posted-message delivery errors approved by D-41:** keep the error beside
+the message, based on the bridge's own delivery/acceptance record. Any
+missing shared read capability belongs in the skills repository.
+Still settle what resolves the error (P-33) and how the owner is notified
+before browser push exists.
 
 ### Q-5. How are room membership and session status presented?
 
@@ -1291,6 +1341,13 @@ Check D-40 with empty and nonempty drafts, including images: selecting a
 user inserts the correct stable handle, preserves existing content and
 focuses the composer without sending or switching rooms. Cover both the
 desktop list and phone panel. This is milestone-1 behavior only.
+
+Verify D-41 from synthetic bridge records: failed transport, delivery
+without acceptance, terminal dead letter, late authenticated acceptance,
+wrong-recipient reply and several intended recipients. Keep unresolved
+errors across room switches, reloads and later messages. Missing, stale or
+unreadable records cannot clear an error or manufacture a failure. Final
+resolution tests follow the owner's P-33 choice.
 
 ## Delivery plan
 
