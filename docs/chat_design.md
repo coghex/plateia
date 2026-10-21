@@ -2655,7 +2655,8 @@ attached to CHAT-2–CHAT-6. Source and query models do not satisfy them.
 This affects CHAT-1, CHAT-3–CHAT-6, CHAT-8 and CHAT-10–CHAT-12 without
 changing the 23 approved boundaries. D-81 settles K-1's remaining
 design contract, subject to those implementation/activation checks and the
-independent K-2–K-4 gates. It does not call the whole design ready, approve
+independent later gates (K-2 since resolved by D-82; K-3/K-4 still open).
+It does not call the whole design ready, approve
 issues or authorize a live change.
 
 ### P-71. Make waiting on the owner explicit in shared agent status
@@ -2685,8 +2686,8 @@ questions and questions addressed only to another agent do not arm a wait.
 Arm it for the successfully posted question, not a failed local posting
 attempt. Correlate turn generations so late confirmation or replay of an old
 question cannot restore a wait cleared by a newer turn. No manual status
-command is needed. Arming it while finishing the current turn leaves a running
-turn stays green until it actually stops. At that point the active wait
+command is needed. Arming it while finishing the current turn leaves the
+dot green until the turn actually stops. At that point the active wait
 produces amber instead of idle. A verified blocking native prompt can produce
 amber within a turn because execution is blocked there.
 
@@ -2729,6 +2730,60 @@ from terminal text in the web page or to patch cmux. If the installed runtime
 cannot supply a required trustworthy observation, expose unknown and return
 the gap before claiming that state works. D-82 settles K-2's design mapping;
 these adapter checks remain implementation obligations. K-3/K-4 remain open.
+
+### P-72. Recover unfinished image uploads without retaining originals
+
+Proposed for K-3, not yet approved. Persist the room's text and attachment
+slots immediately, but retain image bytes only after they meet the approved
+1280-pixel/1-MiB cap. Never put an HD original into browser draft storage,
+an upload spool, the server's asset store or a backup. Original input may
+exist transiently in memory while being uploaded and processed.
+
+Recommend server-side normalization in the Python application, beginning
+as soon as paste/selection starts the upload. The server validates source
+limits and format, produces the capped image, and commits it with its draft
+reference before acknowledging completion. The browser saves the resulting
+asset ID in the existing draft slot. Sending still waits for every image;
+finishing an upload alone never posts a message. This does not choose the
+processor dependency or resource budgets, which remain separate K-3 work.
+
+Use a stable upload ID persisted with the draft slot before the request.
+After reload, query that ID: a completed capped asset recovers even if its
+response was lost. A known in-progress job remains pending; a failed or
+interrupted upload with no recoverable capped image becomes a failed slot
+reading “Image unavailable — paste or choose it again.” Keep the text, image
+position and other attachments. Send remains disabled until that slot is
+replaced or removed. Do not falsely display the missing image as recovered
+or silently send without it.
+
+This is a narrow proposed qualification to D-23: if the page reloads before
+any recoverable capped copy exists, the owner may need to select/paste that
+image again. Normal saved images recover without reselection. While the page
+remains open and still has the original in memory, a transient upload failure
+can be retried directly under D-18. After memory is lost, Retry uses an
+existing capped copy if available; otherwise it asks for replacement input.
+Removing or replacing the failed slot never discards the rest of the draft.
+
+Keep uploaded draft assets pinned under D-49 even when the page is closed;
+recovering by upload ID must not race unused-upload deletion. A server crash
+may lose in-memory processing but cannot expose a half-written asset as
+complete. Cross-device draft synchronization remains out of scope, and no
+browser persistence of submitted/failed sends is introduced.
+
+The tradeoff is unavoidable before a capped copy exists: transparent recovery
+of arbitrary original bytes requires retaining them somewhere. Browser-side
+shrinking could move this interval earlier, but cannot remove failure or
+reload during preparation. Retaining a temporary original would change the
+no-HD-storage rule; it is not assumed as a fallback. Recommend the explicit
+failed slot and reselection for this short interruption window.
+
+This affects CHAT-15/CHAT-16 and their reload/failure checks, without changing
+slice boundaries. Verify interruption before upload, during normalization,
+after the capped asset commits but before its response, and while another
+room is selected. Distinguish recoverable completion, known pending work and
+lost source bytes; preserve the draft throughout. K-3 remains open for the
+upload encoding, processor/pins, resource bounds and archive/export contract.
+K-4 remains open separately.
 
 ## Open questions
 
@@ -2934,6 +2989,10 @@ not shown as current. Neither becomes idle or success merely as time passes.
 These thresholds describe evidence age, not D-35/D-46's shorter UI wait bounds.
 
 ### Q-6. How should images be uploaded, displayed and retained?
+
+P-72 proposes capped-only image retention and the explicit reselection case
+when reload interrupts an image before a recoverable capped copy exists.
+This qualification to draft recovery is not yet approved.
 
 **Composition resolved by D-17:** paste into the message, visible inline
 while typing before Send; no separate preview step. A placeholder link may
@@ -3608,7 +3667,7 @@ and no hook, live config or service was changed during these checks.
 - **Relevant decisions:** D-2–D-6, D-37, D-41, D-61, D-75.
 - **Acceptance signals:** Synthetic producer/consumer fixtures round-trip exact text and identities; unsupported versions fail explicitly. The codecs match the reviewed K-1 operation/state contract; unknown versions cannot silently reinterpret data.
 - **Out of scope:** IRC connections, UI, room activation and a new IPC daemon.
-- **Open questions / stop conditions:** K-1 design resolved by D-81; implement the accepted records and deadline contract. K-2–K-4 still gate their affected semantics; do not invent those in the codecs.
+- **Open questions / stop conditions:** K-1/K-2 design resolved by D-81/D-82; implement their accepted records and semantics. K-3/K-4 still gate their affected semantics; do not invent those in the codecs.
 
 ### CHAT-2. Preserve one logical message across IRC multiline fragments
 
