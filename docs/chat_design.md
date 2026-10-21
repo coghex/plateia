@@ -2342,6 +2342,101 @@ of K-1 and affects CHAT-2, CHAT-3, CHAT-6, CHAT-8 and their consumers.
 Deadline clock semantics and history/live cursor proof remain separate
 unfinished parts of K-1.
 
+### P-68. Reserve server time before submitting content, within the same countdown
+
+Recommend a two-step send using the bridge's continuous monotonic clock.
+The countdown still starts when the owner presses Send, and the saved draft
+still clears immediately. The first request reserves an attempt; it cannot
+publish anything. The second submits its content with an immutable deadline.
+This costs one extra request/response before content submission. It avoids
+comparing the phone's wall clock with the server's or starting a fresh
+ten-second budget when a delayed request reaches the server.
+
+The time calculation deliberately errs toward an earlier cutoff. A slow
+reservation response can leave less time to submit, or use the whole budget;
+it never extends the attempt beyond ten seconds from Send. Keep the existing
+“sending...” countdown and confirmed-cancel/red-retry behavior, without a
+new preparation screen. A possibly written attempt remains unconfirmed under
+D-47 regardless of clock or network behavior.
+
+Proposed protocol, with durations in a common unit:
+
+1. At Send, create the logical/command IDs, record browser monotonic time
+   `b0`, and begin the existing ten-second countdown. Enqueue a preparation
+   command binding account, room, immutable content digest and attempt
+   generation. The bridge creates a non-publishable reservation with its
+   continuous-clock sample `s0`, boot epoch and maximum expiry `s0 + 10s`.
+   It durably records the reservation before returning it. Duplicate requests
+   return that same reservation and timestamp; they never refresh it.
+2. Just before submitting content, measure elapsed browser time `r` since
+   `b0`, including the whole first round trip and local processing. Submit
+   only if `r < 10s` and the clock/lifecycle checks below passed. The final
+   deadline is `s0 + 10s - r - guard`, bounded by the reservation's maximum
+   expiry. Use a 100 ms conservative clock/rounding guard, subject to the
+   supported-browser verification below. If no time remains, enqueue cancel
+   rather than sending content. Once fixed, the deadline never increases.
+3. The bridge validates reservation identity, content, epoch and generation,
+   persists that deadline, and starts no write at or after it. Submission,
+   journal, queue and IRC-connection delays consume the same budget. No
+   component resets the timeout to “now plus ten seconds.” The writer checks
+   again immediately before the first batch write. A write already started
+   retains D-45/D-47's existing outcome rules.
+4. At the browser countdown's zero, use the existing serialized check/cancel.
+   A delayed preparation or submission cannot defeat its tombstone. If the
+   reservation response never arrives, no content was submitted; the browser
+   still waits for authoritative cancellation before offering retry. Reload
+   loses the in-memory pending content and never resumes preparation or
+   submission. The reservation alone expires without ever publishing.
+5. Explicit retry reserves a new generation through the same serialized
+   history-check/retry operation, starts a fresh countdown and follows these
+   steps. A repeated retry command cannot mint another reservation. An old
+   generation cannot cancel, replace or renew the new one.
+
+Why the calculation is conservative: if the reservation clock sample was
+taken `u` seconds after the click and the browser submits after total elapsed
+time `r`, then `r >= u`. In the server clock, the chosen cutoff is the click
+time plus `10s - (r - u) - guard`. Thus time after the reservation sample,
+including its return trip, shortens the window. For example, one second each
+way for the reservation leaves a cutoff about 8.9 seconds after the click,
+not twelve seconds. This arithmetic assumes the validated elapsed-clock
+behavior below; it is not a claim that arbitrary device clocks are perfect.
+
+Host clock: use a shared provider backed on macOS by `mach_continuous_time`,
+converted with the platform timebase and bound to the host's boot epoch.
+It advances during sleep, unlike a process-local timer or a wall-clock
+deadline. Existing SDK declarations document this behavior. Keep the same
+epoch through bridge/web restarts; after a host reboot, old reservations and
+never-started attempts cannot start. Write-started attempts remain subject
+to history reconciliation, not automatic retry. UTC timestamps are for
+display/audit, not write eligibility. A provider/epoch failure refuses new
+writes rather than substituting a clock with different behavior.
+
+Browser clock: use elapsed `performance.now()` in the current document,
+never a phone UTC timestamp sent as server time. Round durations toward
+expiry and include the guard. Invalidate a not-yet-submitted reservation
+across hiding/freezing/resumption or a detected clock discontinuity; do not
+resume its content submission automatically. Test actual phone/desktop
+sleep and background behavior: elapsed time must advance, or the pending
+reservation must be invalidated before submission. A wall-clock comparison
+may detect an anomaly but cannot extend the budget. If the supported browser
+cannot meet the 100 ms error guard and suspension rule, do not activate this
+protocol or silently weaken its deadline; return the evidence.
+The [High Resolution Time specification](https://www.w3.org/TR/hr-time-3/)
+distinguishes monotonic elapsed time from adjustable wall time; it is a
+contract to verify on supported browsers, not evidence of their behavior.
+
+Synthetic arithmetic checks on 2026-10-21 covered asymmetric round trips,
+local delay and a reservation response arriving after ten seconds. They
+confirm the formula in those cases only; no browser, bridge or network
+implementation was tested. CHAT-5/CHAT-6/CHAT-12 must cover those cases plus
+duplicate commands, cancellation before preparation, lost replies, clock
+changes, sleep, reboot, delayed body arrival and crashes at each transition.
+
+Owner approval is pending because this adds a round trip and permits a
+conservatively earlier cutoff. It affects K-1 and CHAT-1, CHAT-5, CHAT-6,
+CHAT-10 and CHAT-12; it does not change their approved boundaries. History
+coverage and the remaining API contract still require resolution.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -3046,7 +3141,43 @@ retry requests, old submit/cancel arriving after a new generation, a crash
 on either side of every durable transition, and a web restart while the
 bridge continues. Preserve the accepted ten-second cutoff and five-second
 unknown-notice delay; tests must use the eventual explicit clock contract,
-not reset the timeout at HTTP receipt. No issue is ready from this table alone.
+not reset the timeout at HTTP receipt. P-68 proposes the clock/reservation
+protocol and awaits approval. No issue is ready from this table alone.
+
+### K-1 evidence: history cursors still need a complete ordering contract
+
+Source inspection on 2026-10-21 found that Ergo 2.19.1's SQLite-backed
+`Between` resolves a native msgid to its timestamp, then queries with strict
+`nanotime > after` / `nanotime < before` bounds and orders only by nanotime.
+Native IDs are therefore not a second ordering key in this implementation.
+If a page ends partway through messages with an equal timestamp, continuing
+from its last msgid can skip the remainder of that timestamp.
+[SQLite history queries](https://github.com/ergochat/ergo/blob/v2.19.1/irc/sqlite/history.go).
+
+A read-only design experiment used an in-memory SQLite table with invented
+IDs 1–4, timestamps 100, 100, 100, 101 and page size two. The inspected
+predicate returned `[1, 2]`, then `[4]`, omitting ID 3. This reproduces the
+query boundary, not an observed loss in the live IRC service. It prevents
+claiming gap-free coverage solely from a completed page and its last msgid.
+The previously observed first-item AROUND gap also has a source explanation:
+`GenericAround` returns when there is no earlier half-page, before retrieving
+the requested first item.
+[AROUND implementation](https://github.com/ergochat/ergo/blob/v2.19.1/irc/history/queries.go).
+
+The shared bridge currently advances through its `HistoryPager` using the
+last native msgid (or timestamp) of a full page. A boundary/count heuristic
+is insufficient for the new coverage claim. Missing reference IDs, retention,
+query errors and reconnects must likewise remain distinguishable from an
+authoritatively completed available range.
+
+Next resolve a history reader with a stable total order and a provable
+history/live handoff, within the no-patch constraint. Do not treat adding an
+end-of-page flag or merely deduplicating overlaps as proof that every row was
+reachable. Any proposal to read Ergo's storage directly would introduce a
+versioned storage dependency and requires its own explicit design choice;
+none is selected here. Positive complete history evidence can still prove a
+send posted. Under D-47, absence after write-started remains insufficient to
+authorize retry regardless of how the paging question is settled.
 
 ### Stage checkpoints
 
