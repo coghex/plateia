@@ -3118,6 +3118,82 @@ subject to its implementation and deployment checks. K-4 and whole-design
 readiness remain open; no tracker artifact or live configuration change is
 authorized by this decision.
 
+### P-76. Let shared chat control work-room IRC permissions
+
+Proposed first part of K-4, not yet approved. Give the shared bridge a
+configured service account for work-room channel registration and mode
+changes. It is the channel founder; ordinary conversation accounts,
+including every owner, assistant and agent account, have no channel voice,
+operator or founder grants in these rooms. This is IRC channel administration,
+not a change to the owner's authority or to authenticated message senders.
+The service account does not post conversation on anyone's behalf; D-77's
+sender still posts as the actual authenticated account.
+
+Create/register a new work channel through shared lifecycle code before
+joining its first conversation participant. Verify registration, persistent
+account grants and current member modes before declaring provisioning
+complete. If the name already exists with unexpected ownership or grants,
+report a conflict; do not silently take it over or remove permissions.
+The rollout plan must explicitly reconcile legacy work rooms that will be
+archived. Permanent rooms and owner-named parked exceptions retain their
+existing setup until their applicable cutover work.
+
+For an active work room, use normal unmoderated conversation with no
+outside-channel posting (`+n`). For a frozen or archived work room, shared
+chat sets moderation (`+m`) as well. With no participant voice or higher
+channel mode, this rejects new conversation from terminal and phone IRC
+clients as well as from plateia. Keep the registered channel and its
+identity; do not unregister or purge it as an archive shortcut. Only the
+shared lifecycle restores ordinary posting on a legitimate reopen. D-71's
+owner PART actions still occur at the archive stage, not at this permission
+change.
+
+The service account is dedicated to channel control, has no unrelated
+server-operator capability, and never supplies a conversational bypass.
+Ordinary participants do not receive automatic grants on reconnect. A
+deliberate administrator override or unexpected permission change is a
+visible lifecycle conflict requiring reconciliation, not evidence that the
+room remains safely frozen. It does not change owner authority to direct
+that reconciliation. Shared chat owns these operations and their durable
+intent; plateia only displays the resulting state. No new persistent service
+or server patch is proposed.
+
+#### Evidence and remaining barrier work
+
+Read-only inspection of the installed-version upstream source, Ergo 2.19.1,
+shows that `CanSpeak` blocks outsiders with `+n` and unprivileged members
+with `+m`; any channel-user mode bypasses the moderation check. Registration
+keeps an empty channel alive. Permission checking precedes delivery and
+history insertion, so a successful mode change cannot prove that earlier
+handlers have finished. Mode writeback is asynchronous. These are source
+facts, not a live qualification result.
+[Ergo channel implementation](https://github.com/ergochat/ergo/blob/v2.19.1/irc/channel.go).
+ChanServ exposes registration and persistent account grants; its registration
+policy must permit the configured control account at setup.
+[Ergo ChanServ implementation](https://github.com/ergochat/ergo/blob/v2.19.1/irc/chanserv.go).
+The inspected shared sender/bridge has no existing work-room registration
+or mode-control lifecycle to reuse as a completed capability.
+
+This proposal selects control ownership and the prospective posting gate
+only. **It does not settle archive completeness or the full K-4 barrier.**
+Still resolve how admitted shared sends drain before freezing, how posts
+already executing in other IRC clients are accounted for, and how server
+restart/persistence gaps affect verification. Do not treat mode replies,
+PONG, a quiet interval or repeated matching history reads as proof that no
+earlier post can appear. D-65's exception remains limited to its approved
+dismissed send IDs; this proposal does not silently extend it to unidentified
+other-client posts. Keep Ergo and bring any needed guarantee change to the
+owner, with evidence; never patch it.
+
+CHAT-18 owns provisioning and permission ownership; CHAT-19 owns freezing
+and the still-open archive barrier; CHAT-20 owns later correction/reopen;
+CHAT-22 owns the explicit per-project setup. Keep the 23 approved boundaries.
+Qualification must cover direct owner/agent IRC clients, automatic grants,
+always-on membership restoration, conflicting existing channels, bridge and
+Ergo restarts, and permission changes during close/reopen. Missing evidence
+keeps closure unresolved. No account, mode, configuration or service changes
+are authorized now.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -3168,6 +3244,8 @@ failure of preservation becomes visible. No archive browser in this milestone.
 D-65 permits closure after dismissal using current IRC history, with an
 explicit unconfirmed-ID note and closed-room gap marker. D-66 reconciles a
 later-confirmed send within 24 hours after closure and on legitimate reopen.
+P-76 proposes shared ownership of work-room IRC permissions. It remains
+unapproved and does not settle K-4's archive barrier or completeness evidence.
 
 ### Q-3. What interface separates plateia from shared chat?
 
