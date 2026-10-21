@@ -1830,6 +1830,21 @@ concurrency, processing and deployment checks remain required. K-4 and
 whole-design readiness remain open; no implementation or live change is
 authorized by this decision.
 
+### D-87. Give shared chat a moderator account for work-room control
+
+Owner decision 2026-10-21. Accept P-76 as written at `9729415571`:
+a dedicated shared-chat moderator account registers and controls work-room
+IRC permissions. Conversation accounts, including owners, assistants and
+agents, receive no voice, operator or founder grants in those rooms. The
+moderator never posts conversation; owner authority remains unchanged.
+Keep `+n` while active and add `+m` when frozen or archived, with the
+verification and conflict rules in P-76. Permanent rooms keep their setup.
+
+Account creation is a live setup action: the manager confirms it with the
+owner at setup. No account or service is changed now. This settles K-4's
+permission ownership, not its in-flight post/archive race, tracker lifecycle,
+archive completion or reopen recovery.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -3120,7 +3135,7 @@ authorized by this decision.
 
 ### P-76. Let shared chat control work-room IRC permissions
 
-Proposed first part of K-4, not yet approved. Give the shared bridge a
+Accepted by D-87, owner decision 2026-10-21. Give the shared bridge a
 configured service account for work-room channel registration and mode
 changes. It is the channel founder; ordinary conversation accounts,
 including every owner, assistant and agent account, have no channel voice,
@@ -3192,7 +3207,8 @@ Qualification must cover direct owner/agent IRC clients, automatic grants,
 always-on membership restoration, conflicting existing channels, bridge and
 Ergo restarts, and permission changes during close/reopen. Missing evidence
 keeps closure unresolved. No account, mode, configuration or service changes
-are authorized now.
+are authorized now. The manager confirms moderator-account creation with
+the owner at setup.
 
 ## Open questions
 
@@ -3244,8 +3260,9 @@ failure of preservation becomes visible. No archive browser in this milestone.
 D-65 permits closure after dismissal using current IRC history, with an
 explicit unconfirmed-ID note and closed-room gap marker. D-66 reconciles a
 later-confirmed send within 24 hours after closure and on legitimate reopen.
-P-76 proposes shared ownership of work-room IRC permissions. It remains
-unapproved and does not settle K-4's archive barrier or completeness evidence.
+D-87 accepts P-76's shared moderator ownership of work-room IRC permissions;
+account creation is confirmed with the owner at setup. K-4's archive barrier
+and completeness evidence remain open.
 
 ### Q-3. What interface separates plateia from shared chat?
 
