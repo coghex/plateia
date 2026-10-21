@@ -1157,8 +1157,9 @@ archived history and images, and do not bypass D-14's rejection of posts until
 reopening or D-51's reuse of an existing room. This does not authorize arbitrary
 room names, new room types or live configuration changes during design.
 Creation eligibility for milestone 1 follows D-59. D-58 settles opening
-an archived room for milestone 1. Define connection ownership and join/leave
-lifetime in the shared contract.
+an archived room for milestone 1. D-60 settles switching and explicit
+join/leave controls. Define connection ownership and reconnect lifetime in
+the shared contract.
 
 ### D-57. Include live assistants in every room without an IRC join
 
@@ -1204,6 +1205,28 @@ own rules. Record that intent without designing the rules, editor, storage,
 routing or implementation now. It is outside milestone 1, with no future
 milestone assigned. Do not turn this shortcut into a permanent restriction
 or add custom-room machinery to the milestone-1 slices.
+
+### D-60. Preserve joins on room switches and provide Join/Leave controls
+
+Owner decision 2026-10-21. Accept P-51 with the owner's addition. Switching
+rooms changes the visible conversation only; it does not leave rooms already
+joined. Every room page has a **Join/Leave** control. **Leave sends IRC PART**
+and removes that owner account from the room's user list when confirmed.
+Join establishes real membership. Preserve the other owner account's separate
+entry if that account is still joined.
+
+The guiding principle is that room functionality mirrors IRC for the most
+part. Apply the explicitly approved exceptions, including D-58's milestone-1
+archive rule: an archived page must not enable Join, reopen the room or create
+a replacement channel. Show its archive notice and an unavailable Join
+control. This principle does not add other IRC commands or features to scope.
+
+After an explicit Leave, do not immediately rejoin merely because the same
+page rerenders. Keep the button consistent with authoritative membership;
+failed or unknown join/part outcomes must not be shown as success. Leaving
+does not delete the saved room draft, conversation or images. These controls
+must work on phone and desktop. No live joins, parts or connection changes
+are performed during design.
 
 ## Proposals
 
@@ -1607,16 +1630,24 @@ with their own rules are a deferred future requirement, not designed now.
 
 ### P-51. Switching rooms preserves existing joins
 
-Recommend that switching the visible room changes the view without leaving
-rooms already joined. Opening the next eligible room joins it under D-56;
-the previous room keeps its real owner membership. Do not send an automatic
-IRC PART merely because the owner changes the visible room or project.
+Resolved by D-60: switching preserves joins. Every room page also has a
+Join/Leave control; Leave is IRC PART. Room functionality should mostly
+mirror IRC, within the approved milestone scope and archive exceptions.
 
-This matches keeping multiple rooms joined in an IRC client. It does not
-fabricate membership when a connection has ended, and it does not authorize
-parting rooms or disconnecting other owner clients. Connection ownership and
-reconnect/leave lifetime remain shared-contract details. The room-switching
-rule awaits owner approval.
+### P-52. Use one configured owner account for plateia joins and posts
+
+Recommend that all plateia browsers, on phone and desktop, use the configured
+primary owner IRC account for joining, leaving and posting. Do not silently
+select a different account from the device type. Keep the owner's other IRC
+account distinct in membership and message attribution under D-55.
+
+This gives the shared sender one explicit posting identity and makes the
+Join/Leave control act for that same identity. The owner must choose the
+account before the connection contract is final. Multiple browsers using
+that account must observe the same authoritative membership, including
+explicit leaves. Do not add an account-switching UI without a separate
+decision, or infer authority from a display-name alias. Private configuration
+holds the real account mapping; this proposal creates or changes no account.
 
 ## Open questions
 
@@ -1635,6 +1666,9 @@ permanent rooms and real issue/PR rooms only. Custom rooms with their own
 rules are deferred future work, not designed here.
 **Archived links resolved by D-58 for milestone 1:** show “This room is
 archived.” without joining, reopening or creating a replacement room.
+**Switching and membership controls resolved by D-60:** switching keeps
+existing joins; every room page has Join/Leave, with Leave sending IRC PART.
+Archived pages keep Join unavailable under D-58.
 **Issue closure without any PR resolved by D-10:** close and preserve the log.
 **Multiple PRs resolved by D-11:** share the issue room and close after the
 last open PR closes.
@@ -1762,7 +1796,9 @@ a missing room within the shared lifecycle.
 **Assistants resolved by D-57:** list live assistants in every room using
 shared session records, without an IRC join or status dot. Remaining:
 status explanations and connection lifetime details supporting owner behavior.
-P-51 proposes keeping existing joins when switching the visible room.
+**Switching/join/leave resolved by D-60:** keep joined rooms while switching;
+Join/Leave sends the corresponding IRC action. P-52 asks which owner account
+plateia uses consistently for those actions and posts.
 **Current-task line deferred by D-30:** optional milestone-2 setting,
 excluded from milestone 1; no default selected.
 **Freshness already resolved:** prior `plateia_design.md` D-52 (owner
@@ -1887,6 +1923,12 @@ channel is absent. Only eligible milestone-1 rooms can be created; linked
 PRs resolve to the issue room and concurrent first opens cannot duplicate it.
 Retain the named parked-room exceptions. Do not add or test custom-room rules
 as a milestone-1 feature.
+Check D-60 on phone and desktop: room/project switches issue no PART;
+Leave parts the current owner account and changes its list entry only on
+confirmation; Join restores confirmed membership. Keep the other owner
+account's entry independent. A rerender after Leave must not undo the action.
+Preserve the saved draft, conversation and images. Exercise delayed/failed
+membership responses and verify the archive-page control cannot bypass D-58.
 Check D-57 with a live assistant that has no IRC connection: it appears in
 every room, including project rooms, general and `#chat-test`, with the
 assistant role color and no dot. End its session and verify removal; a
@@ -2100,6 +2142,8 @@ Include D-58's milestone-1 archived-link notice with room opening; it must
 consult shared lifecycle state before attempting to join or create a channel.
 Include D-52's main-room convention in the same shared/global skill change.
 Apply D-59's milestone-1 creation eligibility in that shared room contract.
+Include D-60's membership controls and persistent joins across view switches
+with room opening, backed by the shared IRC membership interface.
 Custom rooms and their own rules remain a deferred future requirement with
 no milestone-1 slice or speculative implementation.
 
