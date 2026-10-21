@@ -2521,6 +2521,107 @@ The K-1 overlap contract below applies the owner's selected approach and
 records source/model evidence. Source inspection of Ergo's query code is
 evidence about its IRC behavior, not permission to query its live storage.
 
+### P-70. Give chat readers a shared snapshot and resumable change cursor
+
+Proposed completion of K-1's read/API contract, not yet approved. Keep the
+existing Python API and bridge-owned durable queue from D-77. Add a shared
+read view: a snapshot and a change cursor, with ordered updates after that
+cursor. The same boundary serves plateia and other shared-chat clients;
+plateia does not parse IRC, reconstruct history or run another sender.
+No new daemon, Ergo database reader or second history authority is proposed.
+
+The reason for this choice is the handoff: independently fetching history
+and then starting live delivery can miss messages between those operations.
+A shared view makes that handoff one contract and lets a reconnect replay
+updates. If a cursor is no longer available, return an explicit reset and a
+new snapshot instead of pretending that no updates occurred. This follows
+the snapshot/cursor pattern already selected for the earlier board read model
+in `plateia_design.md` D-49, but applies it explicitly to milestone-1 chat.
+
+#### History and live handoff
+
+- The bridge establishes and verifies its live room subscription before
+  starting the IRC history query. Its parser keeps accepting live arrivals
+  while labeled history batches are read; complete messages from either
+  source merge by native IDs and verified logical aliases. Preserve source
+  provenance: a live echo alone never becomes durable history evidence.
+- Catch-up scans backward using D-80. Where a previous checkpoint exists,
+  it must find that checkpoint's ID and exhaust its entire boundary
+  millisecond, by crossing into an older millisecond or obtaining the positive
+  end indication. Seeing the checkpoint ID alone is insufficient. A missing
+  checkpoint, retention gap or saturated boundary remains explicitly
+  incomplete; it cannot be hidden by attaching live updates to the result.
+- Commit each merged record and its change revision together in shared
+  durable state. A snapshot includes everything through revision R; clients
+  then receive updates strictly after R. Replayed updates are idempotent.
+  Record late history confirmation as an update to the existing message,
+  not another visible copy. Conflicting ID/content/account evidence is an
+  explicit conflict, never a text-based merge.
+- Keep a stream epoch as well as a monotonic revision so replaced or rebuilt
+  state cannot reuse an old cursor. If a disconnect interrupts the scan,
+  invalidate that scan's coverage and repeat from a known boundary. If a
+  consumer falls behind retained changes, require a new snapshot. A web
+  restart cannot remove the bridge's already-recorded messages or evidence.
+- This prevents a gap introduced by the shared read-view handoff. It cannot
+  make Ergo delivery and persistence atomic. A message delivered before the
+  live subscription but not yet visible in an IRC query may evade that query;
+  an insertion failure may never produce a history record. D-47's existing
+  limitation remains: no scan, cursor, checkpoint or live echo proves a
+  write-started send absent or cancelled. Known unconfirmed IDs continue
+  reconciliation; unknown server omissions cannot be inferred from page size.
+- Return available messages with their coverage state. Respect D-46's
+  15-second syncing bound rather than blocking the page indefinitely on a
+  scan. A cursor reset does not renew that waiting period. This is not a new
+  browser copy of the failed/unconfirmed send queue.
+
+#### Version-one records and operations
+
+These are semantic fields, not final Python symbol or JSON field names.
+
+| Record or operation | Required meaning |
+| --- | --- |
+| Envelope | API version, shared-state epoch/revision, observation time, source and freshness; unsupported major versions fail explicitly. |
+| Message | Stable room identity, authenticated sender/account evidence, native msgid aliases, optional covered logical ID, exact text, timestamp, complete-batch status, live/history provenance and managed asset references. Untagged external IRC posts keep their native identity. |
+| History page | Messages, opaque next cursor, queried bounds, effective limit and coverage (`complete for queried available range`, `more`, `incomplete` or `unavailable`) with a reason. Separate evidence of a positive match from evidence about the range. |
+| Snapshot/change feed | Room message projection, coverage and permitted notice/delivery/membership metadata at one revision; ordered idempotent upserts and explicit reset on an unusable cursor. Clock frames use D-79's fresh samples, never replayed event timestamps. |
+| Submit | Command ID, logical message ID, attempt generation, immutable actor/room/content, managed asset references and D-79's epoch/deadline. Durable registration is not posting. |
+| Check/cancel | Command ID and actor/room/logical ID/generation; serializes with the writer and creates a tombstone if the attempt has not arrived. Returns posted evidence, confirmed cancellation or unconfirmed, never a guessed success. |
+| Retry | New command ID and deadline, same logical ID and immutable content, expected cancelled generation. Recheck IRC history and atomically allocate at most one next generation; stale, contradictory or unavailable evidence cannot publish. |
+| Dismiss notice | Idempotent command scoped to the unconfirmed logical send. Persist suppression across devices without changing its send outcome or touching a bridge-delivery error. |
+| Membership | Idempotent join/leave command with immutable acting owner account and room/lifecycle generation; result contains observed IRC membership or an unresolved failure, not a success inferred from enqueue. |
+
+All mutating commands enter the shared queue through the Python API;
+execution remains in the existing bridge. Reads use that API's shared view,
+not private tables from the web application. Persist the command identity,
+immutable payload binding and result together so repeated requests return
+the same result. A crashed client's replay cannot refresh a deadline or
+allocate another retry. Keep D-77's process-lifetime writer lock and the
+identity/cancellation table below as the send-state contract. No covered
+command may fall through to the old outbox or direct caller-owned IRC writes.
+
+The browser receives actual history and the durable dismissal/notice facts
+approved in D-48. It does not receive a restored pending message body or a
+retry action after reload; D-36's no-browser-recovery rule still applies.
+Snapshots must not restore a covered send's live-only body as though it were
+confirmed history. A body already present in the current page may continue
+its existing send interaction; rebuilding the page does not recover it.
+Agent-delivery outcomes retain the separate per-recipient identity from
+D-41/D-42; posted-to-IRC and accepted-by-agent never share one success flag.
+
+Required verification includes arrivals during every page and snapshot
+boundary, duplicate/reordered API delivery, interrupted nested batches,
+missing checkpoints, saturated timestamps, epoch changes, stale cursors,
+late history confirmation and a crash between record/revision publication.
+Exact tagged history round trips, buffer sizing, clock behavior and owner
+session sharing still require the isolated integration checks already
+attached to CHAT-2–CHAT-6. Source and query models do not satisfy them.
+
+This affects CHAT-1, CHAT-3–CHAT-6, CHAT-8 and CHAT-10–CHAT-12 without
+changing the 23 approved boundaries. Acceptance would settle K-1's remaining
+design contract, subject to those implementation/activation checks and the
+independent K-2–K-4 gates. It would not call the whole design ready, approve
+issues or authorize a live change.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -2590,8 +2691,9 @@ D-34/D-45 require browser-created IDs, one shared sender serializing
 submission/check/cancel/retry, and a history check before any same-ID retry.
 The writer must not start an IRC write after its attempt's deadline; a write
 already in flight remains unconfirmed until settled. D-77 establishes writer
-ownership; D-79/P-68 fixes the clock mapping. Complete the remaining API
-contract and authoritative history/live coverage, keeping retry generations
+ownership; D-79/P-68 fixes the clock mapping and D-80 selects overlapping
+IRC history. P-70 proposes the remaining API and history/live handoff,
+keeping retry generations
 distinct from delayed originals. The current PONG/text-match sender
 does not satisfy this. D-36 rejects browser recovery storage; enforcement
 must work after the browser disappears. P-37 records the proposed protocol.
@@ -3175,7 +3277,8 @@ stop and return evidence to the owner only if actual phone input remains HEIC.
 K-1's execution ownership is resolved by D-77, its native single-batch
 transport plan by D-78, its clock protocol by D-79/P-68 and its IRC-only
 history read boundary by D-80. The overlap contract below makes D-80
-concrete; detailed API records and the history/live handoff remain open.
+concrete; P-70 proposes the detailed API records and history/live handoff
+and awaits owner signoff.
 Transport activation still needs D-78's verification and
 separately confirmed setup change; clock activation still needs actual-browser
 verification under P-68.
@@ -3187,8 +3290,8 @@ or by source inspection alone.
 The following makes D-34/D-45/D-47/D-48/D-77 concrete without declaring
 the gate resolved. It is a contract to implement and verify, not a claim
 about the current `chatlib` or bridge. D-78 selects the native single-batch
-wire representation and D-79/P-68 fixes the clock mapping. The final API
-records and history/live cursor remain open.
+wire representation and D-79/P-68 fixes the clock mapping. P-70 proposes the
+remaining API records and history/live cursor; it is not yet approved.
 
 Keep four identities distinct: the browser's logical message ID; the
 attempt generation for each explicit retry; a command ID for idempotent
@@ -3373,7 +3476,7 @@ CHAT-3 still requires isolated-server integration evidence before activation.
 - **Relevant decisions:** D-37–D-39, D-45–D-48.
 - **Acceptance signals:** Messages arriving during paging appear once; reconnect and equal-timestamp boundaries preserve order. Incomplete/denied history stays unknown. Legacy ungrouped posts remain separate.
 - **Out of scope:** A browser disk history cache, archive browsing and delivery-state inference.
-- **Open questions / stop conditions:** K-1 / Q-3; cursor ordering, paging completeness and lookup evidence must be fixed.
+- **Open questions / stop conditions:** K-1 / Q-3; D-80 selects overlapping IRC bounds and explicit incompleteness. P-70's handoff/read contract needs approval, followed by isolated-server verification of coverage, ID evidence and cursor recovery.
 
 ### CHAT-4. Share owner IRC sessions and verified room membership
 
