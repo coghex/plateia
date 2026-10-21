@@ -692,7 +692,7 @@ never be posted. If missing then, the owner retypes it. Expiry alone does
 not prove absence during the in-flight window. There is no automatic
 reconstruction or resubmission of the discarded local entry. D-35's
 message-level feedback applies while that entry remains in the current page;
-P-38 addresses the reloaded room's history state.
+D-46 addresses the reloaded room's history state.
 
 This supersedes P-27. It does not remove server-side cancellation and
 deduplication records required by D-34. The deadline belongs to a send
@@ -963,6 +963,30 @@ Sources for the installed release: [history selectors](https://github.com/ergoch
 [serialization](https://github.com/ergochat/ergo/blob/v2.19.1/irc/history/serialization.go),
 [SQLite history storage](https://github.com/ergochat/ergo/blob/v2.19.1/irc/sqlite/history.go),
 and [AROUND implementation](https://github.com/ergochat/ergo/blob/v2.19.1/irc/history/queries.go).
+
+### D-46. Bound history syncing after reload, then show unconfirmed
+
+Owner decision 2026-10-20. Accept P-38 with a fixed time limit. After reload,
+show the room-level **“Syncing history...”** notice while a prior write is
+unsettled. Never restore its pending message, content or retry entry. If
+recovery cannot finish within the bound, replace the syncing notice with an
+explicit unconfirmed notice rather than leaving it apparently progressing
+forever.
+
+The owner delegated the bound. Design selection: **15 seconds from the
+room's first history request in the loaded page**, then small grey
+**“unconfirmed: awaiting history”**. This uses D-35's total waiting duration
+and unknown-state wording, with room-level placement. Repeated requests,
+reconnects and room switches do not restart the timer within that page.
+Account for elapsed time when a suspended page resumes. No per-send browser
+storage is introduced; a new page starts a new bounded history request.
+
+The timer changes the notice only. It does not prove cancellation, enable
+retry or declare an absent message safe to retype. Continue recovery; remove
+either notice once the prior write is settled and authoritative history has
+caught up. A server that remains unreachable leaves an honest unconfirmed
+notice, not an endless syncing state. These are history-recovery notices,
+not milestone-2 unread or delivery-progress features.
 
 ## Proposals
 
@@ -1244,14 +1268,10 @@ The shared skills/service owns this protocol; plateia presents its results.
 
 ### P-38. Mark reloaded history as syncing while a prior send is unsettled
 
-D-36 forbids restoring a pending message after reload. Under D-45, a write
-started before cutoff can nevertheless still settle afterward. Recommend
-showing a room-level “Syncing history...” notice while the shared sender
-reports an unresolved prior write for that room. Do not reconstruct its
-message text or retry entry in the browser. Once the write settles and
-history catches up, remove the notice; the owner can then rely on absence
-when deciding whether to retype. The notice reports synchronization, not
-milestone-2 unread or receipt progress.
+Resolved by D-46 with the owner's time-limit condition: “Syncing history...”
+lasts at most 15 seconds from the room's first history request in a loaded
+page, then becomes “unconfirmed: awaiting history” until recovery completes.
+No pending message or retry entry is restored.
 
 ## Open questions
 
@@ -1338,8 +1358,10 @@ until confirmed cancellation, and normal display on confirmed posting.
 unconfirmed sends. The shared sender starts no write after the attempt's
 deadline. Once an earlier write has settled and history is complete, the
 message is in history or will never post; the owner retypes if missing.
-Q-3 must establish that settlement and history coverage. P-38 proposes a
-room-level history-sync notice during the unresolved interval after reload.
+Q-3 must establish that settlement and history coverage.
+**Reload history notice resolved by D-46:** “Syncing history...” for at most
+15 seconds, then “unconfirmed: awaiting history” until settlement and
+history catch-up. Neither notice restores a pending send or authorizes retry.
 **Long-message presentation resolved by D-37:** one web message with line
 breaks preserved and explicit transport grouping, never time-based merging.
 **Message size resolved by D-38:** 64 KiB of text, with a warning before
@@ -1524,6 +1546,15 @@ must recheck history and must not reactivate an expired original attempt.
 These fault and restart checks remain required future validation; the
 read-only D-45 probes do not establish their results.
 
+Check D-46 with a prior unsettled write after reload: the room notice changes
+from syncing to unconfirmed at 15 seconds even if requests never return.
+Repeated requests, reconnects, room switches and page suspension must not
+extend that bound within the loaded page. Verify settlement both before and
+after the bound, with history lagging separately: clear the notice only when
+both are resolved. A fresh reload gets a bounded request without recovering
+any pending send from browser storage. Neither timeout nor notice removal
+may manufacture a cancellation result or a retry entry.
+
 Draft recovery checks must retain text and images across room switches and
 reloads on the same device, including drafts whose uploads are interrupted
 or have failed. Cleanup must not remove saved-draft attachments.
@@ -1593,6 +1624,7 @@ Include D-36/D-45's writer cutoff, logical ID in authoritative IRC history
 and complete history lookup in that contract. Resolve P-37's settlement
 proof without an IRC patch. Do not add browser pending-send storage or
 reload restoration.
+Include D-46's bounded room-level recovery notice with history loading.
 Exclude D-30's optional current-task line and setting from all milestone-1
 slices; retain only the milestone-2 note.
 The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
