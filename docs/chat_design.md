@@ -3315,6 +3315,105 @@ atomic archive publication and membership/reopen fencing. Its remaining
 contract must include isolated delayed-handler, late old-timestamp, failed
 history-write and interrupted-correction cases. No live change is authorized.
 
+### P-78. Fence close/reopen work and keep uncertain cleanup visibly pending
+
+Proposed K-4 recovery rule, not yet approved. Keep a durable lifecycle record
+for each stable room in shared chat, with a monotonically increasing
+generation, desired open/closed state, observed phase and outstanding
+operation receipts. Serialize lifecycle actions for that room. A reopen
+supersedes the old close intent immediately, but does not expose posting or
+issue a new owner JOIN until older conflicting IRC commands are settled.
+
+The practical rule is: **an old close must never freeze or part an owner from
+the newly active generation**. A local generation check alone cannot enforce
+this after a command has already reached IRC. Persist the operation's intent
+before writing, including room, generation, acting account, exact effect and
+command/connection identity. Check the current generation before dispatch;
+cancel undispatched obsolete work. Do not replay an uncertain MODE or PART
+just because a worker restarted or its reply was lost.
+
+#### Close and supersession ordering
+
+1. Record closing and stop admitting new shared sends/joins for that room.
+   Drain already admitted sends until no further shared write will be issued
+   for them, under their existing deadlines. Record any indeterminate outcome;
+   do not wait for its dismissal before freezing. Do not extend deadlines or
+   give conversation accounts a moderation bypass.
+   Until the moderator's block is verified, direct IRC clients can still
+   post; include their history under D-88. Do not claim the IRC freeze has
+   happened merely because plateia shows a grey title.
+2. Set and verify the moderator's posting block. Build and verify the D-88
+   history snapshot and D-86 image copies. An undismissed unconfirmed send
+   or any other required unresolved evidence still prevents completion.
+3. Before each owner PART, check that the close generation is still current
+   and that its archive is verified. Record and settle each account's
+   operation separately. A reopen stops remaining undispatched PARTs; it
+   does not undo or pretend away one already sent.
+4. Mark the room closed only after the current generation's required archive
+   and membership steps are verified. Persist that closure time once for
+   D-66/D-88's window. If a reopen has superseded it, retain any verified
+   snapshot but never publish the obsolete operation as the room's current
+   closed state or start a false closure window.
+
+All slow exports and copies carry their room generation. Recheck it at
+publication, rather than holding a network operation or the global sender
+queue hostage to archive I/O. A stale export cannot overwrite the current
+archive pointer, clear newer errors or mark a reopened room closed. Keep
+previously verified archive generations until their replacements are fully
+verified; failed work and uncertain references remain recoverable.
+
+#### Reopen and the uncertainty case
+
+On a verified reopen trigger, record the newer desired generation and stop
+dispatching old close effects. Finish accounting for effects already sent.
+Perform the required on-reopen history reconciliation, preserve history and
+images, then remove the posting block and verify the resulting room state.
+Only after this is safe does the room become active. Opening/joining it then
+acts as the bound owner under D-71; do not automatically join every owner.
+
+If a connection fails with an old MODE or PART still potentially executing,
+keep the room unavailable for new shared posts and joins until completion or
+non-execution is proved. Show a grey title with `Reopening…` while checking;
+after 15 seconds without resolution show `Reopening blocked: a previous room
+change is unconfirmed.` A pending close uses the corresponding
+`Closing blocked: a room change is unconfirmed.` The bound changes the
+display, not the outcome. Recovery continues when evidence arrives; there
+is no dismissal that allows a conflicting reopen, and no automatic server
+restart or forced client disconnect. If existing interfaces cannot supply
+the proof, report the blocker for an owner-directed recovery action.
+
+This can delay a reopened issue's room after an outage. That is the explicit
+tradeoff being proposed, rather than letting an old cleanup affect new work.
+It does not promise that all direct IRC clients obey plateia's pending UI:
+shared chat reports real membership/modes and any outside change honestly.
+
+#### Evidence boundary and implementation checks
+
+Ergo 2.19.1 processes commands in order within one session's command loop.
+That supports checking a correlated mutation result and a subsequent
+same-session read while the session remains intact; it does not establish
+the fate of another session's pending handler after disconnection.
+[Ergo client loop](https://github.com/ergochat/ergo/blob/v2.19.1/irc/client.go).
+MODE applies changes before announcing them, with separate history work.
+[Ergo mode handler](https://github.com/ergochat/ergo/blob/v2.19.1/irc/handlers.go).
+Neither a fresh connection's state query nor a local generation number alone
+proves an older command cannot run later. The adapter must distinguish
+confirmed effect, confirmed rejection/non-dispatch and unresolved execution;
+do not infer the latter two from a timeout. A PONG is not archive durability
+evidence under D-88.
+
+CHAT-18 owns the lifecycle record/generations; CHAT-19 owns close effects
+and recoverable archive publication; CHAT-20 owns reopen and correction;
+CHAT-21 displays these states. Keep the approved slice boundaries. Verify
+reopen before dispatch, during a partial owner cleanup, after a lost command
+reply, during archive copy/publication and after process restart. Verify
+that delayed old jobs cannot change the newly active generation.
+
+Approval would settle this recovery behavior, not all of K-4. Tracker
+association/evidence, exact persistent record and archive-publication
+contracts, and the adapter's concrete completion evidence remain to be
+resolved before affected issue drafting. No live operation is authorized.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -3370,6 +3469,8 @@ account creation is confirmed with the owner at setup. K-4's archive barrier
 and completeness evidence remain open.
 D-88 accepts P-77's explicit history-snapshot limit with bounded late checks
 covering every client. The remaining close/reopen protocol is still K-4 work.
+P-78 proposes serialized durable generations and visibly blocked recovery
+when an old IRC mutation is unconfirmed; it awaits owner approval.
 
 ### Q-3. What interface separates plateia from shared chat?
 
