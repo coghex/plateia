@@ -75,14 +75,18 @@ These are inputs for the shared presence contract, not proof that a registered
 account is currently online or that browser-owner presence already exists.
 No identity sync or live configuration change was run for this inspection.
 
-Owner-account follow-up, 2026-10-21: the manager reports that private chat
-configuration currently has one system-wide owner account; the phone account
-has owner status only in another project's configuration. This is a reported
-configuration fact, not a configuration file inspected or reproduced here.
-Read-only source checks confirm single-global-owner assumptions in
-`chatlib.cited_authority`, `chat-bridge.handle` and `identities.allocate`.
-D-61 therefore requires shared ownership/configuration work, not merely a web
-display alias. No credentials or live configuration were read or changed.
+Owner-account follow-up, 2026-10-21: the owner's update supersedes the earlier
+single-owner finding. The manager reports that the phone account is now a
+shared-chat owner, with support delivered in skills commit `7ce2401`.
+Read-only source inspection confirms that `chatlib.owners(cfg)` combines
+`owner` and `owners`, and that authority, delegation citations, owner-led
+enrollment, direct dispatch and owner notifications consume that set.
+The commit includes second-owner regression tests; those tests were inspected,
+not run for this documentation update. The applied private configuration is
+manager-reported, not inspected or reproduced here. D-61/D-62 consume this
+completed support; plateia must recognize every account in the shared owner
+set, not maintain its own two-account authority list. No credentials or live
+configuration were read or changed by this design session.
 
 ### Relationship to the earlier design
 
@@ -1247,19 +1251,19 @@ attribution under D-54/D-55. Real account mappings remain private.
 
 The owner delegated the browser-to-account mechanism for design to settle;
 bring back only a material owner choice. D-62 records that selection.
-The phone account's existing limited owner configuration is insufficient
-for plateia's projects. Include a shared-chat configuration/skills change
-that consistently recognizes both accounts as owners. Audit primary-owner
-assumptions in delegation checks, routing, identity metadata and owner-only
-actions; do not grant owner authority through a browser flag or nickname.
+**Owner update 2026-10-21:** the phone account is now an owner in shared chat;
+the owner-authorized configuration change and shared support in skills commit
+`7ce2401` are complete. They are no longer pending rollout actions. Consume
+the canonical `chatlib.owners(cfg)` set (`owner` plus `owners`) for every
+owner account's authority, rather than duplicating a two-account permission
+list in plateia. Browser profiles select attribution and cannot grant authority.
 
-**Rollout boundary:** the live owner-account authorization/configuration
-change is the owner's own action at rollout. Design and implement the shared
-support through its normal delivery process, then verify readiness against
-the owner's applied configuration before enabling phone actions. If that
-configuration is absent, show the blocked setup state rather than posting
-as the desktop account or silently giving the phone account lesser authority.
-Do not change live config, credentials, accounts or security policy now.
+Browser binding and sender/membership integration remain implementation work.
+At runtime, if a profile's account is absent from the shared owner set, block
+its account actions rather than posting as the other account or silently
+giving it lesser authority. This is a configuration validity check, not an
+outstanding request to add the phone account. No further live configuration
+change is performed by this design session.
 
 D-45 still requires one shared sender coordinating writes; it can authenticate
 separate IRC connections for the two accounts. Bind every logical message ID
@@ -1274,8 +1278,10 @@ the chosen mechanism, not a claim of deployed behavior:
 
 - On first use, after the existing owner-access check, choose **Phone** or
   **Desktop** once for that browser. The server maps that profile to the
-  privately configured owner account. Show the current account alongside
-  the composer so attribution is apparent before Send.
+  privately configured owner account, validated against the canonical shared
+  owner set already supported by `7ce2401`. Setup does not add accounts or
+  alter their authority. Show the current account alongside the composer so
+  attribution is apparent before Send.
 - Keep an opaque browser-binding token in an HttpOnly, SameSite cookie,
   Secure on the deployed HTTPS origin. Store its account/profile mapping
   server-side. Reloads retain the binding; a new browser or cleared cookie
@@ -1712,7 +1718,8 @@ mirror IRC, within the approved milestone scope and archive exceptions.
 
 Rejected by D-61. Phone and desktop use their respective owner accounts with
 equal authority. D-62 settles browser binding under the owner's delegation;
-the shared owner-configuration change remains the owner's rollout action.
+the shared owner-configuration change is complete as of the owner's
+2026-10-21 update, with support in skills commit `7ce2401`.
 
 ### P-53. Keep IRC connections and joins when the browser closes
 
@@ -1804,11 +1811,12 @@ from the bridge's records. Include late acceptance after dead-lettering,
 structured recipient identity and freshness; plateia must not implement a
 parallel delivery-state inference engine over textual trace output.
 
-D-61 adds two real owner accounts with equivalent authority. The shared
+D-61 uses two real owner accounts with equivalent authority. The shared
 sender coordinates both while binding each operation to its original account.
-The ownership contract must recognize the phone account consistently, including
-cited authority and owner-only actions, without treating it as an assistant
-or replacing its attribution with the desktop account. D-62's browser binding
+The shared ownership contract is already delivered in skills commit `7ce2401`:
+consume its canonical owner set for permissions, including cited authority
+and owner-only actions. Do not treat the phone account as an assistant or
+replace its attribution with the desktop account. D-62's browser binding
 selects an existing account; it cannot grant shared-chat authority.
 
 ### Q-4. What are the posting and recovery interactions?
@@ -1885,8 +1893,9 @@ status explanations and connection lifetime details supporting owner behavior.
 Join/Leave sends the corresponding IRC action.
 **Acting accounts resolved by D-61:** phone and desktop use their respective
 owner accounts with equal authority. D-62 selects a remembered browser profile
-under the owner's delegation. The owner applies the required live shared-chat
-authorization change at rollout. P-53 asks whether browser closure keeps IRC
+under the owner's delegation. The owner reports the shared-chat authorization
+change complete, backed by skills commit `7ce2401`; no rollout action remains
+for adding the phone account. P-53 asks whether browser closure keeps IRC
 connections and joined rooms.
 **Current-task line deferred by D-30:** optional milestone-2 setting,
 excluded from milestone 1; no default selected.
@@ -2032,10 +2041,12 @@ Resize the page and change the user-agent without changing the binding.
 Reload retains setup; a missing/invalid binding requires setup before an
 account action, with no fallback identity. Verify protected setup, rejection
 of arbitrary request-supplied accounts and no browser IRC credentials.
-Phone actions remain blocked until the shared owner configuration is ready.
+Reject a profile whose mapped account is absent from the shared owner set.
 Delayed sends, check/cancel and same-ID retries must retain their original
 account across reconnects and browser-binding changes. Include parity checks
-for shared owner/delegation permissions and reject unconfigured identities.
+for shared owner/delegation permissions, including an additional synthetic
+owner to catch a hard-coded two-account permission list, and reject
+unconfigured identities.
 
 Verify shared delivery and room lifecycle with the plateia process stopped.
 Verify localhost binding and the browser boundary with synthetic requests.
@@ -2245,11 +2256,12 @@ Include D-52's main-room convention in the same shared/global skill change.
 Apply D-59's milestone-1 creation eligibility in that shared room contract.
 Include D-60's membership controls and persistent joins across view switches
 with room opening, backed by the shared IRC membership interface.
-Include D-61's shared multi-owner support and D-62's browser binding in the
-posting/membership slices. Record the phone-account owner-configuration change
-as an explicit owner-performed rollout prerequisite; no worker changes live
-authorization during design or implementation. Gate account actions on the
-configured identity and shared permission checks, without a fallback account.
+Reuse D-61's completed shared multi-owner support (`7ce2401`) in the
+posting/membership slices, alongside D-62's browser binding and the shared
+sender's two-account integration. Do not add a redundant support slice or
+pending rollout task for the already applied phone-account owner change.
+Gate account actions on the configured identity and shared permission checks,
+without a fallback account or a separate plateia owner-authority list.
 Custom rooms and their own rules remain a deferred future requirement with
 no milestone-1 slice or speculative implementation.
 
