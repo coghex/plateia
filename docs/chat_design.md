@@ -45,9 +45,10 @@ concrete precondition
 These 23 slices follow D-74's approved stage order. D-76 approves their
 boundaries at `e6107c0663`, boundaries only. D-81 settles K-1's design
 contract; D-82 settles K-2's state mapping; D-86 settles K-3's image contract.
-Their integration checks remain required. K-4 remains a contract
-gate before affected issue drafting. No tracker artifact has been filed; the
-design is not ready for issue processing yet.
+Their integration checks remain required. D-87–D-94 settle K-4's design
+contract, as mapped in the coverage review below. No tracker artifact has
+been filed. The design remains `exploring` pending the owner's explicit
+readiness approval, not another implementation or live-change approval.
 
 ## Epic contract
 
@@ -229,6 +230,9 @@ the bridge's existing phone alerts unchanged (D-43).
 D-1 through D-7 restate accepted source decisions. D-8 onward record the
 owner's answers in this design conversation. None approves unspecified mechanisms or
 delivery slices.
+Earlier entries retain the questions that were open when they were recorded;
+the current open-question resolutions and contract-gate review below identify
+the later decisions that settle them.
 
 ### D-1. Deliver working chat together
 
@@ -4018,6 +4022,10 @@ owner-specific global skill change when the room-model work is implemented.
 
 ### Q-2. What is a work room's exact lifecycle?
 
+**Design contract resolved by D-87–D-94**, together with the earlier lifecycle
+decisions below. Isolated implementation checks and owner-confirmed setup
+remain required; accepted evidence limits must remain explicit.
+
 **Opening resolved by D-9:** create on first use, including issue review.
 **Opening from plateia resolved by D-56:** join as the owner and create if
 missing, within the shared room model.
@@ -4053,17 +4061,16 @@ same closure rule. **PR resumption resolved by D-51:** reopened and
 replacement PRs reuse their existing issue/PR room with history and images.
 **Work without a tracker item resolved by D-52:** use the project's main
 room; design remains in general. Existing rooms, including grouped request
-rooms, are addressed under Q-8. Settle how closure preserves a complete file
-log despite outages or late posts, and how completion or
-failure of preservation becomes visible. No archive browser in this milestone.
+rooms, are addressed under Q-8. D-88/D-92/D-93 settle snapshot coverage,
+verified preservation and recovery after outages or late posts. No archive
+browser is included in this milestone.
 D-65 permits closure after dismissal using current IRC history, with an
 explicit unconfirmed-ID note and closed-room gap marker. D-66 reconciles a
 later-confirmed send within 24 hours after closure and on legitimate reopen.
 D-87 accepts P-76's shared moderator ownership of work-room IRC permissions;
-account creation is confirmed with the owner at setup. K-4's archive barrier
-and completeness evidence remain open.
+account creation is confirmed with the owner at setup.
 D-88 accepts P-77's explicit history-snapshot limit with bounded late checks
-covering every client. The remaining close/reopen protocol is still K-4 work.
+covering every client.
 D-89 accepts P-78's serialized durable generations and visibly blocked
 recovery when an old IRC mutation is unconfirmed, with manager-first recovery.
 D-90 accepts P-79's durable shared association registry, initial GitHub/workflow
@@ -4071,10 +4078,11 @@ link evidence and manager-first conflict handling.
 D-91 accepts P-80's fresh tracker observation and work-round transition
 contract, including first use and reopen history.
 D-92 accepts P-81's shared control store and immutable archive publication
-protocol. IRC completion evidence remains open.
+protocol.
 D-93 accepts P-82's current-state IRC receipts, reconnect reconciliation and
 explicit crash-persistence gap, and requires shared lifecycle work to continue
-with the web process stopped. Combined K-4 coverage is being audited.
+with the web process stopped. The combined K-4 coverage review below maps
+these accepted contracts to the affected slices.
 D-94 resolves P-83's web-off image-URL availability question without changing
 the accepted local image-archive contract.
 
@@ -4085,9 +4093,9 @@ feed, D-80 overlap, D-79 clock, D-78 native batch and D-77 sender ownership
 apply together. The evidence and implementation obligations below remain;
 they are not unanswered design choices or claims of completed verification.
 
-Settle discovery, history/live handoff, posting as the owner, stable operation
-identity, mention routing, delivery failure facts and presence. Verify the
-canonical source before specifying changes. New workflow behavior belongs in
+Implement the accepted discovery, history/live handoff, owner posting,
+operation identity, routing, delivery and presence contracts. Recheck the
+canonical source during issue drafting. New workflow behavior belongs in
 the skills repository. Do not revive retired packages by inference.
 
 Earlier `plateia_design.md` D-16 selected a shared, versioned Python API
@@ -4209,8 +4217,8 @@ the owner accounts, not an automatic entry in every room.
 **Opening/joining resolved by D-56:** opening joins as the owner and creates
 a missing room within the shared lifecycle.
 **Assistants resolved by D-57:** list live assistants in every room using
-shared session records, without an IRC join or status dot. Remaining:
-status explanations. D-63 settles connection lifetime and shared membership;
+shared session records, without an IRC join or status dot. D-82 supplies
+the status meanings and evidence rules. D-63 settles connection lifetime and shared membership;
 D-64 settles owner-only retention with no connected IRC clients.
 **Switching/join/leave resolved by D-60:** keep joined rooms while switching;
 Join/Leave sends the corresponding IRC action.
@@ -4264,9 +4272,10 @@ and desktop, using the same draft and immediate upload, posting only on Send.
 real phone testing exposes unconverted input and the owner separately approves
 the decoder dependency.
 **Source limits resolved by D-69:** 20 MiB encoded and 50 million pixels;
-larger inputs follow the failed-upload rule. Remaining:
-device paste and chooser validation, processing mechanics, link access and
-archive mechanics.
+larger inputs follow the failed-upload rule. D-85/D-86 settle processing and
+asset access; D-88/D-92 settle archive mechanics. Actual device paste/chooser
+and processing qualification remain required. D-94 permits web-served images
+to be unavailable with the web stopped; local archives remain readable.
 Plateia stores images; shared chat records their links.
 **Inline scope resolved by D-73:** managed image references render inline;
 external image URLs stay clickable links with no image or website previews.
@@ -4283,8 +4292,8 @@ Carry forward prior `plateia_design.md` D-64's browser trust boundary:
 localhost/Tailscale access, allowed Host and same-origin requests, the owner's
 configured identity, and protected mutating/streaming endpoints. Render chat
 as untrusted content; restrict links to http/https and safe new-tab behavior.
-Its JSON/custom-header mutation rule still applies. Specify the image-upload
-encoding within that boundary before defining the upload slice.
+Its JSON/custom-header mutation rule still applies. D-85's bounded JSON
+upload encoding stays within that boundary.
 
 ### Q-8. How should existing rooms be archived and migrated?
 
@@ -4303,7 +4312,8 @@ posts until reopened, retaining the file log.
 **Closing transition resolved by D-15:** block new submissions, settle
 already-accepted posts and verify the archive; keep the title grey and
 problems visible until verified closure.
-Still specify normal archive verification and interruption/retry behavior.
+D-88/D-89/D-92/D-93 settle normal archive verification and interruption
+recovery, including the explicit snapshot and IRC crash-persistence limits.
 D-65 resolves permanent send uncertainty: after dismissal, archive current
 IRC history and record the gap by logical ID; keep the closed-room marker.
 D-66 limits late-send checks to 24 hours after closure and again on reopen;
@@ -4705,8 +4715,8 @@ checks actually ran in CI versus locally; neither substitutes for the other.
 These gates separate settled contracts from unfinished design work; they
 are not permission to let implementers invent behavior. D-76 approves the
 dependency decomposition, while D-81/D-82/D-86 settle K-1/K-2/K-3's design contracts.
-Approved boundaries do not make the remaining contracts ready.
-Resolve each affected gate in this design before drafting that implementation
+The K-4 coverage review below maps its later approvals. Approved boundaries
+alone never settle a contract. Carry each accepted contract into its affected
 issue. Bring any new user-visible behavior or serious ownership choice to the
 owner; exact field spelling and test mechanics are implementation details.
 
@@ -4730,9 +4740,51 @@ separately confirmed setup change; clock activation still needs actual-browser
 verification under P-68.
 D-82 settles K-2's design mapping, including automatic owner waits; its
 runtime-source checks remain. D-86 settles K-3 through P-75 and D-83–D-85;
-its implementation and deployment checks remain. K-4 remains open. K-1–K-3
-are resolved by explicit contract approval, not boundary approval or source
-inspection alone.
+its implementation and deployment checks remain. D-87–D-94 settle K-4 as
+mapped below. All four gates are resolved by explicit contract approvals,
+not boundary approval or source inspection alone. This does not approve
+design readiness, issue creation, implementation acceptance or live setup.
+
+### K-4 coverage and readiness review, 2026-10-21
+
+This is a consolidation of accepted decisions, not a new behavior proposal.
+
+| Required contract | Accepted resolution | Implementation slices |
+| --- | --- | --- |
+| Room identity, links and tracker evidence | D-90/P-79: durable bindings, manager-first ambiguity and owner approval for moving used bindings. D-91/P-80: complete fresh observations, work rounds, close/reopen events and final recheck. | CHAT-18 |
+| Admission, drain and freeze | D-87/P-76: dedicated moderator and participant permissions. D-89/P-78: stop new admission, drain existing attempts, freeze before snapshot. D-92/P-81: gate and admission in the same control store. | CHAT-18, CHAT-19 |
+| History coverage and image preservation | D-88/P-77: available-history snapshot, explicit limits and no silent known omissions. D-80: overlapping IRC pages. D-86/P-75: local pins and verified capped-image export. | CHAT-19 |
+| Publication and correction | D-92/P-81: durable SQLite control records, sealed immutable bundles, verified publication and retained revisions; correction preserves the original closure deadline. | CHAT-18–CHAT-20 |
+| Owner cleanup and reopen fencing | D-71: part all owners at archive, join the bound owner on legitimate opening. D-89/P-78 and D-93/P-82: generations, operation receipts, blocked unknown old commands, current-state verification and reconnect repair. | CHAT-18–CHAT-21 |
+| Unconfirmed sends and all-client late posts | D-65/D-66 and D-88/P-77: named dismissed gaps, correction across all clients for 24 hours and on legitimate reopen only; no indefinite history watcher. D-93 accepts the IRC restart gap. | CHAT-19, CHAT-20 |
+| Legacy rollout | D-44: per-project clean cutover, warning and owner closure prerequisites, explicit parked exceptions. D-16: discard old design rooms without logs. The manager owns concrete rollout mapping; live actions retain their authorization gates. | CHAT-22 |
+| Web independence | D-93/D-94: all shared operations and local archives work with the web stopped; web-served content is unavailable. The dependency audit is closed, with explicit runtime qualification still required. | CHAT-15, CHAT-18–CHAT-23 |
+
+K-4's design contract is resolved. Preserve its limits when drafting: a
+snapshot is not proof that all server handlers finished, confirmed IRC state
+is not crash-proof persistence, and an unconfirmed old mutation can block
+reopening until manager-first recovery obtains evidence. Never convert those
+limits into a success inferred from elapsed time.
+
+Readiness checks: the epic goal/done condition and non-goals are explicit;
+the 23 approved boundaries remain in dependency order with matching ledger
+entries; K-1–K-4 have accepted contracts; compatibility, retention, recovery,
+privacy, local shared-skills delivery and live setup gates are recorded.
+HEIC remains deliberately conditional under D-68, and concrete per-project
+activation belongs to the manager under D-44. These are named stop conditions,
+not undecided milestone-1 behavior delegated to implementers.
+
+Tracker recheck on 2026-10-21 found no open issues or pull requests in
+`coghex/plateia`. The closed [previous epic #10](https://github.com/coghex/plateia/issues/10)
+covered the earlier captured-chat/board arc, not this milestone's working-chat
+scope and current canonical-skills ownership. No existing open umbrella
+duplicates this design. Repeat per-artifact deduplication during processing.
+
+Recommend the design for the owner's readiness approval. Until that approval,
+keep `Design state: exploring` and create no tracker artifact. After approval,
+process the epic first, then one child at a time with separate owner signoff;
+the manager runs each filed issue's review. No implementation or activation
+is approved by this readiness review.
 
 ### K-1 elaboration: identity and cancellation invariants
 
@@ -4938,7 +4990,7 @@ and no hook, live config or service was changed during these checks.
 - **Relevant decisions:** D-2–D-6, D-37, D-41, D-61, D-75.
 - **Acceptance signals:** Synthetic producer/consumer fixtures round-trip exact text and identities; unsupported versions fail explicitly. The codecs match the reviewed K-1 operation/state contract; unknown versions cannot silently reinterpret data.
 - **Out of scope:** IRC connections, UI, room activation and a new IPC daemon.
-- **Open questions / stop conditions:** K-1/K-2/K-3 design resolved by D-81/D-82/D-86; implement their accepted records and semantics. K-4 still gates its affected semantics; do not invent those in the codecs.
+- **Open questions / stop conditions:** K-1–K-4 are settled by the mapped approvals; implement their accepted records and semantics without inventing behavior in the codecs. Exact field spelling remains an implementation detail.
 
 ### CHAT-2. Preserve one logical message across IRC multiline fragments
 
@@ -5089,7 +5141,7 @@ and no hook, live config or service was changed during these checks.
 - **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
 - **Scope:** Add bounded PNG/JPEG/WebP processing, protected upload/read endpoints, durable capped assets and draft/send/archive reference accounting. Include 24-hour deletion only after proven unreferenced, plus a documented archive export/pinning contract usable without the web process.
 - **Phase:** 2. **Depends on:** CHAT-12, CHAT-13, CHAT-14. **Ordering:** critical path.
-- **Relevant decisions:** D-18–D-23, D-49, D-68, D-69.
+- **Relevant decisions:** D-18–D-23, D-49, D-68, D-69, D-83–D-86, D-93, D-94.
 - **Acceptance signals:** Input/output limits and malformed-image failures are enforced. Drafts, retries, uncertain sends and archives protect assets across restart; only provably unused objects expire. No retained HD attachment and no unconditional HEIC dependency.
 - **Out of scope:** Inline rendering, archive UI and live data cleanup.
 - **Open questions / stop conditions:** K-3 is settled by D-83–D-86. Implement and verify P-75's catalog/reference/export contract and the approved processing bounds; do not treat approval as runtime qualification.
@@ -5122,32 +5174,32 @@ and no hook, live config or service was changed during these checks.
 - **Implementation owner:** Shared skills, local delivery under D-75.
 - **Scope:** Introduce stable room kinds, issue/PR associations and lifecycle generations. Create on first use, reuse rooms on reopened/replacement work, preserve per-project legacy mode until cutover, and update the owner's global skills at this stage. Represent main/testing/general/chat-test routing and scope.
 - **Phase:** 3. **Depends on:** CHAT-17, CHAT-1, CHAT-4, CHAT-9. **Ordering:** critical path.
-- **Relevant decisions:** D-8–D-11, D-16, D-44, D-51–D-59, D-74.
+- **Relevant decisions:** D-8–D-11, D-16, D-44, D-51–D-59, D-74, D-87, D-89–D-93.
 - **Acceptance signals:** Concurrent first use creates one logical room; multiple PRs share the issue room and last-open-PR closure is correct. Unknown tracker evidence does not fabricate closure, and untouched projects retain legacy behavior.
 - **Out of scope:** Archive storage, live room provisioning, custom rooms and tracker mutations by plateia.
-- **Open questions / stop conditions:** K-4 / Q-2 and Q-8; settle lifecycle evidence/registration and update semantics before drafting.
+- **Open questions / stop conditions:** K-4 is settled. Implement P-79/P-80's registry, association and fresh tracker/work-round contract, P-81's shared control store and P-82's receipts/reconnect rules. Unexpected links or ownership go to the manager; setup remains separately authorized.
 
 ### CHAT-19. Verify structured room archives with their images and membership cleanup
 
 - **Outcome:** A work room closes only with verified structured history, images and membership cleanup.
 - **Implementation owner:** Shared skills, local delivery under D-75.
-- **Scope:** Implement the closing barrier, complete history export and image pin/copy verification through the approved storage contract. Persist a self-describing structured archive and cleanup state; part every owner after the required archive steps, with generation checks and recoverable failures.
+- **Scope:** Implement admission/drain/freeze, export of the complete enumerated available-history snapshot under D-88's limits, and image pin/copy verification. Follow P-81's immutable publication protocol; part every owner after the required archive steps, using P-78/P-82's generation and operation receipts.
 - **Phase:** 3. **Depends on:** CHAT-18, CHAT-3, CHAT-6, CHAT-15. **Ordering:** critical path.
-- **Relevant decisions:** D-14, D-15, D-20, D-51, D-70, D-71.
-- **Acceptance signals:** Archives work with the web process stopped; missing history/images or failed writes cannot claim success. Other-client posts are covered by the barrier; interruption/reopen races preserve data and new joins. No plaintext transcript.
+- **Relevant decisions:** D-14, D-15, D-20, D-51, D-70, D-71, D-86–D-94.
+- **Acceptance signals:** Archives work with the web process stopped; known missing history/images or failed writes cannot claim success. Verify the running-state posting block and preserve D-88/D-93's late-post and crash limits explicitly. Interruption/reopen races preserve archives and fence old cleanup; no plaintext transcript or half-published archive.
 - **Out of scope:** Dismissing uncertain outcomes, the late-send window, archive browser and live legacy deletion.
-- **Open questions / stop conditions:** K-4 / Q-2, Q-8; settle posting barrier and cross-store completion before drafting. K-3's asset side is settled by D-86/P-75.
+- **Open questions / stop conditions:** K-3/K-4 are settled. Missing coverage, images, current permissions or required completion receipts remain unresolved outcomes; apply the accepted manager-first recovery rather than weakening verification.
 
 ### CHAT-20. Close dismissed send gaps and reconcile bounded late history
 
 - **Outcome:** Dismissed uncertainties close with explicit gaps and bounded, verified later correction.
 - **Implementation owner:** Shared skills, local delivery under D-75.
-- **Scope:** Allow closure from current history after per-send dismissal, recording unresolved IDs and gap metadata. Check for late appearances only within 24 hours of closure and on genuine reopen; verify archive/image corrections and retain original notes with annotations.
+- **Scope:** Allow closure from current history after per-send dismissal, recording unresolved IDs and gap metadata. Check all-client late appearances under D-88 only within 24 hours of closure and on genuine reopen; publish verified immutable archive/image corrections and retain original notes with annotations.
 - **Phase:** 3. **Depends on:** CHAT-19, CHAT-5, CHAT-6. **Ordering:** critical path.
-- **Relevant decisions:** D-47–D-49, D-65, D-66, D-70.
+- **Relevant decisions:** D-47–D-49, D-65, D-66, D-70, D-86, D-88, D-89, D-92–D-94.
 - **Acceptance signals:** Expiry/restart cannot extend the watcher or imply cancellation. Corrected messages occur once; independent gaps persist and uncertain images remain protected. Failed correction preserves the existing archive.
 - **Out of scope:** Indefinite watchers, resending, reopening just to correct history and delivery-error dismissal.
-- **Open questions / stop conditions:** K-4 / Q-8; persist closure generation, deadline and correction receipts in the reviewed archive contract.
+- **Open questions / stop conditions:** K-4 is settled. Preserve the original closure deadline and generation checks; incomplete history or failed correction cannot erase gaps or replace a verified archive.
 
 ### CHAT-21. Present every room type and its lifecycle in plateia
 
@@ -5155,7 +5207,7 @@ and no hook, live config or service was changed during these checks.
 - **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
 - **Scope:** Switch room discovery/navigation to the canonical room model, including global/testing lists, issue/PR first use and reopened rooms. Show grey closing state, verified archival removal, the milestone-1 archived notice and its gap marker. Keep creation/join authority in shared chat.
 - **Phase:** 3. **Depends on:** CHAT-18, CHAT-19, CHAT-20, CHAT-13, CHAT-14, CHAT-17. **Ordering:** critical path.
-- **Relevant decisions:** D-9, D-14–D-16, D-28, D-51–D-60, D-65, D-71.
+- **Relevant decisions:** D-9, D-14–D-16, D-28, D-51–D-60, D-65, D-71, D-89, D-93, D-94.
 - **Acceptance signals:** Phone and desktop expose all configured room types and correct user scope. Old archived links cannot create replacements or join; a reopened room restores its conversation and joins through the bound account.
 - **Out of scope:** Archive browsing/search, custom room rules, new workflow logic in the browser and live provisioning.
 - **Open questions / stop conditions:** None beyond the reviewed lifecycle contract and the owner's separately performed room provisioning.
@@ -5166,7 +5218,7 @@ and no hook, live config or service was changed during these checks.
 - **Implementation owner:** Shared skills, local delivery under D-75.
 - **Scope:** Add the resumable per-project cutover procedure/tooling and executed skill guidance: inventory/dry-run, owner warning/closure prerequisites, named parked exceptions, legacy archive, design-room discard without logs, mode switch and new-room convention. Include setup verification for configured owner always-on.
 - **Phase:** 3. **Depends on:** CHAT-21, CHAT-18, CHAT-19, CHAT-20. **Ordering:** critical path.
-- **Relevant decisions:** D-8, D-12, D-13, D-16, D-44, D-52, D-64, D-71, D-74.
+- **Relevant decisions:** D-8, D-12, D-13, D-16, D-44, D-52, D-64, D-71, D-74, D-87–D-94.
 - **Acceptance signals:** Synthetic plans refuse unclosed non-exempt work, preserve permanent/parked rooms, isolate other projects and recover from partial failures. No destructive step occurs as a side effect of reading the plan; record completed and remaining steps.
 - **Out of scope:** Actually warning/closing/discarding/switching live projects during implementation tests or changing canonical owner authority again.
 - **Open questions / stop conditions:** Q-8 operational mapping remains the manager's concrete rollout work; live steps require the applicable owner authorization and D-44 warning.
@@ -5182,7 +5234,7 @@ and no hook, live config or service was changed during these checks.
 - **Explicit web-stopped check (D-93):** In the isolated integration environment, stop only the plateia web process and leave it stopped throughout the scenario. Use independent IRC clients to read/post and address a manager; verify bridge delivery and manager acceptance. Drive an invented work room through freeze, verified structured archive with image copies, and legitimate reopen/owner join through shared chat. Keep the local asset command installed and invoke it on demand; no web listener or resident asset service may be required. Verify shared reconnect recovery and the bounded late check still operate, then start the web process and verify it reads the resulting state without replaying lifecycle actions. Record process/service separation and the observed outcomes; any dependency on a running web process fails this check. Do not stop live services for qualification.
 - **Web-served availability (D-94):** Page, uploads and managed image URLs need not work while the web process is stopped. Verify that restart serves the same retained image URLs and archive readers never required those URLs; do not add an independent image server.
 - **Out of scope:** A new feature batch, duplicated unit tests, production fault injection and claiming HEIC or live cutover verification without evidence.
-- **Open questions / stop conditions:** All K gates and any triggered D-68 decision must be resolved; owner acceptance still determines milestone completion.
+- **Open questions / stop conditions:** K-1–K-4's design contracts are resolved; qualification must prove their agreed outcomes and limits. Any triggered D-68 dependency decision still needs owner approval, and owner acceptance determines milestone completion.
 
 The owner must approve the slice boundaries and design readiness before
 `process-design-doc` begins. It then processes the epic first and one child
