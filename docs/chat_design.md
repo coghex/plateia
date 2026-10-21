@@ -21,7 +21,7 @@ concrete precondition
 - [x] CHAT-1. Define the shared chat API records and compatibility contract — [#37]
 - [x] CHAT-2. Preserve one logical message across IRC multiline fragments — [#38]
 - [x] CHAT-3. Expose authoritative history with a gap-free live handoff — [#39]
-- [ ] CHAT-4. Share owner IRC sessions and verified room membership
+- [x] CHAT-4. Share owner IRC sessions and verified room membership — [#40]
 - [ ] CHAT-5. Persist and fence logical send attempts before IRC writes
 - [ ] CHAT-6. Connect the shared sender to Ergo with conservative recovery
 - [ ] CHAT-7. Publish role and agent-state facts from real sessions
