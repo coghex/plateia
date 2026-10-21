@@ -464,9 +464,9 @@ proportions preserved and no upscaling. The encoded file is at most 1 MiB
 
 Store and archive only the capped image. These limits are independent of
 window size and apply from the first image slice. Fine text in large
-screenshots may require cropping before paste. Input decoding and processing
-need separate resource limits; the stored-file cap is not a total memory
-budget.
+screenshots may require cropping before paste. D-69 bounds source bytes and
+pixels; decoding and concurrency still need a bounded implementation because
+the stored-file cap is not a total memory budget.
 
 ### D-23. Keep each room's unfinished message on the same device
 
@@ -1471,11 +1471,32 @@ Only if that testing finds HEIC arriving unconverted should HEIC support be
 brought forward. Record the reproduction and detected format without
 publishing the owner's photo or metadata, then obtain a separate owner
 decision on the decoder dependency before adding it. Do not silently install
-a decoder or claim that untested phone selection works. This is a verification-triggered
-follow-up, not an unconditional milestone-1 dependency or slice.
+a decoder or claim that untested phone selection works. This is a
+verification-triggered follow-up, not an unconditional milestone-1 dependency
+or slice.
 
 Unsupported inputs show an error and leave the existing draft intact under
 D-18; do not silently flatten animation or send text without a failed image.
+
+### D-69. Limit source images to 20 MiB and 50 megapixels
+
+Owner decision 2026-10-21. Accept P-59. Each source image must be at most
+**20 MiB encoded (20,971,520 bytes)** and **50 million pixels** before
+shrinking. Both limits apply to paste and the image button. Exceeding either
+limit follows D-18's failed-upload rule: show the error, keep the whole draft
+unsent, and let the owner retry or remove the image. Do not silently send
+only its text or discard other draft content.
+
+The saved and archived result still obeys D-22: at most 1280 pixels on the
+longest side and 1 MiB, preserving proportions, without upscaling, and
+shrinking further if necessary. Do not retain the high-resolution source as
+an attachment or archive asset.
+
+Enforce source limits before full decoding and storage as appropriate:
+bound the bytes received and check decoded dimensions before allocating
+the full pixel buffer. These limits alone are not a total processing-memory
+guarantee; bound concurrent image processing as part of the implementation.
+Verify the actual content instead of trusting client-supplied sizes.
 
 ## Proposals
 
@@ -1561,9 +1582,9 @@ Resolved by D-22. The owner approved both limits, shrinking further if needed.
 A square 1280-pixel image uses 6.25 MiB for one four-byte-per-pixel buffer;
 that arithmetic is not a bound on total upload-processing memory.
 
-The incoming file-byte/pixel limits and processing-memory budget still need
-their own technical contract: shrinking the output does not bound decoding
-the input. [Pillow's image documentation](https://pillow.readthedocs.io/en/stable/reference/Image.html)
+D-69 now settles incoming file-byte/pixel limits; the bounded processing
+implementation still needs verification because shrinking the output does
+not bound decoding the input. [Pillow's image documentation](https://pillow.readthedocs.io/en/stable/reference/Image.html)
 documents proportional thumbnail sizing and separate input pixel-count
 checks. It is feasibility evidence, not a library selection or a source for
 the owner-approved numeric limits.
@@ -1944,19 +1965,27 @@ package selection, installation or claim of tested browser/device behavior.
 
 ### P-59. Bound source images before shrinking them
 
-Recommend accepting each source image up to **20 MiB encoded** and
-**50 million pixels** before resizing. These are proposed input/processing
-limits, separate from D-22's much smaller stored result. They allow large
-source photos while bounding upload bytes and decoded image dimensions.
-They are not themselves a total memory bound; implementation must also bound
-concurrent decoding and reject over-limit dimensions before allocating the
-full pixel buffer.
+Resolved by D-69, owner decision 2026-10-21: at most 20 MiB encoded and
+50 million pixels per source image. Exceeding either limit follows the
+failed-upload rule; saved images still obey the 1280-pixel/1-MiB cap.
 
-If either limit is exceeded, show an image error and keep the message unsent
-for removal or replacement under D-18. Never retain the high-resolution
-original as an attachment or archive asset. Accepted images still shrink to
-at most 1280 pixels on the longest side and 1 MiB, shrinking further if
-needed. Owner approval of the source limits is pending.
+### P-60. Make milestone-1 room archives readable as local files
+
+Recommend one folder per room containing its structured conversation log,
+a plain-text transcript and its capped images. The transcript lets the owner
+read the preserved conversation in an ordinary editor before the milestone-2
+archive browser exists. Include sender, timestamp, message line breaks,
+image-file references and D-65/D-66 gap notes and later-confirmed annotations.
+
+Generate the transcript from the same verified structured archive; it is
+not a second conversation authority. Late verified corrections update both
+representations together. Keep a verification manifest for the log and images
+so partial copies are detectable. Exact schema, filenames and atomic update
+mechanics remain implementation details to specify and verify.
+
+This does not add archive browsing or search to the milestone-1 page. The
+choice pending owner approval is providing the readable local transcript
+alongside the structured log and images rather than structured files alone.
 
 ## Open questions
 
@@ -2161,7 +2190,9 @@ uploads after 24 hours; keep needed images and uncertain cases.
 and desktop, using the same draft and immediate upload, posting only on Send.
 **Input formats resolved by D-68:** PNG, JPEG and WebP stills; HEIC only if
 real phone testing exposes unconverted input and the owner separately approves
-the decoder dependency. P-59 proposes source byte/pixel limits. Remaining:
+the decoder dependency.
+**Source limits resolved by D-69:** 20 MiB encoded and 50 million pixels;
+larger inputs follow the failed-upload rule. Remaining:
 device paste and chooser validation, processing mechanics, link access and
 archive mechanics.
 Plateia stores images; shared chat records their links.
@@ -2207,6 +2238,8 @@ The manager owns D-44's concrete activation procedure and parked-room
 mapping. Do not reopen the rejected gradual-migration plan.
 Include the conversation's images in the archive and its verification
 (D-20).
+P-60 proposes a readable local transcript alongside the structured log and
+images, without adding a milestone-1 archive browser.
 For rooms being archived, preserve conversation history and references.
 Discarded design rooms are exempt. Do not assume existing JSONL
 files alone prove a complete archive, or that removing a room from a client
@@ -2380,6 +2413,13 @@ page unconverted, record that result and bring the decoder dependency to the
 owner before adding support. If all tested paths yield supported formats,
 record the tested device/browser and omit the extra decoder. This test is
 still required; it has not been performed during design.
+For D-69, test source byte size and pixel count independently, at each limit
+and just above it. An otherwise valid image at both limits may proceed to
+shrinking; an over-limit source fails before full decoding and leaves the
+draft unsent. Exercise paste and chooser paths, inaccurate declared sizes,
+interrupted uploads and concurrent processing. For each accepted format,
+verify that saved and archived files satisfy both output caps and that no
+high-resolution source becomes a retained attachment.
 Check D-31's desktop Enter/Shift+Enter and phone Return/Send behavior,
 including input-method composition and attempts to submit while an image
 upload is unfinished or the connection is unavailable.
@@ -2577,7 +2617,8 @@ Include D-67's image button in the first image-composition slice, using the
 same upload and draft path as paste. D-68 sets PNG/JPEG/WebP as the initial
 input scope; include real phone-format verification in the image slice and
 keep any HEIC decoder behind its evidence trigger and separate owner decision.
-Settle P-59's source limits before defining image-processing acceptance.
+Apply D-69's source byte/pixel limits from the first image-processing slice,
+with failed-upload behavior and bounded decoding verification.
 Include image preservation in the archive contract from the first image
 slice; placeholder links do not defer D-20's storage obligations.
 Apply D-21's upload-time cap in that first slice too; inline rendering is
