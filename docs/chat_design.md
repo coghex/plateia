@@ -733,6 +733,8 @@ earlier publication-expiry interpretation: this is the single sender's
 decision cutoff, after which it starts no IRC write for that attempt. A
 write started before cutoff can remain in flight; D-35 covers the unknown
 outcome; D-47 allows it to remain unconfirmed when proof cannot be recovered.
+D-79/P-68 supplies the host/browser clock mapping and permits conservative
+earlier expiry; no network delay can extend the ten-second budget.
 
 The shared sender contract requires a serialized check-and-cancel operation,
 not a separate unsynchronized read followed by cancellation. It covers an ID
@@ -1697,6 +1699,31 @@ to change the running server now. If verification exposes a needed buffer
 change, bring its size and evidence back rather than silently changing
 unrelated limits. The accepted slice boundaries stay unchanged.
 
+### D-79. Prefer heartbeat clock samples when they preserve the conservative cutoff
+
+Owner decision 2026-10-21. Accept P-68's goal and conservative-cutoff rule,
+but do not adopt its per-send reservation handshake. First evaluate the
+project manager's heartbeat variant: samples from the bridge's continuous
+clock and boot epoch arrive ahead of time on the live stream, and Send uses
+one content-bearing request. Adopt that variant if equally safe; otherwise
+return the specific failure and evidence to the owner.
+
+The browser uses the sample and its receipt time to calculate a conservative
+deadline, requires a current-document sample newer than the last resume or
+freeze and recent enough to trust, and otherwise waits briefly for a fresh
+heartbeat. The server refuses deadlines beyond its own current time plus ten
+seconds and never extends one. Preserve epoch handling, cancellation
+tombstones, retry generations, D-45/D-47 and actual-browser verification.
+Backgrounding after content submission does not cancel that submitted attempt.
+
+Evaluation outcome 2026-10-21: adopt the heartbeat variant under this
+delegation. P-68 now records the selected protocol, equivalence argument,
+90 synthetic arithmetic cases and required lifecycle safeguards. This is
+design-level equivalence under the same bounded-clock-error assumption,
+not a claim of completed browser/sleep/network integration tests. Those
+activation checks remain mandatory; a failure returns to the owner rather
+than silently weakening the contract or switching protocols.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2342,100 +2369,179 @@ of K-1 and affects CHAT-2, CHAT-3, CHAT-6, CHAT-8 and their consumers.
 Deadline clock semantics and history/live cursor proof remain separate
 unfinished parts of K-1.
 
-### P-68. Reserve server time before submitting content, within the same countdown
+### P-68. Use heartbeat clock samples for a single-request send
 
-Recommend a two-step send using the bridge's continuous monotonic clock.
-The countdown still starts when the owner presses Send, and the saved draft
-still clears immediately. The first request reserves an attempt; it cannot
-publish anything. The second submits its content with an immutable deadline.
-This costs one extra request/response before content submission. It avoids
-comparing the phone's wall clock with the server's or starting a fresh
-ten-second budget when a delayed request reaches the server.
+Resolved by D-79: the goal and conservative cutoff are accepted; the
+heartbeat variant is selected after the comparison below. The original
+per-send reservation proposal remains available at `8472a78bef`; it is not
+an alternate implementation path or an automatic fallback.
 
-The time calculation deliberately errs toward an earlier cutoff. A slow
-reservation response can leave less time to submit, or use the whole budget;
-it never extends the attempt beyond ten seconds from Send. Keep the existing
-“sending...” countdown and confirmed-cancel/red-retry behavior, without a
-new preparation screen. A possibly written attempt remains unconfirmed under
-D-47 regardless of clock or network behavior.
+#### Selected clock and submission contract
 
-Proposed protocol, with durations in a common unit:
+The shared clock provider uses the host's continuous monotonic clock and
+boot epoch. On macOS, `mach_continuous_time` advances during sleep, as the
+installed SDK declarations specify. Convert through the platform timebase;
+bridge and web processes use the same shared provider and epoch. UTC is
+display/audit data, never write eligibility. Keep the epoch through process
+restarts; a host reboot invalidates old, never-started attempts. Write-started
+attempts still require history reconciliation and never restart automatically.
 
-1. At Send, create the logical/command IDs, record browser monotonic time
-   `b0`, and begin the existing ten-second countdown. Enqueue a preparation
-   command binding account, room, immutable content digest and attempt
-   generation. The bridge creates a non-publishable reservation with its
-   continuous-clock sample `s0`, boot epoch and maximum expiry `s0 + 10s`.
-   It durably records the reservation before returning it. Duplicate requests
-   return that same reservation and timestamp; they never refresh it.
-2. Just before submitting content, measure elapsed browser time `r` since
-   `b0`, including the whole first round trip and local processing. Submit
-   only if `r < 10s` and the clock/lifecycle checks below passed. The final
-   deadline is `s0 + 10s - r - guard`, bounded by the reservation's maximum
-   expiry. Use a 100 ms conservative clock/rounding guard, subject to the
-   supported-browser verification below. If no time remains, enqueue cancel
-   rather than sending content. Once fixed, the deadline never increases.
-3. The bridge validates reservation identity, content, epoch and generation,
-   persists that deadline, and starts no write at or after it. Submission,
-   journal, queue and IRC-connection delays consume the same budget. No
-   component resets the timeout to “now plus ten seconds.” The writer checks
-   again immediately before the first batch write. A write already started
-   retains D-45/D-47's existing outcome rules.
-4. At the browser countdown's zero, use the existing serialized check/cancel.
-   A delayed preparation or submission cannot defeat its tombstone. If the
-   reservation response never arrives, no content was submitted; the browser
-   still waits for authoritative cancellation before offering retry. Reload
-   loses the in-memory pending content and never resumes preparation or
-   submission. The reservation alone expires without ever publishing.
-5. Explicit retry reserves a new generation through the same serialized
-   history-check/retry operation, starts a fresh countdown and follows these
-   steps. A repeated retry command cannot mint another reservation. An old
-   generation cannot cancel, replace or renew the new one.
+Piggyback a fresh sample on live stream frames and on a heartbeat at least
+once per second while the page is active. This is part of the existing chat
+stream, not a new service or per-message preparation exchange. Sample the
+shared host clock freshly when constructing the frame; do not relabel an old
+cached heartbeat as new. Carry the clock epoch, stream generation, increasing
+sample sequence and sampled time. The browser records `b_r = performance.now()`
+when it receives the sample, and keeps it only in memory.
 
-Why the calculation is conservative: if the reservation clock sample was
-taken `u` seconds after the click and the browser submits after total elapsed
-time `r`, then `r >= u`. In the server clock, the chosen cutoff is the click
-time plus `10s - (r - u) - guard`. Thus time after the reservation sample,
-including its return trip, shortens the window. For example, one second each
-way for the reservation leaves a cutoff about 8.9 seconds after the click,
-not twelve seconds. This arithmetic assumes the validated elapsed-clock
-behavior below; it is not a claim that arbitrary device clocks are perfect.
+Use a sample only in its current document/stream generation, with no
+intervening hide, freeze, resume or reconnect, and at most **five seconds**
+of browser elapsed time since receipt. Out-of-order samples cannot replace
+a newer one. Invalidate on lifecycle changes; after resume/reconnect create
+a new stream generation and require a freshly sampled frame for it. Old
+queued callbacks/frames are ignored even if delivered after resume. A new
+connection must produce a fresh clock sample, not replay one from its history
+cursor. This establishes that a resumed page does not mistake delivery of an
+old buffered frame for a sample taken after resume.
 
-Host clock: use a shared provider backed on macOS by `mach_continuous_time`,
-converted with the platform timebase and bound to the host's boot epoch.
-It advances during sleep, unlike a process-local timer or a wall-clock
-deadline. Existing SDK declarations document this behavior. Keep the same
-epoch through bridge/web restarts; after a host reboot, old reservations and
-never-started attempts cannot start. Write-started attempts remain subject
-to history reconciliation, not automatic retry. UTC timestamps are for
-display/audit, not write eligibility. A provider/epoch failure refuses new
-writes rather than substituting a clock with different behavior.
+At Send, create the logical/command IDs, record browser time `b0`, start the
+ten-second countdown and clear the saved draft under D-33. With a valid
+sample, submit the content once, carrying an immutable deadline:
 
-Browser clock: use elapsed `performance.now()` in the current document,
-never a phone UTC timestamp sent as server time. Round durations toward
-expiry and include the guard. Invalidate a not-yet-submitted reservation
-across hiding/freezing/resumption or a detected clock discontinuity; do not
-resume its content submission automatically. Test actual phone/desktop
-sleep and background behavior: elapsed time must advance, or the pending
-reservation must be invalidated before submission. A wall-clock comparison
-may detect an anomaly but cannot extend the budget. If the supported browser
-cannot meet the 100 ms error guard and suspension rule, do not activate this
-protocol or silently weaken its deadline; return the evidence.
+`deadline = s + (b0 - b_r) + 10 seconds - guard`
+
+Use the existing **100 ms guard**. Encode server clock values without
+floating-point precision loss, round the signed browser duration downward,
+and never round the final deadline later. The sample value, signed elapsed
+duration, boot epoch and attempt generation accompany the request; the shared API validates their
+shape and the deadline calculation. It rejects a wrong host epoch, an expired
+deadline or a deadline greater than its own current clock plus ten seconds.
+All queueing, validation and connection delays consume the same budget.
+The writer rechecks immediately before its write-start decision. No API
+receipt, reconnect, duplicate command or web restart refreshes the deadline.
+
+If no valid sample is available at the click, wait in the existing sending
+state for a fresh frame, bounded by the **original ten-second countdown**.
+Keep `b0`; do not start a new countdown when the frame arrives. The new
+receipt time can be later than `b0`, so `b0 - b_r` is negative and must remain
+negative. Recompute using that fixed click time; if the resulting budget is
+already exhausted, do not submit content and request cancellation. There is
+no per-send reservation request. If the page hides/freezes before content
+submission, invalidate that unsent attempt and request cancellation; do not
+resume it later. The normal path has already submitted content at Send, so
+backgrounding afterward does not cancel it or alter its deadline.
+
+At zero, use the existing serialized check/cancel and its durable tombstone,
+including when no content request ever reached the bridge. Show retry only
+after confirmed cancellation. Repeated API commands remain idempotent;
+explicit retry keeps the logical ID, creates one fresh attempt generation,
+and gets its own click time/deadline through the same rule. Once submitted,
+the fixed deadline belongs to the attempt, independently of the browser's
+current stream or lifetime. Do not invalidate an already-registered attempt
+merely because the page later changes stream generation. Reload stores or
+restores neither submitted content nor retry state. D-35/D-47 apply to
+unanswered checks and possibly written attempts unchanged.
+
+#### Equivalence and verification
+
+Let `s` be the server sample time, `d >= 0` its transport/queueing delay to
+the browser callback, and `a` the signed interval from that callback to the
+click. In ideal shared units, true server time at the click is `s + d + a`.
+If the measured signed interval has error `e`, the selected deadline is
+`s + a + e + 10s - guard`. It is no later than the true click plus ten
+seconds whenever `e <= guard`, because the difference is
+`e - guard - d <= 0`. Delayed or buffered delivery only makes expiry earlier.
+The proof also holds when the frame arrives after the click (`a < 0`).
+Clamping that interval to zero would invalidate the proof and is forbidden.
+
+The reservation alternative also depends on a bounded browser elapsed-time
+error; it does not remove that assumption. Heartbeat reuse adds elapsed time
+since a previous sample, so the five-second freshness cap bounds that interval.
+A post-click wait is bounded by the original ten seconds. Verify the error
+bound in both directions over those intervals, including timer coarsening
+and rate differences. The unchanged 100 ms guard is an activation condition,
+not an assumption inferred merely from the existence of `performance.now()`.
 The [High Resolution Time specification](https://www.w3.org/TR/hr-time-3/)
-distinguishes monotonic elapsed time from adjustable wall time; it is a
-contract to verify on supported browsers, not evidence of their behavior.
+distinguishes elapsed monotonic time from wall time but does not establish
+the behavior of the owner's actual browser under sleep.
 
-Synthetic arithmetic checks on 2026-10-21 covered asymmetric round trips,
-local delay and a reservation response arriving after ten seconds. They
-confirm the formula in those cases only; no browser, bridge or network
-implementation was tested. CHAT-5/CHAT-6/CHAT-12 must cover those cases plus
-duplicate commands, cancellation before preparation, lost replies, clock
-changes, sleep, reboot, delayed body arrival and crashes at each transition.
+| Case | Required result |
+| --- | --- |
+| Fresh frame available at Send | One content request; fixed conservative deadline. |
+| Asymmetric network delay or buffered frame | Cutoff can be earlier, never later; no latency compensation that adds time. |
+| Frame arrives after Send | Keep the original click time and signed negative interval; no renewed budget. |
+| Stale sample, resume or reconnect | Drop the old generation and await a freshly sampled frame; no old callback can authorize submission. |
+| No fresh frame before zero | No content submission; serialized cancellation/tombstone before retry. |
+| Hide/freeze before content submission | Cancel the unsent attempt; no submission resumed later. |
+| Background/reconnect after submission | Keep the already-fixed deadline and sender state; no automatic cancellation or retry. |
+| Host sleep or wall-clock correction | Continuous host clock still expires the attempt; wall time cannot extend it. |
+| Host reboot or unknown clock epoch | Refuse old never-started attempts; possibly written attempts remain unconfirmed until proved posted. |
+| Browser elapsed-time behavior exceeds the guard | Stop activation and return evidence; do not silently choose a weaker clock or another protocol. |
 
-Owner approval is pending because this adds a round trip and permits a
-conservatively earlier cutoff. It affects K-1 and CHAT-1, CHAT-5, CHAT-6,
-CHAT-10 and CHAT-12; it does not change their approved boundaries. History
-coverage and the remaining API contract still require resolution.
+On 2026-10-21, 90 exact-rational arithmetic cases covered signed sample ages
+from -9.9 to +5 seconds, delivery delays from zero to 60 seconds and elapsed
+errors of -100, 0 and +100 ms. Every resulting cutoff was no later than click
+plus ten seconds. A counterexample confirmed that clamping a post-click
+sample's negative age to zero extends the cutoff. These are design arithmetic
+checks, not a running browser or network test.
+
+Compared with the reservation handshake, this removes its extra send-time
+round trip and gives the same conservative publication-start bound under the
+same clock-error/epoch conditions. Lifecycle invalidation and fresh stream
+generations supply the required resume safety. Therefore select it under
+D-79's conditional authorization. CHAT-5/CHAT-6/CHAT-12 must verify actual
+phone/desktop timing, sleep/background behavior, delayed/replayed frames,
+clock epochs, cancellation races, and crashes before activation. No live
+change or implementation was made during this evaluation.
+
+### P-69. Read Ergo's persisted history through a versioned, read-only shared adapter
+
+Recommend allowing the shared chat library to read the installed Ergo
+SQLite history directly, behind its existing IRC boundary. Use that source
+for persisted-history paging and native/logical-ID lookup, while IRC remains
+the live transport and only publication path. Plateia consumes the normalized
+Python API; it neither opens Ergo's database nor implements its schema.
+
+This addresses the inspected IRC paging limitation recorded under K-1:
+native message-ID cursors become timestamp bounds and can skip tied rows.
+The database exposes a distinct history row ID as well as timestamp, native
+msgid, serialized item and room association. Those provide the inputs for
+stable ordering and exact lookup without an Ergo patch. Reading the actual
+persisted record also avoids treating a shared log's absence as proof that
+nothing posted. Existing D-47 uncertainty remains unchanged.
+
+The cost is a deliberate dependency on Ergo's storage format. Keep a
+versioned backend for the inspected release/schema, verify schema and record
+shape before reading, and refuse unsupported formats rather than guessing.
+The configured database location stays private, outside this repository.
+Use an ordinary read-only SQLite connection that sees the live WAL; do not
+use immutable-file mode for a changing database. Do not write tables, run
+migrations/checkpoints, change retention or administer Ergo through this
+reader. An unreadable or unsupported source is explicit unavailability,
+not an empty conversation or cancelled send.
+
+This proposal selects the read boundary, not a simplistic high-water-mark
+algorithm. The inspected `AddChannelItem` writes the base history row and room
+association separately. A joined row can therefore become readable after
+a larger row ID already exists. Exact history/live reconciliation must keep
+unresolved associations and late insertions visible; merely saving the
+largest joined ID would be unsafe. Snapshot, retention and restart behavior
+must be specified before the affected issues are drafted.
+[Ergo SQLite schema, writes and queries](https://github.com/ergochat/ergo/blob/v2.19.1/irc/sqlite/history.go),
+[history serialization](https://github.com/ergochat/ergo/blob/v2.19.1/irc/history/serialization.go).
+
+An IRC-only reader would retain less storage coupling, but cannot claim
+complete traversal at the verified ambiguous boundaries without another
+proven mechanism. Do not solve that by patching Ergo, silently skipping
+records, or declaring an unprovable send cancelled. Recommend the read-only
+adapter and explicit compatibility check rather than accepting that paging
+limitation for the normal history path.
+
+Owner approval is pending for this storage coupling. It affects K-1,
+especially CHAT-3/CHAT-6 and their archive consumers, without changing their
+approved slice boundaries. No live database read, configuration change or
+implementation is part of this proposal; source inspection and synthetic
+query evidence are the current basis.
 
 ## Open questions
 
@@ -2498,18 +2604,17 @@ the skills repository. Do not revive retired packages by inference.
 Earlier `plateia_design.md` D-16 selected a shared, versioned Python API
 inside the existing bridge/client processes, without a new initial IPC
 daemon. Carry that interface direction forward alongside `plateia_design.md`
-D-78's canonical
-skills ownership. Existing connection/post helpers are not yet the typed
+D-78's canonical skills ownership. Existing connection/post helpers are not yet the typed
 history, membership, delivery and serialized-sender contract required here;
 define those extensions without assuming the retired capture is available.
 
 D-34/D-45 require browser-created IDs, one shared sender serializing
 submission/check/cancel/retry, and a history check before any same-ID retry.
 The writer must not start an IRC write after its attempt's deadline; a write
-already in flight remains unconfirmed until settled. Distinguish a fresh
-retry from a delayed original attempt, and establish deadline clock semantics,
-exclusive writer ownership across restart, and complete authoritative history
-coverage after the old write settles. The current PONG/text-match sender
+already in flight remains unconfirmed until settled. D-77 establishes writer
+ownership; D-79/P-68 fixes the clock mapping. Complete the remaining API
+contract and authoritative history/live coverage, keeping retry generations
+distinct from delayed originals. The current PONG/text-match sender
 does not satisfy this. D-36 rejects browser recovery storage; enforcement
 must work after the browser disappears. P-37 records the proposed protocol.
 Verify its evidence rules and refusal to retry uncertain outcomes. A missing
@@ -3089,10 +3194,12 @@ owner; exact field spelling and test mechanics are implementation details.
 D-75 resolves tracking and local skills delivery. D-68's HEIC question is a
 deliberately conditional verification gate, not a mandatory decoder dependency:
 stop and return evidence to the owner only if actual phone input remains HEIC.
-K-1's execution ownership is resolved by D-77 and its native single-batch
-transport plan by D-78. Its remaining deadline, detailed operation/state
-and history/live contracts are still open. Transport activation still needs
-D-78's verification and separately confirmed setup change.
+K-1's execution ownership is resolved by D-77, its native single-batch
+transport plan by D-78 and its clock protocol by D-79/P-68. Detailed API
+records and history/live contracts remain open; P-69 proposes the history
+read boundary. Transport activation still needs D-78's verification and
+separately confirmed setup change; clock activation still needs actual-browser
+verification under P-68.
 K-2–K-4 remain open. No gate has been marked resolved by boundary approval
 or by source inspection alone.
 
@@ -3101,7 +3208,8 @@ or by source inspection alone.
 The following makes D-34/D-45/D-47/D-48/D-77 concrete without declaring
 the gate resolved. It is a contract to implement and verify, not a claim
 about the current `chatlib` or bridge. D-78 selects the native single-batch
-wire representation; the clock mapping and history/live cursor are still open.
+wire representation and D-79/P-68 fixes the clock mapping. The final API
+records and history/live cursor remain open.
 
 Keep four identities distinct: the browser's logical message ID; the
 attempt generation for each explicit retry; a command ID for idempotent
@@ -3140,9 +3248,9 @@ Required fault cases include cancel arriving before submit, two identical
 retry requests, old submit/cancel arriving after a new generation, a crash
 on either side of every durable transition, and a web restart while the
 bridge continues. Preserve the accepted ten-second cutoff and five-second
-unknown-notice delay; tests must use the eventual explicit clock contract,
-not reset the timeout at HTTP receipt. P-68 proposes the clock/reservation
-protocol and awaits approval. No issue is ready from this table alone.
+unknown-notice delay; tests must use D-79/P-68's selected heartbeat clock
+contract, not reset the timeout at HTTP receipt. No issue is ready from this
+table alone.
 
 ### K-1 evidence: history cursors still need a complete ordering contract
 
@@ -3174,8 +3282,8 @@ Next resolve a history reader with a stable total order and a provable
 history/live handoff, within the no-patch constraint. Do not treat adding an
 end-of-page flag or merely deduplicating overlaps as proof that every row was
 reachable. Any proposal to read Ergo's storage directly would introduce a
-versioned storage dependency and requires its own explicit design choice;
-none is selected here. Positive complete history evidence can still prove a
+versioned storage dependency; P-69 proposes that explicit design choice,
+which remains pending. Positive complete history evidence can still prove a
 send posted. Under D-47, absence after write-started remains insufficient to
 authorize retry regardless of how the paging question is settled.
 
