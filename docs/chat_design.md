@@ -1411,8 +1411,33 @@ Dismissal does not waive other archive verification or resolve agent-delivery
 errors under D-42. D-48's dismissal is per send: another undismissed
 unconfirmed send still keeps closure pending.
 
-P-56 addresses a formerly unconfirmed send that is later found in IRC history;
-do not invent its final archive treatment during implementation.
+D-66 governs later confirmation, with checks limited to 24 hours after
+closure and again on legitimate reopening.
+
+### D-66. Reconcile late sends for 24 hours after closure and on reopen
+
+Owner decision 2026-10-21. Accept P-56 with a fixed limit: check for late
+appearance in authoritative IRC history only during the **24 hours after
+closure**, and again if the room reopens under D-51. Do not keep an indefinite
+watcher on closed rooms. Persist the closure time so a restart does not
+restart or extend the window. Opening an archived-room link under D-58 is
+not reopening the room and does not start another checking window.
+
+If a named send is found and verified, update the archive with the message
+once, in its IRC history order, and include its referenced images. Preserve
+the original gap note with an annotation that the send was later confirmed.
+Clear that send's gap marker only after the archive update is verified;
+remaining unresolved sends keep their markers. The correction leaves the
+room closed and never resends anything. A failed archive update must remain
+recoverable without losing the existing archive or duplicating the message.
+
+After the 24-hour checking window ends, unresolved notes and markers stand;
+check again on a genuine room reopen. The end of checking is not evidence
+that a send was cancelled, never posted or is safe to retry. It also does
+not prove an image unused: D-49 continues to protect uncertain references.
+The two 24-hour periods have different starting events: this one starts at
+room closure; unused-upload cleanup starts only when an image is provably
+unreferenced.
 
 ## Proposals
 
@@ -1850,17 +1875,24 @@ An unresolved send must not keep a room closing indefinitely after dismissal.
 
 ### P-56. Update a closed archive when an unconfirmed send is found later
 
-Recommend reconciling a closed archive if authoritative IRC history later
-contains a send named in its D-65 gap note. Include the message once in its
-IRC history order, preserve its referenced images, and verify the updated
-archive. Keep the original closure note as a record of what was unknown then,
-adding that the send was subsequently confirmed. Remove that send's unresolved
-gap marker only after the archive update succeeds; other gaps keep their marks.
+Resolved by D-66, owner decision 2026-10-21, with the owner's limit: check
+only during the 24 hours after closure and again on reopening. A verified
+late send updates the archive and images, annotates the original note and
+clears its gap marker without reopening or resending. No indefinite watcher.
 
-The room remains closed and no message is resent. This is archive correction,
-not resumed work or a milestone-2 archive browsing feature. A failed update
-remains visible and must be recoverable without duplicating the message or
-losing the existing archive. Owner approval is pending.
+### P-57. Offer an image button alongside pasting
+
+Recommend a small image button in the milestone-1 composer on phone and
+desktop, opening the device's file/photo chooser. This lets the owner select
+an image without copying it first. Pasting remains supported.
+
+Both entry paths use the same upload and composition behavior: insert at the
+current draft position, begin upload immediately, show the image inline in
+the final milestone-1 experience, and post only on Send. Keep D-17's early
+placeholder-link slice and D-18/D-22's failure behavior and stored-image caps.
+This proposes an additional way to choose images, not general file sharing,
+a separate preview/caption screen or a change to retention. Owner approval
+is pending; supported input formats and processing limits remain to settle.
 
 ## Open questions
 
@@ -1908,8 +1940,8 @@ rooms, are addressed under Q-8. Settle how closure preserves a complete file
 log despite outages or late posts, and how completion or
 failure of preservation becomes visible. No archive browser in this milestone.
 D-65 permits closure after dismissal using current IRC history, with an
-explicit unconfirmed-ID note and closed-room gap marker. P-56 covers a send
-that is later found in authoritative history.
+explicit unconfirmed-ID note and closed-room gap marker. D-66 reconciles a
+later-confirmed send within 24 hours after closure and on legitimate reopen.
 
 ### Q-3. What interface separates plateia from shared chat?
 
@@ -2061,6 +2093,7 @@ size on tap/click. No retained high-resolution originals.
 and file at most 1 MiB, shrinking further as needed.
 **Unused-upload cleanup resolved by D-49:** delete provably unreferenced
 uploads after 24 hours; keep needed images and uncertain cases.
+P-57 proposes an image button alongside pasting on phone and desktop.
 Remaining: PNG paste on phone and desktop,
 input/processing limits, link access and archive mechanics.
 Plateia stores images; shared chat records their links.
@@ -2100,7 +2133,8 @@ problems visible until verified closure.
 Still specify normal archive verification and interruption/retry behavior.
 D-65 resolves permanent send uncertainty: after dismissal, archive current
 IRC history and record the gap by logical ID; keep the closed-room marker.
-P-56 proposes reconciling a later-confirmed send into that archive.
+D-66 limits late-send checks to 24 hours after closure and again on reopen;
+verified results update the archive and images and annotate the original note.
 The manager owns D-44's concrete activation procedure and parked-room
 mapping. Do not reopen the rejected gradual-migration plan.
 Include the conversation's images in the archive and its verification
@@ -2216,8 +2250,15 @@ Multiple gaps require independent dismissal; one dismissal must not hide or
 waive another. An unavailable history read, failed archive write or missing
 referenced image still prevents successful verification. Confirm that no
 resend, same-ID retry, cancellation claim or deletion of uncertain images
-occurs, and that the note and marker survive a service restart. P-56's
-later-confirmation policy remains pending before its verification is specified.
+occurs, and that the note and marker survive a service restart.
+Check D-66 with a send found within the 24-hour window: include it once with
+its images, annotate the gap note and clear only its resolved marker after
+verification. Repeated results and interrupted archive writes must not
+duplicate messages or lose the existing archive. Verify that checks stop
+at the persisted closure deadline, including across restarts and outages;
+afterward the unresolved note stands without a watcher. A genuine reopen
+checks again, while an archived-link visit does not. Expiry must neither
+enable retry nor release uncertain image references for cleanup.
 
 The initial cleanup needs synthetic examples of closed-out PR work,
 owner-named parked work, non-exempt open work, existing design rooms and
@@ -2401,8 +2442,10 @@ Include D-46's bounded room-level recovery notice and D-47/D-48's remembered
 dismissal with history loading and the shared sender contract.
 Carry D-65's dismissal exception into shared archive completion, including
 the durable logical-ID note and milestone-1 closed-room gap marker. Preserve
-IRC history as the record and protect uncertain image references. Settle
-P-56's later-confirmation behavior before finalizing the archive slice.
+IRC history as the record and protect uncertain image references. Include
+D-66's bounded late-send checks and verified archive correction in that
+shared lifecycle work: 24 hours from closure, plus a check on genuine reopen,
+with no indefinite watcher or browser-owned background job.
 Exclude D-30's optional current-task line and setting from all milestone-1
 slices; retain only the milestone-2 note.
 The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
