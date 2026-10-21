@@ -1989,6 +1989,11 @@ assigned design channel. The manager continues to coordinate canonical issue
 reviews. This extends D-95's signoff authority without changing the approved
 design, child boundaries, review gates or live-action authority.
 
+Owner clarification 2026-10-21: epics are tracking issues and do not require
+the solvable-issue readiness review gate. Epic #36 is verified and its owner
+filing approval stands. Each filed child still receives the opposite-brand
+issue review launched by the project manager.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
