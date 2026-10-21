@@ -17,7 +17,7 @@ concrete precondition
 
 ## Processing status
 
-- [ ] EPIC. Deliver milestone 1: working chat on phone and desktop
+- [x] EPIC. Deliver milestone 1: working chat on phone and desktop — [#36]
 - [ ] CHAT-1. Define the shared chat API records and compatibility contract
 - [ ] CHAT-2. Preserve one logical message across IRC multiline fragments
 - [ ] CHAT-3. Expose authoritative history with a gap-free live handoff
@@ -46,9 +46,10 @@ These 23 slices follow D-74's approved stage order. D-76 approves their
 boundaries at `e6107c0663`, boundaries only. D-81 settles K-1's design
 contract; D-82 settles K-2's state mapping; D-86 settles K-3's image contract.
 Their integration checks remain required. D-87–D-94 settle K-4's design
-contract, as mapped in the coverage review below. No tracker artifact has
-been filed. D-95 records the owner's readiness approval; each tracker
-artifact still needs separate signoff before filing.
+contract, as mapped in the coverage review below. Epic [#36](https://github.com/coghex/plateia/issues/36)
+is filed; all 23 children remain unprocessed. D-95 records readiness and
+D-96 delegates issue/epic signoff to the project manager within the approved
+design. Each artifact still needs separate signoff before filing.
 
 ## Epic contract
 
@@ -1971,6 +1972,22 @@ This approves the ready design and drafting workflow, not any unpresented
 issue, implementation, installation or live setup. Existing confirmation
 gates for IRC limits, owner persistence, moderator-account creation and
 per-project cutover remain in force.
+
+### D-96. Delegate issue and epic signoff to the project manager
+
+Owner decision 2026-10-21. Approve the epic draft for filing with only the
+specified requirement-1 wording change: each child receives separate signoff
+before filing, by the owner or the project manager under this delegation.
+The delegation covers issue and epic approval when the proposed text matches
+the recorded decisions. It does not permit new design choices, scope changes
+or deviations from an owner decision; those return to the owner.
+
+Bring future child drafts from this design to the project manager for signoff
+rather than directly to the owner. Keep one artifact at a time, present the
+complete exact draft before approval, and report every filed issue in the
+assigned design channel. The manager continues to coordinate canonical issue
+reviews. This extends D-95's signoff authority without changing the approved
+design, child boundaries, review gates or live-action authority.
 
 ## Proposals
 
@@ -4795,8 +4812,8 @@ scope and current canonical-skills ownership. No existing open umbrella
 duplicates this design. Repeat per-artifact deduplication during processing.
 
 D-95 records the owner's readiness approval at `872b7eb262`. Process the epic
-first, then one child at a time with separate owner signoff; the manager runs
-each filed issue's review. No implementation or activation is approved by
+first, then one child at a time with separate owner or delegated project-manager
+signoff under D-96; the manager runs each filed issue's review. No implementation or activation is approved by
 this readiness review.
 
 ### K-1 elaboration: identity and cancellation invariants
@@ -5252,5 +5269,6 @@ and no hook, live config or service was changed during these checks.
 D-76 and D-95 approve the slice boundaries and design readiness.
 `process-design-doc` processes the epic first and one child
 at a time, obtaining separate signoff before each tracker artifact is filed.
-The manager runs filed-issue reviews. D-75's local skills route does not
+Under D-96, bring future child drafts to the project manager for signoff; new
+design choices still go to the owner. The manager runs filed-issue reviews. D-75's local skills route does not
 waive issue approval, exact-commit review or merge authorization.
