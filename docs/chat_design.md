@@ -1941,6 +1941,19 @@ any live service.
 P-82's IRC completion/restart choice is settled. Audit the combined K-4
 contract and this web-off boundary before declaring the gate resolved.
 
+### D-94. Accept web-served unavailability while the web service is off
+
+Owner decision 2026-10-21. Accept P-83 at `68eebb0f8c`: nothing served
+by the web service is guaranteed while it is stopped, including the page,
+uploads and managed image URLs opened from other IRC clients. Restarting
+the service restores the same image links; no independent image server is
+required in milestone 1.
+
+D-93 still applies to everything not web-served: IRC, bridge, managers,
+independent clients, shared room lifecycle and local image archives continue
+working. This resolves the web-off audit's image-URL availability question.
+CHAT-23 verifies both sides of that boundary without stopping live services.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -3974,25 +3987,23 @@ authorized by this proposal.
 
 ### P-83. Allow image URLs to be unavailable while the web process is stopped
 
-Proposed clarification of D-93, not yet approved. Keep image HTTP serving
+Accepted by D-94, owner decision 2026-10-21. Keep image HTTP serving
 with the plateia web process in milestone 1. When that process is stopped,
 the page, uploads and opening managed image URLs are unavailable, including
 opening those URLs from an independent IRC client. IRC still carries the
 links; the capped files, asset references and local archive copies remain
 intact. Starting the web process restores the same URLs without reposting.
 
-Recommend this limit to preserve the selected single web server and
+This limit preserves the selected single web server and
 short-lived asset command, without introducing a separate image-serving
 service. Shared send/pin/export operations continue through the local asset
 command, never through an HTTP image fetch. Archive readers use the recorded
 relative file paths. This does not relax D-93's requirement that IRC, bridge,
 managers, clients and room lifecycle work while the web process is stopped.
 
-The ambiguity is whether D-93's web-off requirement also includes remote
-image viewing from other IRC clients. If it does, the current HTTP-serving
-boundary does not satisfy it; design independent image serving with the
-owner before proceeding, rather than silently adding a persistent service
-or requiring plateia's web process to stay up.
+D-94 resolves the earlier ambiguity: D-93 does not guarantee remote image
+viewing while the web service is stopped. Do not add an independent image
+server or require the web process to stay up for shared lifecycle work.
 
 CHAT-15 owns serving and the local asset command; CHAT-23 must check the
 approved availability boundary with the web stopped and after restart.
@@ -4064,8 +4075,8 @@ protocol. IRC completion evidence remains open.
 D-93 accepts P-82's current-state IRC receipts, reconnect reconciliation and
 explicit crash-persistence gap, and requires shared lifecycle work to continue
 with the web process stopped. Combined K-4 coverage is being audited.
-P-83 flags the remaining web-off image-URL availability question; it does
-not reopen the accepted local image-archive contract.
+D-94 resolves P-83's web-off image-URL availability question without changing
+the accepted local image-archive contract.
 
 ### Q-3. What interface separates plateia from shared chat?
 
@@ -4327,14 +4338,14 @@ Design inspection 2026-10-21, not runtime qualification:
 | Tracker polling, room freeze/archive/reopen and reconnect repair | Shared lifecycle owns these under D-87–D-93. Timers and recovery cannot be started only by a web request or hosted in the web process. |
 | Image pinning, verification and archive export | D-86's installed local asset command opens the catalog/files on demand. It requires neither the web app nor a resident asset process, and must not fetch its own HTTP URLs. |
 | Reading archived images | D-92's immutable bundle includes verified local images and relative references; neither a web URL nor a running web process is needed. |
-| Opening a managed image URL from another IRC client | The proposed HTTP route belongs to the web process. This is the flagged availability ambiguity in P-83; do not claim that remote image viewing works while that process is stopped. |
+| Opening a managed image URL from another IRC client | D-94 accepts that the HTTP route is unavailable with the web process stopped. Verify that restarting it serves the same retained image URLs. |
 
 The first six rows expose no required running-web dependency in the accepted
 design. They are implementation acceptance obligations, not evidence of
 implemented behavior. A worker finding such a dependency must report it as
 a D-93 violation and fix or escalate it before claiming the slice complete.
-The final row needs the owner's clarification before declaring this audit
-closed. No live process was stopped for this inspection.
+D-94 resolves the final row, closing this design dependency audit. Runtime
+qualification remains required. No live process was stopped for this inspection.
 
 The eventual design must make these observable: phone/desktop parity;
 history/live continuity; correct project and general-room routing; no
@@ -5166,9 +5177,10 @@ and no hook, live config or service was changed during these checks.
 - **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
 - **Scope:** Add the bounded end-to-end qualification harness/scenarios for the integrated shared APIs, web app, managed images and lifecycle. Cover cross-component failures not already proved by each slice's local tests, using isolated services and invented data; record phone/desktop acceptance evidence.
 - **Phase:** 3. **Depends on:** CHAT-22. **Ordering:** critical path.
-- **Relevant decisions:** D-1, D-6, D-34–D-49, D-65–D-74, D-86–D-93.
+- **Relevant decisions:** D-1, D-6, D-34–D-49, D-65–D-74, D-86–D-94.
 - **Acceptance signals:** Restart during send plus image retention plus archive/reopen preserves the agreed outcomes. Shared work continues with plateia stopped; all three stage checkpoints pass and no deferred feature is needed to complete milestone 1.
 - **Explicit web-stopped check (D-93):** In the isolated integration environment, stop only the plateia web process and leave it stopped throughout the scenario. Use independent IRC clients to read/post and address a manager; verify bridge delivery and manager acceptance. Drive an invented work room through freeze, verified structured archive with image copies, and legitimate reopen/owner join through shared chat. Keep the local asset command installed and invoke it on demand; no web listener or resident asset service may be required. Verify shared reconnect recovery and the bounded late check still operate, then start the web process and verify it reads the resulting state without replaying lifecycle actions. Record process/service separation and the observed outcomes; any dependency on a running web process fails this check. Do not stop live services for qualification.
+- **Web-served availability (D-94):** Page, uploads and managed image URLs need not work while the web process is stopped. Verify that restart serves the same retained image URLs and archive readers never required those URLs; do not add an independent image server.
 - **Out of scope:** A new feature batch, duplicated unit tests, production fault injection and claiming HEIC or live cutover verification without evidence.
 - **Open questions / stop conditions:** All K gates and any triggered D-68 decision must be resolved; owner acceptance still determines milestone completion.
 
