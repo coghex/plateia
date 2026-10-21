@@ -2254,6 +2254,73 @@ their consumers. D-77 does not resolve the rest
 of K-1: exact deadline clock semantics, operation records, fragment identity,
 history/live cursors and evidence validation still need the detailed contract.
 
+### P-67. Fit one supported message into one native Ergo multiline batch
+
+Recommend using one native multiline batch for every covered logical message,
+including the full 65,536-byte text limit, instead of publishing several
+independent batches and adding a cross-batch commit protocol. Retain the
+browser-created logical ID as a client-only tag on the batch opener, bind it
+to the authenticated account and room, and retain the native history msgid
+as its alias. Individual IRC lines remain explicitly grouped by the batch.
+This preserves CHAT-2's approved outcome and boundary.
+
+At setup, propose Ergo's native `limits.multiline.max-bytes: 65536` and
+`max-lines: 65536`. The line ceiling accommodates even a valid nonempty
+64 KiB message made mostly of line breaks without silently adding a smaller
+text limit. Preserve every supported leading/trailing blank line and space;
+do not send an empty/all-line-break batch, which the protocol rejects.
+Require negotiated multiline support and enough capacity before any write.
+If those preconditions fail, report the configuration problem without
+publishing part of the message or falling back to independent posts.
+
+This is a server configuration proposal for later owner-controlled setup,
+not an Ergo patch or authorization to change anything live now. The native
+limits are server-wide, not a plateia-only setting. The current server
+configuration and the complete wire/output-buffer budget must be checked
+before activation; a 64 KiB body is not a 64 KiB IRC exchange. In particular,
+the installed sample configuration has a 96k send queue. Do not assume that
+queue can hold the worst-case multiline output or enlarge unrelated limits
+silently. Any needed buffer change must be sized, tested and brought back
+with evidence before activation.
+
+Evidence reviewed 2026-10-21:
+
+- Ergo 2.19.1 exposes the byte and line limits as configuration and advertises
+  their values. The installed sample uses 4096 bytes and 100 lines.
+  [Configuration and capability construction](https://github.com/ergochat/ergo/blob/v2.19.1/irc/config.go).
+- Its batch handler accumulates the incoming lines and dispatches the message
+  after a valid closing batch marker; its receive handler does not dispatch
+  each batched line as a separate post. The session retains batch state.
+  **Inference:** using one batch removes publication between independent
+  chunks of the same logical message. This is source evidence, not a fault
+  test or proof of durable history insertion.
+  [Batch and message handlers](https://github.com/ergochat/ergo/blob/v2.19.1/irc/handlers.go),
+  [session batch state](https://github.com/ergochat/ergo/blob/v2.19.1/irc/client.go).
+- IRCv3 defines newline/concat reconstruction and requires client-only tags
+  on the opening batch. Match the installed draft capability names and verify
+  exact tagged live/history round trips rather than assuming all versions
+  implement the latest draft identically.
+  [Multiline specification](https://ircv3.net/specs/extensions/multiline).
+
+The sender still records write-started before sending the opener. Once that
+attempt starts, loss of confirmation remains potentially published: receiving
+a valid closing marker may have committed the whole message. D-45/D-47's
+history authority and unconfirmed/no-retry rule remain unchanged, including
+the known delivery-before-history gap. This proposal does not claim an
+atomic transaction between delivery and durable history or change the deadline.
+
+Before activation, CHAT-2/CHAT-6 must verify one complete history identity and
+one agent dispatch at the size/line limits, exact text and logical-tag replay,
+interleaved independent messages, interrupted batches, lost final replies,
+capability changes, and realistic output buffering/fakelag on isolated Ergo.
+Do not add a second multi-batch fallback if verification fails: bring the
+evidence back before changing the transport design or approved text limit.
+
+Owner approval is pending for the server-wide limit change and single-batch
+transport choice. This is part of K-1 and affects CHAT-2, CHAT-3, CHAT-6,
+CHAT-8 and their consumers. Deadline clock semantics and history/live cursor
+proof remain separate unfinished parts of K-1.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -2906,6 +2973,53 @@ K-1's execution ownership is resolved by D-77. Its remaining deadline,
 operation/state, fragment and history/live contracts are still open.
 K-2–K-4 remain open. No gate has been marked resolved by boundary approval
 or by source inspection alone.
+
+### K-1 elaboration: identity and cancellation invariants
+
+The following makes D-34/D-45/D-47/D-48/D-77 concrete without declaring
+the gate resolved. It is a contract to implement and verify, not a claim
+about the current `chatlib` or bridge. P-67 separately proposes the wire
+representation; the clock mapping and history/live cursor are still open.
+
+Keep four identities distinct: the browser's logical message ID; the
+attempt generation for each explicit retry; a command ID for idempotent
+API requests; and native IRC msgids identifying history evidence. A retry
+keeps the logical ID and immutable account, room and content, but gets a new
+attempt generation and deadline. A repeated HTTP request keeps its command
+ID and cannot create another generation. Batch references and response
+labels are transient framing/correlation values, never durable message IDs.
+The browser keeps submitted content and its retry information only in memory.
+
+| Journal fact | Permitted transition/result | Insufficient evidence |
+| --- | --- | --- |
+| No attempt has been registered | A check/cancel records an account/room-bound cancellation tombstone for that ID and generation before confirming cancellation. A later original request cannot bypass it. | A missing row alone cannot return a retryable cancellation. |
+| Registered, no write started | Under writer serialization, either cancel/expire durably or record write-started durably before socket access. The competing operation observes the committed result. | An HTTP timeout or an uncommitted cancellation request. |
+| Write-started | Match the complete message in authoritative IRC history, or retain unconfirmed. Restart does not resume the remaining bytes or retry the attempt. | Missing history, a PONG, disconnected socket, new writer lock or failed local log append. |
+| Posted with matching history evidence | Return the same posted message and native aliases for repeated submit/check/retry requests; do not write again. | Matching text without matching logical ID, account, room and exact content. |
+| Confirmed cancelled before any write | An explicit retry checks history and atomically creates at most one new attempt generation. If required evidence is unavailable or contradictory, do not publish. | A request to retry an unknown, expired-old-generation or write-started attempt. |
+| Unconfirmed notice dismissed | Persist dismissal independently of the send outcome; suppress that notice across devices. Later history evidence can still settle the underlying send. | Dismissal never authorizes retry, erases a delivery error or cancels a possible IRC publication. |
+
+Cancellation of an older generation cannot cancel a newer retry, and a
+delayed submission cannot replace immutable content or refresh its deadline.
+Reject identity/content conflicts explicitly. A cancellation tombstone need
+not hold message text, but must identify the account, room, logical ID and
+attempt it fences. Persist commands and state changes transactionally;
+enqueue acknowledgement means durable registration, not IRC posting.
+
+The single writer validates account authority, room eligibility, capability,
+size and deadline before marking write-started. That mark is deliberately
+conservative: a crash immediately afterward may leave an unconfirmed send
+even if no byte was actually written. It buys the accepted at-most-once
+behavior by refusing to guess. Journal corruption, unsupported state/API
+versions and failure to acquire the writer lock cannot fall back to direct
+posting. Reconciliation can read history without becoming a second writer.
+
+Required fault cases include cancel arriving before submit, two identical
+retry requests, old submit/cancel arriving after a new generation, a crash
+on either side of every durable transition, and a web restart while the
+bridge continues. Preserve the accepted ten-second cutoff and five-second
+unknown-notice delay; tests must use the eventual explicit clock contract,
+not reset the timeout at HTTP receipt. No issue is ready from this table alone.
 
 ### Stage checkpoints
 
