@@ -2965,6 +2965,143 @@ D-85 settles K-3's upload encoding and processing behavior. The
 asset-reference/pinning/export contract and its web-down operation remain
 open, as does K-4. The 23 slice boundaries stay unchanged.
 
+### P-75. Keep one image catalog and expose local pin/export operations without the web process
+
+Proposed completion of K-3, not yet approved. Plateia owns the capped image
+files and one durable SQLite asset catalog outside the repository. Shared
+chat owns send, message and room/archive lifecycle decisions. Both use a
+versioned local asset API; the browser never edits the catalog, and shared
+chat does not depend on the HTTP server to preserve or export an image.
+
+Implement that API in the installed plateia asset package, callable through
+a short-lived JSON command using its configured Python 3.11+ environment.
+It opens the same catalog and files whether the web process is running or
+stopped. It does not import the web application or Pillow to pin, verify or
+copy an already-capped asset. This adds no persistent service and copies no
+chat code into plateia. Shared callers depend on the versioned command
+contract, not the catalog schema or the checkout's internal module paths.
+Ordinary text chat continues if the asset interface is unavailable; an image
+send or archive that needs it reports an unresolved failure and retains its
+references instead of claiming success.
+
+#### Asset identity, storage and access
+
+Each completed upload has an opaque asset ID, immutable capped bytes,
+SHA-256 digest, byte length, dimensions, media type and storage/schema
+version. Retrying the same upload ID returns the same asset; a replacement
+uses a new upload ID. Do not overwrite an existing asset ID with different
+bytes. Cross-upload content deduplication is unnecessary for milestone 1.
+Write/flush the capped file before committing its complete catalog record
+and initial draft reference. Recover interrupted staging explicitly; neither
+an orphan file nor a catalog row without verified bytes is a complete image.
+
+Messages carry stable managed image URLs and asset IDs in the shared logical
+record. Recognize a managed link only through configured canonical origins,
+the exact asset route and a valid catalog identity, never by filename suffix
+or a resemblance to the hostname. The browser reads capped images through
+the existing private access boundary; serve only complete catalog objects
+with the recorded safe image media type and `nosniff`. Opening the image
+returns the same capped bytes, not another resolution or an original. Outside
+URLs remain ordinary links under D-73. Archive entries also name the asset
+ID, digest and a relative local image path, so reading an archive requires
+neither a live URL nor the web process.
+
+#### References and the draft-to-send handoff
+
+The catalog stores individual durable references, not a caller-maintained
+integer count. A reference identifies its kind, owner/producer, stable use ID
+and generation: draft slot, send/retry, unresolved send, observed message or
+archive generation. Acquire/release is idempotent and scoped to that exact
+reference. A late release cannot remove a newer generation or another use.
+Only the corresponding shared lifecycle can release send/message/archive
+references; a browser operation can release only its bound draft/slot use.
+
+| Transition | Required ordering |
+| --- | --- |
+| Upload completes | Commit the capped asset with its draft reference before returning success. A removed/replaced slot has a generation tombstone; late upload completion cannot recreate that draft attachment. |
+| Send clears the browser draft | D-33 still clears local draft storage immediately. Before any IRC write, durably acquire a send/retry reference for every managed asset and record its receipt in the shared send journal. Only then release the submitted draft revision's references. |
+| Send fails or is cancelled before writing | Keep references while the current page may offer retry. A confirmed cancellation alone does not mean the image is unused. Release that retry use only on explicit disposal/replacement evidence; loss of the page without such evidence remains uncertain under D-49. |
+| Send becomes posted | Acquire the message reference before releasing its send-only reference. Unconfirmed outcomes retain protection even after notice dismissal or the 24-hour late-check window. |
+| Managed link arrives through another IRC client | Observing the reference in live delivery or history acquires a message reference. Do not require that the message originated in plateia. A live reference protects its image even before durable history confirmation. |
+| Draft/image is removed | Release only the exact acknowledged draft-slot revision. Other drafts, messages, retries and archives retain their independent references. Browser inactivity, reload and missing local storage are not releases. |
+
+Pin acquisition and shared send registration are separate durable operations,
+not a claimed transaction across two stores. On a crash between them, retain
+the extra pin and reconcile by stable operation IDs. Favor a retained asset
+over a dangling published link. If an asset is missing, corrupt, being
+deleted or cannot be pinned, refuse the image-bearing attempt before writing;
+do not strip its links and send the remaining text. Existing deadlines still
+apply while obtaining asset evidence. Catalog operations cannot extend them.
+
+#### Offline archive export and cleanup
+
+The local API supplies versioned operations to inspect/verify an asset,
+acquire/release a reference, look up an upload, pin an archive's asset set and
+export that pinned set. Requests include command/use IDs and generations;
+responses include catalog version/epoch, exact IDs/digests and explicit
+complete, missing, conflicting or unavailable results. Unknown versions fail
+explicitly. Shared callers never infer successful preservation from an exit
+code without the matching result or from a file path alone.
+
+Shared archiving first pins the complete referenced set, then asks the asset
+API to copy each immutable capped file into its private staging directory.
+The helper accepts destinations only within the configured archive root;
+the browser cannot supply filesystem paths. Re-read and verify each copied
+file's digest and length, returning a manifest of IDs, relative paths, media
+types, dimensions and checksums. Include that information in the one
+self-describing structured archive under D-70. A manifest is preservation
+metadata, not a second conversation transcript. Long copy work holds neither
+the sender execution path nor a long catalog transaction.
+
+Shared lifecycle code verifies the conversation and image set before
+publishing the archive generation and reporting closure. Failure leaves
+the previous complete generation intact and the new pins retained for
+recovery. Preserve stable asset IDs on reopen; corrections add their required
+pins/files before publishing a new verified generation. K-4 still determines
+the posting barrier, exact close/reopen generations and final publication.
+The image export contract does not waive unavailable history or missing files.
+
+Use D-49's 24-hour grace only after the catalog can establish no reference
+and no unresolved producer/staging operation. Record `unreferenced_since`;
+new use cancels that grace. Under catalog serialization, recheck immediately
+before marking an asset deleting. New acquisitions either protect it before
+that transition or fail before a caller may publish a link. Complete deletion
+recoverably; do not leave a missing blob labeled available. Reconciliation
+gaps, interrupted reference delivery, catalog corruption or uncertain browser
+disposal prevent a claim of unused and therefore prevent cleanup. An old
+timestamp, empty query result or absent browser heartbeat is insufficient.
+Shared positive references must be reconciled before cleanup can advance;
+never use a negative IRC history scan to release a known uncertain send pin.
+
+This implements existing retention choices, including their conservative
+cost: an abandoned draft/retry with no provable release can retain its capped
+images. Do not introduce age-based draft expiry or a new owner cleanup UI.
+Keep the canonical image while any log/message/archive reference needs it;
+the archive's verified local copy also remains self-contained. No files are
+removed as part of accepting this design.
+
+#### Verification and ownership
+
+The repository currently has only the routine-inbox package and no asset
+catalog/export implementation. This is a new contract, not an existing
+capability verified by source inspection. CHAT-15 provides the catalog, local
+API, reference transitions and cleanup; CHAT-16 supplies browser draft and
+retry-disposal evidence; CHAT-19/CHAT-20 consume archive operations from shared
+lifecycle code under the later K-4 contract. Keep those approved boundaries.
+
+Verify crash points around file/catalog commit, pin/enqueue/draft release,
+retry disposal, deletion versus new acquisition and archive copying. Stop the
+web process and prove that the local API can pin/export/verify invented
+assets, including missing or corrupted files and stale generations. Exercise
+two drafts sharing one asset, a lost upload reply, a direct IRC managed link,
+an unconfirmed send and a late archive correction. Missing evidence must keep
+the image and expose the failure, not silently complete cleanup or closure.
+
+Acceptance would settle the remaining K-3 design contract together with
+D-83–D-85, subject to its implementation and deployment checks. K-4 and
+whole-design readiness would remain open; no tracker artifact or live
+configuration change is authorized by this proposal.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -3177,7 +3314,7 @@ D-84 accepts P-73's Pillow 13.0.0 and Python 3.11 minimum for the new web
 application, with the existing inbox compatibility preserved.
 D-85 accepts P-74's bounded JSON uploads, separate image worker and normalized
 output behavior. Asset references and archive export remain
-separate K-3 work.
+separate K-3 work, proposed in P-75's local catalog/pin/export contract.
 
 **Composition resolved by D-17:** paste into the message, visible inline
 while typing before Send; no separate preview step. A placeholder link may
