@@ -358,6 +358,14 @@ keep the room visible with its title grey. Show unresolved delivery or
 archive problems rather than claiming closure succeeded. Once closure is
 verified, mark it archived and remove it from active lists under D-14.
 
+Owner amendment 2026-10-21, D-65: a dismissed unconfirmed send does not keep
+closure pending indefinitely. Finalize from IRC history as it stands, with
+an explicit archive note identifying each unresolved logical send ID and a
+small gap marker on the closed room. Until dismissal, the grey closing rule
+still applies. Other archive failures and missing referenced images remain
+subject to verification; this exception does not turn an unavailable history
+read into a complete archive.
+
 This applies to normal closure and rooms being archived in the initial
 cleanup; discarded design rooms require no saved or verified log (D-13).
 An outage can keep
@@ -1060,6 +1068,9 @@ outcome to posted/cancelled, or authorizes retry. Preserve the shared sender's
 unresolved record so a delayed request cannot become a new send merely
 because its notice was dismissed. A later authoritative posted result remains
 part of normal history.
+For room closure, D-65 additionally permits finalizing the current-history
+archive after dismissal, with a named-ID gap note and closed-room marker;
+the send's outcome itself remains unconfirmed.
 
 If the owner chooses to retype and Send, that is a **new message with a new
 logical ID**. It is independent of the original; its ID cannot deduplicate
@@ -1376,6 +1387,32 @@ This is an approved setup action, not an action performed during design.
 Verify both zero-client retention and restoration of persisted membership
 after an Ergo restart. Keep this membership setting separate from D-61's
 already completed owner-authority configuration.
+
+### D-65. Finalize closure after dismissal, recording the unconfirmed gap
+
+Owner decision 2026-10-21. Reject P-55 in favor of finalizing from IRC history
+as it stands once the owner dismisses the unconfirmed-send notice under
+D-47. Before dismissal, keep D-15's grey closing state. After dismissal,
+that unresolved outcome no longer prevents closure; the room can leave the
+active list once the history-based archive and its images are verified.
+
+IRC history remains the conversation record. Do not insert an unconfirmed
+send into the archived conversation as though it posted, or treat dismissal
+as cancellation or permission to retry. Instead, include an explicit archive
+note naming each unconfirmed send's logical ID and stating that it was never
+confirmed at closure. Keep the shared dismissal and uncertainty records;
+D-49 still protects any images whose use cannot be disproved.
+
+The closed room carries a small marker identifying this gap. Include it on
+the milestone-1 archived-room notice under D-58; this does not add an archive
+browser or a way to join or reopen the room. The marker distinguishes an
+archive closed with a known uncertainty from one with no such recorded gap.
+Dismissal does not waive other archive verification or resolve agent-delivery
+errors under D-42. D-48's dismissal is per send: another undismissed
+unconfirmed send still keeps closure pending.
+
+P-56 addresses a formerly unconfirmed send that is later found in IRC history;
+do not invent its final archive treatment during implementation.
 
 ## Proposals
 
@@ -1806,17 +1843,24 @@ was made during design; the separate owner-authority setup is already complete.
 
 ### P-55. Keep closure pending while a send remains unconfirmed
 
-Recommend retaining D-15's grey closing state when an accepted send still
-has an unprovable outcome under D-47, even if its notice was dismissed.
-Dismissal hides the send notice; it does not establish whether the final
-conversation archive is complete. Preserve available history, images and
-the unresolved send record while waiting, and explain why closure is pending.
+Rejected by D-65, owner decision 2026-10-21. Until dismissal, keep the grey
+closing state. After dismissal, finalize from current IRC history, name each
+unconfirmed logical send ID in an archive note and mark the closed room's gap.
+An unresolved send must not keep a room closing indefinitely after dismissal.
 
-Because D-47 permits permanent uncertainty, this can keep a finished-work
-room closing indefinitely. The alternative would permit a completed archive
-that explicitly records the unresolved outcome and needs a policy for any
-later-discovered message. That exception to verified closure is not approved.
-Settle this interaction before specifying the archive completion protocol.
+### P-56. Update a closed archive when an unconfirmed send is found later
+
+Recommend reconciling a closed archive if authoritative IRC history later
+contains a send named in its D-65 gap note. Include the message once in its
+IRC history order, preserve its referenced images, and verify the updated
+archive. Keep the original closure note as a record of what was unknown then,
+adding that the send was subsequently confirmed. Remove that send's unresolved
+gap marker only after the archive update succeeds; other gaps keep their marks.
+
+The room remains closed and no message is resent. This is archive correction,
+not resumed work or a milestone-2 archive browsing feature. A failed update
+remains visible and must be recoverable without duplicating the message or
+losing the existing archive. Owner approval is pending.
 
 ## Open questions
 
@@ -1863,8 +1907,9 @@ room; design remains in general. Existing rooms, including grouped request
 rooms, are addressed under Q-8. Settle how closure preserves a complete file
 log despite outages or late posts, and how completion or
 failure of preservation becomes visible. No archive browser in this milestone.
-P-55 asks whether a permanently unconfirmed send keeps closure pending even
-after its notice is dismissed; do not infer archive completeness from dismissal.
+D-65 permits closure after dismissal using current IRC history, with an
+explicit unconfirmed-ID note and closed-room gap marker. P-56 covers a send
+that is later found in authoritative history.
 
 ### Q-3. What interface separates plateia from shared chat?
 
@@ -2053,8 +2098,9 @@ posts until reopened, retaining the file log.
 already-accepted posts and verify the archive; keep the title grey and
 problems visible until verified closure.
 Still specify normal archive verification and interruption/retry behavior.
-P-55 carries the unresolved interaction between D-15's verified closure and
-D-47's potentially permanent send uncertainty.
+D-65 resolves permanent send uncertainty: after dismissal, archive current
+IRC history and record the gap by logical ID; keep the closed-room marker.
+P-56 proposes reconciling a later-confirmed send into that archive.
 The manager owns D-44's concrete activation procedure and parked-room
 mapping. Do not reopen the rejected gradual-migration plan.
 Include the conversation's images in the archive and its verification
@@ -2160,6 +2206,18 @@ Verify shared delivery and room lifecycle with the plateia process stopped.
 Verify localhost binding and the browser boundary with synthetic requests.
 Exact tests and fixtures follow the approved contracts rather than inventing
 behavior here.
+
+Check D-65 with an unconfirmed send in a closing room. Before dismissal it
+keeps the room grey; after dismissal the shared lifecycle can finish from
+available, fully read IRC history and verified images. The archive includes
+an explicit note with the unresolved logical ID, not a fabricated posted
+message, and the milestone-1 closed-room notice displays the gap marker.
+Multiple gaps require independent dismissal; one dismissal must not hide or
+waive another. An unavailable history read, failed archive write or missing
+referenced image still prevents successful verification. Confirm that no
+resend, same-ID retry, cancellation claim or deletion of uncertain images
+occurs, and that the note and marker survive a service restart. P-56's
+later-confirmation policy remains pending before its verification is specified.
 
 The initial cleanup needs synthetic examples of closed-out PR work,
 owner-named parked work, non-exempt open work, existing design rooms and
@@ -2341,6 +2399,10 @@ unconfirmed outcome when P-37 cannot prove settlement or recording. Do not
 add an IRC patch, browser pending-send storage or reload restoration.
 Include D-46's bounded room-level recovery notice and D-47/D-48's remembered
 dismissal with history loading and the shared sender contract.
+Carry D-65's dismissal exception into shared archive completion, including
+the durable logical-ID note and milestone-1 closed-room gap marker. Preserve
+IRC history as the record and protect uncertain image references. Settle
+P-56's later-confirmation behavior before finalizing the archive slice.
 Exclude D-30's optional current-task line and setting from all milestone-1
 slices; retain only the milestone-2 note.
 The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
