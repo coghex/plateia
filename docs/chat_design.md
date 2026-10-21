@@ -1787,6 +1787,18 @@ Normal saved images recover without reselection; D-18 still governs upload
 failure and retry/removal. K-3's encoding, processor/pins, resource bounds and
 archive/export contract remain to be settled. K-4 remains open separately.
 
+### D-84. Use pinned Pillow 13 and scope the new app to Python 3.11+
+
+Owner decision 2026-10-21. Accept P-73: use pinned Pillow 13 for image
+processing, initially 13.0.0, with a Python 3.11+ floor for the new web
+application only. Give that application separate 3.11/3.14 checks and keep
+the existing inbox's Python 3.10 support and 3.10/3.14 checks. Follow P-73's
+dependency locking and CI aggregation contract. Installation belongs to
+the implementing slice; nothing is installed or changed live now.
+
+This settles K-3's processor and scoped Python compatibility choice, not its
+remaining encoding, processing budgets or asset-reference/export contract.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2801,7 +2813,7 @@ K-4 remains open separately.
 
 ### P-73. Use current Pillow with a Python 3.11 floor for the new web application
 
-Proposed for K-3, not yet approved. Use **Pillow 13.0.0** for server-side
+Resolved by D-84, owner decision 2026-10-21. Use **Pillow 13.0.0** for server-side
 PNG/JPEG/WebP validation and shrinking, and require **Python 3.11 or newer**
 for the new web application. Qualify that application on Python 3.11 and
 3.14; use the existing local 3.14 runtime for deployment. The existing
@@ -2837,8 +2849,8 @@ dependency lock for local qualification and CI. Recheck the selected release
 at implementation for required fixes, documenting any pin update and running
 the same checks rather than using a floating version.
 
-This settles only the processor choice and the scoped Python compatibility
-contract if approved. It does not claim a dependency was installed or tested,
+This settles the processor choice and the scoped Python compatibility
+contract under D-84. It does not claim a dependency was installed or tested,
 or settle output encoding, processing budgets, storage/reference ownership or
 archive export. Those remain K-3 work; K-4 remains open. The 23 approved
 slice boundaries do not change.
@@ -3051,8 +3063,8 @@ These thresholds describe evidence age, not D-35/D-46's shorter UI wait bounds.
 D-83 accepts P-72's capped-only image retention and the explicit reselection case
 when reload interrupts an image before a recoverable capped copy exists.
 This qualifies D-23's draft recovery without retaining HD originals.
-P-73 proposes Pillow 13.0.0 and a Python 3.11 minimum for the new web
-application, with the existing inbox compatibility preserved; it is pending.
+D-84 accepts P-73's Pillow 13.0.0 and Python 3.11 minimum for the new web
+application, with the existing inbox compatibility preserved.
 
 **Composition resolved by D-17:** paste into the message, visible inline
 while typing before Send; no separate preview step. A placeholder link may
@@ -3821,7 +3833,7 @@ and no hook, live config or service was changed during these checks.
 
 - **Outcome:** The browser reaches shared chat through one protected Python adapter as its bound owner.
 - **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
-- **Scope:** Add the Python application/static serving and typed shared-API adapter. Bind Phone/Desktop profiles through the server-backed cookie and enforce the approved localhost/Tailscale, Host, Origin and mutation protections. Expose history/live, send and membership operations without duplicating shared workflow, and extend the existing Python CI matrix to cover the new backend.
+- **Scope:** Add the Python 3.11+ application/static serving and typed shared-API adapter. Bind Phone/Desktop profiles through the server-backed cookie and enforce the approved localhost/Tailscale, Host, Origin and mutation protections. Expose history/live, send and membership operations without duplicating shared workflow. Add separate backend 3.11/3.14 checks under D-84, retaining the inbox's 3.10/3.14 matrix.
 - **Phase:** 1. **Depends on:** CHAT-3, CHAT-4, CHAT-6, CHAT-7, CHAT-8, CHAT-9. **Ordering:** critical path.
 - **Relevant decisions:** D-6, D-25, D-61, D-62, D-75.
 - **Acceptance signals:** Synthetic requests reject arbitrary actors and invalid bindings; operations keep their original owner. API failures stay typed and static/API serving uses one protected origin.
@@ -3881,7 +3893,7 @@ and no hook, live config or service was changed during these checks.
 - **Relevant decisions:** D-18–D-23, D-49, D-68, D-69.
 - **Acceptance signals:** Input/output limits and malformed-image failures are enforced. Drafts, retries, uncertain sends and archives protect assets across restart; only provably unused objects expire. No retained HD attachment and no unconditional HEIC dependency.
 - **Out of scope:** Inline rendering, archive UI and live data cleanup.
-- **Open questions / stop conditions:** K-3 / Q-6; settle storage/reference ownership, upload encoding, processing dependency and failed-draft persistence first.
+- **Open questions / stop conditions:** K-3 / Q-6; D-83/D-84 settle interrupted-draft recovery and the pinned processor. Storage/reference ownership, upload encoding and resource bounds remain.
 
 ### CHAT-16. Compose image links through paste and the image button
 
