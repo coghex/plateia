@@ -18,11 +18,34 @@ concrete precondition
 ## Processing status
 
 - [ ] EPIC. Deliver milestone 1: working chat on phone and desktop
+- [ ] CHAT-1. Define the shared chat API records and compatibility contract
+- [ ] CHAT-2. Preserve one logical message across IRC multiline fragments
+- [ ] CHAT-3. Expose authoritative history with a gap-free live handoff
+- [ ] CHAT-4. Share owner IRC sessions and verified room membership
+- [ ] CHAT-5. Persist and fence logical send attempts before IRC writes
+- [ ] CHAT-6. Connect the shared sender to Ergo with conservative recovery
+- [ ] CHAT-7. Publish role and agent-state facts from real sessions
+- [ ] CHAT-8. Expose durable per-recipient bridge delivery outcomes
+- [ ] CHAT-9. Apply mention routing to complete logical messages
+- [ ] CHAT-10. Serve a protected Python web adapter with browser owner binding
+- [ ] CHAT-11. Build the first text chat page with live history and composition
+- [ ] CHAT-12. Complete browser send recovery and remembered dismissal
+- [ ] CHAT-13. Show room users and owner join/leave controls
+- [ ] CHAT-14. Display bridge-backed agent-delivery errors on messages
+- [ ] CHAT-15. Store capped images with durable references and safe cleanup
+- [ ] CHAT-16. Compose image links through paste and the image button
+- [ ] CHAT-17. Render managed images inline and verify phone formats
+- [ ] CHAT-18. Implement shared room identities and issue/PR lifecycle mapping
+- [ ] CHAT-19. Verify structured room archives with their images and membership cleanup
+- [ ] CHAT-20. Close dismissed send gaps and reconcile bounded late history
+- [ ] CHAT-21. Present every room type and its lifecycle in plateia
+- [ ] CHAT-22. Provide guarded per-project cutover and owner-specific guidance
+- [ ] CHAT-23. Qualify the complete milestone across service and browser boundaries
 
-No child slices are fully defined yet. D-17 records the agreed image delivery
-sequence: placeholder link first, inline image later within milestone 1.
-Remaining material choices precede full dependency ordering and issue
-boundaries.
+These 23 proposed slices follow D-74's approved stage order. Boundaries await
+owner review, and K-1–K-4 identify the remaining contracts that gate affected
+issue drafting. No tracker artifact has been filed; the design is not ready
+for issue processing yet.
 
 ## Epic contract
 
@@ -33,13 +56,17 @@ boundaries.
   closed issue/PR conversations and their images are preserved together;
   PNG sharing works; and the
   five V-12 guarantees hold through connection loss and process restarts.
+  Apply the owner's explicit unconfirmed-send/dismissal and archive-gap
+  rules in D-47/D-48/D-65/D-66 rather than claiming every uncertain send
+  can be proved posted or cancelled.
   The concrete acceptance scenarios follow the decisions below.
 - **Users and operators:** one owner; the existing shared chat services and
   agents continue operating independently of the web application.
 - **Arc label:** None proposed.
 - **Publication:** this document belongs to `coghex/plateia`, on `master`.
-  Shared workflow changes belong in the skills repository under D-78; their
-  handoff and tracking must be settled before processing affected slices.
+  All milestone-1 issues use that tracker. Shared workflow implementation
+  stays in the skills repository under D-78, using D-75's local review and
+  delivery route; plateia code uses its own pull requests.
 
 ## Current state and evidence
 
@@ -60,7 +87,7 @@ Read-only checks on 2026-10-20:
 | Skills repository, `chat/scripts/chat-bridge`, `project_for`, `handle` | Routing uses project channel names/prefixes. Ordinary direct agent delivery is restricted by sender category, unlike V-6's any-agent communication. Queuing precedes logging, with crash replay permitted. These are integration gaps, not evidence that the new contract is implemented. |
 | Skills repository, `chat/SKILL.md`, identity and delivery sections | Stable identities, session discovery, history, outbox, delivery and acceptance machinery exist. Their exact guarantees and usable interface require focused verification before designing the web adapter. IRC login alone is not presence evidence. |
 | Shared `chat-bridge`, `Deliveries._record`, `_dead`, `accept`, `accepted`, and `pchat trace`, checked for D-41 | The bridge records attempts, dead letters and authenticated replies/acks. Delivery success and recipient acceptance are separate. Attempt records omit a structured recipient field; acceptance closes matching pending items, while late acknowledgements also have a separate record. `trace` renders request-oriented text, not a typed per-message/per-recipient outcome. A shared read contract is required for plateia. |
-| GitHub issue inventory, `coghex/plateia` | No open issues on 2026-10-20. Earlier foundation epic #10 and collaboration epic #26 are closed; neither is an open milestone 1 tracker. Recheck overlap before readiness. |
+| GitHub issue/PR inventory, `coghex/plateia`, refreshed 2026-10-21 | No open issues or PRs. Earlier foundation epic #10 and collaboration epic #26 are closed; neither is an open milestone 1 tracker. Recheck overlap before readiness. |
 | `.github/workflows/ci.yml`, refreshed 2026-10-20 | Python 3.10/3.14 tests feed an always-running `build-test` aggregate that rejects any non-success dependency. There is no frontend package or Node build yet. D-27 extends this existing gate. |
 
 The brief identifies general and project testing rooms as not yet configured.
@@ -1590,6 +1617,29 @@ order, not every implementation mechanism, final issue boundary or readiness.
 The owner still approves design readiness and each issue before filing;
 the manager runs filed-issue reviews.
 
+### D-75. Track shared work in plateia and deliver skills changes locally
+
+Owner decision 2026-10-21, relayed by the project manager after the tracking
+question. Every milestone-1 issue is tracked in `coghex/plateia`, including
+issues whose implementation belongs in the canonical skills repository.
+Keep that repository local only for now; do not add a remote or copy chat
+implementation into plateia.
+
+For each shared-chat issue, a worker changes a branch in a separate checkout
+of the local skills repository. An opposite-brand reviewer approves the
+exact commit, the relevant local test suites run with their results recorded,
+and the owner or a level-2 agent authorizes merging into the canonical
+checkout. The plateia issue names the skills change and links the reviewed
+commit and test evidence as completion. There is no invented GitHub PR or CI
+gate for the local repository. A changed commit needs review of that commit.
+
+Plateia implementation remains in its own isolated worktree and PR with the
+normal review and CI gates. Keep cross-repository changes in separate slices
+with explicit dependencies and completion evidence. Shared-chat issues may
+be drafted for owner signoff on this route; this does not waive the design
+readiness checkpoint, individual issue approval or the brief's prohibition
+on live changes during design.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2096,6 +2146,18 @@ usable text chat first, images second, and the new room model, archives and
 per-project cutovers third, all in milestone 1. The manager gives the owner
 the D-44 warning before any live cutover. Reviewable slice boundaries and
 issue signoffs follow; no live change is authorized here.
+
+### P-65. Use the proposed 23 dependency-ordered slice boundaries
+
+Recommend the CHAT-1–CHAT-23 breakdown in the delivery plan: 13 shared-skills
+changes and 10 plateia changes, each with a separate outcome, implementation
+owner, dependencies, acceptance evidence and scope limit. All use plateia's
+tracker and D-75's applicable delivery route.
+
+This proposal asks for agreement on the work boundaries within D-74's
+approved order. K-1–K-4 remain explicit design-contract gates; accepting
+the boundaries does not resolve those contracts or declare the design ready
+for issue processing. Owner approval is pending.
 
 ## Open questions
 
@@ -2701,96 +2763,319 @@ dismissed. No new browser-push path belongs in milestone 1.
 
 ## Delivery plan
 
-P-64 proposes text chat first, image sharing second, and the shared work-room
-lifecycle/archive/cutover third, all within milestone 1. This ordering is
-awaiting the owner's decision; it is not yet a finalized slice ledger.
+D-74 approves three stages: text chat, images, then the new room lifecycle,
+archives and per-project cutovers. The following **23 proposed slices** turn
+that order into reviewable changes. Their boundaries are for owner review;
+the design remains `exploring`. No issue or pull request is created here.
 
-No fully specified child slices yet. Define stable `CHAT-N` entries and mirror them in
-Processing status after blocking choices are settled. Each must identify its
-owning repository, dependencies and a reviewable outcome. Include D-8's
-owner-specific global skill change with the room-model work; do not make
-changing the live convention an advance prerequisite for unrelated work.
-Keep D-24's disconnected typing within normal composer work. D-34's
-deadline/check/cancel/retry contract requires explicit shared-chat delivery
-work and network-fault coverage before the web sender can claim safe retry.
-Resolve Q-3's writer ownership, settlement and attempt-fencing contract before
-defining those slices. Do not defer it as a low-priority local-network edge
-case or add an offline send queue.
-Include D-36/D-45's writer cutoff, logical ID in authoritative IRC history
-and complete history lookup in that contract. Apply D-47's accepted
-unconfirmed outcome when P-37 cannot prove settlement or recording. Do not
-add an IRC patch, browser pending-send storage or reload restoration.
-Include D-46's bounded room-level recovery notice and D-47/D-48's remembered
-dismissal with history loading and the shared sender contract.
-Carry D-65's dismissal exception into shared archive completion, including
-the durable logical-ID note and milestone-1 closed-room gap marker. Preserve
-IRC history as the record and protect uncertain image references. Include
-D-66's bounded late-send checks and verified archive correction in that
-shared lifecycle work: 24 hours from closure, plus a check on genuine reopen,
-with no indefinite watcher or browser-owned background job.
-Use D-70's single self-describing structured archive format in that work;
-exclude plaintext transcript generation. Include D-71's all-owner PART
-cleanup and verified rejoin on opening the reopened room in the same shared
-lifecycle contract, with protection against stale closure operations.
-Exclude D-30's optional current-task line and setting from all milestone-1
-slices; retain only the milestone-2 note.
-Apply D-72's literal rendering in the first working-chat slice. Exclude
-Markdown rendering from milestone-1 dependencies and slices; no later
-milestone number is assigned. Apply D-73 in the inline-image slice and do
-not add an external-link preview service or dependency.
-The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
-dependency pins and web CI job feeding `build-test`. Keep implementation
-in normal isolated code worktrees; this document does not install tools.
-Include D-16's design-agent use of general in that change, with no dedicated
-design-room slice or conversation migration. General's live provisioning
-remains the owner's action.
-Include D-12/D-44's clean cutover as an explicit per-project rollout step:
-manager warning, owner closure of non-exempt tracker work, normal legacy
-archive, then project switch and issue/PR work. Include marked parked-room
-exceptions and isolation of projects not yet switched. The manager owns
-the concrete rollout details; this is not postponed to milestone 2's archive
-browser and is not a gradual migration of every active room.
-Discard existing design rooms during that rollout without saved logs.
-Include D-51's reopening and replacement-PR behavior in the shared room
-lifecycle work, with history and images preserved through repeated closures.
-Include D-58's milestone-1 archived-link notice with room opening; it must
-consult shared lifecycle state before attempting to join or create a channel.
-Include D-52's main-room convention in the same shared/global skill change.
-Apply D-59's milestone-1 creation eligibility in that shared room contract.
-Include D-60's membership controls and persistent joins across view switches
-with room opening, backed by the shared IRC membership interface.
-Carry D-63's browser-independent sessions and cross-client membership into
-that interface, including updates from the owner's existing clients. Include
-D-64's approved always-on setup for all owner accounts, without extending it
-to agents or assistants. This is membership retention, not another
-owner-authority configuration task; no live change is made during design.
-Reuse D-61's completed shared multi-owner support (`7ce2401`) in the
-posting/membership slices, alongside D-62's browser binding and the shared
-sender's two-account integration. Do not add a redundant support slice or
-pending rollout task for the already applied phone-account owner change.
-Gate account actions on the configured identity and shared permission checks,
-without a fallback account or a separate plateia owner-authority list.
-Custom rooms and their own rules remain a deferred future requirement with
-no milestone-1 slice or speculative implementation.
+All issues use `coghex/plateia`. “Shared skills” means implementation in the
+canonical local skills repository through D-75: separate checkout/branch,
+exact-commit opposite-brand review, recorded local tests and an owner/level-2
+authorized merge. “Plateia” means an isolated worktree and one focused PR
+with the normal opposite-brand review and CI. No slice combines code from
+both repositories in one change; shared completion evidence gates consumers.
 
-Image sequencing from D-17: first deliver pasted-image insertion as a
-placeholder link in the message; then deliver inline image display,
-including in the message being composed. Both are milestone 1 work. Record
-their final issue boundaries and dependencies once the remaining upload
-contract is settled; D-25/D-26 have settled the page framework and editor.
-Include D-67's image button in the first image-composition slice, using the
-same upload and draft path as paste. D-68 sets PNG/JPEG/WebP as the initial
-input scope; include real phone-format verification in the image slice and
-keep any HEIC decoder behind its evidence trigger and separate owner decision.
-Apply D-69's source byte/pixel limits from the first image-processing slice,
-with failed-upload behavior and bounded decoding verification.
-Include image preservation in the archive contract from the first image
-slice; placeholder links do not defer D-20's storage obligations.
-Apply D-21's upload-time cap in that first slice too; inline rendering is
-the later presentation change.
-Include D-49's reference tracking and 24-hour cleanup of provably unused
-uploads in the first image-storage slice, without expiring saved drafts.
+Dependencies are required completion evidence, not just an issue being closed
+or a branch existing. Documentation lands through `docs-push` as it becomes
+ready; executable skills and test-consumed contracts travel with their code.
+Each slice owns meaningful local verification; CHAT-23 covers remaining
+cross-component fault cases rather than postponing testing until the end.
 
-The owner explicitly
-approves readiness before issue processing, and each tracker artifact gets
-separate signoff. The project manager runs filed-issue reviews.
+Public plateia CI uses invented contract fixtures; it must not vendor the
+private shared source or depend on a remote that does not exist. Real shared
+integration runs in isolated local checkouts against the reviewed skills
+commit and records sanitized completion evidence under D-75. Record which
+checks actually ran in CI versus locally; neither substitutes for the other.
+
+### Contract gates before affected issue drafting
+
+These are explicit unfinished design work, not permission to let implementers
+invent behavior. The owner requested the dependency decomposition now; the
+gates keep the draft useful without calling unresolved contracts ready.
+Resolve each affected gate in this design before drafting that implementation
+issue. Bring any new user-visible behavior or serious ownership choice to the
+owner; exact field spelling and test mechanics are implementation details.
+
+| Gate | Required resolution | Affected slices |
+| --- | --- | --- |
+| K-1 / Q-3 | Versioned Python API execution in existing shared processes; single-writer ownership and restart fencing; durable journal states; browser/server deadline clock basis; logical fragment identity/completeness; authoritative history/live cursor and retry evidence. Retain D-47's unknown outcome whenever proof is absent. | CHAT-1–CHAT-6, CHAT-8–CHAT-12 |
+| K-2 / Q-5 | Verify sources that distinguish idle, working and waiting on the owner from mere live-session registration; specify freshness and unknown results without guessing. | CHAT-7, CHAT-13 |
+| K-3 / Q-6 | Upload encoding within the approved browser boundary, processor/pins and resource bounds; persisted image drafts before/after failed upload without retained HD attachments; one asset-reference/export contract usable by shared archiving while the web process is down. | CHAT-15–CHAT-17, CHAT-19 |
+| K-4 / Q-2, Q-8 | Tracker-to-room lifecycle evidence/generations; posting barrier covering other IRC clients; authoritative archive coverage, image verification and atomic completion/correction; membership cleanup and interruption/reopen recovery. | CHAT-18–CHAT-22 |
+
+D-75 resolves tracking and local skills delivery. D-68's HEIC question is a
+deliberately conditional verification gate, not a mandatory decoder dependency:
+stop and return evidence to the owner only if actual phone input remains HEIC.
+
+### Stage checkpoints
+
+- **Stage 1, CHAT-1–CHAT-14:** usable text chat in existing rooms on phone
+  and desktop, including history, drafts, correct identity/membership, user
+  lists, send recovery and bridge-backed delivery errors. Intermediate PRs
+  are not represented as a finished reliable chat experience.
+- **Stage 2, CHAT-15–CHAT-17:** managed image links, then inline images,
+  with reference retention/cleanup and both input methods from the first
+  image feature. Stored caps apply from the start.
+- **Stage 3, CHAT-18–CHAT-23:** new room types and issue/PR conventions,
+  verified archives, bounded gap correction, per-project cutover readiness
+  and full integration evidence. No live cutover is bundled into a code
+  merge; the manager supplies the D-44 warning and concrete rollout plan.
+
+### CHAT-1. Define the shared chat API records and compatibility contract
+
+- **Outcome:** Consumers exchange versioned chat facts without reinterpreting unknown data.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Add versioned Python records/codecs for rooms, complete logical messages, history cursors, freshness, membership, sender attempts and recipient delivery facts. Define stable IDs and explicit unknown/error results; anticipate image references and lifecycle generations without implementing those features.
+- **Phase:** 1. **Depends on:** none. **Ordering:** critical path.
+- **Relevant decisions:** D-2–D-6, D-37, D-41, D-61, D-75.
+- **Acceptance signals:** Synthetic producer/consumer fixtures round-trip exact text and identities; unsupported versions fail explicitly. The codecs match the reviewed K-1 operation/state contract; unknown versions cannot silently reinterpret data.
+- **Out of scope:** IRC connections, UI, room activation and a new IPC daemon.
+- **Open questions / stop conditions:** K-1 / Q-3; exact API execution and deadline contract must be reviewed first.
+
+### CHAT-2. Preserve one logical message across IRC multiline fragments
+
+- **Outcome:** A supported long post is one exact logical message in live delivery and history.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Extend the shared encoder and bridge reassembly with explicit logical ID, ordered fragment identity and completeness checks up to 65,536 UTF-8 bytes. Preserve leading/trailing blank lines, spacing and attachment-link text. Retain native message-ID aliases needed for history and acceptance.
+- **Phase:** 1. **Depends on:** CHAT-1. **Ordering:** critical path; may run in parallel once its listed dependencies and contract gates are satisfied.
+- **Relevant decisions:** D-37, D-38, D-45, D-72.
+- **Acceptance signals:** Interleaved posts never merge; duplicate, missing and reordered fragments do not dispatch partial instructions. Complete live and replayed records match byte-for-byte, including boundary-size Unicode input.
+- **Out of scope:** Browser rendering, retry policy and heuristic merging of legacy posts.
+- **Open questions / stop conditions:** K-1 / Q-3; prove the chosen tag/grouping round-trip against isolated Ergo before activation.
+
+### CHAT-3. Expose authoritative history with a gap-free live handoff
+
+- **Outcome:** Readers move between older history and live arrivals without gaps or duplicate messages.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Add bounded page reads, logical-ID lookup and a cursor-based history/live handoff behind the Python API. Return coverage and freshness explicitly. Deduplicate native and logical aliases; expose incomplete history without claiming a missing send was cancelled.
+- **Phase:** 1. **Depends on:** CHAT-1, CHAT-2. **Ordering:** critical path; may run in parallel once its listed dependencies and contract gates are satisfied.
+- **Relevant decisions:** D-37–D-39, D-45–D-48.
+- **Acceptance signals:** Messages arriving during paging appear once; reconnect and equal-timestamp boundaries preserve order. Incomplete/denied history stays unknown. Legacy ungrouped posts remain separate.
+- **Out of scope:** A browser disk history cache, archive browsing and delivery-state inference.
+- **Open questions / stop conditions:** K-1 / Q-3; cursor ordering, paging completeness and lookup evidence must be fixed.
+
+### CHAT-4. Share owner IRC sessions and verified room membership
+
+- **Outcome:** Owner accounts retain real, shared membership independently of browser lifetime.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Expose join, part and membership observations for every configured owner through persistent account sessions in existing shared processes. Attach to Ergo's same-account multiclient identity; preserve account-specific membership and emit confirmed/stale/unknown results.
+- **Phase:** 1. **Depends on:** CHAT-1. **Ordering:** critical path; may run in parallel once its listed dependencies and contract gates are satisfied.
+- **Relevant decisions:** D-54–D-56, D-60–D-64, D-75.
+- **Acceptance signals:** Two clients share a synthetic account's joins/parts; another account stays independent. Browser/web-process closure does not part it. Setup verification covers owner-only always-on without applying live settings.
+- **Out of scope:** Issue/PR room creation policy, browser profile UI, changing owner authority or agent session records.
+- **Open questions / stop conditions:** K-1 / Q-3; session ownership and restart reconciliation contract. Live always-on setup remains a separate authorized operation.
+
+### CHAT-5. Persist and fence logical send attempts before IRC writes
+
+- **Outcome:** Every covered send has a durable, fenced attempt state before publication can start.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Implement the exclusive-writer journal and submit/check/cancel/retry/dismiss state machine, binding logical ID to actor, room and immutable content. Persist attempt generations and deadlines; allow conclusive cancellation only with evidence. Exercise an injected writer without live IRC.
+- **Phase:** 1. **Depends on:** CHAT-1. **Ordering:** critical path; may run in parallel once its listed dependencies and contract gates are satisfied.
+- **Relevant decisions:** D-33–D-36, D-45, D-47, D-48, D-61.
+- **Acceptance signals:** Competing writers, delayed old attempts, crash windows and repeated requests cannot produce a second write. Pre-write cancellation is durable; dismissal survives restart and does not change the outcome.
+- **Out of scope:** Ergo publication/history integration, browser pending-send storage and offline send queues.
+- **Open questions / stop conditions:** K-1 / Q-3; journal durability, fencing and cross-process clock semantics must be settled before this issue.
+
+### CHAT-6. Connect the shared sender to Ergo with conservative recovery
+
+- **Outcome:** Owner sends recover from authoritative evidence and cannot retry an unprovable outcome.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Route covered owner submissions through the serialized sender, retaining the account and logical ID in IRC. Check authoritative history before retry; recover positive complete matches. Preserve unconfirmed outcomes whenever publication or recording cannot be disproved.
+- **Phase:** 1. **Depends on:** CHAT-2, CHAT-3, CHAT-4, CHAT-5. **Ordering:** critical path.
+- **Relevant decisions:** D-34–D-38, D-45–D-48, D-61, D-63.
+- **Acceptance signals:** Isolated network/crash tests cover lost replies, partial batches and history-write gaps. No new write begins after its deadline, uncertain attempts cannot retry, and account changes cannot move an operation.
+- **Out of scope:** Ergo patches, replacing the server, text-match deduplication and migration of unrelated legacy outbox entries.
+- **Open questions / stop conditions:** K-1 / Q-3; distinguish covered sends from existing outbox traffic and prove no bypass for their IDs.
+
+### CHAT-7. Publish role and agent-state facts from real sessions
+
+- **Outcome:** Every displayed agent state has real session evidence and explicit freshness.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Normalize session-backed agent/assistant presence, role colors, project scope and idle/working/waiting-on-owner evidence into the shared read API. Include timestamps and stale/unknown states; keep owner membership a separate input.
+- **Phase:** 1. **Depends on:** CHAT-1. **Ordering:** critical path; may run in parallel once its listed dependencies and contract gates are satisfied.
+- **Relevant decisions:** D-5, D-28–D-30, D-53–D-55, D-57.
+- **Acceptance signals:** Ended sessions disappear after reliable inventory; outages preserve honest stale/unknown evidence. Waiting is not invented from registration or IRC login, and assistants have no status pip.
+- **Out of scope:** Current-task lines, new status semantics and browser-specific session discovery.
+- **Open questions / stop conditions:** K-2 / Q-5; verify authoritative evidence for all three agent states before defining mappings.
+
+### CHAT-8. Expose durable per-recipient bridge delivery outcomes
+
+- **Outcome:** Clients can read each recipient's durable delivery failure and eventual acceptance.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Add structured recipient/logical-message attribution to bridge delivery and acceptance records and expose a typed read projection. Join late authenticated acceptance to earlier failures without scraping trace prose.
+- **Phase:** 1. **Depends on:** CHAT-1, CHAT-2. **Ordering:** critical path; may run in parallel once its listed dependencies and contract gates are satisfied.
+- **Relevant decisions:** D-41–D-43.
+- **Acceptance signals:** Only the intended recipient's acceptance clears its error; dead letters and late replies survive restart. Resent/redirected copies remain independent and existing phone alerts are unchanged.
+- **Out of scope:** New browser push, dismissal of delivery errors and milestone-2 progress indicators.
+- **Open questions / stop conditions:** Q-3; finalize aliases between native acknowledgement IDs and complete logical messages in K-1.
+
+### CHAT-9. Apply mention routing to complete logical messages
+
+- **Outcome:** Complete messages reach the intended recipients once without granting authority.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Dispatch a complete logical post once: ordinary project messages to the manager, explicit mentions to named sessions, general-room posts only to mentions. Support approved cross-project addressing while preserving executor authority checks and project-specific policies.
+- **Phase:** 1. **Depends on:** CHAT-2, CHAT-8. **Ordering:** critical path; may run in parallel once its listed dependencies and contract gates are satisfied.
+- **Relevant decisions:** D-4, D-16, D-41–D-43.
+- **Acceptance signals:** No partial batch wakes an agent; replay does not create duplicate work. Untagged general messages remain undispatched and routing never grants authority or changes acceptance/phone-alert policy.
+- **Out of scope:** Creating general/testing rooms, issue/PR room mapping and executing work inside plateia.
+- **Open questions / stop conditions:** Q-3; existing legacy identities and project-specific delivery contracts must remain compatible.
+
+### CHAT-10. Serve a protected Python web adapter with browser owner binding
+
+- **Outcome:** The browser reaches shared chat through one protected Python adapter as its bound owner.
+- **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
+- **Scope:** Add the Python application/static serving and typed shared-API adapter. Bind Phone/Desktop profiles through the server-backed cookie and enforce the approved localhost/Tailscale, Host, Origin and mutation protections. Expose history/live, send and membership operations without duplicating shared workflow, and extend the existing Python CI matrix to cover the new backend.
+- **Phase:** 1. **Depends on:** CHAT-3, CHAT-4, CHAT-6, CHAT-7, CHAT-8, CHAT-9. **Ordering:** critical path.
+- **Relevant decisions:** D-6, D-25, D-61, D-62, D-75.
+- **Acceptance signals:** Synthetic requests reject arbitrary actors and invalid bindings; operations keep their original owner. API failures stay typed and static/API serving uses one protected origin.
+- **Out of scope:** Copied chat code, browser IRC credentials, new shared IPC daemon and live service installation.
+- **Open questions / stop conditions:** K-1 / Q-3 and Q-7; concrete adapter/execution and browser streaming contract before drafting.
+
+### CHAT-11. Build the first text chat page with live history and composition
+
+- **Outcome:** The owner can read, compose and post literal text on phone and desktop.
+- **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
+- **Scope:** Introduce Svelte/Vite/TypeScript, Tiptap's minimal schema, pinned toolchain/lockfile and web CI feeding build-test. Implement responsive project/room navigation, literal live/history rendering, paging and Jump to latest, text drafting and posting in existing rooms.
+- **Phase:** 1. **Depends on:** CHAT-10. **Ordering:** critical path.
+- **Relevant decisions:** D-1, D-23–D-28, D-31, D-38–D-40, D-72.
+- **Acceptance signals:** Phone and desktop can read and post through the real adapter; drafts retain exact text across room switches/reload. Keyboard and scrolling rules hold; web checks/build pass alongside existing Python tests.
+- **Out of scope:** Images, Markdown, work-room migration and claiming stage 1 complete before CHAT-12–CHAT-14.
+- **Open questions / stop conditions:** Q-7; resolve room URL/navigation contract and include owner-access binding from CHAT-10.
+
+### CHAT-12. Complete browser send recovery and remembered dismissal
+
+- **Outcome:** The browser presents every send outcome honestly through delay, failure and reload.
+- **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
+- **Scope:** Present the countdown, zero/unconfirmed states, one transient failed-send entry and same-ID retry only after confirmed cancellation. Clear the saved draft at Send, honor shared dismissal, and bound history syncing without persisting pending-send data in the browser.
+- **Phase:** 1. **Depends on:** CHAT-11, CHAT-6. **Ordering:** critical path.
+- **Relevant decisions:** D-32–D-36, D-45–D-48.
+- **Acceptance signals:** Latency, reload and lost-response scenarios match the shared outcome; no local timeout enables retry. A later message replaces the failure, and a new uncertainty is not muted by an old dismissal.
+- **Out of scope:** Agent-delivery error dismissal, offline sending and browser pending-send recovery storage.
+- **Open questions / stop conditions:** K-1 / Q-3; use the reviewed sender outcomes, not UI inference.
+
+### CHAT-13. Show room users and owner join/leave controls
+
+- **Outcome:** The room shows the correct users, roles and status pips with working membership controls.
+- **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
+- **Scope:** Render project/global user lists with role colors, approved pips and freshness. Keep separate joined owner entries and live assistants without pips. Add room Join/Leave controls and mention insertion while preserving drafts.
+- **Phase:** 1. **Depends on:** CHAT-11, CHAT-4, CHAT-7. **Ordering:** critical path.
+- **Relevant decisions:** D-28–D-30, D-40, D-53–D-64.
+- **Acceptance signals:** Phone panels and desktop columns share behavior. Changes from another IRC client appear correctly; a rerender does not undo Leave. Stale evidence cannot manufacture membership or idle status.
+- **Out of scope:** Current-task lines, archived-room controls and session scanning in the web app.
+- **Open questions / stop conditions:** K-2 / Q-5; consume the canonical state mapping from CHAT-7.
+
+### CHAT-14. Display bridge-backed agent-delivery errors on messages
+
+- **Outcome:** A posted message's unresolved agent-delivery failure remains visible until acceptance.
+- **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
+- **Scope:** Attach persistent per-recipient delivery errors to posted messages using the shared projection, including late acceptance. Keep original and redirected/resubmitted copies independent and preserve bridge alerts.
+- **Phase:** 1. **Depends on:** CHAT-11, CHAT-8, CHAT-9. **Ordering:** critical path.
+- **Relevant decisions:** D-41–D-43.
+- **Acceptance signals:** Errors survive view switches/reloads; only correct recipient acceptance clears them. Viewing an error creates no new phone alert and offers no dismissal.
+- **Out of scope:** Queued/delivered/accepted progress badges and browser push.
+- **Open questions / stop conditions:** None beyond the reviewed CHAT-8 contract.
+
+### CHAT-15. Store capped images with durable references and safe cleanup
+
+- **Outcome:** Capped image assets survive every valid reference and expire only when proven unused.
+- **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
+- **Scope:** Add bounded PNG/JPEG/WebP processing, protected upload/read endpoints, durable capped assets and draft/send/archive reference accounting. Include 24-hour deletion only after proven unreferenced, plus a documented archive export/pinning contract usable without the web process.
+- **Phase:** 2. **Depends on:** CHAT-12, CHAT-13, CHAT-14. **Ordering:** critical path.
+- **Relevant decisions:** D-18–D-23, D-49, D-68, D-69.
+- **Acceptance signals:** Input/output limits and malformed-image failures are enforced. Drafts, retries, uncertain sends and archives protect assets across restart; only provably unused objects expire. No retained HD attachment and no unconditional HEIC dependency.
+- **Out of scope:** Inline rendering, archive UI and live data cleanup.
+- **Open questions / stop conditions:** K-3 / Q-6; settle storage/reference ownership, upload encoding, processing dependency and failed-draft persistence first.
+
+### CHAT-16. Compose image links through paste and the image button
+
+- **Outcome:** The owner can paste or select images into a persistent draft and send their managed links.
+- **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
+- **Scope:** Insert managed placeholder links at the draft position from paste or chooser, upload immediately and post only on Send. Preserve text/images across switches and reloads, tie references to send IDs, and block the whole message on failed or unfinished uploads.
+- **Phase:** 2. **Depends on:** CHAT-15, CHAT-11. **Ordering:** critical path.
+- **Relevant decisions:** D-17–D-19, D-23, D-33, D-38, D-49, D-67–D-69.
+- **Acceptance signals:** Both phone and desktop entry paths use the same durable draft/upload flow. Cancelled selection preserves the draft; failed uploads remain retryable/removable and image links count toward the text limit.
+- **Out of scope:** Inline images, external image fetching and retaining an HD source as a saved attachment.
+- **Open questions / stop conditions:** K-3 / Q-6; validate the exact pre-upload/failed-image reload representation.
+
+### CHAT-17. Render managed images inline and verify phone formats
+
+- **Outcome:** Managed images appear inline in the draft and conversation on phone and desktop.
+- **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
+- **Scope:** Replace managed link placeholders with inline images in composer and conversation; fit the column and open the stored capped image on selection. Keep outside URLs as links. Complete real phone chooser/paste format verification.
+- **Phase:** 2. **Depends on:** CHAT-16. **Ordering:** critical path.
+- **Relevant decisions:** D-17, D-21, D-22, D-67–D-69, D-73.
+- **Acceptance signals:** Position and draft text remain stable; live/history render only managed objects without outside previews. Record phone behavior privately using safe evidence; unconverted HEIC triggers its separate owner dependency decision.
+- **Out of scope:** Animation, video, previews, Markdown and automatic installation of a HEIC decoder.
+- **Open questions / stop conditions:** Q-6; conditional HEIC follow-up only if actual phone evidence meets D-68.
+
+### CHAT-18. Implement shared room identities and issue/PR lifecycle mapping
+
+- **Outcome:** Every supported work item resolves to one shared room with a consistent lifecycle.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Introduce stable room kinds, issue/PR associations and lifecycle generations. Create on first use, reuse rooms on reopened/replacement work, preserve per-project legacy mode until cutover, and update the owner's global skills at this stage. Represent main/testing/general/chat-test routing and scope.
+- **Phase:** 3. **Depends on:** CHAT-17, CHAT-1, CHAT-4, CHAT-9. **Ordering:** critical path.
+- **Relevant decisions:** D-8–D-11, D-16, D-44, D-51–D-59, D-74.
+- **Acceptance signals:** Concurrent first use creates one logical room; multiple PRs share the issue room and last-open-PR closure is correct. Unknown tracker evidence does not fabricate closure, and untouched projects retain legacy behavior.
+- **Out of scope:** Archive storage, live room provisioning, custom rooms and tracker mutations by plateia.
+- **Open questions / stop conditions:** K-4 / Q-2 and Q-8; settle lifecycle evidence/registration and update semantics before drafting.
+
+### CHAT-19. Verify structured room archives with their images and membership cleanup
+
+- **Outcome:** A work room closes only with verified structured history, images and membership cleanup.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Implement the closing barrier, complete history export and image pin/copy verification through the approved storage contract. Persist a self-describing structured archive and cleanup state; part every owner after the required archive steps, with generation checks and recoverable failures.
+- **Phase:** 3. **Depends on:** CHAT-18, CHAT-3, CHAT-6, CHAT-15. **Ordering:** critical path.
+- **Relevant decisions:** D-14, D-15, D-20, D-51, D-70, D-71.
+- **Acceptance signals:** Archives work with the web process stopped; missing history/images or failed writes cannot claim success. Other-client posts are covered by the barrier; interruption/reopen races preserve data and new joins. No plaintext transcript.
+- **Out of scope:** Dismissing uncertain outcomes, the late-send window, archive browser and live legacy deletion.
+- **Open questions / stop conditions:** K-3/K-4 / Q-2, Q-6, Q-8; prove posting barrier and cross-store verification before drafting.
+
+### CHAT-20. Close dismissed send gaps and reconcile bounded late history
+
+- **Outcome:** Dismissed uncertainties close with explicit gaps and bounded, verified later correction.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Allow closure from current history after per-send dismissal, recording unresolved IDs and gap metadata. Check for late appearances only within 24 hours of closure and on genuine reopen; verify archive/image corrections and retain original notes with annotations.
+- **Phase:** 3. **Depends on:** CHAT-19, CHAT-5, CHAT-6. **Ordering:** critical path.
+- **Relevant decisions:** D-47–D-49, D-65, D-66, D-70.
+- **Acceptance signals:** Expiry/restart cannot extend the watcher or imply cancellation. Corrected messages occur once; independent gaps persist and uncertain images remain protected. Failed correction preserves the existing archive.
+- **Out of scope:** Indefinite watchers, resending, reopening just to correct history and delivery-error dismissal.
+- **Open questions / stop conditions:** K-4 / Q-8; persist closure generation, deadline and correction receipts in the reviewed archive contract.
+
+### CHAT-21. Present every room type and its lifecycle in plateia
+
+- **Outcome:** The page follows the canonical room lifecycle without bypassing archived-room rules.
+- **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
+- **Scope:** Switch room discovery/navigation to the canonical room model, including global/testing lists, issue/PR first use and reopened rooms. Show grey closing state, verified archival removal, the milestone-1 archived notice and its gap marker. Keep creation/join authority in shared chat.
+- **Phase:** 3. **Depends on:** CHAT-18, CHAT-19, CHAT-20, CHAT-13, CHAT-14, CHAT-17. **Ordering:** critical path.
+- **Relevant decisions:** D-9, D-14–D-16, D-28, D-51–D-60, D-65, D-71.
+- **Acceptance signals:** Phone and desktop expose all configured room types and correct user scope. Old archived links cannot create replacements or join; a reopened room restores its conversation and joins through the bound account.
+- **Out of scope:** Archive browsing/search, custom room rules, new workflow logic in the browser and live provisioning.
+- **Open questions / stop conditions:** None beyond the reviewed lifecycle contract and the owner's separately performed room provisioning.
+
+### CHAT-22. Provide guarded per-project cutover and owner-specific guidance
+
+- **Outcome:** The manager can review and execute a resumable per-project cutover plan within owner authorization.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Add the resumable per-project cutover procedure/tooling and executed skill guidance: inventory/dry-run, owner warning/closure prerequisites, named parked exceptions, legacy archive, design-room discard without logs, mode switch and new-room convention. Include setup verification for configured owner always-on.
+- **Phase:** 3. **Depends on:** CHAT-21, CHAT-18, CHAT-19, CHAT-20. **Ordering:** critical path.
+- **Relevant decisions:** D-8, D-12, D-13, D-16, D-44, D-52, D-64, D-71, D-74.
+- **Acceptance signals:** Synthetic plans refuse unclosed non-exempt work, preserve permanent/parked rooms, isolate other projects and recover from partial failures. No destructive step occurs as a side effect of reading the plan; record completed and remaining steps.
+- **Out of scope:** Actually warning/closing/discarding/switching live projects during implementation tests or changing canonical owner authority again.
+- **Open questions / stop conditions:** Q-8 operational mapping remains the manager's concrete rollout work; live steps require the applicable owner authorization and D-44 warning.
+
+### CHAT-23. Qualify the complete milestone across service and browser boundaries
+
+- **Outcome:** The complete milestone has reproducible integration evidence across its component boundaries.
+- **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
+- **Scope:** Add the bounded end-to-end qualification harness/scenarios for the integrated shared APIs, web app, managed images and lifecycle. Cover cross-component failures not already proved by each slice's local tests, using isolated services and invented data; record phone/desktop acceptance evidence.
+- **Phase:** 3. **Depends on:** CHAT-22. **Ordering:** critical path.
+- **Relevant decisions:** D-1, D-6, D-34–D-49, D-65–D-74.
+- **Acceptance signals:** Restart during send plus image retention plus archive/reopen preserves the agreed outcomes. Shared work continues with plateia stopped; all three stage checkpoints pass and no deferred feature is needed to complete milestone 1.
+- **Out of scope:** A new feature batch, duplicated unit tests, production fault injection and claiming HEIC or live cutover verification without evidence.
+- **Open questions / stop conditions:** All K gates and any triggered D-68 decision must be resolved; owner acceptance still determines milestone completion.
+
+The owner must approve the slice boundaries and design readiness before
+`process-design-doc` begins. It then processes the epic first and one child
+at a time, obtaining separate signoff before each tracker artifact is filed.
+The manager runs filed-issue reviews. D-75's local skills route does not
+waive issue approval, exact-commit review or merge authorization.
