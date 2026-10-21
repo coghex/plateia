@@ -1890,6 +1890,20 @@ This settles association ownership and conflict behavior. K-4 still needs
 the tracker observation/transition contract, persistent archive publication
 and concrete IRC completion evidence. No live registration is authorized.
 
+### D-91. Accept fresh tracker evidence and separate rounds of work
+
+Owner decision 2026-10-21. Accept P-80 as written at `e1d02e4d3a`:
+use fresh GitHub state and close/reopen events to drive lifecycle. A reopen
+starts a new round, so PRs closed in an earlier round cannot immediately
+close it again. Check every relevant PR/link before closing and recheck
+before finalizing; incomplete or unavailable evidence waits.
+
+Accept P-80's first-use and closure/replacement table. Create a room on first
+use only for active work; an archived link still cannot reopen it. This
+settles K-4's tracker observation and transition semantics. The durable
+registry/archive publication contract and concrete IRC completion evidence
+remain to be settled. No live polling setup or tracker mutation is authorized.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -3540,7 +3554,7 @@ it does not settle all of K-4 or authorize any live registration or cutover.
 
 ### P-80. Drive lifecycle from fresh tracker evidence and distinct rounds of work
 
-Proposed K-4 tracker contract, not yet approved. Shared chat observes GitHub
+Accepted by D-91, owner decision 2026-10-21. Shared chat observes GitHub
 centrally per project and updates D-90's registry and D-89's desired lifecycle
 state. It does not change the tracker. Manager completion posts, labels,
 missing list entries and elapsed time are not substitutes for verified
@@ -3644,8 +3658,8 @@ links, issue close/reopen between polls, replacement PRs, historical closed
 PRs at first use, equal-time ambiguous events, partial/rate-limited reads,
 new registration during pagination and reopen during archive cleanup.
 
-Acceptance would settle tracker observation and transition semantics. K-4
-would still need the exact durable registry/archive publication contract and
+D-91 settles tracker observation and transition semantics. K-4
+still needs the exact durable registry/archive publication contract and
 concrete IRC completion evidence. No live polling setup or tracker mutation
 is authorized by this proposal.
 
@@ -3708,8 +3722,8 @@ D-89 accepts P-78's serialized durable generations and visibly blocked
 recovery when an old IRC mutation is unconfirmed, with manager-first recovery.
 D-90 accepts P-79's durable shared association registry, initial GitHub/workflow
 link evidence and manager-first conflict handling.
-P-80 proposes the fresh tracker observation and work-round transition
-contract, including first use and reopen history; it awaits owner approval.
+D-91 accepts P-80's fresh tracker observation and work-round transition
+contract, including first use and reopen history.
 
 ### Q-3. What interface separates plateia from shared chat?
 
