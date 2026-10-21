@@ -50,7 +50,8 @@ Read-only checks on 2026-10-20:
 | Skills repository, `chat/scripts/chatlib.py`, `post` | Posting authenticates an account and handles IRC message formatting. Its result is a line count; its public signature has no caller-supplied logical operation ID. This alone does not establish browser retry safety. |
 | Skills repository, `chat/scripts/chatlib.py`, `_round`, `already_posted`, refreshed 2026-10-20 | The sender waits for a PONG after writing IRC messages. Retry reconciliation matches account/text/time in local logs; partially landed posts may be retried whole. There is no message-ID check-and-cancel API. This does not meet D-34's at-most-once contract. |
 | Read-only Ergo capability probe, shared sender/bridge source and isolated multiline tests, 2026-10-20 | Ergo advertises `batch`, `message-tags` and `draft/multiline`. Shared chat negotiates multiline and joins each batch in live/history delivery. Ten selected existing tests pass. Oversized posts still become separate batch records without a common logical message ID; leading/trailing blank lines are stripped. See D-37 for the required gaps. No test messages were sent to live rooms. |
-| Upstream Ergo at `678d29d5442b00aa4ed79e86f9139443a3e1994a`, `batchHandlerMultiline`, `dispatchMessageToTarget`, `Channel.SendSplitMessage` | A complete batch is dispatched to the channel; the inspected publication path has no caller-message-ID deduplication or per-message deadline check. This is upstream source evidence, not proof that the installed binary is identical. P-36 addresses the remaining publication-boundary gap. |
+| Upstream Ergo at `678d29d5442b00aa4ed79e86f9139443a3e1994a`, publication path | No caller-ID deduplication or per-message expiry check was found. P-36's server-patch proposal was rejected; D-45 changes the deadline to the single writer's decision cutoff. |
+| Installed Ergo 2.19.1, read-only capability/history checks for D-45 | Negotiated message tags, batches, multiline, echo-message, labeled-response, CHATHISTORY, server-time and account tags. History replay retained an existing client-only reply tag; repeated reads retained the same value. A mid-window server-msgid lookup succeeded. No tagged test message was posted, and no config/service change or restart was made. |
 | Skills repository, `chat/scripts/chat-bridge`, `project_for`, `handle` | Routing uses project channel names/prefixes. Ordinary direct agent delivery is restricted by sender category, unlike V-6's any-agent communication. Queuing precedes logging, with crash replay permitted. These are integration gaps, not evidence that the new contract is implemented. |
 | Skills repository, `chat/SKILL.md`, identity and delivery sections | Stable identities, session discovery, history, outbox, delivery and acceptance machinery exist. Their exact guarantees and usable interface require focused verification before designing the web adapter. IRC login alone is not presence evidence. |
 | Shared `chat-bridge`, `Deliveries._record`, `_dead`, `accept`, `accepted`, and `pchat trace`, checked for D-41 | The bridge records attempts, dead letters and authenticated replies/acks. Delivery success and recipient acceptance are separate. Attempt records omit a structured recipient field; acceptance closes matching pending items, while late acknowledgements also have a separate record. `trace` renders request-oriented text, not a typed per-message/per-recipient outcome. A shared read contract is required for plateia. |
@@ -633,21 +634,22 @@ remains minimal; send recovery is a required, fully tested contract.
 The owner delegated the countdown duration. Design selection: **10 seconds
 per send attempt**, measured from dispatch with a monotonic clock; display
 the rounded-up remaining seconds, clamped at zero. Reconnects and background
-tab suspension do not restart that attempt's deadline. D-36 strengthens
-this from a browser feedback deadline to an expiry carried by the send and
-enforced by the server. The status/check response can still arrive later;
-D-35 settles its presentation while the original page remains open.
+tab suspension do not restart that attempt's deadline. D-45 supersedes the
+earlier publication-expiry interpretation: this is the single sender's
+decision cutoff, after which it starts no IRC write for that attempt. A
+write started before cutoff can remain in flight; D-35 covers the unknown
+outcome until IRC history settles it.
 
-The server contract requires an atomic check-and-cancel operation, not a
-separate read followed by cancellation. Cancellation must also cover an ID
+The shared sender contract requires a serialized check-and-cancel operation,
+not a separate unsynchronized read followed by cancellation. It covers an ID
 whose original request has not arrived yet. Durable cancellation and
 deduplication metadata are distinct from D-32's unsaved failed-message UI;
 they must survive service restarts to reject late requests. They are not a
 saved failure conversation or an automatic retry queue.
 
 An explicit retry must be distinguishable from delayed delivery of the
-cancelled attempt while retaining the same logical ID. The protocol must
-fence the old attempt and serialize retry, cancellation and publication.
+cancelled attempt while retaining the same logical ID. The single sender
+must fence old attempts and serialize retry, cancellation and IRC writes.
 A local timeout, missing bridge log entry, or successful socket write is
 not authoritative proof of the IRC publication outcome. Q-3 must establish
 that proof at the actual publication boundary; do not claim the existing
@@ -682,12 +684,15 @@ Persist nothing about them in the browser: no pending-message content,
 ID, deadline or recovery entry. Send still clears the saved draft at once
 (D-33). Unsubmitted drafts remain covered by D-23.
 
-Each send carries its deadline. The server refuses to post an attempt that
-reaches it after that deadline. After reload, once the deadline has passed,
-the message must either be in the room's history or never be posted. If
-missing, the owner retypes it. There is no automatic reconstruction or
-resubmission of the discarded local entry. D-35's countdown and unknown
-state apply only while that entry remains in the current page.
+Each send carries its deadline. D-45 clarifies enforcement: the shared
+single sender refuses to start an IRC write after the cutoff, but a write
+already started can still be in flight. After reload, **once the prior
+attempt has settled**, the message is in authoritative IRC history or will
+never be posted. If missing then, the owner retypes it. Expiry alone does
+not prove absence during the in-flight window. There is no automatic
+reconstruction or resubmission of the discarded local entry. D-35's
+message-level feedback applies while that entry remains in the current page;
+P-38 addresses the reloaded room's history state.
 
 This supersedes P-27. It does not remove server-side cancellation and
 deduplication records required by D-34. The deadline belongs to a send
@@ -695,15 +700,12 @@ attempt; an explicit retry in the still-open page retains the logical ID
 and has its own deadline. The expired original attempt must remain unable
 to post, even after a retry is authorized.
 
-The promised history-or-never outcome is stronger than checking a timestamp
-only on HTTP arrival. Q-3 must cover requests queued before expiry, IRC
-publication in flight at expiry, server restart, clock disagreement and
-history lag. Expiry must work without a surviving browser to request
-cancellation. A stale or incomplete history view cannot prove a message
-missing: retyping safely depends on an authoritative history result that
-includes every post committed before the cutoff. These are implementation
-obligations of the accepted outcome, not capabilities established in the
-existing sender. Resolve them before claiming this contract is deliverable.
+Q-3 must cover requests queued before expiry, writes in flight at cutoff,
+sender restart, clock disagreement and history lag. The sender's expiry
+rule must work without a surviving browser to request cancellation. A stale
+or incomplete history view cannot prove a message missing: retyping safely
+depends on settled authoritative history, as clarified by D-45. Resolve
+the settlement proof before claiming this contract is deliverable.
 
 ### D-37. Preserve long posts using explicit transport grouping
 
@@ -906,6 +908,62 @@ No live rooms, tracker items or configuration change during this design.
 The project's rollout warning and owner closure step happen when the
 implemented room-model change is ready to activate.
 
+### D-45. Use one sender and IRC history; never patch the IRC server
+
+Owner decision 2026-10-20. Reject P-36. The owner will not maintain an IRC
+server patch. Design the no-patch approach first:
+
+1. Use a single sender for owner posts. It never starts an IRC write for an
+   attempt after that attempt's deadline. The deadline is the writer's
+   decision cutoff, not a guarantee of IRC publication by that instant.
+2. Carry every message's logical ID into IRC, for example in a client-only
+   message tag. IRC history is authoritative. If an outcome is unclear,
+   look for that ID: found means posted; absent **once settled** means
+   cancelled. A missing bridge-log entry is insufficient.
+3. A retry keeps the same logical ID and checks IRC history before writing.
+   Serialize retries through the same sender so they cannot duplicate work.
+4. Cover the in-flight window with D-35's unconfirmed state. Do not claim
+   cancellation or enable retry before settlement.
+
+This supersedes D-34/D-36's strict publication-deadline interpretation while
+preserving their ID, retry and no-browser-persistence decisions. Verify
+installed-server support read-only. If the no-patch approach cannot meet
+the contract, bring the evidence and a different IRC server back to the
+owner as a decision. A maintained patch is never the fallback. No server
+replacement or live configuration/service change is authorized now.
+
+Read-only verification:
+
+- The installed binary reports **Ergo 2.19.1**. A client using the designer's
+  own identity negotiated `message-tags`, `batch`, `draft/multiline`,
+  `echo-message`, `labeled-response`, `draft/chathistory`, `server-time` and
+  `account-tag`.
+- A history query without room membership was refused. A temporary reader
+  in the existing design room obtained labeled history responses containing
+  account, server message ID, time and an existing client-only reply tag.
+  Repeating the read retained that tag's value; no private values or message
+  contents are reproduced here. The reader left after the queries.
+- A mid-window native `msgid` history query found the selected message.
+  An initial edge query did not; its cause was not established. The release's
+  `GenericAround` also has a documented first-item edge case. Recovery must
+  use complete pagination, not an `AROUND` result as proof of absence.
+- In the matching release, history items contain a generic tag map and
+  serialize it into the history store. CHATHISTORY selectors accept server
+  `msgid` or timestamp, not arbitrary client-tag values. Logical-ID lookup
+  therefore requires scanning authoritative, fully paged history and
+  matching the tag, or an equivalent shared index verified against history.
+- These checks establish the capability path, not a tested implementation
+  of the new sender. No test post with the proposed ID tag, process crash,
+  server restart or config change was performed. Durable retention, the
+  exact new tag round-trip and the old-write settlement barrier remain
+  required implementation validation.
+
+Sources for the installed release: [history selectors](https://github.com/ergochat/ergo/blob/v2.19.1/irc/handlers.go#L811),
+[history item tags](https://github.com/ergochat/ergo/blob/v2.19.1/irc/history/history.go),
+[serialization](https://github.com/ergochat/ergo/blob/v2.19.1/irc/history/serialization.go),
+[SQLite history storage](https://github.com/ergochat/ergo/blob/v2.19.1/irc/sqlite/history.go),
+and [AROUND implementation](https://github.com/ergochat/ergo/blob/v2.19.1/irc/history/queries.go).
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1086,8 +1144,8 @@ seconds and the wording is “unconfirmed: awaiting server”.
 ### P-27. Recover unconfirmed submissions after a same-device reload
 
 Rejected by D-36. No browser persistence or restoration of unconfirmed
-sends. Each attempt instead carries a server-enforced deadline; after
-reload and expiry, the owner uses history and retypes a missing message.
+sends. D-45 clarifies the sender's deadline and requires settled history,
+not just elapsed time, before a missing message can safely be retyped.
 
 ### P-28. Keep long text as one visible message
 
@@ -1135,35 +1193,65 @@ completion; there is no general gradual migration of active work.
 
 ### P-36. Add message-ID and deadline enforcement at the IRC publication boundary
 
-The Python/shared-chat sender can refuse an expired request before writing
-to IRC, but cannot retract bytes already in flight or queued at the IRC
-server. If it loses confirmation, a local journal or missing bridge log
-cannot establish whether IRC has published the message. Closing the socket
-does not prove that earlier bytes were not processed. These are the races
-D-34/D-36 require the design to handle, especially after browser reload.
+Rejected by D-45. No Ergo patch or owner-maintained IRC server. Design the
+single-sender/history approach first; if it cannot work, bring evidence for
+choosing a different server to the owner. Do not revive this patch proposal.
 
-Read-only inspection of [Ergo's batch handler and dispatcher](https://github.com/ergochat/ergo/blob/678d29d5442b00aa4ed79e86f9139443a3e1994a/irc/handlers.go#L587)
-and [channel publication method](https://github.com/ergochat/ergo/blob/678d29d5442b00aa4ed79e86f9139443a3e1994a/irc/channel.go#L1343)
-found no expiry or caller-ID deduplication check on that path. Multiline
-framing supplies grouping, not the missing transactional send contract.
-The exact installed release and any applicable extension mechanism still
-need verification before implementation is specified.
+### P-37. Shared single-sender protocol for the no-patch approach
 
-Recommend including server-side support at that boundary as a prerequisite:
-authenticate the sender, bind the logical ID to content and destination,
-reject expired/cancelled attempts at publication, persist a terminal outcome
-with the canonical message, and answer check/cancel/retry consistently
-across lost responses and restarts. An explicit retry keeps the logical ID
-but must not revive an expired earlier attempt. History must expose the
-same outcome so the browser can safely rely on D-36 after reload.
+Proposed implementation contract under D-45, not a claim of existing code:
 
-This may require maintaining an Ergo patch, beyond the existing Python and
-skills changes. Its owning checkout, review/delivery path and exact atomic
-storage design are not settled. Do not assume that client-only tags or a
-Python lock implement these guarantees, or claim that a patch is already
-designed or validated. The owner must approve this scope before treating
-it as an accepted architecture. No server code, binary, configuration or
-running service changes during design.
+1. All submissions and retries covered by this contract go through one
+   shared sender. Enforce exclusive writer ownership across restarts. Keep
+   an attempt journal on the server before touching the socket; browser
+   pending-message persistence remains forbidden. Bind the logical ID to
+   authenticated sender, room and immutable content so ID reuse cannot
+   silently change the instruction.
+2. Give an explicit retry a distinct attempt generation and deadline, while
+   keeping the logical ID. Reject expired or cancelled old generations,
+   including HTTP requests arriving after a newer retry. Under the same
+   writer serialization, check the deadline immediately before starting the
+   write. A queued, not-yet-written attempt can be cancelled conclusively.
+3. Carry a client-only logical-ID tag through the multiline representation;
+   retain it in the shared record and expose it with the server's `msgid`.
+   Labeled responses correlate queries; they are not durable logical IDs.
+   D-37's complete-message grouping still applies to every supported size.
+4. After an uncertain write, recover from IRC history, not text matching or
+   the bridge's last logged message. Save the pre-send history cursor and
+   inspect the complete relevant range through an authoritative settled
+   endpoint. Match the logical tag, account and room. A cached shared index
+   may accelerate a positive lookup but cannot prove absence unless its
+   coverage is known complete. Missing access, pruned history or an
+   interrupted page means unknown, not cancelled.
+5. On a healthy original connection, an ordered round-trip after the write,
+   followed by history retrieval, is the candidate settlement barrier. A
+   reconnect alone is not one: an old server session might still process
+   buffered bytes. Recovery must prove the prior write can no longer appear
+   before declaring absence or allowing another write for the ID. Validate
+   this against the installed server's session lifecycle and crash cases;
+   a guessed sleep or local socket close is insufficient.
+6. If the matching complete message is found, record posted and return it
+   without writing again. If absent after proven settlement, record the
+   cancelled attempt. Before an explicit same-ID retry, check history again
+   and allow one new attempt under the exclusive writer. An unproven outcome
+   stays unconfirmed without retry, as D-35 requires.
+
+The installed capabilities support tagged history recovery, but the exact
+disconnect/restart settlement proof and 64 KiB multiline transport are
+still open technical gates. No assertion of completed at-most-once recovery
+follows from capability negotiation or these read-only history queries.
+The shared skills/service owns this protocol; plateia presents its results.
+
+### P-38. Mark reloaded history as syncing while a prior send is unsettled
+
+D-36 forbids restoring a pending message after reload. Under D-45, a write
+started before cutoff can nevertheless still settle afterward. Recommend
+showing a room-level “Syncing history...” notice while the shared sender
+reports an unresolved prior write for that room. Do not reconstruct its
+message text or retry entry in the browser. Once the write settles and
+history catches up, remove the notice; the owner can then rely on absence
+when deciding whether to retype. The notice reports synchronization, not
+milestone-2 unread or receipt progress.
 
 ## Open questions
 
@@ -1198,26 +1286,26 @@ identity, mention routing, delivery failure facts and presence. Verify the
 canonical source before specifying changes. New workflow behavior belongs in
 the skills repository. Do not revive retired packages by inference.
 
-D-34 requires browser-created IDs, atomic check/cancel, durable rejection
-of late cancelled attempts and explicit same-ID retry. Specify how a retry
-is distinguished from a delayed original request, and how the IRC boundary
-proves posting or cancellation across crashes and lost acknowledgements.
-The current PONG/text-match sender does not satisfy this. This is a required
-shared-chat change and a design-readiness gate, not work to hide in a
-browser retry handler. D-36 rejects browser recovery storage: expiry must
-work after the browser disappears. Establish deadline clock semantics,
-the final publication cutoff and complete history through that cutoff,
-including pending IRC writes and a lagging bridge. An HTTP arrival-time
-check alone does not establish the accepted history-or-never guarantee.
-P-36 proposes the server-side publication support needed to close that gap;
-its added maintenance scope awaits the owner's decision.
+D-34/D-45 require browser-created IDs, one shared sender serializing
+submission/check/cancel/retry, and a history check before any same-ID retry.
+The writer must not start an IRC write after its attempt's deadline; a write
+already in flight remains unconfirmed until settled. Distinguish a fresh
+retry from a delayed original attempt, and establish deadline clock semantics,
+exclusive writer ownership across restart, and complete authoritative history
+coverage after the old write settles. The current PONG/text-match sender
+does not satisfy this. D-36 rejects browser recovery storage; enforcement
+must work after the browser disappears. P-37 records the proposed protocol
+and its unresolved settlement proof as a design-readiness gate. A missing
+bridge entry, elapsed timer or newly connected reader is not cancellation.
+P-36 is rejected: no IRC patch. If the installed server cannot support the
+contract, bring a different server choice to the owner.
 
 D-37 requires explicit logical grouping across any transport fragments,
 exact content preservation and the same identity in live delivery/history.
 Existing per-batch reassembly is insufficient for oversized posts. Define
 the relationship between browser IDs, durable message IDs, batch references
-and ordered parts; verify whole-message publication and expiry before
-dispatching an agent instruction.
+and ordered parts; verify complete logical messages and sender cutoff/recovery
+before dispatching an agent instruction.
 
 D-41 requires a shared, typed per-message/per-recipient delivery outcome
 from the bridge's records. Include late acceptance after dead-lettering,
@@ -1241,14 +1329,17 @@ clears the draft immediately; only one failed send is shown, cleared by any
 later message, including a newer failure.
 **Deadline and retry resolved by D-34:** countdown, authoritative server
 check/cancel, normal display if posted, retry icon if cancelled, same-ID
-retry with at-most-once posting. The delegated duration is 10 seconds.
+retry with at-most-once posting. The delegated duration is 10 seconds;
+D-45 makes this the writer's decision cutoff, not an IRC commit deadline.
 **Unanswered deadline check resolved by D-35:** keep “sending... (0)” for
 five more seconds, then small grey “unconfirmed: awaiting server”; no retry
 until confirmed cancellation, and normal display on confirmed posting.
-**Reload behavior resolved by D-36:** no persistence or reappearance of
-unconfirmed sends; the server enforces the deadline carried by each attempt.
-After expiry, a message is in history or will never post; the owner retypes
-if missing. Q-3 must establish that guarantee at the publication boundary.
+**Reload behavior resolved by D-36/D-45:** no persistence or reappearance of
+unconfirmed sends. The shared sender starts no write after the attempt's
+deadline. Once an earlier write has settled and history is complete, the
+message is in history or will never post; the owner retypes if missing.
+Q-3 must establish that settlement and history coverage. P-38 proposes a
+room-level history-sync notice during the unresolved interval after reload.
 **Long-message presentation resolved by D-37:** one web message with line
 breaks preserved and explicit transport grouping, never time-based merging.
 **Message size resolved by D-38:** 64 KiB of text, with a warning before
@@ -1404,7 +1495,7 @@ and responses, not just localhost success. Cover cancellation reaching the
 server before the original send; publication racing cancellation; a posted
 message whose reply is lost; repeated cancellation calls; a retry arriving
 before a delayed original attempt; duplicate retry calls; and service
-restart after posting or cancellation. Assert at most one IRC post and
+restart after posting or cancellation. Assert at most one logical IRC post and
 at most one resulting agent action, with no publication by cancelled old
 attempts. Test countdown expiry during tab suspension and reconnect without
 resetting its deadline. No red failure icon may falsely describe a posted
@@ -1418,15 +1509,20 @@ the text; a confirmed cancellation permits the red retry icon, subject to
 the single-failure rule. Waiting longer alone must never manufacture either
 outcome.
 
-D-36 checks must reload or close the browser before confirmation and prove
+D-36/D-45 checks must reload or close the browser before confirmation and prove
 there is no persisted pending content, ID, deadline or restored entry.
 Unsubmitted drafts must still survive. Delay the original request past
-expiry with no browser left to cancel it, and verify it never posts. Also
-cover requests received before expiry but queued or writing to IRC when
-the deadline passes, clock skew, restart and delayed history ingestion.
-Verify the history-or-never result from authoritative history, not a stale
-browser cache or a missing bridge-log entry. A same-ID retry with a fresh
-attempt deadline must not reactivate an expired original attempt.
+expiry with no browser left to cancel it, and verify no IRC write starts.
+Also cover requests received before expiry but queued when it passes. A
+write already in flight may post later and must remain unconfirmed until
+settled. Cover clock skew, competing writers during restart, lost old
+connections and delayed history ingestion. Prove the previous write has
+settled, then page the complete authoritative history range before treating
+absence as cancellation. Missing capabilities, pruned history or incomplete
+coverage must remain unknown. A same-ID retry with a fresh attempt deadline
+must recheck history and must not reactivate an expired original attempt.
+These fault and restart checks remain required future validation; the
+read-only D-45 probes do not establish their results.
 
 Draft recovery checks must retain text and images across room switches and
 reloads on the same device, including drafts whose uploads are interrupted
@@ -1490,11 +1586,13 @@ changing the live convention an advance prerequisite for unrelated work.
 Keep D-24's disconnected typing within normal composer work. D-34's
 deadline/check/cancel/retry contract requires explicit shared-chat delivery
 work and network-fault coverage before the web sender can claim safe retry.
-Resolve Q-3's publication boundary and attempt-fencing contract before
+Resolve Q-3's writer ownership, settlement and attempt-fencing contract before
 defining those slices. Do not defer it as a low-priority local-network edge
 case or add an offline send queue.
-Include D-36's server-enforced expiry and history completeness in that
-contract. Do not add browser pending-send storage or reload restoration.
+Include D-36/D-45's writer cutoff, logical ID in authoritative IRC history
+and complete history lookup in that contract. Resolve P-37's settlement
+proof without an IRC patch. Do not add browser pending-send storage or
+reload restoration.
 Exclude D-30's optional current-task line and setting from all milestone-1
 slices; retain only the milestone-2 note.
 The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
