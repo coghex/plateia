@@ -1569,6 +1569,27 @@ be an image. Keep the stored-image caps and retention/archive requirements.
 The early placeholder-link slice still shows links until inline rendering
 ships; the completed milestone displays managed images inline under D-17.
 
+### D-74. Deliver text chat, then images, then rooms and archives
+
+Owner decision 2026-10-21. Accept P-64. Milestone 1 delivery order is:
+
+1. Shared sender/API contracts and usable text chat in existing rooms,
+   with reading, posting and history delivered together.
+2. Image sharing: managed links first, then inline images.
+3. The issue/PR room model, archives and per-project clean cutovers,
+   including the shared/global skill changes.
+
+All three stages are required for milestone 1. Initial shared contracts
+must account for later room lifecycle and image references without creating
+parallel records. Shared prerequisite work may precede its visible stage.
+Before any project cutover goes live, the project manager gives the owner
+the D-44 warning; no live activation is authorized by this design decision.
+
+Next define dependency-ordered, reviewable slices. This approves their stage
+order, not every implementation mechanism, final issue boundary or readiness.
+The owner still approves design readiness and each issue before filing;
+the manager runs filed-issue reviews.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2070,28 +2091,11 @@ website previews.
 
 ### P-64. Deliver text chat, then images, then the new room lifecycle
 
-Recommend this milestone-1 delivery order:
-
-1. Establish the necessary shared API/sender contracts and deliver usable
-   text chat in existing configured rooms: reading, posting and history
-   together, with owner identity, draft handling, user lists and reliability.
-2. Add image sharing through paste and the image button, first as managed
-   links and then inline, with caps, retention, references and phone testing.
-3. Deliver the shared issue/PR room model, remaining room-type integration,
-   verified conversation/image archives and the per-project clean cutover.
-   Make the owner-specific global skill changes here, as D-8 requires.
-
-All three stages are required for milestone 1. This order lets the new
-archive lifecycle be exercised against working image storage immediately,
-and lets the owner use text chat while the room migration is still pending.
-Initial shared contracts must anticipate room identities, archive/image
-references and lifecycle generations so later stages do not create competing
-records. Shared prerequisite work can precede its visible stage where needed.
-
-This is proposed delivery ordering, not approval of implementation, live
-cutover, a ready design or final child-issue boundaries. Resolve the remaining
-shared technical contracts and define reviewable dependency-ordered slices
-after the owner settles this order. Owner approval is pending.
+Resolved by D-74, owner decision 2026-10-21. Deliver shared contracts and
+usable text chat first, images second, and the new room model, archives and
+per-project cutovers third, all in milestone 1. The manager gives the owner
+the D-44 warning before any live cutover. Reviewable slice boundaries and
+issue signoffs follow; no live change is authorized here.
 
 ## Open questions
 
