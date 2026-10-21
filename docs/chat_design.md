@@ -42,10 +42,10 @@ concrete precondition
 - [ ] CHAT-22. Provide guarded per-project cutover and owner-specific guidance
 - [ ] CHAT-23. Qualify the complete milestone across service and browser boundaries
 
-These 23 proposed slices follow D-74's approved stage order. Boundaries await
-owner review, and K-1–K-4 identify the remaining contracts that gate affected
-issue drafting. No tracker artifact has been filed; the design is not ready
-for issue processing yet.
+These 23 slices follow D-74's approved stage order. D-76 approves their
+boundaries at `e6107c0663`, boundaries only. K-1–K-4 remain contract gates
+before affected issue drafting. No tracker artifact has been filed; the
+design is not ready for issue processing yet.
 
 ## Epic contract
 
@@ -1640,6 +1640,17 @@ be drafted for owner signoff on this route; this does not waive the design
 readiness checkpoint, individual issue approval or the brief's prohibition
 on live changes during design.
 
+### D-76. Approve the 23 slice boundaries, with the contract gates still open
+
+Owner decision 2026-10-21. Accept P-65's boundaries at `e6107c0663`:
+CHAT-1–CHAT-14 for shared foundations and usable text chat, CHAT-15–CHAT-17
+for images, and CHAT-18–CHAT-23 for rooms, archives, cutovers and final
+testing. Preserve the dependency order and separate implementation owners.
+
+This approves boundaries only, not implementation or design readiness.
+Resolve K-1–K-4 before drafting affected issues. Each issue still requires
+owner signoff before filing, and the project manager runs its review.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2149,15 +2160,66 @@ issue signoffs follow; no live change is authorized here.
 
 ### P-65. Use the proposed 23 dependency-ordered slice boundaries
 
-Recommend the CHAT-1–CHAT-23 breakdown in the delivery plan: 13 shared-skills
-changes and 10 plateia changes, each with a separate outcome, implementation
-owner, dependencies, acceptance evidence and scope limit. All use plateia's
-tracker and D-75's applicable delivery route.
+Resolved by D-76, boundaries only, at `e6107c0663`. The 13 shared-skills
+changes and 10 plateia changes use D-75's applicable delivery route.
+K-1–K-4 remain open; this is not approval to draft issues or implement.
 
-This proposal asks for agreement on the work boundaries within D-74's
-approved order. K-1–K-4 remain explicit design-contract gates; accepting
-the boundaries does not resolve those contracts or declare the design ready
-for issue processing. Owner approval is pending.
+### P-66. Put the covered sender in the existing bridge, behind a durable queue
+
+Recommend one sender inside the existing shared chat bridge process. Clients
+call the shared Python API to record commands in a durable local queue and
+read results; they never take over its IRC writes. This implements the
+already-selected Python API/no-new-daemon boundary from earlier D-16 and
+this design's D-2/D-45. The queue, attempt journal and sender implementation
+belong to shared skills, not the web server.
+
+The bridge owns persistent owner-account connections and serializes the
+covered send/check/cancel/retry operations for both owner accounts. The
+web server can restart without taking these connections or commands with
+it. If the bridge is unavailable, clients do not bypass it: commands wait
+only until their existing attempt deadline, and expired commands must never
+start a write when it returns. This does not extend the ten-second deadline
+or automatically retry a failed message. Existing terminal IRC clients can
+still post independently; their ordinary posts do not gain the covered
+sender's logical-ID retry guarantee.
+
+Use a local transactional journal behind the API, rather than the legacy
+text-match outbox. An exclusive process-lifetime writer lock prevents two
+bridge instances from publishing covered sends. Record a write-started state
+durably before the first socket write; after a crash that state remains
+potentially published, even if the socket may never have been touched.
+The new writer may look for the ID in history but must never resume or
+resend that attempt merely because it acquired the lock. D-47's unconfirmed
+outcome remains available. A separate cancelled-before-write state permits
+the already-approved explicit retry with a fresh attempt generation.
+
+The queue must be serviced promptly within the existing bridge, independently
+of potentially slow agent-delivery work. Bridge-generated commands enqueue
+without synchronously waiting for the same consumer. Its current one-minute
+outbox flush is not the new scheduler. No covered logical ID may also enter
+the legacy replay path; adoption by a shared caller replaces that caller's
+direct-write/replay path for covered sends. This proposal does not silently
+migrate historical outbox entries or change unrelated terminal clients.
+
+Read-only evidence, 2026-10-21: canonical `chat/scripts/chat-bridge` already
+owns a service loop, history catch-up and delivery processing, and calls
+`flush_outbox` every minute. `chatlib.post` opens a caller-owned connection;
+`outbox_claim` locks only the file claim, not publication ownership, and
+replays leftover claimed files after a crash. These are reusable boundaries,
+not proof that the required exclusive sender or journal exists. No code,
+live configuration or service change was made.
+
+The alternative is letting individual clients acquire sender ownership and
+open their own connections. That retains the current caller-driven shape
+but spreads persistent connection lifetime and restart recovery across web
+and command-line processes. Recommend the existing bridge to keep one
+owner of those responsibilities without adding a service.
+
+Owner approval is pending because this fixes execution ownership and makes
+covered sends depend on bridge availability. It affects K-1, particularly
+CHAT-1 and CHAT-4–CHAT-6, and their consumers. It does not resolve the rest
+of K-1: exact deadline clock semantics, operation records, fragment identity,
+history/live cursors and evidence validation still need the detailed contract.
 
 ## Open questions
 
@@ -2764,9 +2826,10 @@ dismissed. No new browser-push path belongs in milestone 1.
 ## Delivery plan
 
 D-74 approves three stages: text chat, images, then the new room lifecycle,
-archives and per-project cutovers. The following **23 proposed slices** turn
-that order into reviewable changes. Their boundaries are for owner review;
-the design remains `exploring`. No issue or pull request is created here.
+archives and per-project cutovers. D-76 approves the following **23 slice
+boundaries** at `e6107c0663`. The design remains `exploring` until the
+contract gates are resolved and the owner approves readiness. No issue or
+pull request is created here.
 
 All issues use `coghex/plateia`. “Shared skills” means implementation in the
 canonical local skills repository through D-75: separate checkout/branch,
@@ -2790,8 +2853,8 @@ checks actually ran in CI versus locally; neither substitutes for the other.
 ### Contract gates before affected issue drafting
 
 These are explicit unfinished design work, not permission to let implementers
-invent behavior. The owner requested the dependency decomposition now; the
-gates keep the draft useful without calling unresolved contracts ready.
+invent behavior. D-76 approves the dependency decomposition but leaves these
+gates open; approved boundaries do not make unresolved contracts ready.
 Resolve each affected gate in this design before drafting that implementation
 issue. Bring any new user-visible behavior or serious ownership choice to the
 owner; exact field spelling and test mechanics are implementation details.
@@ -2806,6 +2869,9 @@ owner; exact field spelling and test mechanics are implementation details.
 D-75 resolves tracking and local skills delivery. D-68's HEIC question is a
 deliberately conditional verification gate, not a mandatory decoder dependency:
 stop and return evidence to the owner only if actual phone input remains HEIC.
+K-1 starts with P-66's concrete sender-ownership proposal; its approval is
+pending. K-2–K-4 are unchanged and remain open. No gate has been marked
+resolved by boundary approval or by source inspection alone.
 
 ### Stage checkpoints
 
