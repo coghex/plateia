@@ -75,6 +75,15 @@ These are inputs for the shared presence contract, not proof that a registered
 account is currently online or that browser-owner presence already exists.
 No identity sync or live configuration change was run for this inspection.
 
+Owner-account follow-up, 2026-10-21: the manager reports that private chat
+configuration currently has one system-wide owner account; the phone account
+has owner status only in another project's configuration. This is a reported
+configuration fact, not a configuration file inspected or reproduced here.
+Read-only source checks confirm single-global-owner assumptions in
+`chatlib.cited_authority`, `chat-bridge.handle` and `identities.allocate`.
+D-61 therefore requires shared ownership/configuration work, not merely a web
+display alias. No credentials or live configuration were read or changed.
+
 ### Relationship to the earlier design
 
 `plateia_design.md` remains historical design evidence; this document does
@@ -1228,6 +1237,71 @@ does not delete the saved room draft, conversation or images. These controls
 must work on phone and desktop. No live joins, parts or connection changes
 are performed during design.
 
+### D-61. Use separate phone and desktop owner accounts with equal authority
+
+Owner decision 2026-10-21. Reject P-52. From the owner's phone, plateia joins,
+leaves and posts as the phone's existing IRC account; from the desktop, it
+acts as the desktop's existing account. Both have the same owner authority
+and permissions. Keep their separate membership entries and real message
+attribution under D-54/D-55. Real account mappings remain private.
+
+The owner delegated the browser-to-account mechanism for design to settle;
+bring back only a material owner choice. D-62 records that selection.
+The phone account's existing limited owner configuration is insufficient
+for plateia's projects. Include a shared-chat configuration/skills change
+that consistently recognizes both accounts as owners. Audit primary-owner
+assumptions in delegation checks, routing, identity metadata and owner-only
+actions; do not grant owner authority through a browser flag or nickname.
+
+**Rollout boundary:** the live owner-account authorization/configuration
+change is the owner's own action at rollout. Design and implement the shared
+support through its normal delivery process, then verify readiness against
+the owner's applied configuration before enabling phone actions. If that
+configuration is absent, show the blocked setup state rather than posting
+as the desktop account or silently giving the phone account lesser authority.
+Do not change live config, credentials, accounts or security policy now.
+
+D-45 still requires one shared sender coordinating writes; it can authenticate
+separate IRC connections for the two accounts. Bind every logical message ID
+and attempt to its actual source account. History lookup, retry and membership
+actions must retain that identity; a reconnect or browser-profile change must
+not move an existing operation to the other account.
+
+### D-62. Bind each browser to a remembered Phone or Desktop profile
+
+Design selection under the owner's 2026-10-21 delegation in D-61; this is
+the chosen mechanism, not a claim of deployed behavior:
+
+- On first use, after the existing owner-access check, choose **Phone** or
+  **Desktop** once for that browser. The server maps that profile to the
+  privately configured owner account. Show the current account alongside
+  the composer so attribution is apparent before Send.
+- Keep an opaque browser-binding token in an HttpOnly, SameSite cookie,
+  Secure on the deployed HTTPS origin. Store its account/profile mapping
+  server-side. Reloads retain the binding; a new browser or cleared cookie
+  requires setup again. Do not guess from screen width, user-agent strings
+  or responsive layout, and do not silently fall back to the other account.
+- Continue enforcing the existing localhost/Tailscale identity, Host and
+  Origin requirements. Profile selection is a protected same-origin mutation
+  and can select only the configured owner profiles. The binding selects
+  attribution; shared chat remains the authority on permissions. No IRC
+  password enters the browser, and no new user-registration system is added.
+- Resolve joins, parts and sends from the server's binding, not an account
+  name supplied with each request. Bind an accepted operation immutably to
+  that account; later binding changes cannot alter its sender or retry it
+  under another identity. Membership is independent between the two accounts.
+
+This cookie is browser setup state, not storage of pending messages; D-36's
+ban on persisting unconfirmed content, IDs and deadlines remains intact.
+Persisting drafts remains governed by D-23.
+
+Evidence for avoiding inference from Tailscale user identity: Serve provides
+the authenticated user's identity, and Tailscale's example states that the
+same user's other devices receive the same identity headers. It therefore
+does not by itself distinguish Phone from Desktop.
+[Serve identity headers](https://tailscale.com/docs/features/tailscale-serve#identity-headers),
+[official identity-header example](https://github.com/tailscale-dev/id-headers-demo).
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1636,18 +1710,22 @@ mirror IRC, within the approved milestone scope and archive exceptions.
 
 ### P-52. Use one configured owner account for plateia joins and posts
 
-Recommend that all plateia browsers, on phone and desktop, use the configured
-primary owner IRC account for joining, leaving and posting. Do not silently
-select a different account from the device type. Keep the owner's other IRC
-account distinct in membership and message attribution under D-55.
+Rejected by D-61. Phone and desktop use their respective owner accounts with
+equal authority. D-62 settles browser binding under the owner's delegation;
+the shared owner-configuration change remains the owner's rollout action.
 
-This gives the shared sender one explicit posting identity and makes the
-Join/Leave control act for that same identity. The owner must choose the
-account before the connection contract is final. Multiple browsers using
-that account must observe the same authoritative membership, including
-explicit leaves. Do not add an account-switching UI without a separate
-decision, or infer authority from a display-name alias. Private configuration
-holds the real account mapping; this proposal creates or changes no account.
+### P-53. Keep IRC connections and joins when the browser closes
+
+Recommend keeping each account's shared IRC connection and joined rooms when
+its plateia browser closes. Reopening resumes the same real membership;
+closing or suspending a browser is not an automatic PART or logout. The
+shared service already owns sending independently of the web application.
+
+The consequence is explicit: the account remains logged into IRC and appears
+in joined rooms even while its browser is closed. Explicit Leave still parts
+the room under D-60. A genuinely lost IRC connection uses actual membership
+and recovery state, not invented online presence. This connection-lifetime
+choice awaits owner approval and does not change existing clients now.
 
 ## Open questions
 
@@ -1726,6 +1804,13 @@ from the bridge's records. Include late acceptance after dead-lettering,
 structured recipient identity and freshness; plateia must not implement a
 parallel delivery-state inference engine over textual trace output.
 
+D-61 adds two real owner accounts with equivalent authority. The shared
+sender coordinates both while binding each operation to its original account.
+The ownership contract must recognize the phone account consistently, including
+cited authority and owner-only actions, without treating it as an assistant
+or replacing its attribution with the desktop account. D-62's browser binding
+selects an existing account; it cannot grant shared-chat authority.
+
 ### Q-4. What are the posting and recovery interactions?
 
 **Draft recovery resolved by D-23:** keep each room's unfinished message and
@@ -1797,8 +1882,12 @@ a missing room within the shared lifecycle.
 shared session records, without an IRC join or status dot. Remaining:
 status explanations and connection lifetime details supporting owner behavior.
 **Switching/join/leave resolved by D-60:** keep joined rooms while switching;
-Join/Leave sends the corresponding IRC action. P-52 asks which owner account
-plateia uses consistently for those actions and posts.
+Join/Leave sends the corresponding IRC action.
+**Acting accounts resolved by D-61:** phone and desktop use their respective
+owner accounts with equal authority. D-62 selects a remembered browser profile
+under the owner's delegation. The owner applies the required live shared-chat
+authorization change at rollout. P-53 asks whether browser closure keeps IRC
+connections and joined rooms.
 **Current-task line deferred by D-30:** optional milestone-2 setting,
 excluded from milestone 1; no default selected.
 **Freshness already resolved:** prior `plateia_design.md` D-52 (owner
@@ -1935,6 +2024,18 @@ assistant role color and no dot. End its session and verify removal; a
 registered account without live-session evidence must not appear as current.
 Source outages use stale/unknown handling without turning it into a live
 assistant. Listing it must not join IRC or alter message routing.
+Check D-61/D-62 with synthetic Phone and Desktop browser profiles: their
+joins, parts and posts use distinct configured accounts with equivalent owner
+authority and unchanged attribution. Multiple browsers on one profile share
+that account's membership; a leave must not part the other account.
+Resize the page and change the user-agent without changing the binding.
+Reload retains setup; a missing/invalid binding requires setup before an
+account action, with no fallback identity. Verify protected setup, rejection
+of arbitrary request-supplied accounts and no browser IRC credentials.
+Phone actions remain blocked until the shared owner configuration is ready.
+Delayed sends, check/cancel and same-ID retries must retain their original
+account across reconnects and browser-binding changes. Include parity checks
+for shared owner/delegation permissions and reject unconfigured identities.
 
 Verify shared delivery and room lifecycle with the plateia process stopped.
 Verify localhost binding and the browser boundary with synthetic requests.
@@ -2144,6 +2245,11 @@ Include D-52's main-room convention in the same shared/global skill change.
 Apply D-59's milestone-1 creation eligibility in that shared room contract.
 Include D-60's membership controls and persistent joins across view switches
 with room opening, backed by the shared IRC membership interface.
+Include D-61's shared multi-owner support and D-62's browser binding in the
+posting/membership slices. Record the phone-account owner-configuration change
+as an explicit owner-performed rollout prerequisite; no worker changes live
+authorization during design or implementation. Gate account actions on the
+configured identity and shared permission checks, without a fallback account.
 Custom rooms and their own rules remain a deferred future requirement with
 no milestone-1 slice or speculative implementation.
 
