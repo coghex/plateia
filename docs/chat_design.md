@@ -5,7 +5,7 @@ phone and desktop. It records the milestone's existing owner decisions and
 keeps unresolved choices explicit. It does not authorize implementation,
 installation, live configuration or service changes.
 
-Design state: `exploring`
+Design state: `ready for issue processing`
 
 Vision-edit rule (owner decision 2026-10-20, D-50): present the exact proposed
 wording and obtain owner approval before any future edit to `docs/vision.md`.
@@ -47,8 +47,8 @@ boundaries at `e6107c0663`, boundaries only. D-81 settles K-1's design
 contract; D-82 settles K-2's state mapping; D-86 settles K-3's image contract.
 Their integration checks remain required. D-87–D-94 settle K-4's design
 contract, as mapped in the coverage review below. No tracker artifact has
-been filed. The design remains `exploring` pending the owner's explicit
-readiness approval, not another implementation or live-change approval.
+been filed. D-95 records the owner's readiness approval; each tracker
+artifact still needs separate signoff before filing.
 
 ## Epic contract
 
@@ -1957,6 +1957,20 @@ D-93 still applies to everything not web-served: IRC, bridge, managers,
 independent clients, shared room lifecycle and local image archives continue
 working. This resolves the web-off audit's image-URL availability question.
 CHAT-23 verifies both sides of that boundary without stopping live services.
+
+### D-95. Approve the design for issue processing
+
+Owner decision 2026-10-21. The design at `872b7eb262` is ready for issue
+processing. Continue in the same design session with `process-design-doc`:
+draft the epic first, then one dependency-ready child at a time, obtaining
+the owner's separate approval of each exact artifact before filing it.
+Report each filed issue through the assigned design channel; the project
+manager runs its issue review.
+
+This approves the ready design and drafting workflow, not any unpresented
+issue, implementation, installation or live setup. Existing confirmation
+gates for IRC limits, owner persistence, moderator-account creation and
+per-project cutover remain in force.
 
 ## Proposals
 
@@ -4687,9 +4701,9 @@ dismissed. No new browser-push path belongs in milestone 1.
 
 D-74 approves three stages: text chat, images, then the new room lifecycle,
 archives and per-project cutovers. D-76 approves the following **23 slice
-boundaries** at `e6107c0663`. The design remains `exploring` until the
-contract gates are resolved and the owner approves readiness. No issue or
-pull request is created here.
+boundaries** at `e6107c0663`. The contract gates are resolved and D-95 records
+readiness approval at `872b7eb262`. Each epic/child draft still needs its
+own signoff before filing; no pull request is created by design processing.
 
 All issues use `coghex/plateia`. “Shared skills” means implementation in the
 canonical local skills repository through D-75: separate checkout/branch,
@@ -4780,11 +4794,10 @@ covered the earlier captured-chat/board arc, not this milestone's working-chat
 scope and current canonical-skills ownership. No existing open umbrella
 duplicates this design. Repeat per-artifact deduplication during processing.
 
-Recommend the design for the owner's readiness approval. Until that approval,
-keep `Design state: exploring` and create no tracker artifact. After approval,
-process the epic first, then one child at a time with separate owner signoff;
-the manager runs each filed issue's review. No implementation or activation
-is approved by this readiness review.
+D-95 records the owner's readiness approval at `872b7eb262`. Process the epic
+first, then one child at a time with separate owner signoff; the manager runs
+each filed issue's review. No implementation or activation is approved by
+this readiness review.
 
 ### K-1 elaboration: identity and cancellation invariants
 
@@ -5236,8 +5249,8 @@ and no hook, live config or service was changed during these checks.
 - **Out of scope:** A new feature batch, duplicated unit tests, production fault injection and claiming HEIC or live cutover verification without evidence.
 - **Open questions / stop conditions:** K-1–K-4's design contracts are resolved; qualification must prove their agreed outcomes and limits. Any triggered D-68 dependency decision still needs owner approval, and owner acceptance determines milestone completion.
 
-The owner must approve the slice boundaries and design readiness before
-`process-design-doc` begins. It then processes the epic first and one child
+D-76 and D-95 approve the slice boundaries and design readiness.
+`process-design-doc` processes the epic first and one child
 at a time, obtaining separate signoff before each tracker artifact is filed.
 The manager runs filed-issue reviews. D-75's local skills route does not
 waive issue approval, exact-commit review or merge authorization.
