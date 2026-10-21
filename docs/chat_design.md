@@ -1107,8 +1107,8 @@ the list; uncertain evidence follows the established freshness rules.
 
 This changes the **list only**. It does not change routing or authority,
 add a testing workflow, or require each listed agent to hold an IRC connection.
-Owner presence and room opening follow D-54/D-55/D-56; the remaining
-assistant rule is P-48.
+Owner presence and room opening follow D-54/D-55/D-56; assistant presence
+follows D-57.
 
 ### D-54. Show the owner only from real logged-in room membership
 
@@ -1126,8 +1126,8 @@ accounts. The owner retains the owner role color and has no status pip.
 The shared IRC boundary supplies membership and its freshness to plateia.
 Missing or stale evidence must not be shown as a current join. D-55 keeps
 owner accounts as separate entries; D-56 makes opening a room join it as
-the owner. Assistants still require a live session; P-48 recommends whether
-an IRC join is additionally required.
+the owner. D-57 lists assistants by their live sessions without requiring
+an IRC join.
 
 ### D-55. Keep owner accounts as separate user-list entries
 
@@ -1155,6 +1155,18 @@ room names, new room types or live configuration changes during design.
 Exact creation eligibility and the behavior of opening an archived room
 remain explicit follow-ups to settle within these rules. Define connection
 ownership and join/leave lifetime in the shared contract.
+
+### D-57. Include live assistants in every room without an IRC join
+
+Owner decision 2026-10-21. Accept P-48. Assistants appear in every room's
+user list while their session is live, using shared session records. No IRC
+join is required. Keep their assistant role color and show no status dot.
+
+An ended session leaves the list. Registration alone is not evidence that
+a session is live; stale or unknown evidence follows the existing freshness
+rules. The shared service supplies this information. Plateia does not inspect
+cmux or run session discovery itself. This presence rule does not change
+assistant authority, message routing or connection ownership.
 
 ## Proposals
 
@@ -1541,17 +1553,20 @@ replace an archived room with a fresh one.
 
 ### P-48. Keep assistant presence based on live sessions
 
-Recommend listing registered global assistants in rooms while fresh shared
-session evidence establishes a live session, without additionally requiring
-an IRC join. This follows the real-session basis used for agents and avoids
-making a short-lived posting connection determine assistant availability.
-Ended sessions leave the list; uncertain evidence uses the existing freshness
-rules. Assistants retain their role color and no status pip.
+Resolved by D-57: assistants with live sessions appear in every room using
+shared session evidence, without an IRC join or status dot.
 
-The shared service supplies this evidence; plateia does not inspect cmux or
-run identity discovery. Registration alone is insufficient. The live-session
-requirement stands; whether an IRC join is also required awaits the separate
-owner question. The two owner-account questions are resolved by D-55/D-56.
+### P-49. Opening an archived room does not reopen it
+
+Recommend that opening an archived room through an old link in milestone 1
+shows **“This room is archived.”**, without joining, recreating or reopening
+it. The log and images remain preserved; archive browsing is still milestone 2.
+Do not offer Send or silently create a new IRC channel for an archived room.
+
+Reopened tracker work follows D-51 and makes the original room active again;
+opening it then joins normally under D-56. A closing room remains governed
+by D-15 until preservation is verified. This proposal specifies the archived
+case as an exception to D-56's normal open/join behavior and needs owner approval.
 
 ## Open questions
 
@@ -1565,7 +1580,8 @@ owner-specific global skill change when the room-model work is implemented.
 **Opening resolved by D-9:** create on first use, including issue review.
 **Opening from plateia resolved by D-56:** join as the owner and create if
 missing, within the shared room model. Still specify eligible room names
-and the result of opening an archived room without bypassing its lifecycle.
+and the result of opening an archived room without bypassing its lifecycle
+(P-49).
 **Issue closure without any PR resolved by D-10:** close and preserve the log.
 **Multiple PRs resolved by D-11:** share the issue room and close after the
 last open PR closes.
@@ -1689,9 +1705,10 @@ active agents across projects; this changes the list only.
 the owner accounts, not an automatic entry in every room.
 **Account display resolved by D-55:** separate entries for the two accounts.
 **Opening/joining resolved by D-56:** opening joins as the owner and creates
-a missing room within the shared lifecycle. Remaining: whether assistants
-also need an IRC join (P-48), status explanations, and the connection lifetime
-details supporting the approved owner behavior.
+a missing room within the shared lifecycle.
+**Assistants resolved by D-57:** list live assistants in every room using
+shared session records, without an IRC join or status dot. Remaining:
+status explanations and connection lifetime details supporting owner behavior.
 **Current-task line deferred by D-30:** optional milestone-2 setting,
 excluded from milestone 1; no default selected.
 **Freshness already resolved:** prior `plateia_design.md` D-52 (owner
@@ -1804,6 +1821,12 @@ and show presence only after membership is established. Concurrent opens
 must converge on one shared room identity. Include failed joins and archived
 room records with no live channel; do not silently create a replacement
 conversation or enable posting to an archived room.
+Check D-57 with a live assistant that has no IRC connection: it appears in
+every room, including project rooms, general and `#chat-test`, with the
+assistant role color and no dot. End its session and verify removal; a
+registered account without live-session evidence must not appear as current.
+Source outages use stale/unknown handling without turning it into a live
+assistant. Listing it must not join IRC or alter message routing.
 
 Verify shared delivery and room lifecycle with the plateia process stopped.
 Verify localhost binding and the browser boundary with synthetic requests.
