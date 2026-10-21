@@ -64,7 +64,7 @@ Read-only checks on 2026-10-20:
 | `.github/workflows/ci.yml`, refreshed 2026-10-20 | Python 3.10/3.14 tests feed an always-running `build-test` aggregate that rejects any non-success dependency. There is no frontend package or Node build yet. D-27 extends this existing gate. |
 
 The brief identifies general and project testing rooms as not yet configured.
-This design does not inspect or publish private configuration. Creating those
+This design does not publish private configuration. Creating those
 rooms in live configuration remains the owner's action.
 
 Presence follow-up, 2026-10-21: shared `chat/scripts/identities.py` supports
@@ -85,8 +85,32 @@ The commit includes second-owner regression tests; those tests were inspected,
 not run for this documentation update. The applied private configuration is
 manager-reported, not inspected or reproduced here. D-61/D-62 consume this
 completed support; plateia must recognize every account in the shared owner
-set, not maintain its own two-account authority list. No credentials or live
-configuration were read or changed by this design session.
+set, not maintain its own two-account authority list. That authority follow-up
+required no private configuration inspection or changes. The manager also
+reports the bridge restarted on `7ce2401`, with this authority now live.
+
+Membership follow-up, 2026-10-21: read-only inspection identifies the running
+installation as Ergo 2.19.1. Its configuration enables multiclient attachment,
+allows it by default and forces nicknames to equal account names. The matching
+release's `ClientManager.SetNick` attaches an authenticated connection to the
+existing account's client; channel membership belongs to that shared client,
+and `Channel.Part` removes it and reports the PART to its other sessions.
+This supports D-63's shared membership across interfaces, conditional on
+authenticating during connection registration. No test JOIN/PART, owner login,
+configuration change or service restart was performed.
+[Ergo 2.19.1 attachment implementation](https://github.com/ergochat/ergo/blob/v2.19.1/irc/client_lookup_set.go),
+[channel membership implementation](https://github.com/ergochat/ergo/blob/v2.19.1/irc/channel.go).
+
+Retention after **all** IRC connections disappear is a separate setting:
+the installation uses opt-in always-on accounts. A read-only examination of
+the running process's datastore found that always-on is not enabled for every
+owner profile. P-54 proposes completing that setup later; multiclient support
+alone is not proof of zero-connection retention. This check does not establish
+runtime join/part behavior through a live experiment or successful recovery
+after a server restart; those remain integration verification.
+[Ergo always-on behavior](https://github.com/ergochat/ergo/blob/v2.19.1/docs/USERGUIDE.md#always-on),
+[persistence setting evaluation](https://github.com/ergochat/ergo/blob/v2.19.1/irc/config.go),
+[startup restoration](https://github.com/ergochat/ergo/blob/v2.19.1/irc/accounts.go).
 
 ### Relationship to the earlier design
 
@@ -1308,6 +1332,31 @@ does not by itself distinguish Phone from Desktop.
 [Serve identity headers](https://tailscale.com/docs/features/tailscale-serve#identity-headers),
 [official identity-header example](https://github.com/tailscale-dev/id-headers-demo).
 
+### D-63. Keep account sessions and membership behind every interface
+
+Owner decision 2026-10-21. Accept P-53. Each owner account stays logged in
+and joined behind plateia whether or not its browser is open. Closing or
+suspending the interface is not PART or logout; reopening resumes the
+account's existing membership. Its room-list presence means joined, not
+currently viewing. A real loss of authoritative IRC state remains stale or
+unknown under the existing freshness rules.
+
+Membership is shared with the owner's other IRC clients on the same account.
+Join or Leave in plateia changes that account's membership everywhere;
+actions from another client must likewise update plateia. The two different
+owner accounts remain independent. Do not maintain a competing browser-only
+join list or automatically undo a PART received from another client. D-56's
+explicit room opening and D-60's Join control remain ways to join again;
+a rerender or background refresh is not a new request to join.
+
+Use the installed Ergo's multiclient attachment, verified read-only above:
+authenticate the shared service's connection as the selected account during
+registration so it attaches to the same identity. Keep this service lifetime
+independent of browser connections and the web application. No Ergo patch or
+replacement membership service is needed. Retention with no connected IRC
+clients is a separate always-on setting, tracked in P-54; do not silently
+assume its current configuration satisfies that stronger recovery case.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1723,16 +1772,24 @@ the shared owner-configuration change is complete as of the owner's
 
 ### P-53. Keep IRC connections and joins when the browser closes
 
-Recommend keeping each account's shared IRC connection and joined rooms when
-its plateia browser closes. Reopening resumes the same real membership;
-closing or suspending a browser is not an automatic PART or logout. The
-shared service already owns sending independently of the web application.
+Resolved by D-63, owner decision 2026-10-21. Accounts remain logged in and
+joined behind the interface, sharing membership with their other IRC clients.
+The installed Ergo configuration and matching source support multiclient
+attachment; zero-connection retention is separately tracked in P-54.
 
-The consequence is explicit: the account remains logged into IRC and appears
-in joined rooms even while its browser is closed. Explicit Leave still parts
-the room under D-60. A genuinely lost IRC connection uses actual membership
-and recovery state, not invented online presence. This connection-lifetime
-choice awaits owner approval and does not change existing clients now.
+### P-54. Enable Ergo always-on for both owner profiles at setup
+
+Recommend enabling Ergo's existing always-on behavior for any owner profile
+that lacks it when this integration is set up. Then the account keeps its
+membership even if every IRC client, including the shared service, disconnects;
+Ergo also restores persisted membership when it restarts. Explicit PART still
+leaves the room everywhere and must not be undone by an old client-side list.
+
+This is a proposed owner-authorized account-setting action at implementation
+setup, not a change made during design. It is separate from the completed
+shared-chat owner-authority change in D-61. The alternative is to rely on the
+shared service keeping an IRC connection alive, without server retention
+when the final connection is lost. Owner approval is pending.
 
 ## Open questions
 
@@ -1754,6 +1811,9 @@ archived.” without joining, reopening or creating a replacement room.
 **Switching and membership controls resolved by D-60:** switching keeps
 existing joins; every room page has Join/Leave, with Leave sending IRC PART.
 Archived pages keep Join unavailable under D-58.
+**Connection lifetime resolved by D-63:** closing the browser keeps the
+account joined; membership is shared with its other IRC clients. P-54 covers
+Ergo retention if every IRC client disconnects.
 **Issue closure without any PR resolved by D-10:** close and preserve the log.
 **Multiple PRs resolved by D-11:** share the issue room and close after the
 last open PR closes.
@@ -1888,15 +1948,16 @@ the owner accounts, not an automatic entry in every room.
 a missing room within the shared lifecycle.
 **Assistants resolved by D-57:** list live assistants in every room using
 shared session records, without an IRC join or status dot. Remaining:
-status explanations and connection lifetime details supporting owner behavior.
+status explanations. D-63 settles connection lifetime and shared membership;
+P-54 covers retention with no connected IRC clients.
 **Switching/join/leave resolved by D-60:** keep joined rooms while switching;
 Join/Leave sends the corresponding IRC action.
 **Acting accounts resolved by D-61:** phone and desktop use their respective
 owner accounts with equal authority. D-62 selects a remembered browser profile
 under the owner's delegation. The owner reports the shared-chat authorization
 change complete, backed by skills commit `7ce2401`; no rollout action remains
-for adding the phone account. P-53 asks whether browser closure keeps IRC
-connections and joined rooms.
+for adding the phone account. D-63 keeps sessions and joined rooms behind
+the interface, shared across that account's IRC clients.
 **Current-task line deferred by D-30:** optional milestone-2 setting,
 excluded from milestone 1; no default selected.
 **Freshness already resolved:** prior `plateia_design.md` D-52 (owner
@@ -2047,6 +2108,18 @@ account across reconnects and browser-binding changes. Include parity checks
 for shared owner/delegation permissions, including an additional synthetic
 owner to catch a hard-coded two-account permission list, and reject
 unconfigured identities.
+
+Check D-63 with two IRC clients on one synthetic owner account: join and
+part from either interface, observe the same membership in both, and verify
+that a part received from elsewhere is not undone by a browser rerender.
+Keep the other owner account's membership independent. Close every browser
+and stop the web application while the shared service continues: neither
+action should PART or log out the account. Reopening must reconcile with
+current IRC membership. Verify attachment during authenticated registration,
+including existing sessions; do not silently connect under a fallback nick.
+If P-54 is accepted, also verify zero-client retention, server-restart
+restoration and that a completed PART is not restored as a join. These are
+future isolated integration checks, not tests performed on the owner's rooms.
 
 Verify shared delivery and room lifecycle with the plateia process stopped.
 Verify localhost binding and the browser boundary with synthetic requests.
@@ -2256,6 +2329,10 @@ Include D-52's main-room convention in the same shared/global skill change.
 Apply D-59's milestone-1 creation eligibility in that shared room contract.
 Include D-60's membership controls and persistent joins across view switches
 with room opening, backed by the shared IRC membership interface.
+Carry D-63's browser-independent sessions and cross-client membership into
+that interface, including updates from the owner's existing clients. P-54's
+always-on setup remains a separate pending choice, not a code workaround or
+another owner-authority configuration task.
 Reuse D-61's completed shared multi-owner support (`7ce2401`) in the
 posting/membership slices, alongside D-62's browser binding and the shared
 sender's two-account integration. Do not add a redundant support slice or
