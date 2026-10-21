@@ -109,9 +109,10 @@ In scope:
   and the existing `#chat-test` room.
 - Live reading, posting and history as one milestone.
 - File preservation of closed work-room logs with their images (D-20).
-- A one-time cleanup before adopting the new room model: archive completed
-  work rooms, retain active/permanent rooms, and discard existing design
-  rooms without saved logs (D-12/D-13/D-16).
+- A clean cutover per project: warn the owner, close non-exempt issues/PRs,
+  archive legacy request rooms and restart work in issue/PR rooms. Only
+  owner-named parked work keeps a marked legacy room (D-44). Permanent rooms
+  stay; existing design rooms are discarded without saved logs (D-16).
 - Each room's user list, role colors, and agent idle/working/waiting pips.
 - Pasted image sharing with PNG support at minimum.
 - V-12 reliability, a Python server, localhost listening and access through
@@ -251,9 +252,10 @@ migration only as an open question; that was not a concrete rollout step.
 
 The delivery plan must explicitly account for this work alongside D-8's
 global skill change. This is a design requirement, not an instruction to
-archive live rooms now. D-13 settles which rooms to archive, retain or discard;
-preservation and how active work carries forward still need an agreed
-contract (Q-8). It does not require milestone 2's archive browser.
+archive live rooms now. D-44 settles the clean per-project cutover and parked
+exceptions, superseding general retention of active implementation rooms.
+D-16's design-room discard still applies. It does not require milestone 2's
+archive browser.
 
 ### D-13. Archive completed work rooms; discard existing design rooms
 
@@ -262,8 +264,9 @@ Owner decision 2026-10-20, amended by the owner's later answer:
 - Archive completed implementation rooms after saving and verifying their
   logs. Finished means the PR is closed out; a room covering several PRs
   remains active while any associated PR is open.
-- Keep active implementation rooms and permanent main/general/testing rooms.
-  Bring uncertain cases to the owner.
+- Keep permanent main/general/testing rooms. D-44 supersedes the earlier
+  general retention of active implementation rooms: only owner-named parked
+  exceptions retain their marked legacy room through cutover.
 - Discard all existing design rooms at rollout, whether their work is
   finished or not. Do not migrate their conversations or save or verify
   their logs. This replaces the earlier all-issues-approved cleanup rule.
@@ -866,6 +869,42 @@ contract. Browser push stays in milestone 2. Dismissing an existing phone
 notification does not resolve the chat error; D-42 still requires acceptance
 by the intended agent.
 
+### D-44. Cut over each project cleanly, with named parked exceptions
+
+Owner decision 2026-10-20, replacing P-35's gradual migration. Before the
+new issue/PR room model goes live for a project:
+
+1. Its manager warns the owner about that project's cutover.
+2. The owner closes every open issue and PR except parked items the owner
+   explicitly names as exceptions.
+3. Archive that project's legacy request rooms through the normal archive
+   path. The existing design-room exception remains D-16: discard those
+   rooms without migration or saved logs. Permanent rooms remain.
+4. Switch the project to the new model and restart work in issue/PR rooms.
+
+A named parked issue/PR keeps its existing room in place, visibly marked
+as a legacy room, until its work finishes. This is the explicit exception;
+ordinary unfinished work is not grandfathered into old rooms. Preserve the
+exception's tracker association so it does not acquire a duplicate room.
+
+The owner accepted some historical loss during cutover and delegated rollout
+details to the project manager. Preserve the available record through the
+normal archive path and describe retained coverage honestly; do not require
+perfect historical reconstruction as a migration project. This tolerance
+is for legacy cutover, not permission to silently drop new messages or
+images under the new model.
+
+The manager's delegated rollout design is a **per-project switch in shared
+chat configuration**. Each project has its own warning and owner cutover;
+other projects remain on their existing convention until theirs occurs.
+D-8's owner-specific global skill change must honor this switch, including
+parked exceptions, rather than forcing every project to change at once.
+The switch and room lifecycle belong in shared chat, not plateia mapping.
+
+No live rooms, tracker items or configuration change during this design.
+The project's rollout warning and owner closure step happen when the
+implemented room-model change is ready to activate.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1089,18 +1128,9 @@ alongside the chat error, with no bridge notification change.
 
 ### P-35. Finish active legacy implementation work in its existing rooms
 
-For Q-8's active-room transition, recommend leaving unfinished implementation
-work in its current room until that work finishes. Record which tracker
-items already use each retained room, including grouped legacy rooms, so
-first use does not create duplicate rooms for that in-flight work. Use the
-new issue/PR room model for new work after rollout. Archive retained rooms
-under the approved completion and verification rules when they finish.
-
-This preserves ongoing conversations without splitting or moving them.
-It does not change D-13/D-16's separate rule to discard existing design
-rooms without saved logs. The transition would be an explicit temporary
-exception in D-8's shared room-model and owner-specific skill rollout, not
-a second room model maintained by plateia. This proposal is not yet approved.
+Rejected by D-44 in favor of a clean cutover per project. Only parked
+issues/PRs explicitly named by the owner retain marked legacy rooms until
+completion; there is no general gradual migration of active work.
 
 ## Open questions
 
@@ -1246,20 +1276,23 @@ Reconcile the earlier browser trust boundary with posting and attachments.
 ### Q-8. How should existing rooms be archived and migrated?
 
 D-12 requires an explicit initial archive/migration step.
-**Selection resolved by D-13:** archive completed implementation rooms after
-saving and verifying logs; retain active/permanent rooms and ask about
-uncertain ones. Completed means closed-out PRs. Discard existing design rooms
-at rollout without migration or saved logs; new design conversations use
-general (D-16). The current reporting channel stays in use for now.
+**Cutover resolved by D-44:** warn the owner per project; the owner closes
+non-exempt issues/PRs; archive legacy request rooms; switch that project
+and restart work in issue/PR rooms. Only owner-named parked items keep marked
+legacy rooms until they finish. Some historical loss at cutover is accepted;
+rollout details belong to the project manager. Other projects remain on
+their existing model until their own cutover. Permanent rooms stay.
+Discard design rooms without migration or saved logs (D-16); new design
+conversations use general. The current reporting channel stays in use now.
 
 **Archived behavior resolved by D-14:** leave active lists and reject new
 posts until reopened, retaining the file log.
 **Closing transition resolved by D-15:** block new submissions, settle
 already-accepted posts and verify the archive; keep the title grey and
 problems visible until verified closure.
-Still specify archive completeness and verification,
-active-room mapping (P-35 proposes keeping unfinished implementation work
-in its current room), interruption/retry behavior and the rollout sequence.
+Still specify normal archive verification and interruption/retry behavior.
+The manager owns D-44's concrete activation procedure and parked-room
+mapping. Do not reopen the rejected gradual-migration plan.
 Include the conversation's images in the archive and its verification
 (D-20).
 For rooms being archived, preserve conversation history and references.
@@ -1294,10 +1327,14 @@ Exact tests and fixtures follow the approved contracts rather than inventing
 behavior here.
 
 The initial cleanup needs synthetic examples of closed-out PR work,
-incomplete implementation work, existing design rooms, permanent rooms and
-ambiguous rooms. Show that archived work records survive, active
-implementation work remains reachable, and design rooms are discarded
-without conversation migration or saved logs.
+owner-named parked work, non-exempt open work, existing design rooms and
+permanent rooms. Verify D-44's warning/owner-closure/archive/switch order:
+non-exempt open work prevents activation; named parked work remains reachable
+in marked legacy rooms without duplicates; permanent rooms remain; and
+design rooms are discarded without migration or saved logs. Verify that
+switching one project does not change another project's room behavior.
+Historical gaps accepted at cutover must not be represented as complete
+records or weaken preservation for new work.
 Verify that new design conversations use general, that completing a design
 never closes general, and that discarding a design room does not mark
 unfinished tracker work complete.
@@ -1431,10 +1468,12 @@ in normal isolated code worktrees; this document does not install tools.
 Include D-16's design-agent use of general in that change, with no dedicated
 design-room slice or conversation migration. General's live provisioning
 remains the owner's action.
-Include D-12's initial cleanup as an explicit rollout step before
-adopting the new room model. Its selection and preservation contract (Q-8)
-must be settled before defining the affected slice and execution procedure;
-it is not postponed to milestone 2's archive browser.
+Include D-12/D-44's clean cutover as an explicit per-project rollout step:
+manager warning, owner closure of non-exempt tracker work, normal legacy
+archive, then project switch and issue/PR work. Include marked parked-room
+exceptions and isolation of projects not yet switched. The manager owns
+the concrete rollout details; this is not postponed to milestone 2's archive
+browser and is not a gradual migration of every active room.
 Discard existing design rooms during that rollout without saved logs.
 
 Image sequencing from D-17: first deliver pasted-image insertion as a
