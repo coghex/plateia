@@ -1904,6 +1904,21 @@ settles K-4's tracker observation and transition semantics. The durable
 registry/archive publication contract and concrete IRC completion evidence
 remain to be settled. No live polling setup or tracker mutation is authorized.
 
+### D-92. Accept the shared control store and verified immutable archives
+
+Owner decision 2026-10-21. Accept P-81 as written at `b26849ae31`:
+keep shared send/control and room lifecycle records in one local SQLite
+store, and publish immutable archive folders only after their log and images
+are verified. Switch the current archive pointer and lifecycle/feed state
+in the same control-store transaction after the required checks and cleanup.
+
+Retain published revisions without automatic pruning in milestone 1.
+The separate image catalog remains behind its asset command; this is an
+ordered recovery protocol, not a cross-store transaction. This settles
+K-4's durable registry/archive publication contract. Concrete IRC completion
+and restart evidence remain open. No live storage or service change is
+authorized.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -3665,7 +3680,7 @@ is authorized by this proposal.
 
 ### P-81. Publish immutable archive bundles through one durable shared control store
 
-Proposed K-4 persistence contract, not yet approved. Put the shared bridge's
+Accepted by D-92, owner decision 2026-10-21. Put the shared bridge's
 durable send/control records, room registry, lifecycle operations and change
 feed in one local SQLite database outside the repository. CHAT-5 establishes
 the durable send store; CHAT-18 adds room records and migrations to that
@@ -3799,8 +3814,8 @@ simultaneous correction/reopen and stale candidates with invented data on
 the supported platforms. No durability fault test has been run for this
 proposal yet.
 
-Acceptance would settle the durable registry/archive publication contract.
-K-4 would still need the concrete IRC completion and restart-evidence
+D-92 settles the durable registry/archive publication contract.
+K-4 still needs the concrete IRC completion and restart-evidence
 contract before affected issue drafting. No database, service, archive or
 configuration is changed live by this proposal.
 
@@ -3865,8 +3880,8 @@ D-90 accepts P-79's durable shared association registry, initial GitHub/workflow
 link evidence and manager-first conflict handling.
 D-91 accepts P-80's fresh tracker observation and work-round transition
 contract, including first use and reopen history.
-P-81 proposes the shared control store and immutable archive publication
-protocol; it awaits owner approval. IRC completion evidence remains open.
+D-92 accepts P-81's shared control store and immutable archive publication
+protocol. IRC completion evidence remains open.
 
 ### Q-3. What interface separates plateia from shared chat?
 
