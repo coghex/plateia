@@ -65,7 +65,7 @@ design is not ready for issue processing yet.
 - **Arc label:** None proposed.
 - **Publication:** this document belongs to `coghex/plateia`, on `master`.
   All milestone-1 issues use that tracker. Shared workflow implementation
-  stays in the skills repository under D-78, using D-75's local review and
+  stays in the skills repository under `plateia_design.md` D-78, using D-75's local review and
   delivery route; plateia code uses its own pull requests.
 
 ## Current state and evidence
@@ -144,7 +144,7 @@ after a server restart; those remain integration verification.
 `plateia_design.md` remains historical design evidence; this document does
 not silently inherit its former epic or delivery order.
 
-- D-78 governs chat source ownership and retires the capture/release work.
+- `plateia_design.md` D-78 governs chat source ownership and retires the capture/release work.
 - The vision's 2026-10-20 milestones replace the old board-first path for
   this work. Board prerequisites are not prerequisites for working chat.
 - The current vision expressly leaves the framework and evaluation method
@@ -1681,6 +1681,22 @@ the deadline clock, operation/state, fragment and history/live contracts
 before drafting the affected issues. No implementation or live change is
 authorized by this design approval.
 
+### D-78. Plan one native multiline batch per message, with setup verification
+
+Owner decision 2026-10-21. Accept P-67 as a plan. At setup, raise Ergo's
+native multiline limits to 65,536 bytes and 65,536 lines so each supported
+64 KiB message uses one native batch. Do not split one logical message into
+independently published batches, and do not patch Ergo. Preserve the
+logical ID and exact text across the batch's wire lines and native history
+identity. The existing unconfirmed/no-retry rules still apply.
+
+Verify buffer sizing and fault behavior before activation. The change is
+server-wide live configuration: the project manager confirms it with the
+owner at setup before applying it. This design approval is not permission
+to change the running server now. If verification exposes a needed buffer
+change, bring its size and evidence back rather than silently changing
+unrelated limits. The accepted slice boundaries stay unchanged.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2256,7 +2272,11 @@ history/live cursors and evidence validation still need the detailed contract.
 
 ### P-67. Fit one supported message into one native Ergo multiline batch
 
-Recommend using one native multiline batch for every covered logical message,
+Resolved by D-78 as a plan, owner decision 2026-10-21, with buffer/fault
+verification before activation and separate owner confirmation of the live
+setup change. The accepted proposal and evidence follow.
+
+Use one native multiline batch for every covered logical message,
 including the full 65,536-byte text limit, instead of publishing several
 independent batches and adding a cross-batch commit protocol. Retain the
 browser-created logical ID as a client-only tag on the batch opener, bind it
@@ -2316,10 +2336,11 @@ capability changes, and realistic output buffering/fakelag on isolated Ergo.
 Do not add a second multi-batch fallback if verification fails: bring the
 evidence back before changing the transport design or approved text limit.
 
-Owner approval is pending for the server-wide limit change and single-batch
-transport choice. This is part of K-1 and affects CHAT-2, CHAT-3, CHAT-6,
-CHAT-8 and their consumers. Deadline clock semantics and history/live cursor
-proof remain separate unfinished parts of K-1.
+D-78 approves the single-batch plan; actual server-wide activation remains
+subject to its verification and owner-confirmation conditions. This is part
+of K-1 and affects CHAT-2, CHAT-3, CHAT-6, CHAT-8 and their consumers.
+Deadline clock semantics and history/live cursor proof remain separate
+unfinished parts of K-1.
 
 ## Open questions
 
@@ -2381,7 +2402,8 @@ the skills repository. Do not revive retired packages by inference.
 
 Earlier `plateia_design.md` D-16 selected a shared, versioned Python API
 inside the existing bridge/client processes, without a new initial IPC
-daemon. Carry that interface direction forward alongside D-78's canonical
+daemon. Carry that interface direction forward alongside `plateia_design.md`
+D-78's canonical
 skills ownership. Existing connection/post helpers are not yet the typed
 history, membership, delivery and serialized-sender contract required here;
 define those extensions without assuming the retired capture is available.
@@ -2883,12 +2905,15 @@ archiving use the capped version, with no retained high-resolution original.
 
 Long-message verification must cover exact leading, trailing and internal
 line breaks, Unicode split boundaries, negotiated byte/line limits, multiple
-batches, interleaved same-sender posts, repeated identical posts, truncated
+independent messages in separate batches, interleaved same-sender posts,
+repeated identical posts, truncated
 batches, reconnect and history replay. Assert one web message per logical
 post and one instruction dispatch, with no merging of separate posts or
-partial dispatch when a fragment is absent. Missing multiline capability
-must exercise the specified equivalent contract or an explicit refusal,
-never heuristic joining. Existing 10-test evidence is a baseline only.
+partial dispatch when a fragment is absent. Under D-78, one covered message
+must fit one batch; missing capability or insufficient limits cause an
+explicit refusal before writing, never a multi-batch or plain-line fallback.
+Verify output buffers and fault behavior before the separately confirmed
+live setup change. Existing 10-test evidence is a baseline only.
 
 Verify D-38 at 65,535, 65,536 and 65,537 serialized UTF-8 bytes, including
 multibyte characters and attachment links. Over-limit content must remain
@@ -2969,8 +2994,10 @@ owner; exact field spelling and test mechanics are implementation details.
 D-75 resolves tracking and local skills delivery. D-68's HEIC question is a
 deliberately conditional verification gate, not a mandatory decoder dependency:
 stop and return evidence to the owner only if actual phone input remains HEIC.
-K-1's execution ownership is resolved by D-77. Its remaining deadline,
-operation/state, fragment and history/live contracts are still open.
+K-1's execution ownership is resolved by D-77 and its native single-batch
+transport plan by D-78. Its remaining deadline, detailed operation/state
+and history/live contracts are still open. Transport activation still needs
+D-78's verification and separately confirmed setup change.
 K-2–K-4 remain open. No gate has been marked resolved by boundary approval
 or by source inspection alone.
 
@@ -2978,8 +3005,8 @@ or by source inspection alone.
 
 The following makes D-34/D-45/D-47/D-48/D-77 concrete without declaring
 the gate resolved. It is a contract to implement and verify, not a claim
-about the current `chatlib` or bridge. P-67 separately proposes the wire
-representation; the clock mapping and history/live cursor are still open.
+about the current `chatlib` or bridge. D-78 selects the native single-batch
+wire representation; the clock mapping and history/live cursor are still open.
 
 Keep four identities distinct: the browser's logical message ID; the
 attempt generation for each explicit retry; a command ID for idempotent
@@ -3050,12 +3077,12 @@ not reset the timeout at HTTP receipt. No issue is ready from this table alone.
 
 - **Outcome:** A supported long post is one exact logical message in live delivery and history.
 - **Implementation owner:** Shared skills, local delivery under D-75.
-- **Scope:** Extend the shared encoder and bridge reassembly with explicit logical ID, ordered fragment identity and completeness checks up to 65,536 UTF-8 bytes. Preserve leading/trailing blank lines, spacing and attachment-link text. Retain native message-ID aliases needed for history and acceptance.
+- **Scope:** Extend the shared encoder and bridge reassembly with an explicit logical ID and complete native multiline batch up to 65,536 UTF-8 bytes under D-78. Preserve leading/trailing blank lines, spacing and attachment-link text across the ordered wire lines. Retain native message-ID aliases needed for history and acceptance. Refuse before writing if negotiated capacity is insufficient; no cross-batch fallback.
 - **Phase:** 1. **Depends on:** CHAT-1. **Ordering:** critical path; may run in parallel once its listed dependencies and contract gates are satisfied.
-- **Relevant decisions:** D-37, D-38, D-45, D-72.
+- **Relevant decisions:** D-37, D-38, D-45, D-72, D-78.
 - **Acceptance signals:** Interleaved posts never merge; duplicate, missing and reordered fragments do not dispatch partial instructions. Complete live and replayed records match byte-for-byte, including boundary-size Unicode input.
 - **Out of scope:** Browser rendering, retry policy and heuristic merging of legacy posts.
-- **Open questions / stop conditions:** K-1 / Q-3; prove the chosen tag/grouping round-trip against isolated Ergo before activation.
+- **Open questions / stop conditions:** K-1 / Q-3; prove the chosen tag/grouping round-trip, output-buffer sizing and interrupted-batch behavior against isolated Ergo before activation. The manager separately confirms the live setup change with the owner under D-78.
 
 ### CHAT-3. Expose authoritative history with a gap-free live handoff
 
