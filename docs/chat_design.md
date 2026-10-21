@@ -1452,7 +1452,31 @@ current text and images. D-17's placeholder-link stage and later inline
 stage apply to both entry methods, as do D-18's whole-message upload-failure
 behavior, D-22's stored-image caps, D-23's draft persistence and D-49's
 reference tracking. There is no separate preview/caption screen or general
-file-sharing feature. Supported input formats remain to settle under P-58.
+file-sharing feature. D-68 settles the supported input formats.
+
+### D-68. Support PNG, JPEG and WebP; verify whether HEIC is needed
+
+Owner decision 2026-10-21. Accept P-58 with a narrower initial scope:
+milestone 1 supports PNG, JPEG and WebP still images. Animation and video
+remain out of scope. All accepted formats use the existing immediate-upload
+flow and D-22's stored-image cap: 1280 pixels on the longest side and 1 MiB.
+
+Do not add HEIC/HEIF support or its decoder dependency now. During real
+phone verification, inspect what the page actually receives from the photo
+chooser and paste, including photos originally stored as HEIC. The expected
+conversion to a supported format is a hypothesis to verify on the owner's
+phone, not a guarantee about every browser, picker source or file extension.
+
+Only if that testing finds HEIC arriving unconverted should HEIC support be
+brought forward. Record the reproduction and detected format without
+publishing the owner's photo or metadata, then obtain a separate owner
+decision on the decoder dependency before adding it. Do not silently install
+a decoder, require manual conversion as the final phone experience, or claim
+that untested phone selection works. This is a verification-triggered
+follow-up, not an unconditional milestone-1 dependency or slice.
+
+Unsupported inputs show an error and leave the existing draft intact under
+D-18; do not silently flatten animation or send text without a failed image.
 
 ## Proposals
 
@@ -1903,23 +1927,37 @@ posting still happens only on Send.
 
 ### P-58. Support common still-image formats in milestone 1
 
-Recommend accepting PNG, JPEG, WebP and HEIC/HEIF still images through both
-paste and the image button. This covers screenshots and selected photos
-without requiring the owner to convert the file first. Store a normalized,
-capped still image under D-21/D-22 rather than retaining the original upload.
-Animation and video are outside this proposed milestone-1 format scope;
-unsupported inputs get a clear error while the draft remains intact, rather
-than silently losing their moving content. Owner approval is pending.
+Resolved by D-68, owner decision 2026-10-21, with a narrower initial scope:
+PNG, JPEG and WebP stills. HEIC/HEIF is conditional on real phone testing
+showing unconverted input, followed by a separate owner decision on any
+decoder dependency. Animation and video remain out.
 
 Technical feasibility evidence, 2026-10-21: Pillow documents PNG, JPEG and
 WebP support; Pillow-Heif supplies HEIF decoding through libheif. HEIC support
 would therefore add a decoder dependency, with exact package pins and wheel
 compatibility for the project's Python/macOS/CI environments to verify before
-implementation. This is a candidate processing path, not a package selection,
-installation or claim of tested browser/device behavior.
+implementation if D-68's trigger is met and the owner approves the dependency.
+This is retained feasibility evidence, not an approved HEIC implementation,
+package selection, installation or claim of tested browser/device behavior.
 [Pillow formats](https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html),
 [Pillow-Heif](https://pillow-heif.readthedocs.io/en/stable/index.html),
 [installation and wheels](https://pillow-heif.readthedocs.io/en/latest/installation.html).
+
+### P-59. Bound source images before shrinking them
+
+Recommend accepting each source image up to **20 MiB encoded** and
+**50 million pixels** before resizing. These are proposed input/processing
+limits, separate from D-22's much smaller stored result. They allow large
+source photos while bounding upload bytes and decoded image dimensions.
+They are not themselves a total memory bound; implementation must also bound
+concurrent decoding and reject over-limit dimensions before allocating the
+full pixel buffer.
+
+If either limit is exceeded, show an image error and keep the message unsent
+for removal or replacement under D-18. Never retain the high-resolution
+original as an attachment or archive asset. Accepted images still shrink to
+at most 1280 pixels on the longest side and 1 MiB, shrinking further if
+needed. Owner approval of the source limits is pending.
 
 ## Open questions
 
@@ -2122,8 +2160,11 @@ and file at most 1 MiB, shrinking further as needed.
 uploads after 24 hours; keep needed images and uncertain cases.
 **Image selection resolved by D-67:** image button alongside paste on phone
 and desktop, using the same draft and immediate upload, posting only on Send.
-P-58 proposes the supported still-image formats. Remaining: device paste and
-chooser validation, input/processing limits, link access and archive mechanics.
+**Input formats resolved by D-68:** PNG, JPEG and WebP stills; HEIC only if
+real phone testing exposes unconverted input and the owner separately approves
+the decoder dependency. P-59 proposes source byte/pixel limits. Remaining:
+device paste and chooser validation, processing mechanics, link access and
+archive mechanics.
 Plateia stores images; shared chat records their links.
 
 ### Q-7. Which page framework, evaluation method and browser layout?
@@ -2329,6 +2370,17 @@ sending; cancelling the chooser leaves the draft unchanged. Exercise the
 same upload failure, retry/removal, caps and draft persistence through paste
 and selection. Both entry methods must work in the placeholder-link slice
 and the completed inline-image experience.
+For D-68, cover valid PNG, JPEG and WebP stills plus animated, video,
+unsupported and malformed inputs. Verify the stored caps for each accepted
+format and retain the draft when an image fails. On the owner's phone,
+exercise photo-library selection, file selection and image paste, including
+a photo whose source format is HEIC; inspect the received content's actual
+format rather than relying only on its extension or declared MIME type.
+Keep private images and metadata out of public evidence. If HEIC reaches the
+page unconverted, record that result and bring the decoder dependency to the
+owner before adding support. If all tested paths yield supported formats,
+record the tested device/browser and omit the extra decoder. This test is
+still required; it has not been performed during design.
 Check D-31's desktop Enter/Shift+Enter and phone Return/Send behavior,
 including input-method composition and attempts to submit while an image
 upload is unfinished or the connection is unavailable.
@@ -2523,8 +2575,10 @@ including in the message being composed. Both are milestone 1 work. Record
 their final issue boundaries and dependencies once the remaining upload
 contract is settled; D-25/D-26 have settled the page framework and editor.
 Include D-67's image button in the first image-composition slice, using the
-same upload and draft path as paste. Settle P-58's input format scope and
-decoder dependency before defining the image-processing slice.
+same upload and draft path as paste. D-68 sets PNG/JPEG/WebP as the initial
+input scope; include real phone-format verification in the image slice and
+keep any HEIC decoder behind its evidence trigger and separate owner decision.
+Settle P-59's source limits before defining image-processing acceptance.
 Include image preservation in the archive contract from the first image
 slice; placeholder links do not defer D-20's storage obligations.
 Apply D-21's upload-time cap in that first slice too; inline rendering is
