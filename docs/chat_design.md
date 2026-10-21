@@ -1919,6 +1919,28 @@ K-4's durable registry/archive publication contract. Concrete IRC completion
 and restart evidence remain open. No live storage or service change is
 authorized.
 
+### D-93. Accept IRC recovery and reaffirm operation with the web stopped
+
+Owner decision 2026-10-21. Accept P-82 as written at `07017ff3d4`:
+confirm current IRC effects, recheck and repair after reconnects, and keep
+shared posting blocked while relevant state is unverified. Unconfirmed old
+commands still fence reopening and go to the manager first. Accept the
+specified crash-persistence gap and existing 24-hour/on-reopen late checks;
+never restart the IRC server automatically.
+
+Reaffirm that the plateia web process may be stopped while IRC runs. IRC,
+the bridge, managers, other IRC clients and shared room freeze/archive/reopen
+must continue. Image archiving uses the installed local asset command,
+invoked as needed, without a running web service. The web page is unavailable;
+stopping it must not stop or take ownership of these shared functions.
+CHAT-23 must explicitly exercise this boundary. Flag any design or
+implementation dependency that violates it rather than requiring the web
+process to stay up. This is a design requirement, not authorization to stop
+any live service.
+
+P-82's IRC completion/restart choice is settled. Audit the combined K-4
+contract and this web-off boundary before declaring the gate resolved.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -3821,7 +3843,7 @@ configuration is changed live by this proposal.
 
 ### P-82. Confirm current IRC effects and recheck room state after reconnects
 
-Proposed K-4 completion/restart contract, not yet approved. A confirmed IRC
+Accepted by D-93, owner decision 2026-10-21. A confirmed IRC
 operation proves its effect in the running server, not that the effect is
 durable across an Ergo crash. Use the receipts below, retain D-89's blocking
 rule for uncertain old commands, and reconcile room permissions and owner
@@ -3885,7 +3907,7 @@ MODE applies changes before announcing them; the later ordered query concerns
 the running state, not a storage flush.
 [Ergo command handlers](https://github.com/ergochat/ergo/blob/v2.19.1/irc/handlers.go).
 
-#### Reconnect recovery and the accepted gap being proposed
+#### Reconnect recovery and the accepted gap
 
 On bridge startup or loss of a relevant IRC connection, mark affected current
 observations unverified. Before resuming shared sends, joins or lifecycle
@@ -3912,7 +3934,7 @@ matching state or elapsed time is not that proof. Evidence unavailable through
 the qualified adapter goes to the manager first; hands-on action remains the
 owner's call. Never restart Ergo or disconnect other clients automatically.
 
-**Proposed explicit limit:** after an Ergo crash, saved permissions or owner
+**Accepted explicit limit:** after an Ergo crash, saved permissions or owner
 memberships may be older than their last confirmed running state. Until
 shared chat reconnects and repairs them, an archived room may temporarily
 allow direct IRC posts or show restored owner joins. Shared posting stays
@@ -3944,7 +3966,7 @@ or always-on membership writeback. Verify no old command can affect a newly
 active generation and no outage restarts the history window. These fault
 tests have not run; activation requires their sanitized evidence.
 
-Acceptance would settle the IRC completion and restart-limit choice. Review
+D-93 settles the IRC completion and restart-limit choice. Review
 the combined K-4 contract and cutover obligations before declaring that gate
 resolved; neither this proposal nor its approval calls the whole design ready.
 No live commands, configuration, database reads or server changes are
@@ -4013,8 +4035,9 @@ D-91 accepts P-80's fresh tracker observation and work-round transition
 contract, including first use and reopen history.
 D-92 accepts P-81's shared control store and immutable archive publication
 protocol. IRC completion evidence remains open.
-P-82 proposes current-state IRC receipts, reconnect reconciliation and an
-explicit crash-persistence gap; it awaits owner approval.
+D-93 accepts P-82's current-state IRC receipts, reconnect reconciliation and
+explicit crash-persistence gap, and requires shared lifecycle work to continue
+with the web process stopped. Combined K-4 coverage is being audited.
 
 ### Q-3. What interface separates plateia from shared chat?
 
@@ -5094,8 +5117,9 @@ and no hook, live config or service was changed during these checks.
 - **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
 - **Scope:** Add the bounded end-to-end qualification harness/scenarios for the integrated shared APIs, web app, managed images and lifecycle. Cover cross-component failures not already proved by each slice's local tests, using isolated services and invented data; record phone/desktop acceptance evidence.
 - **Phase:** 3. **Depends on:** CHAT-22. **Ordering:** critical path.
-- **Relevant decisions:** D-1, D-6, D-34–D-49, D-65–D-74.
+- **Relevant decisions:** D-1, D-6, D-34–D-49, D-65–D-74, D-86–D-93.
 - **Acceptance signals:** Restart during send plus image retention plus archive/reopen preserves the agreed outcomes. Shared work continues with plateia stopped; all three stage checkpoints pass and no deferred feature is needed to complete milestone 1.
+- **Explicit web-stopped check (D-93):** In the isolated integration environment, stop only the plateia web process and leave it stopped throughout the scenario. Use independent IRC clients to read/post and address a manager; verify bridge delivery and manager acceptance. Drive an invented work room through freeze, verified structured archive with image copies, and legitimate reopen/owner join through shared chat. Keep the local asset command installed and invoke it on demand; no web listener or resident asset service may be required. Verify shared reconnect recovery and the bounded late check still operate, then start the web process and verify it reads the resulting state without replaying lifecycle actions. Record process/service separation and the observed outcomes; any dependency on a running web process fails this check. Do not stop live services for qualification.
 - **Out of scope:** A new feature batch, duplicated unit tests, production fault injection and claiming HEIC or live cutover verification without evidence.
 - **Open questions / stop conditions:** All K gates and any triggered D-68 decision must be resolved; owner acceptance still determines milestone completion.
 
