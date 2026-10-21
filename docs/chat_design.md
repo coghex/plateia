@@ -3210,6 +3210,96 @@ keeps closure unresolved. No account, mode, configuration or service changes
 are authorized now. The manager confirms moderator-account creation with
 the owner at setup.
 
+### P-77. Close from a verified history snapshot and check all clients for late posts
+
+Proposed K-4 archive semantics, not yet approved. After draining admitted
+shared sends and verifying the moderator's posting block, archive the IRC
+history available at closure. Extend D-66's bounded reconciliation from
+named unconfirmed sends to **all ordinary conversation messages**, including
+ones sent directly by other IRC clients. Check during the 24 hours after
+closure and again on legitimate reopen; do not add an indefinite watcher.
+
+This qualifies D-15's completeness requirement: a verified archive preserves
+the history successfully enumerated at closure and its images, but is not
+proof that every earlier server handler has finished or that every delivered
+message reached durable history. Every structured archive records that
+snapshot boundary, its coverage and this limitation in self-describing
+metadata. It does not claim an absolute final-message watermark.
+
+#### Why the moderator alone cannot prove final history
+
+In Ergo 2.19.1, `SendSplitMessage` checks permission, then delivers, then
+inserts history. No lock spans those steps. An allowed ordering is: a direct
+client passes the permission check; the moderator freezes the room; an
+archive read finishes; the earlier handler resumes and inserts its message.
+History insertion errors are logged without reversing delivery.
+[Ergo channel source](https://github.com/ergochat/ergo/blob/v2.19.1/irc/channel.go).
+The persistent backend associates a history entry with its channel after
+inserting its base record, using the original message timestamp. A late
+entry can therefore appear behind an already-read timestamp boundary.
+[Ergo history source](https://github.com/ergochat/ergo/blob/v2.19.1/irc/sqlite/history.go).
+
+This is a source-supported possible ordering, not a reproduced live failure
+or an estimate of its frequency. PONG, a quiet period and repeated identical
+reads do not establish a bound on it. An extra fixed wait would reduce the
+chance but would not supply the missing proof. Retain the owner's choice of
+Ergo without a patch; this proposal makes the resulting archive limit
+explicit instead of leaving every closure waiting for an unavailable proof.
+
+#### What may close, and what still blocks closure
+
+- Keep D-65 unchanged for known shared sends: an undismissed unconfirmed
+  send prevents closure; dismissal permits its named gap note and marker.
+  The broader late check does not dismiss or retry any send.
+- Still require successful history enumeration under D-80, the expected
+  available-history coverage, complete logical messages, verified images
+  under D-86 and the remaining K-4 publication/cleanup checks. Unavailable
+  history, a saturated page boundary, a missing required history range,
+  corrupt files or missing images cannot become a successful snapshot.
+- Reconcile messages already observed live against authoritative history.
+  A known missing direct-client message is an archive problem and keeps
+  closure unresolved; this proposal gives it no automatic dismissal. The
+  exception here is the **unobserved possibility** of a handler appearing
+  later, not permission to discard a known discrepancy.
+- Ordinary successful snapshots need no new room warning solely because
+  that theoretical race exists. The structured log states the limitation;
+  D-65's marker continues to identify actual named gaps, and detected archive
+  failures remain visible. Absence of a marker does not certify that an
+  unseen server-side write was impossible.
+
+#### Bounded correction and its limit
+
+Reconciliation must search for newly visible records across the archived
+room's retained history range, not only timestamps after its newest message
+or the list of known send IDs. Use D-80's overlapping IRC pages and deduplicate
+by native/logical identity; never read the Ergo database. Keep previously
+verified archive records when current retention no longer returns them.
+Maintain live observation during the permitted checking window as an
+additional source of candidates, not a replacement for history evidence.
+
+A newly confirmed message is incorporated once, in history order, together
+with verified image copies. Publish a recoverable new archive revision;
+preserve the previous verified revision and annotate the correction. Follow
+D-66's existing rules for named gap notes and markers. Failed reconciliation
+or correction records its error rather than claiming a successful check.
+Neither an outage nor a restart extends the persisted 24-hour window; record
+missed checks and resume only while time remains. Genuine reopen performs
+another history reconciliation. An archived-link visit does not.
+
+The owner would be accepting this limit: an unseen message saved only after
+the checking window can remain absent until reopen; a message never saved
+to IRC history cannot be recovered by these scans. This is why the archive
+describes its actual evidence rather than claiming all server-side work was
+proved complete. Known evidence and uncertain image references are retained
+under D-49/D-86; ending checks is not proof that anything is unused.
+
+This changes CHAT-19/CHAT-20's archive and correction semantics, without
+changing the approved slice boundaries or editing the vision. K-4 still
+needs tracker evidence, the precise drain/freeze sequence, restart recovery,
+atomic archive publication and membership/reopen fencing. Its remaining
+contract must include isolated delayed-handler, late old-timestamp, failed
+history-write and interrupted-correction cases. No live change is authorized.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -3263,6 +3353,8 @@ later-confirmed send within 24 hours after closure and on legitimate reopen.
 D-87 accepts P-76's shared moderator ownership of work-room IRC permissions;
 account creation is confirmed with the owner at setup. K-4's archive barrier
 and completeness evidence remain open.
+P-77 proposes an explicit history-snapshot limit with bounded late checks
+covering every client; it requires owner approval before dependent design.
 
 ### Q-3. What interface separates plateia from shared chat?
 
