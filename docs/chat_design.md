@@ -7,6 +7,10 @@ installation, live configuration or service changes.
 
 Design state: `exploring`
 
+Vision-edit rule (owner decision 2026-10-20, D-50): present the exact proposed
+wording and obtain owner approval before any future edit to `docs/vision.md`.
+Approval to record a design answer is not approval to edit the vision.
+
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
 concrete precondition
@@ -1033,6 +1037,33 @@ room. The attempt record and its protection against duplicate writes remain;
 a later confirmed message appears normally in history. D-47's separation
 between hiding a notice and resolving the outcome continues to apply.
 
+### D-49. Delete provably unused image uploads after 24 hours
+
+Owner decision 2026-10-20. Accept P-41. Delete unused uploads **24 hours after
+they become unreferenced**. Keep anything still needed by a saved draft, send
+or retry, unresolved send, posted message or archive. Keep an image whenever
+it cannot be proven unused. Inactivity or an offline browser is not proof.
+
+Removing an image from one draft or discarding one retry entry releases only
+that reference. Other references continue to protect the stored image. Saved
+drafts do not expire just because they have not been opened. Interrupted
+uploads and uncertain draft reference state must be reconciled before cleanup
+can classify their images as unused. Recheck references before deletion;
+new use during the grace period prevents cleanup.
+
+Include reference tracking and cleanup in the first image-storage slice,
+alongside D-20/D-22's retention and storage caps. This is the future behavior;
+no live uploads or files are deleted during design.
+
+### D-50. Obtain exact-wording approval before future vision edits
+
+Owner decision 2026-10-20. The owner approved after the fact the V-12 edit
+published in `9d75f41098`, which records the D-47/D-48 exception for remembered
+dismissal of unconfirmed-send notices. Before **any future vision edit**,
+present the exact proposed wording to the owner and obtain approval first.
+Do not infer that approval from a design answer or approval to record it here.
+This turn records the rule in this document; it does not change the vision.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1373,20 +1404,24 @@ record remains and a late positive result still appears in history.
 
 ### P-41. Remove unused image uploads after a grace period
 
-Recommend deleting demonstrably unused uploads **24 hours after they become
-unreferenced**. Keep images referenced by saved drafts, current sends or
-retry entries, unresolved sends, posted messages and archived conversations.
-A draft does not expire merely because it has not been opened recently.
+Resolved by D-49: delete provably unused uploads after a 24-hour grace period;
+retain anything referenced or whose unused status is uncertain. Exact
+reference registration and interrupted-upload recovery belong in the
+attachment contract.
 
-Removing an image from a draft, replacing the draft or discarding a retry
-entry can release that reference; it cannot remove another reference to the
-same stored image. A pasted image uploaded before a crash must not be treated
-as unused merely because its browser is offline. Reconcile draft/upload
-references first; when reference state is unknown, retain the image.
+### P-42. Reuse the room when PR work resumes
 
-This is a proposed storage-cleanup rule, not a new browser workflow or a live
-cleanup action. The retention period needs owner approval. Exact reference
-registration and interrupted-upload recovery belong in the attachment contract.
+Prior `plateia_design.md` D-66 already settles reopening an issue into its
+same room. Recommend the corresponding rule for PRs: reopening a standalone
+PR reopens its original room; reopening an associated PR or beginning work on
+a replacement PR for the same issue reuses that issue's room. Preserve the
+conversation and image references rather than creating a new room for each
+attempt. First-use creation under D-9 still applies if no room exists yet.
+
+If closure is in progress, the shared room lifecycle must reconcile the
+resumed work before declaring closure complete. Retain already preserved
+history; a stale archive operation must not remove the now-active room from
+the active list. This proposal needs owner approval for the PR lifecycle rule.
 
 ## Open questions
 
@@ -1412,8 +1447,9 @@ without conversation migration or saved logs.
 decision 2026-10-08) reuses and unarchives the same room. Preserve that rule;
 this milestone's D-10/D-11 replace the earlier board-dependent closure trigger.
 D-11 and V-2 say PR closure, not only merge, so closed-unmerged PRs use the
-same closure rule. Remaining: PR reopening, replacement PRs, and other work
-without a tracker item. Existing rooms, including grouped request
+same closure rule. P-42 proposes reuse for reopened and replacement PRs.
+Remaining: that PR rule and other work without a tracker item. Existing rooms,
+including grouped request
 rooms, are addressed under Q-8. Settle how closure preserves
 a complete file log despite outages or late posts, and how completion or
 failure of preservation becomes visible. No archive browser in this milestone.
@@ -1541,11 +1577,11 @@ cap stored images independently on upload, and open the capped image at full
 size on tap/click. No retained high-resolution originals.
 **Stored-image limits resolved by D-22:** longest side at most 1280 pixels
 and file at most 1 MiB, shrinking further as needed.
+**Unused-upload cleanup resolved by D-49:** delete provably unreferenced
+uploads after 24 hours; keep needed images and uncertain cases.
 Remaining: PNG paste on phone and desktop,
-input/processing limits, link access, unused-upload cleanup and archive mechanics.
+input/processing limits, link access and archive mechanics.
 Plateia stores images; shared chat records their links.
-P-41 proposes a 24-hour grace period for demonstrably unused uploads while
-protecting all draft/send/conversation references.
 
 ### Q-7. Which page framework, evaluation method and browser layout?
 
@@ -1712,6 +1748,11 @@ new notice or erase either send's recovery record.
 Draft recovery checks must retain text and images across room switches and
 reloads on the same device, including drafts whose uploads are interrupted
 or have failed. Cleanup must not remove saved-draft attachments.
+Check D-49 on both sides of the 24-hour grace boundary, with reference reuse
+during cleanup, a draft left offline longer than a day, an interrupted
+upload, a retry entry and an unresolved send. Delete only proven unused
+objects; uncertainty must retain them. Posted and archived image references
+remain protected independently of draft removal.
 Archive checks must show that the conversation and its image files are
 preserved together, that references still resolve, and that a missing image
 cannot be silently treated as a fully verified archive.
@@ -1805,6 +1846,8 @@ Include image preservation in the archive contract from the first image
 slice; placeholder links do not defer D-20's storage obligations.
 Apply D-21's upload-time cap in that first slice too; inline rendering is
 the later presentation change.
+Include D-49's reference tracking and 24-hour cleanup of provably unused
+uploads in the first image-storage slice, without expiring saved drafts.
 
 The owner explicitly
 approves readiness before issue processing, and each tracker artifact gets
