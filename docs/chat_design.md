@@ -67,6 +67,14 @@ The brief identifies general and project testing rooms as not yet configured.
 This design does not inspect or publish private configuration. Creating those
 rooms in live configuration remains the owner's action.
 
+Presence follow-up, 2026-10-21: shared `chat/scripts/identities.py` supports
+owner and assistant roles, named global assistants, `status`/`last_seen`,
+and process/session evidence. Its `sync` preserves identities on an empty
+inventory and retires ended sessions only after a successful inventory.
+These are inputs for the shared presence contract, not proof that a registered
+account is currently online or that browser-owner presence already exists.
+No identity sync or live configuration change was run for this inspection.
+
 ### Relationship to the earlier design
 
 `plateia_design.md` remains historical design evidence; this document does
@@ -1090,6 +1098,17 @@ original room, without copying or migrating the conversation. Include this
 convention in D-8's shared room-model and owner-specific global skill change
 when that work is implemented. It does not change live room use now.
 
+### D-53. List all active agents in the shared chat-testing room
+
+Owner decision 2026-10-21. Accept P-44. `#chat-test` lists all active agents
+across projects, as general does, using the same shared session evidence,
+stable handles, role colors and agent status pips. A session that ends leaves
+the list; uncertain evidence follows the established freshness rules.
+
+This changes the **list only**. It does not change routing or authority,
+add a testing workflow, or require each listed agent to hold an IRC connection.
+Human and assistant presence remains the separate question in P-45.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1449,15 +1468,27 @@ the earlier discussion without moving or copying it.
 
 ### P-44. Show all active agents in the shared chat-testing room
 
-Recommend that the system-wide `#chat-test` room list all active agents
-across projects, as general does. Use the same shared session evidence,
-stable handles, role colors and agent status pips. Ending a session removes
-it; stale or unknown evidence follows the existing freshness rules.
+Resolved by D-53: `#chat-test` lists all active agents across projects, as
+general does. Only the list changes; routing, authority and IRC connections
+do not change.
 
-This defines the room's agent list only. It does not add testing workflow,
-grant authority, change message routing or require every displayed agent to
-maintain an IRC connection. Human and assistant presence sources remain a
-separate contract question. This agent-list choice awaits owner approval.
+### P-45. Show the owner and live assistants in room user lists
+
+Recommend showing the owner in every room as the person using this single-owner
+application. This is a self entry, not an inference of human activity from
+the shared sender's IRC connection. Deduplicate the owner's devices into one
+identity. No human activity tracking is needed.
+
+Show registered global assistants in every room while shared session evidence
+establishes that they have a live session. Registration alone is insufficient;
+an ended session leaves the list. Use the established stale/unknown handling
+when the source cannot establish current presence. Both owner and assistants
+retain their role colors and have no status pip, as already decided in D-29.
+
+The shared service supplies assistant presence. Plateia must not run identity
+discovery or inspect cmux to invent it. This presence selection is proposed,
+not a claim that the current shared registry is already a complete presence
+API. It awaits owner approval.
 
 ## Open questions
 
@@ -1585,10 +1616,11 @@ idle, green working and amber waiting dots for agents. Human users and
 assistants have no dot. Similar role/dot hues are acceptable.
 **Project membership already resolved by V-4/D-5:** every active session
 working on a project appears in that project's rooms, including manually
-opened sessions. General lists active agents across projects. Remaining:
-human/assistant presence sources, the shared chat-testing room's agent list,
-and presentation of status explanations.
-P-44 proposes showing all active agents across projects in `#chat-test`.
+opened sessions. General lists active agents across projects.
+**Shared chat-testing list resolved by D-53:** `#chat-test` also lists all
+active agents across projects; this changes the list only.
+Remaining: human/assistant presence selection (P-45) and presentation of
+status explanations.
 **Current-task line deferred by D-30:** optional milestone-2 setting,
 excluded from milestone 1; no default selected.
 **Freshness already resolved:** prior `plateia_design.md` D-52 (owner
@@ -1683,6 +1715,11 @@ Check D-29 with each role and status, including an amber waiting dot beside
 a yellow designer name. Status must also be readable without relying on
 color; humans and assistants have no dot, and unknown evidence never
 appears as idle.
+Check D-53 with synthetic active sessions from several projects: general and
+`#chat-test` expose the same active-agent population, while project rooms keep
+their project population. End a session and age its evidence to check both
+removal and stale/unknown handling. List membership must not create IRC
+connections, route messages or grant authority.
 
 Verify shared delivery and room lifecycle with the plateia process stopped.
 Verify localhost binding and the browser boundary with synthetic requests.
