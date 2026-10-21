@@ -510,7 +510,8 @@ As clarified by D-33, Send clears the saved draft immediately; explicitly
 discarding a draft also clears it. Draft
 storage must preserve its attachments; unused-upload cleanup must not remove
 images still belonging to a saved draft. The storage mechanism and recovery
-of interrupted uploads remain to be designed. Cross-device draft
+of interrupted uploads are qualified by D-83: a reload before a capped copy
+exists may require re-adding that image. Cross-device draft
 synchronization is not part of this decision.
 
 D-32/D-33 exclude failed-send entries from persistence and retain only one
@@ -1773,6 +1774,19 @@ skills, not the web page. P-71 below incorporates the correction. This
 settles K-2's design mapping; source-adapter verification remains required.
 K-3/K-4 and whole-design readiness remain open.
 
+### D-83. Keep unfinished-image failures after reload without retaining HD originals
+
+Owner decision 2026-10-21. Accept P-72. If reload interrupts an image before
+a recoverable capped copy is finished, keep its draft slot and ask the owner
+to paste or choose it again. Keep text and other images; recover a completed
+capped image even when its upload response was lost. Send remains blocked
+until the missing image is replaced or removed. No HD original is retained.
+
+This qualifies D-23's draft recovery for that preparation/upload interval.
+Normal saved images recover without reselection; D-18 still governs upload
+failure and retry/removal. K-3's encoding, processor/pins, resource bounds and
+archive/export contract remain to be settled. K-4 remains open separately.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2733,13 +2747,13 @@ these adapter checks remain implementation obligations. K-3/K-4 remain open.
 
 ### P-72. Recover unfinished image uploads without retaining originals
 
-Proposed for K-3, not yet approved. Persist the room's text and attachment
+Resolved by D-83, owner decision 2026-10-21. Persist the room's text and attachment
 slots immediately, but retain image bytes only after they meet the approved
 1280-pixel/1-MiB cap. Never put an HD original into browser draft storage,
 an upload spool, the server's asset store or a backup. Original input may
 exist transiently in memory while being uploaded and processed.
 
-Recommend server-side normalization in the Python application, beginning
+Use server-side normalization in the Python application, beginning
 as soon as paste/selection starts the upload. The server validates source
 limits and format, produces the capped image, and commits it with its draft
 reference before acknowledging completion. The browser saves the resulting
@@ -2756,7 +2770,7 @@ position and other attachments. Send remains disabled until that slot is
 replaced or removed. Do not falsely display the missing image as recovered
 or silently send without it.
 
-This is a narrow proposed qualification to D-23: if the page reloads before
+This is D-83's narrow qualification to D-23: if the page reloads before
 any recoverable capped copy exists, the owner may need to select/paste that
 image again. Normal saved images recover without reselection. While the page
 remains open and still has the original in memory, a transient upload failure
@@ -2774,7 +2788,7 @@ The tradeoff is unavoidable before a capped copy exists: transparent recovery
 of arbitrary original bytes requires retaining them somewhere. Browser-side
 shrinking could move this interval earlier, but cannot remove failure or
 reload during preparation. Retaining a temporary original would change the
-no-HD-storage rule; it is not assumed as a fallback. Recommend the explicit
+no-HD-storage rule; it is not an approved fallback. Use the explicit
 failed slot and reselection for this short interruption window.
 
 This affects CHAT-15/CHAT-16 and their reload/failure checks, without changing
@@ -2990,9 +3004,9 @@ These thresholds describe evidence age, not D-35/D-46's shorter UI wait bounds.
 
 ### Q-6. How should images be uploaded, displayed and retained?
 
-P-72 proposes capped-only image retention and the explicit reselection case
+D-83 accepts P-72's capped-only image retention and the explicit reselection case
 when reload interrupts an image before a recoverable capped copy exists.
-This qualification to draft recovery is not yet approved.
+This qualifies D-23's draft recovery without retaining HD originals.
 
 **Composition resolved by D-17:** paste into the message, visible inline
 while typing before Send; no separate preview step. A placeholder link may
