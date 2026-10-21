@@ -806,8 +806,8 @@ The error must come from the chat bridge's own delivery/acceptance record.
 Plateia must not guess from an idle session, elapsed time, lack of a reply
 or a missing record. If the required record cannot yet be read through the
 shared contract, add that capability in the skills repository under V-13.
-The owner also requires an explicit definition of resolution; P-33 brings
-that choice back for signoff rather than treating dismissal as acceptance.
+The owner also requires an explicit definition of resolution; D-42 settles
+it as acceptance by the intended agent, with no dismissal.
 
 The shared code already records delivery attempts, terminal dead letters
 and authenticated replies/acknowledgements. A successful transport attempt
@@ -829,6 +829,27 @@ This is distinct from D-32/D-33's temporary failed-send entry: the message
 is already in the conversation record. Its delivery error does not invite
 posting a duplicate instruction. Milestone-2 progress indicators and browser
 push remain out of scope.
+
+### D-42. Only the intended agent's acceptance resolves a delivery error
+
+Owner decision 2026-10-20. Clear a recipient's delivery error only when the
+bridge records authenticated acceptance by that intended agent for the
+same message. The owner cannot dismiss it. For several recipients,
+acceptance resolves only the accepting recipient's error; unresolved
+recipients remain visible. Keep the underlying failure and acceptance
+evidence in the shared record.
+
+If an agent is gone, the owner can resend the message or redirect it to
+another agent. That is an explicit new post with its own message ID and
+delivery tracking. The original keeps its error, even if the new copy is
+accepted. Plateia must not silently retarget the original, automatically
+resend it or treat another agent's acceptance of a new copy as resolution.
+
+This is distinct from D-34's same-ID retry of a send confirmed cancelled
+before posting. Here the original was already posted and the owner chooses
+to make a new copy. A later unrelated reply, successful transport attempt,
+agent appearing online or disappearance from the pending queue does not
+resolve the original delivery error.
 
 ## Proposals
 
@@ -1042,18 +1063,21 @@ the error explicitly. The resolution choice is P-33.
 
 ### P-33. Resolve a delivery error when the intended agent accepts the message
 
-Recommend clearing a recipient's delivery error only when the bridge records
-authenticated acceptance by that intended recipient for the same logical
-message. For several recipients, acceptance resolves only that recipient's
-error; others remain. Preserve the failure and resolution evidence in the
-shared record even after the active error disappears.
+Resolved by D-42: only acceptance by the intended agent clears its error;
+there is no dismissal. Resending or redirecting creates a separately
+tracked copy and leaves the original error in place.
 
-Under this proposal, dismissing a notice does not resolve delivery, and
-there is no browser action that turns a failed delivery into accepted work.
-A later unrelated reply, a successful socket write, the agent becoming
-online or a record disappearing from the pending queue is insufficient.
-The alternatives are owner dismissal as an explicit resolution, or either
-acceptance or dismissal. The owner has not selected between these yet.
+### P-34. Use the bridge's existing delivery-failure alerts in milestone 1
+
+For the remaining Q-4 notification choice, recommend retaining the chat
+bridge's existing phone alerts for terminal delivery failures and stalled
+delivery, alongside D-41's error in the conversation. The shared bridge
+owns when those alerts are sent; plateia does not emit duplicates or alert
+on every transport retry. Existing alerts contain no message body.
+
+This uses the existing shared notification path, not milestone-2 browser
+push or unread/mention indicators. It does not change D-42's resolution
+rule or allow dismissing a phone notification to clear the delivery error.
 
 ## Open questions
 
@@ -1148,8 +1172,10 @@ recipient acceptance without importing milestone 2's full receipt display.
 **Posted-message delivery errors approved by D-41:** keep the error beside
 the message, based on the bridge's own delivery/acceptance record. Any
 missing shared read capability belongs in the skills repository.
-Still settle what resolves the error (P-33) and how the owner is notified
-before browser push exists.
+**Resolution settled by D-42:** only the intended agent's acceptance clears
+its delivery error; no dismissal. A resent or redirected copy has its own
+tracking and does not clear the original. Still settle notification before
+browser push exists (P-34).
 
 ### Q-5. How are room membership and session status presented?
 
@@ -1346,8 +1372,12 @@ Verify D-41 from synthetic bridge records: failed transport, delivery
 without acceptance, terminal dead letter, late authenticated acceptance,
 wrong-recipient reply and several intended recipients. Keep unresolved
 errors across room switches, reloads and later messages. Missing, stale or
-unreadable records cannot clear an error or manufacture a failure. Final
-resolution tests follow the owner's P-33 choice.
+unreadable records cannot clear an error or manufacture a failure.
+Verify D-42 with late acceptance by the correct agent and replies from the
+wrong agent. A resend or redirect must have a new message ID and independent
+tracking; acceptance of that copy must leave the original error intact.
+No dismissal action clears the error. Several recipient failures resolve
+independently, and a permanently gone agent leaves the original unresolved.
 
 ## Delivery plan
 
