@@ -43,8 +43,9 @@ concrete precondition
 - [ ] CHAT-23. Qualify the complete milestone across service and browser boundaries
 
 These 23 slices follow D-74's approved stage order. D-76 approves their
-boundaries at `e6107c0663`, boundaries only. K-1–K-4 remain contract gates
-before affected issue drafting. No tracker artifact has been filed; the
+boundaries at `e6107c0663`, boundaries only. D-81 settles K-1's design
+contract; its integration checks remain required. K-2–K-4 remain contract
+gates before affected issue drafting. No tracker artifact has been filed; the
 design is not ready for issue processing yet.
 
 ## Epic contract
@@ -1738,6 +1739,22 @@ cannot meet K-1 within that accepted limitation, return the evidence to the
 owner as a new question; the rejected database reader is not a fallback.
 No change to Ergo, its configuration or its database is authorized here.
 
+### D-81. Accept the shared snapshot/feed and version-one API contract
+
+Owner decision 2026-10-21. Accept P-70 as written at `d1b12a93a1`.
+Shared chat provides a snapshot at an epoch/revision, followed by ordered,
+idempotent changes. Reconnect replays retained updates; an unusable cursor
+returns an explicit reset and fresh snapshot. Use D-80's overlapping IRC
+history, keep incomplete ranges explicit and preserve the distinction
+between live observation and authoritative history evidence. Do not restore
+pending sends after reload.
+
+Accept P-70's version-one records and commands. This settles the K-1 design
+contract alongside D-77–D-80 and the identity/cancellation invariants below.
+Integration and activation checks remain required; approval is not evidence
+that the implementation exists or passes them. K-2–K-4 remain open, the
+design stays exploring and no issue or live change is approved by this step.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2523,7 +2540,8 @@ evidence about its IRC behavior, not permission to query its live storage.
 
 ### P-70. Give chat readers a shared snapshot and resumable change cursor
 
-Proposed completion of K-1's read/API contract, not yet approved. Keep the
+Resolved by D-81, owner decision 2026-10-21, accepting this proposal as
+written at `d1b12a93a1`. The accepted contract follows. Keep the
 existing Python API and bridge-owned durable queue from D-77. Add a shared
 read view: a snapshot and a change cursor, with ordered updates after that
 cursor. The same boundary serves plateia and other shared-chat clients;
@@ -2617,9 +2635,9 @@ session sharing still require the isolated integration checks already
 attached to CHAT-2–CHAT-6. Source and query models do not satisfy them.
 
 This affects CHAT-1, CHAT-3–CHAT-6, CHAT-8 and CHAT-10–CHAT-12 without
-changing the 23 approved boundaries. Acceptance would settle K-1's remaining
+changing the 23 approved boundaries. D-81 settles K-1's remaining
 design contract, subject to those implementation/activation checks and the
-independent K-2–K-4 gates. It would not call the whole design ready, approve
+independent K-2–K-4 gates. It does not call the whole design ready, approve
 issues or authorize a live change.
 
 ## Open questions
@@ -2675,6 +2693,11 @@ later-confirmed send within 24 hours after closure and on legitimate reopen.
 
 ### Q-3. What interface separates plateia from shared chat?
 
+**K-1 design contract resolved by D-77–D-81:** the accepted P-70 API and
+feed, D-80 overlap, D-79 clock, D-78 native batch and D-77 sender ownership
+apply together. The evidence and implementation obligations below remain;
+they are not unanswered design choices or claims of completed verification.
+
 Settle discovery, history/live handoff, posting as the owner, stable operation
 identity, mention routing, delivery failure facts and presence. Verify the
 canonical source before specifying changes. New workflow behavior belongs in
@@ -2692,7 +2715,7 @@ submission/check/cancel/retry, and a history check before any same-ID retry.
 The writer must not start an IRC write after its attempt's deadline; a write
 already in flight remains unconfirmed until settled. D-77 establishes writer
 ownership; D-79/P-68 fixes the clock mapping and D-80 selects overlapping
-IRC history. P-70 proposes the remaining API and history/live handoff,
+IRC history. D-81 accepts P-70's API and history/live handoff,
 keeping retry generations
 distinct from delayed originals. The current PONG/text-match sender
 does not satisfy this. D-36 rejects browser recovery storage; enforcement
@@ -3277,21 +3300,21 @@ stop and return evidence to the owner only if actual phone input remains HEIC.
 K-1's execution ownership is resolved by D-77, its native single-batch
 transport plan by D-78, its clock protocol by D-79/P-68 and its IRC-only
 history read boundary by D-80. The overlap contract below makes D-80
-concrete; P-70 proposes the detailed API records and history/live handoff
-and awaits owner signoff.
+concrete; D-81 accepts P-70's detailed API records and history/live handoff
+and settles K-1's design contract.
 Transport activation still needs D-78's verification and
 separately confirmed setup change; clock activation still needs actual-browser
 verification under P-68.
-K-2–K-4 remain open. No gate has been marked resolved by boundary approval
-or by source inspection alone.
+K-2–K-4 remain open. K-1 is resolved by explicit contract approval, not by
+boundary approval or source inspection alone; its runtime checks remain.
 
 ### K-1 elaboration: identity and cancellation invariants
 
-The following makes D-34/D-45/D-47/D-48/D-77 concrete without declaring
-the gate resolved. It is a contract to implement and verify, not a claim
+The following makes D-34/D-45/D-47/D-48/D-77 concrete within the design
+contract accepted by D-81. It is a contract to implement and verify, not a claim
 about the current `chatlib` or bridge. D-78 selects the native single-batch
-wire representation and D-79/P-68 fixes the clock mapping. P-70 proposes the
-remaining API records and history/live cursor; it is not yet approved.
+wire representation and D-79/P-68 fixes the clock mapping. D-81 accepts
+P-70's remaining API records and history/live cursor.
 
 Keep four identities distinct: the browser's logical message ID; the
 attempt generation for each explicit retry; a command ID for idempotent
@@ -3476,7 +3499,7 @@ CHAT-3 still requires isolated-server integration evidence before activation.
 - **Relevant decisions:** D-37–D-39, D-45–D-48.
 - **Acceptance signals:** Messages arriving during paging appear once; reconnect and equal-timestamp boundaries preserve order. Incomplete/denied history stays unknown. Legacy ungrouped posts remain separate.
 - **Out of scope:** A browser disk history cache, archive browsing and delivery-state inference.
-- **Open questions / stop conditions:** K-1 / Q-3; D-80 selects overlapping IRC bounds and explicit incompleteness. P-70's handoff/read contract needs approval, followed by isolated-server verification of coverage, ID evidence and cursor recovery.
+- **Open questions / stop conditions:** K-1 design resolved by D-81. D-80 selects overlapping IRC bounds and explicit incompleteness; P-70 supplies the accepted handoff/read contract. Isolated-server verification of coverage, ID evidence and cursor recovery remains required.
 
 ### CHAT-4. Share owner IRC sessions and verified room membership
 
