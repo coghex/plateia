@@ -1471,8 +1471,7 @@ Only if that testing finds HEIC arriving unconverted should HEIC support be
 brought forward. Record the reproduction and detected format without
 publishing the owner's photo or metadata, then obtain a separate owner
 decision on the decoder dependency before adding it. Do not silently install
-a decoder, require manual conversion as the final phone experience, or claim
-that untested phone selection works. This is a verification-triggered
+a decoder or claim that untested phone selection works. This is a verification-triggered
 follow-up, not an unconditional milestone-1 dependency or slice.
 
 Unsupported inputs show an error and leave the existing draft intact under
