@@ -3431,6 +3431,98 @@ association/evidence, exact persistent record and archive-publication
 contracts, and the adapter's concrete completion evidence remain to be
 resolved before affected issue drafting. No live operation is authorized.
 
+### P-79. Keep durable room associations and reconcile ambiguous tracker links
+
+Proposed K-4 association contract, not yet approved. Shared chat owns one
+durable registry of work-item-to-room associations outside the repository.
+GitHub supplies item identity, current state and declared issue links; an
+editable PR description does not itself rename a room or move its history.
+Keep stable repository/item IDs, item kind, display number/URL, room ID,
+association revision and the evidence/authority that established each link.
+Never identify an item by its number without its repository and kind.
+
+An issue has one work room; all its associated PRs use that room under D-11.
+A standalone PR has its own room under D-59. Reopening or replacing work
+uses the existing association and room under D-51, with D-89's generation
+checks. Creating an association record does not create an IRC room for
+untouched backlog items; D-9's first-use rule still applies.
+
+#### Establishing an association
+
+- The shared workflow can explicitly register the issue/PR link while the
+  manager opens or takes up a PR for that issue. Validate both tracker IDs
+  and project eligibility; record the authenticated authority and command
+  ID. Include this registration in D-8's owner-specific skill changes. It
+  covers cases such as a PR targeting a non-default branch. It changes no
+  GitHub issue, PR, description or sidebar link.
+- Without an existing binding or explicit registration, use the complete
+  GitHub `closingIssuesReferences` result, including manual links. Exactly
+  one eligible issue establishes the issue-room association. A confirmed
+  empty result establishes a standalone-PR room on first use. An error,
+  truncated page set or inaccessible referenced item is not an empty result.
+- More than one linked issue, an out-of-project link or conflicting explicit
+  and GitHub evidence produces an association conflict. Do not pick the
+  lowest number, parse arbitrary mentions as work ownership, create a
+  grouped room or duplicate the PR's conversation into several rooms.
+  Return the conflict to the project manager first. New ambiguous room
+  creation/routing waits for resolution; existing rooms remain usable
+  according to their already established lifecycle state.
+
+GitHub's GraphQL API exposes `closingIssuesReferences` with pagination and
+manual-link controls.
+[GitHub PR schema](https://docs.github.com/en/graphql/reference/pulls#pullrequest).
+GitHub documents that closing keywords only establish links for PRs targeting
+the default branch, that multiple issues may be linked, and that editing a
+description can remove a keyword-based link. This is why a missing link is
+not proof against an explicit workflow association and a changed link cannot
+safely move a conversation by itself.
+[GitHub issue-linking rules](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue).
+
+#### Keeping the association stable
+
+Retain historical associations after PR closure; do not rebuild them from
+only currently open PRs. A replacement PR explicitly registered or uniquely
+linked to the same issue joins its existing association set. Record the
+source and revision of each observation so an older response cannot erase
+a newer registration or silently undo a resolved conflict.
+
+For a GitHub-derived binding, removing or changing the declared issue link
+raises a reconciliation conflict rather than silently changing rooms. An
+explicit workflow binding may legitimately have no GitHub closing link;
+a contradictory nonempty GitHub link still needs reconciliation. A PR
+first used as standalone and later linked to an issue is also a conflict,
+even if that issue's room has not yet been created. Do not silently reparent
+it or erase the standalone conversation.
+
+While a relevant conflict is unresolved, stop automatic closure/reopen
+decisions that depend on that association set and expose the reason to the
+manager and shared read view. Preserve the last confirmed binding and its
+evidence. Do not reroute a submitted message or change its immutable room.
+The manager may repair routine registration errors within established
+authority; moving an already-used binding between rooms requires an explicit
+owner-approved reconciliation plan. No automatic room merge, transcript
+copy, history rewrite or tracker edit is part of this proposal.
+
+This registry is the canonical room association record, not a second tracker
+for issue/PR state. Verify live open/closed/reopened evidence through shared
+GitHub reads before lifecycle actions. An unavailable or inconsistent read
+cannot manufacture closure. Carry forward the approved central polling,
+caching, rate-limit handling and GitHub freshness defaults from
+`plateia_design.md` D-49/D-52; do not add polling per browser or per card.
+The exact completeness and close/reopen-event contract remains K-4 work.
+The inspected shared chat sender/bridge has no implemented tracker-to-room
+registry. This is a contract to add, not a claim that the earlier board
+design already provides a working room adapter.
+
+CHAT-18 owns registry/discovery and workflow registration; CHAT-21 consumes
+the stable room identity and conflict result; CHAT-22 reconciles legacy and
+parked associations during the approved per-project cutover. Keep the 23
+slice boundaries. Verify unique/manual/absent/multiple links, non-default
+branches, partial reads, stale responses, changed links after first use,
+replacement PRs, concurrent first use and restart recovery with invented
+items. This settles association ownership and conflict behavior if accepted;
+it does not settle all of K-4 or authorize any live registration or cutover.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -3488,6 +3580,8 @@ D-88 accepts P-77's explicit history-snapshot limit with bounded late checks
 covering every client. The remaining close/reopen protocol is still K-4 work.
 D-89 accepts P-78's serialized durable generations and visibly blocked
 recovery when an old IRC mutation is unconfirmed, with manager-first recovery.
+P-79 proposes a durable shared association registry, initial GitHub/workflow
+link evidence and manager-first conflict handling; it awaits owner approval.
 
 ### Q-3. What interface separates plateia from shared chat?
 
