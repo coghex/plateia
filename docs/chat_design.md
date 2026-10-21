@@ -1107,8 +1107,8 @@ the list; uncertain evidence follows the established freshness rules.
 
 This changes the **list only**. It does not change routing or authority,
 add a testing workflow, or require each listed agent to hold an IRC connection.
-Owner presence follows D-54; the remaining presentation and assistant rules
-are P-46/P-47/P-48.
+Owner presence and room opening follow D-54/D-55/D-56; the remaining
+assistant rule is P-48.
 
 ### D-54. Show the owner only from real logged-in room membership
 
@@ -1124,11 +1124,37 @@ membership stay in private configuration/state; public examples use invented
 accounts. The owner retains the owner role color and has no status pip.
 
 The shared IRC boundary supplies membership and its freshness to plateia.
-Missing or stale evidence must not be shown as a current join. P-46 asks
-whether the accounts collapse into one displayed owner entry; P-47 asks
-whether opening a room joins it or only reads it. Neither follow-up is
-settled by this correction. Assistants still require a live session; P-48
-recommends whether an IRC join is additionally required.
+Missing or stale evidence must not be shown as a current join. D-55 keeps
+owner accounts as separate entries; D-56 makes opening a room join it as
+the owner. Assistants still require a live session; P-48 recommends whether
+an IRC join is additionally required.
+
+### D-55. Keep owner accounts as separate user-list entries
+
+Owner decision 2026-10-21, answering P-46. Keep the two owner accounts
+separate, as they are now. Show each account as its own entry when that
+account is logged in and joined to the room under D-54. If both are present,
+show two entries; one leaving does not remove the other's entry. Preserve
+the real account attribution of messages. Both retain the owner role color
+and no status pip. Do not aggregate them into one displayed identity.
+
+### D-56. Opening a room joins it and creates it on first use if missing
+
+Owner decision 2026-10-21, answering P-47. Opening a room in plateia joins
+it as the owner, so the corresponding owner account appears after its real
+membership is established. If the room does not yet exist, opening creates
+it, fitted to D-9's create-on-first-use rule and the shared room model.
+Opening is not a read-only operation. A failed or unconfirmed join must not
+be presented as successful membership.
+
+Creation must use the shared room identity/naming and lifecycle rules;
+an absent live IRC channel is not proof that no logical room exists. Preserve
+archived history and images, and do not bypass D-14's rejection of posts until
+reopening or D-51's reuse of an existing room. This does not authorize arbitrary
+room names, new room types or live configuration changes during design.
+Exact creation eligibility and the behavior of opening an archived room
+remain explicit follow-ups to settle within these rules. Define connection
+ownership and join/leave lifetime in the shared contract.
 
 ## Proposals
 
@@ -1503,23 +1529,15 @@ approved under D-29.
 
 ### P-46. Combine joined owner accounts into one owner entry
 
-Recommend one displayed owner entry in a room if at least one configured
-owner account is logged in and joined there. If both accounts are present,
-show the owner once; if one leaves, keep the entry while the other remains.
-Remove it when neither is present, subject to explicit unknown/stale evidence.
-
-Keep the underlying account identities in the shared membership records and
-message attribution. This is display aggregation, not account merging or a
-change to authentication. It awaits owner approval; separate entries for the
-two accounts remain the alternative.
+Rejected in favor of D-55: retain separate entries for the two owner accounts,
+each based on its own logged-in membership. Do not ask this choice again.
 
 ### P-47. Settle whether opening a room joins it as the owner
 
-D-54 leaves two choices: opening a room joins it as the owner and therefore
-adds owner presence, or opening only reads history/live messages and does not
-join as the owner. Bring this as the next separate question after P-46.
-Do not accidentally decide it through a background history reader's joins.
-Connection ownership and join/leave lifetime must follow the selected rule.
+Resolved by D-56: opening joins as the owner and creates a missing room on
+first use within the shared naming/lifecycle rules. Archive behavior and
+creation eligibility must respect D-9/D-14/D-51; no implicit permission to
+replace an archived room with a fresh one.
 
 ### P-48. Keep assistant presence based on live sessions
 
@@ -1533,7 +1551,7 @@ rules. Assistants retain their role color and no status pip.
 The shared service supplies this evidence; plateia does not inspect cmux or
 run identity discovery. Registration alone is insufficient. The live-session
 requirement stands; whether an IRC join is also required awaits the separate
-owner question after the two owner-account questions.
+owner question. The two owner-account questions are resolved by D-55/D-56.
 
 ## Open questions
 
@@ -1545,6 +1563,9 @@ owner-specific global skill change when the room-model work is implemented.
 ### Q-2. What is a work room's exact lifecycle?
 
 **Opening resolved by D-9:** create on first use, including issue review.
+**Opening from plateia resolved by D-56:** join as the owner and create if
+missing, within the shared room model. Still specify eligible room names
+and the result of opening an archived room without bypassing its lifecycle.
 **Issue closure without any PR resolved by D-10:** close and preserve the log.
 **Multiple PRs resolved by D-11:** share the issue room and close after the
 last open PR closes.
@@ -1665,9 +1686,12 @@ opened sessions. General lists active agents across projects.
 **Shared chat-testing list resolved by D-53:** `#chat-test` also lists all
 active agents across projects; this changes the list only.
 **Owner presence resolved by D-54:** actual logged-in IRC membership of
-the owner accounts, not an automatic entry in every room. Remaining:
-one or two owner entries (P-46), whether opening a room joins it (P-47),
-whether assistants also need an IRC join (P-48), and status explanations.
+the owner accounts, not an automatic entry in every room.
+**Account display resolved by D-55:** separate entries for the two accounts.
+**Opening/joining resolved by D-56:** opening joins as the owner and creates
+a missing room within the shared lifecycle. Remaining: whether assistants
+also need an IRC join (P-48), status explanations, and the connection lifetime
+details supporting the approved owner behavior.
 **Current-task line deferred by D-30:** optional milestone-2 setting,
 excluded from milestone 1; no default selected.
 **Freshness already resolved:** prior `plateia_design.md` D-52 (owner
@@ -1772,8 +1796,14 @@ rooms, an authenticated account not joined to the viewed room, and a registered
 but disconnected account. The owner must not appear from viewing a room
 without joining it or from another account's unrelated membership. Include PART/QUIT,
 reconnect and stale membership evidence; unknown must not look like a current
-join. Apply the eventual P-46/P-47 decisions separately to aggregation and
-room-opening behavior.
+join. Check D-55 with both owner accounts present and with either leaving:
+two independent entries, with no aggregate owner entry.
+Check D-56 by opening an existing eligible room and a never-created eligible
+room: join as the configured owner account, create the latter on first use,
+and show presence only after membership is established. Concurrent opens
+must converge on one shared room identity. Include failed joins and archived
+room records with no live channel; do not silently create a replacement
+conversation or enable posting to an archived room.
 
 Verify shared delivery and room lifecycle with the plateia process stopped.
 Verify localhost binding and the browser boundary with synthetic requests.
