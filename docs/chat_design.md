@@ -3972,6 +3972,32 @@ resolved; neither this proposal nor its approval calls the whole design ready.
 No live commands, configuration, database reads or server changes are
 authorized by this proposal.
 
+### P-83. Allow image URLs to be unavailable while the web process is stopped
+
+Proposed clarification of D-93, not yet approved. Keep image HTTP serving
+with the plateia web process in milestone 1. When that process is stopped,
+the page, uploads and opening managed image URLs are unavailable, including
+opening those URLs from an independent IRC client. IRC still carries the
+links; the capped files, asset references and local archive copies remain
+intact. Starting the web process restores the same URLs without reposting.
+
+Recommend this limit to preserve the selected single web server and
+short-lived asset command, without introducing a separate image-serving
+service. Shared send/pin/export operations continue through the local asset
+command, never through an HTTP image fetch. Archive readers use the recorded
+relative file paths. This does not relax D-93's requirement that IRC, bridge,
+managers, clients and room lifecycle work while the web process is stopped.
+
+The ambiguity is whether D-93's web-off requirement also includes remote
+image viewing from other IRC clients. If it does, the current HTTP-serving
+boundary does not satisfy it; design independent image serving with the
+owner before proceeding, rather than silently adding a persistent service
+or requiring plateia's web process to stay up.
+
+CHAT-15 owns serving and the local asset command; CHAT-23 must check the
+approved availability boundary with the web stopped and after restart.
+No slice boundary change or live action is proposed.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -4038,6 +4064,8 @@ protocol. IRC completion evidence remains open.
 D-93 accepts P-82's current-state IRC receipts, reconnect reconciliation and
 explicit crash-persistence gap, and requires shared lifecycle work to continue
 with the web process stopped. Combined K-4 coverage is being audited.
+P-83 flags the remaining web-off image-URL availability question; it does
+not reopen the accepted local image-archive contract.
 
 ### Q-3. What interface separates plateia from shared chat?
 
@@ -4286,6 +4314,27 @@ is archiving it.
 
 Use invented projects, accounts, messages, tracker items and images. Never
 publish live configuration, private chat, personal paths or live screenshots.
+
+### Web-off dependency audit (D-93)
+
+Design inspection 2026-10-21, not runtime qualification:
+
+| Function | Accepted execution boundary and required check |
+| --- | --- |
+| IRC and independent clients | External to plateia; stopping the web process must not stop IRC or disconnect these clients. |
+| Covered sender and owner sessions | D-77 puts the durable queue, sender and connections in the bridge. No browser request or web lifetime owns their continued operation. |
+| Agent delivery, acceptance and manager work | Shared bridge and agent sessions continue independently; verify delivery and acceptance with the web stopped in CHAT-23. |
+| Tracker polling, room freeze/archive/reopen and reconnect repair | Shared lifecycle owns these under D-87–D-93. Timers and recovery cannot be started only by a web request or hosted in the web process. |
+| Image pinning, verification and archive export | D-86's installed local asset command opens the catalog/files on demand. It requires neither the web app nor a resident asset process, and must not fetch its own HTTP URLs. |
+| Reading archived images | D-92's immutable bundle includes verified local images and relative references; neither a web URL nor a running web process is needed. |
+| Opening a managed image URL from another IRC client | The proposed HTTP route belongs to the web process. This is the flagged availability ambiguity in P-83; do not claim that remote image viewing works while that process is stopped. |
+
+The first six rows expose no required running-web dependency in the accepted
+design. They are implementation acceptance obligations, not evidence of
+implemented behavior. A worker finding such a dependency must report it as
+a D-93 violation and fix or escalate it before claiming the slice complete.
+The final row needs the owner's clarification before declaring this audit
+closed. No live process was stopped for this inspection.
 
 The eventual design must make these observable: phone/desktop parity;
 history/live continuity; correct project and general-room routing; no
