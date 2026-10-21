@@ -19,7 +19,7 @@ concrete precondition
 
 - [x] EPIC. Deliver milestone 1: working chat on phone and desktop — [#36]
 - [x] CHAT-1. Define the shared chat API records and compatibility contract — [#37]
-- [ ] CHAT-2. Preserve one logical message across IRC multiline fragments
+- [x] CHAT-2. Preserve one logical message across IRC multiline fragments — [#38]
 - [ ] CHAT-3. Expose authoritative history with a gap-free live handoff
 - [ ] CHAT-4. Share owner IRC sessions and verified room membership
 - [ ] CHAT-5. Persist and fence logical send attempts before IRC writes
@@ -47,7 +47,7 @@ boundaries at `e6107c0663`, boundaries only. D-81 settles K-1's design
 contract; D-82 settles K-2's state mapping; D-86 settles K-3's image contract.
 Their integration checks remain required. D-87–D-94 settle K-4's design
 contract, as mapped in the coverage review below. Epic [#36](https://github.com/coghex/plateia/issues/36)
-is filed; all 23 children remain unprocessed. D-95 records readiness and
+is filed; child processing is recorded in the ledger above. D-95 records readiness and
 D-96 delegates issue/epic signoff to the project manager within the approved
 design. Each artifact still needs separate signoff before filing.
 
