@@ -3538,6 +3538,117 @@ replacement PRs, concurrent first use and restart recovery with invented
 items. D-90 settles association ownership and conflict behavior;
 it does not settle all of K-4 or authorize any live registration or cutover.
 
+### P-80. Drive lifecycle from fresh tracker evidence and distinct rounds of work
+
+Proposed K-4 tracker contract, not yet approved. Shared chat observes GitHub
+centrally per project and updates D-90's registry and D-89's desired lifecycle
+state. It does not change the tracker. Manager completion posts, labels,
+missing list entries and elapsed time are not substitutes for verified
+issue/PR state. Manager/workflow activity may request an immediate coalesced
+refresh; no webhook endpoint or polling in the browser is required.
+
+Keep the approved defaults from `plateia_design.md` D-52: poll every 60
+seconds, use conditional reads where supported, back off to 5 minutes on
+errors/rate limits, mark GitHub evidence stale after 5 minutes and unknown
+after 30 minutes or immediately on authentication failure. An unavailable
+refresh keeps the last confirmed lifecycle and its evidence age; it does
+not close, reopen or create a room by inference.
+
+#### What a complete lifecycle observation contains
+
+For an issue room, read the issue, all declared PR links including closed
+and manually linked PRs, and every additional explicit/historical PR binding
+in D-90's registry. Resolve each relevant PR's current state and issue links.
+Follow every page needed for that set; a missing, inaccessible or failed
+page is unresolved evidence. Validate links through P-79's conflict rules
+before using the set for closure. Never conclude that the last PR closed
+from a query that returns only currently open PRs.
+
+Read the relevant issue/PR close, merge and reopen timeline events, with
+stable event IDs, object identity and timestamps. Keep a durable event
+checkpoint and enough retained evidence to reconstruct the current work
+round after restart. Deduplicate by event ID, not timestamp. Traverse back
+to the known checkpoint or exhaust the filtered history on bootstrap;
+an absent checkpoint requires a full relevant-history reconciliation, not
+a guessed gap. Use timeline order within an item. If cross-item event order
+matters and timestamps cannot resolve it, retain an explicit ambiguity for
+the manager rather than inventing an order from opaque IDs.
+
+GitHub exposes `closedByPullRequestsReferences` with `includeClosedPrs`
+and manual-link controls, and `timelineItems` with typed close/reopen events.
+Reopen events have stable IDs and creation times.
+[GitHub issue schema](https://docs.github.com/en/graphql/reference/issues).
+Each connection must be paged through its `pageInfo` cursors.
+[GitHub pagination](https://docs.github.com/en/graphql/guides/using-pagination-in-the-graphql-api).
+A read-only query against an existing repository item verified the closed-PR
+inclusion and filtered event query shape; it did not exercise concurrent
+tracker edits, missing pages or recovery. No tracker item was modified.
+
+#### First use and a later round of work
+
+Persist which tracker events and already-closed PRs precede the current
+round, separately from the room's IRC/archive operation generation. This
+prevents an old closed PR from immediately undoing a newly reopened issue.
+Historical associations and logs remain; a new round is not a new room.
+Use verified creation/close/reopen events to include a PR that opened and
+closed between polls; observing it open in a prior poll is not required.
+
+| Verified situation | Desired room state |
+| --- | --- |
+| First use of an open issue with no existing room | Open for this round. Record prior closed PRs as history; they alone do not immediately close the newly used room. Any currently open associated PR belongs to the current round. |
+| Any confirmed associated PR remains open, including a draft PR | Keep the issue room open, even if the issue itself is closed. |
+| The last open PR from the current round closes, merged or unmerged, with no associated PR still open | Begin closure under D-11/D-89. The issue may remain open; that unchanged open state does not immediately reopen the room. |
+| The issue closes and no associated PR is open | Begin closure, including a reopened round that has not yet produced a new PR. |
+| A verified issue reopen starts a newer round, with no later event ending that round | Reopen the existing room under D-89. Previously closed PRs do not close this new round by themselves. |
+| A bound PR reopens, or an open replacement PR is associated with the issue | Reopen/use the same issue room; any other open associated PR keeps it open. |
+| A standalone PR closes or reopens | Its own room follows that PR's verified state, preserving identity/history. |
+| First use of a closed issue with no open associated PR, or a closed standalone PR, and no existing room | Do not create an IRC room just to archive it. Return `This work has no active room.` Existing archived identities still use D-58's archive notice. |
+
+An old archived-room link is never a new first use. Neither a comment nor a
+change to `updatedAt` is a reopen event. A closed-then-reopened issue between
+two polls is detected through its timeline even if both observed snapshots
+say open. After an outage, reconcile the latest intended state before
+dispatching effects; do not replay obsolete open/close transitions as live
+room operations. If state and timeline evidence disagree, keep reconciliation
+pending and expose it through the manager-first recovery path.
+
+#### Transition validation and concurrent changes
+
+Store each observation's source IDs, query/page coverage, read start/end,
+source versions/timestamps, association revision and local observation
+revision. Serialize application per project/room; an older response cannot
+overwrite newer evidence or a later explicit registration. A changed binding
+revision invalidates an in-progress closure decision.
+
+Before entering closing, require a successful revalidation of the complete
+relevant issue/PR/link/event set. Revalidate again before final closed-state
+publication after archive and membership work. Evidence used for these
+decisions must still be fresh under the approved thresholds; a failed latest
+read is not overridden by a formerly fresh cache. If the second check cannot
+complete, retain the verified archive and remain visibly closing. A confirmed
+newer reopen supersedes the close and invokes D-89's cleanup fence.
+
+A positive, verified reopen can stop obsolete cleanup promptly; it does not
+skip the remaining checks before the room becomes active. Check the local
+generation before every irreversible lifecycle effect and at final commit.
+GitHub reads and local IRC effects are not one transaction: a remote change
+after the latest successful read may be discovered on the next refresh.
+Reconcile it to the same room under D-89; never claim instantaneous agreement
+with GitHub or a cross-system lock.
+
+This contract belongs in CHAT-18; CHAT-19/CHAT-20 consume its observation and
+generation receipts, and CHAT-21 displays stale/unknown/conflict states.
+No board, additional room type or new slice is introduced. Verify a last-PR
+close with another PR on a later page, draft PRs, explicit non-default-branch
+links, issue close/reopen between polls, replacement PRs, historical closed
+PRs at first use, equal-time ambiguous events, partial/rate-limited reads,
+new registration during pagination and reopen during archive cleanup.
+
+Acceptance would settle tracker observation and transition semantics. K-4
+would still need the exact durable registry/archive publication contract and
+concrete IRC completion evidence. No live polling setup or tracker mutation
+is authorized by this proposal.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -3597,6 +3708,8 @@ D-89 accepts P-78's serialized durable generations and visibly blocked
 recovery when an old IRC mutation is unconfirmed, with manager-first recovery.
 D-90 accepts P-79's durable shared association registry, initial GitHub/workflow
 link evidence and manager-first conflict handling.
+P-80 proposes the fresh tracker observation and work-round transition
+contract, including first use and reopen history; it awaits owner approval.
 
 ### Q-3. What interface separates plateia from shared chat?
 
@@ -4437,7 +4550,7 @@ and no hook, live config or service was changed during these checks.
 - **Relevant decisions:** D-2–D-6, D-37, D-41, D-61, D-75.
 - **Acceptance signals:** Synthetic producer/consumer fixtures round-trip exact text and identities; unsupported versions fail explicitly. The codecs match the reviewed K-1 operation/state contract; unknown versions cannot silently reinterpret data.
 - **Out of scope:** IRC connections, UI, room activation and a new IPC daemon.
-- **Open questions / stop conditions:** K-1/K-2 design resolved by D-81/D-82; implement their accepted records and semantics. K-3/K-4 still gate their affected semantics; do not invent those in the codecs.
+- **Open questions / stop conditions:** K-1/K-2/K-3 design resolved by D-81/D-82/D-86; implement their accepted records and semantics. K-4 still gates its affected semantics; do not invent those in the codecs.
 
 ### CHAT-2. Preserve one logical message across IRC multiline fragments
 
