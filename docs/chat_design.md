@@ -639,7 +639,7 @@ tab suspension do not restart that attempt's deadline. D-45 supersedes the
 earlier publication-expiry interpretation: this is the single sender's
 decision cutoff, after which it starts no IRC write for that attempt. A
 write started before cutoff can remain in flight; D-35 covers the unknown
-outcome until IRC history settles it.
+outcome; D-47 allows it to remain unconfirmed when proof cannot be recovered.
 
 The shared sender contract requires a serialized check-and-cancel operation,
 not a separate unsynchronized read followed by cancellation. It covers an ID
@@ -698,15 +698,17 @@ D-46 addresses the reloaded room's history state.
 This supersedes P-27. It does not remove server-side cancellation and
 deduplication records required by D-34. The deadline belongs to a send
 attempt; an explicit retry in the still-open page retains the logical ID
-and has its own deadline. The expired original attempt must remain unable
-to post, even after a retry is authorized.
+and has its own deadline. An expired original attempt that has not started
+writing must remain unable to post, even after a retry is authorized.
 
 Q-3 must cover requests queued before expiry, writes in flight at cutoff,
 sender restart, clock disagreement and history lag. The sender's expiry
 rule must work without a surviving browser to request cancellation. A stale
 or incomplete history view cannot prove a message missing: retyping safely
-depends on settled authoritative history, as clarified by D-45. Resolve
-the settlement proof before claiming this contract is deliverable.
+depends on settled authoritative history, as clarified by D-45. D-47 accepts
+that some outcomes cannot be proven: keep them unconfirmed without retry;
+the owner may dismiss the notice and independently choose to write a new
+message. Never claim that dismissal proves the original was not delivered.
 
 ### D-37. Preserve long posts using explicit transport grouping
 
@@ -988,6 +990,32 @@ either notice once the prior write is settled and authoritative history has
 caught up. A server that remains unreachable leaves an honest unconfirmed
 notice, not an endless syncing state. These are history-recovery notices,
 not milestone-2 unread or delivery-progress features.
+D-47 additionally permits the owner to dismiss an unconfirmed notice.
+
+### D-47. Keep Ergo; permit dismissal of an unprovable-send notice
+
+Owner decision 2026-10-20. Accept P-39. Keep Ergo, with no server comparison
+or patch. When recording or settlement cannot be proven, the send remains
+**unconfirmed**, potentially indefinitely. There is no automatic resend or
+same-ID retry, and no claim that retyping is safe.
+
+The owner may **dismiss** an unconfirmed notice that cannot settle. Dismissal
+only removes that notice. It never sends anything, changes the original
+outcome to posted/cancelled, or authorizes retry. Preserve the shared sender's
+unresolved record so a delayed request cannot become a new send merely
+because its notice was dismissed. A later authoritative posted result remains
+part of normal history.
+
+If the owner chooses to retype and Send, that is a **new message with a new
+logical ID**. It is independent of the original; its ID cannot deduplicate
+against that original. Do not imply this choice is safe from repeating work
+the original might already have caused. Do not provide a hidden resend in
+the dismissal action or restore the original into the composer.
+
+This applies to the unconfirmed-send/history notices in D-35/D-46. D-42's
+posted-message agent-delivery error still clears only on agent acceptance;
+that error remains non-dismissible. D-36's prohibition on browser persistence
+of pending sends remains in force. P-40 proposes how dismissal survives reload.
 
 ## Proposals
 
@@ -1256,15 +1284,17 @@ Proposed implementation contract under D-45, not a claim of existing code:
    this against the installed server's session lifecycle and crash cases;
    a guessed sleep or local socket close is insufficient.
 6. If the matching complete message is found, record posted and return it
-   without writing again. If absent after proven settlement, record the
-   cancelled attempt. Before an explicit same-ID retry, check history again
+   without writing again. If absent after proven settlement and proven
+   completeness of recording, record the cancelled attempt. Before an explicit
+   same-ID retry, check history again
    and allow one new attempt under the exclusive writer. An unproven outcome
    stays unconfirmed without retry, as D-35 requires.
 
-The installed capabilities support tagged history recovery, but the exact
-disconnect/restart settlement proof and 64 KiB multiline transport are
-still open technical gates. No assertion of completed at-most-once recovery
-follows from capability negotiation or these read-only history queries.
+The installed capabilities support tagged history recovery. D-47 accepts
+unconfirmed outcomes when disconnect/restart settlement or complete recording
+cannot be proven, so the protocol need not always return posted or cancelled.
+Verify its refusal to retry those cases, exclusive writer ownership and
+64 KiB multiline transport before claiming the implementation works.
 The shared skills/service owns this protocol; plateia presents its results.
 P-39 records a further source-level gap: even a settled write can have reached
 recipients without a durable history entry. Absence needs completeness of
@@ -1274,10 +1304,14 @@ recording as well as completion of the old writer.
 
 Resolved by D-46 with the owner's time-limit condition: “Syncing history...”
 lasts at most 15 seconds from the room's first history request in a loaded
-page, then becomes “unconfirmed: awaiting history” until recovery completes.
+page, then becomes “unconfirmed: awaiting history” until recovery completes
+or the owner dismisses it under D-47.
 No pending message or retry entry is restored.
 
 ### P-39. Keep irrecoverable send outcomes unconfirmed, or evaluate another server
+
+Resolved by D-47: keep Ergo and leave unprovable sends unconfirmed, with
+owner dismissal of the notice. No server comparison or patch. Evidence:
 
 Read-only follow-up on Ergo 2.19.1 found an additional limit:
 
@@ -1303,7 +1337,7 @@ not a reproduced live failure. It prevents claiming that an absent ID after
 reconnection or IRC restart always means cancelled. Single-writer ownership
 does not close a delivery-before-history gap.
 
-Recommend retaining the no-patch approach with an explicit limitation:
+The accepted no-patch approach has an explicit limitation:
 when recording or settlement cannot be proven, the outcome may remain
 unconfirmed indefinitely, without retry or a claim that retyping is safe.
 D-46 still bounds the syncing presentation to 15 seconds; it does not impose
@@ -1311,10 +1345,19 @@ a deadline for obtaining truth. Found complete IDs remain posted; an attempt
 known never to have been written can be cancelled. Lost confirmation plus
 missing history alone must never authorize a repeat write.
 
-This limitation needs owner signoff before treating P-37 as deliverable.
-If eventual posted-or-cancelled recovery is required for these cases, evaluate
-a different IRC server as D-45 directs. Never propose an Ergo patch. No
-replacement has been selected, and no live change is authorized.
+The owner accepted this limitation in D-47. It no longer blocks design on
+choosing a server; implementation still needs to verify that uncertain
+outcomes cannot authorize duplicate writes.
+
+### P-40. Remember dismissal in the shared sender
+
+Recommend keeping a dismissal marker with the shared unresolved record,
+so a dismissed notice stays dismissed after reload and on the owner's other
+devices. This stores no pending-send data in the browser and does not erase
+the server's attempt record. Apply the marker only to that unresolved send;
+a new uncertain send gets its own notice, including a new room-level notice
+if needed. A late positive result still appears in history. This persistence
+choice awaits owner approval; D-47 already approves dismissal itself.
 
 ## Open questions
 
@@ -1357,14 +1400,13 @@ retry from a delayed original attempt, and establish deadline clock semantics,
 exclusive writer ownership across restart, and complete authoritative history
 coverage after the old write settles. The current PONG/text-match sender
 does not satisfy this. D-36 rejects browser recovery storage; enforcement
-must work after the browser disappears. P-37 records the proposed protocol
-and its unresolved settlement proof as a design-readiness gate. A missing
+must work after the browser disappears. P-37 records the proposed protocol.
+Verify its evidence rules and refusal to retry uncertain outcomes. A missing
 bridge entry, elapsed timer or newly connected reader is not cancellation.
-P-36 is rejected: no IRC patch. If the installed server cannot support the
-contract, bring a different server choice to the owner.
-P-39 now asks whether permanently unconfirmed outcomes are acceptable when
-Ergo's history cannot establish what happened; otherwise evaluate another
-server. Do not hide this limitation behind the bounded syncing notice.
+P-36 is rejected: no IRC patch. D-47 resolves P-39: keep Ergo, allowing an
+unprovable send to remain unconfirmed without retry. The owner may dismiss
+the notice and choose to send a newly typed message with a new ID. No server
+comparison is needed. Do not hide this limitation behind the syncing notice.
 
 D-37 requires explicit logical grouping across any transport fragments,
 exact content preservation and the same identity in live delivery/history.
@@ -1408,6 +1450,11 @@ Q-3 must establish that settlement and history coverage.
 **Reload history notice resolved by D-46:** “Syncing history...” for at most
 15 seconds, then “unconfirmed: awaiting history” until settlement and
 history catch-up. Neither notice restores a pending send or authorizes retry.
+**Unprovable outcome resolved by D-47:** keep Ergo; unconfirmed can persist
+indefinitely without retry. The owner may dismiss its notice; retyping and
+Send creates a new ID. P-40 asks whether dismissal is remembered by the shared
+sender across reloads and devices. Agent-delivery errors under D-42 remain
+non-dismissible.
 **Long-message presentation resolved by D-37:** one web message with line
 breaks preserved and explicit transport grouping, never time-based merging.
 **Message size resolved by D-38:** 64 KiB of text, with a warning before
@@ -1601,6 +1648,14 @@ both are resolved. A fresh reload gets a bounded request without recovering
 any pending send from browser storage. Neither timeout nor notice removal
 may manufacture a cancellation result or a retry entry.
 
+Check D-47 using synthetic lost-confirmation and history-write-failure cases:
+the sender must retain unknown rather than infer cancellation from absence.
+Dismiss both message-level and room-level unconfirmed notices and assert
+that no send, retry or outcome change occurs. Delayed original requests must
+remain fenced after dismissal. Retyping and Send must allocate a new ID;
+late confirmation of the original must remain independently visible in
+history. Dismissing this notice must not clear an agent-delivery error.
+
 Draft recovery checks must retain text and images across room switches and
 reloads on the same device, including drafts whose uploads are interrupted
 or have failed. Cleanup must not remove saved-draft attachments.
@@ -1667,10 +1722,11 @@ Resolve Q-3's writer ownership, settlement and attempt-fencing contract before
 defining those slices. Do not defer it as a low-priority local-network edge
 case or add an offline send queue.
 Include D-36/D-45's writer cutoff, logical ID in authoritative IRC history
-and complete history lookup in that contract. Resolve P-37's settlement
-proof without an IRC patch. Do not add browser pending-send storage or
-reload restoration.
-Include D-46's bounded room-level recovery notice with history loading.
+and complete history lookup in that contract. Apply D-47's accepted
+unconfirmed outcome when P-37 cannot prove settlement or recording. Do not
+add an IRC patch, browser pending-send storage or reload restoration.
+Include D-46's bounded room-level recovery notice and D-47's dismissal with
+history loading; settle P-40's dismissal persistence before that UI slice.
 Exclude D-30's optional current-task line and setting from all milestone-1
 slices; retain only the milestone-2 note.
 The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
