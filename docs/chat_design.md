@@ -1875,6 +1875,21 @@ service authority. This settles the recovery behavior. K-4 still needs
 tracker associations/evidence, the persistent/archive-publication contract
 and concrete IRC completion evidence before affected issue drafting.
 
+### D-90. Accept durable room associations and manager-first conflicts
+
+Owner decision 2026-10-21. Accept P-79 as written at `2d2346823e`:
+shared chat keeps a durable work-item-to-room registry. Establish links from
+explicit workflow registration or a complete, unambiguous GitHub link
+result. Preserve established bindings and historical associations; ambiguous,
+conflicting or later-changed links go to the project manager first.
+
+A PR linked to several issues waits for resolution. Moving an already-used
+binding requires an explicit owner-approved reconciliation plan; do not
+automatically move conversations or close rooms because a link changed.
+This settles association ownership and conflict behavior. K-4 still needs
+the tracker observation/transition contract, persistent archive publication
+and concrete IRC completion evidence. No live registration is authorized.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -3433,7 +3448,7 @@ resolved before affected issue drafting. No live operation is authorized.
 
 ### P-79. Keep durable room associations and reconcile ambiguous tracker links
 
-Proposed K-4 association contract, not yet approved. Shared chat owns one
+Accepted by D-90, owner decision 2026-10-21. Shared chat owns one
 durable registry of work-item-to-room associations outside the repository.
 GitHub supplies item identity, current state and declared issue links; an
 editable PR description does not itself rename a room or move its history.
@@ -3520,7 +3535,7 @@ parked associations during the approved per-project cutover. Keep the 23
 slice boundaries. Verify unique/manual/absent/multiple links, non-default
 branches, partial reads, stale responses, changed links after first use,
 replacement PRs, concurrent first use and restart recovery with invented
-items. This settles association ownership and conflict behavior if accepted;
+items. D-90 settles association ownership and conflict behavior;
 it does not settle all of K-4 or authorize any live registration or cutover.
 
 ## Open questions
@@ -3580,8 +3595,8 @@ D-88 accepts P-77's explicit history-snapshot limit with bounded late checks
 covering every client. The remaining close/reopen protocol is still K-4 work.
 D-89 accepts P-78's serialized durable generations and visibly blocked
 recovery when an old IRC mutation is unconfirmed, with manager-first recovery.
-P-79 proposes a durable shared association registry, initial GitHub/workflow
-link evidence and manager-first conflict handling; it awaits owner approval.
+D-90 accepts P-79's durable shared association registry, initial GitHub/workflow
+link evidence and manager-first conflict handling.
 
 ### Q-3. What interface separates plateia from shared chat?
 
