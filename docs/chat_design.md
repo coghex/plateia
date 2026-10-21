@@ -1799,6 +1799,22 @@ the implementing slice; nothing is installed or changed live now.
 This settles K-3's processor and scoped Python compatibility choice, not its
 remaining encoding, processing budgets or asset-reference/export contract.
 
+### D-85. Accept bounded image processing and normalized output
+
+Owner decision 2026-10-21. Accept P-74 as written at `ba12576225`: one
+admitted image job at a time, in a separate worker, with a 20-second
+processing deadline and monitored 1-GiB worker-memory stop threshold.
+Exceeding a budget is an upload failure under D-18/D-83. The monitored
+threshold can overshoot; deployment checks must verify its behavior.
+
+Accept the protected JSON/base64 upload boundary and P-74's normalization:
+correct orientation/color, strip source metadata including location,
+preserve transparency and re-encode within the 1280-pixel/1-MiB caps.
+Source limits remain 20 MiB and 50 million pixels. No HD original is kept.
+The implementation and deployment checks remain required; nothing live
+changes now. K-3's remaining design work is the asset-reference/pinning/export
+contract, including archive operation while the web process is down.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2857,7 +2873,8 @@ slice boundaries do not change.
 
 ### P-74. Bound each image job and retain only a normalized capped result
 
-Proposed for K-3, not yet approved. Process one image at a time in a separate,
+Resolved by D-85, owner decision 2026-10-21, accepting this proposal as
+written at `ba12576225`. Process one image at a time in a separate,
 short-lived Pillow worker, with a **20-second processing deadline** and a
 **1-GiB worker resident-memory stop threshold**. Start the processing timer
 before opening the received image, not while the network upload is arriving.
@@ -2944,7 +2961,7 @@ worker timeout/memory failure, parent exit and orphan-worker cleanup, lost
 responses, exact output caps and no original-file persistence. These checks
 use isolated invented inputs; no live service change is authorized here.
 
-Approval would settle K-3's upload encoding and processing behavior. The
+D-85 settles K-3's upload encoding and processing behavior. The
 asset-reference/pinning/export contract and its web-down operation remain
 open, as does K-4. The 23 slice boundaries stay unchanged.
 
@@ -3158,8 +3175,8 @@ when reload interrupts an image before a recoverable capped copy exists.
 This qualifies D-23's draft recovery without retaining HD originals.
 D-84 accepts P-73's Pillow 13.0.0 and Python 3.11 minimum for the new web
 application, with the existing inbox compatibility preserved.
-P-74 proposes bounded JSON uploads, the separate image worker and normalized
-output behavior. It is pending; asset references and archive export remain
+D-85 accepts P-74's bounded JSON uploads, separate image worker and normalized
+output behavior. Asset references and archive export remain
 separate K-3 work.
 
 **Composition resolved by D-17:** paste into the message, visible inline
@@ -3989,7 +4006,7 @@ and no hook, live config or service was changed during these checks.
 - **Relevant decisions:** D-18–D-23, D-49, D-68, D-69.
 - **Acceptance signals:** Input/output limits and malformed-image failures are enforced. Drafts, retries, uncertain sends and archives protect assets across restart; only provably unused objects expire. No retained HD attachment and no unconditional HEIC dependency.
 - **Out of scope:** Inline rendering, archive UI and live data cleanup.
-- **Open questions / stop conditions:** K-3 / Q-6; D-83/D-84 settle interrupted-draft recovery and the pinned processor. Storage/reference ownership, upload encoding and resource bounds remain.
+- **Open questions / stop conditions:** K-3 / Q-6; D-83–D-85 settle interrupted-draft recovery, the pinned processor, upload encoding and resource bounds. Storage/reference ownership and archive export remain.
 
 ### CHAT-16. Compose image links through paste and the image button
 
