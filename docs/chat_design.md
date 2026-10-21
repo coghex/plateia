@@ -132,7 +132,8 @@ Out of scope:
 
 Deferring delivery indicators does not defer durable delivery, duplicate-work
 prevention or visible unresolved failures. Browser push belongs to milestone
-2; the milestone 1 failure-reporting contract must still be settled.
+2. Milestone 1 displays bridge-backed delivery errors (D-41/D-42) and keeps
+the bridge's existing phone alerts unchanged (D-43).
 
 ## Decisions
 
@@ -851,6 +852,20 @@ to make a new copy. A later unrelated reply, successful transport attempt,
 agent appearing online or disappearance from the pending queue does not
 resolve the original delivery error.
 
+### D-43. Keep existing bridge phone alerts unchanged for milestone 1
+
+Owner decision 2026-10-20, scoped to milestone 1. Keep the chat bridge's
+existing phone alerts for failed or stalled delivery alongside the delivery
+error in the chat window. Make no change to bridge notification behavior:
+retain its triggers, timing, routing and content policy. Plateia does not
+send a second alert or add alerts for individual transport retries.
+
+This decision creates no bridge notification change or live configuration
+work. D-41's required shared read interface remains part of the delivery
+contract. Browser push stays in milestone 2. Dismissing an existing phone
+notification does not resolve the chat error; D-42 still requires acceptance
+by the intended agent.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1069,15 +1084,23 @@ tracked copy and leaves the original error in place.
 
 ### P-34. Use the bridge's existing delivery-failure alerts in milestone 1
 
-For the remaining Q-4 notification choice, recommend retaining the chat
-bridge's existing phone alerts for terminal delivery failures and stalled
-delivery, alongside D-41's error in the conversation. The shared bridge
-owns when those alerts are sent; plateia does not emit duplicates or alert
-on every transport retry. Existing alerts contain no message body.
+Resolved by D-43 for milestone 1: retain the existing bridge phone alerts
+alongside the chat error, with no bridge notification change.
 
-This uses the existing shared notification path, not milestone-2 browser
-push or unread/mention indicators. It does not change D-42's resolution
-rule or allow dismissing a phone notification to clear the delivery error.
+### P-35. Finish active legacy implementation work in its existing rooms
+
+For Q-8's active-room transition, recommend leaving unfinished implementation
+work in its current room until that work finishes. Record which tracker
+items already use each retained room, including grouped legacy rooms, so
+first use does not create duplicate rooms for that in-flight work. Use the
+new issue/PR room model for new work after rollout. Archive retained rooms
+under the approved completion and verification rules when they finish.
+
+This preserves ongoing conversations without splitting or moving them.
+It does not change D-13/D-16's separate rule to discard existing design
+rooms without saved logs. The transition would be an explicit temporary
+exception in D-8's shared room-model and owner-specific skill rollout, not
+a second room model maintained by plateia. This proposal is not yet approved.
 
 ## Open questions
 
@@ -1174,8 +1197,9 @@ the message, based on the bridge's own delivery/acceptance record. Any
 missing shared read capability belongs in the skills repository.
 **Resolution settled by D-42:** only the intended agent's acceptance clears
 its delivery error; no dismissal. A resent or redirected copy has its own
-tracking and does not clear the original. Still settle notification before
-browser push exists (P-34).
+tracking and does not clear the original.
+**Milestone-1 notification settled by D-43:** existing bridge phone alerts
+stay unchanged alongside the chat error; no new bridge notification work.
 
 ### Q-5. How are room membership and session status presented?
 
@@ -1234,8 +1258,8 @@ posts until reopened, retaining the file log.
 already-accepted posts and verify the archive; keep the title grey and
 problems visible until verified closure.
 Still specify archive completeness and verification,
-active-room mapping (including grouped or unlinked
-request rooms), interruption/retry behavior and the rollout sequence.
+active-room mapping (P-35 proposes keeping unfinished implementation work
+in its current room), interruption/retry behavior and the rollout sequence.
 Include the conversation's images in the archive and its verification
 (D-20).
 For rooms being archived, preserve conversation history and references.
@@ -1378,6 +1402,11 @@ wrong agent. A resend or redirect must have a new message ID and independent
 tracking; acceptance of that copy must leave the original error intact.
 No dismissal action clears the error. Several recipient failures resolve
 independently, and a permanently gone agent leaves the original unresolved.
+
+Verify D-43 with synthetic bridge records and notification fakes: viewing
+or refreshing the chat error must not send another phone alert, change the
+bridge's existing alert behavior or clear the error when a phone notice is
+dismissed. No new browser-push path belongs in milestone 1.
 
 ## Delivery plan
 
