@@ -1651,6 +1651,36 @@ This approves boundaries only, not implementation or design readiness.
 Resolve K-1–K-4 before drafting affected issues. Each issue still requires
 owner signoff before filing, and the project manager runs its review.
 
+### D-77. The existing bridge owns the single sender behind a durable queue
+
+Owner decision 2026-10-21. Accept P-66 as written at `380b967943`, including
+the deadline precision note. The existing chat bridge owns the single
+covered sender, its persistent owner-account connections, durable command
+queue and transactional attempt journal. Clients enqueue through the shared
+Python API and read results; they do not take over IRC publication. There
+is no new service, and a web-process restart does not own the sender's
+lifetime. An exclusive process-lifetime writer lock fences bridge instances.
+
+If the bridge is down, covered sends cannot start. Queued writes whose
+deadline has passed never start when it returns. A write already started
+may still post or remain unconfirmed under D-45/D-47; restart never retries
+or resumes it merely because the new process obtained the writer lock.
+Persist write-started before touching the socket. Explicit retry remains
+limited to conclusively cancelled, never-started attempts with a fresh
+attempt generation and the same logical message ID.
+
+Service the send queue independently of slow agent delivery. Bridge-originated
+commands must not wait synchronously for their own consumer. Replace the
+minute-long legacy outbox schedule for covered sends and prevent covered
+IDs from also entering the legacy replay path. Historical outbox entries
+are not implicitly migrated. Other terminal IRC clients remain independent
+and do not gain this API's retry guarantee.
+
+This resolves execution ownership within K-1, not the whole gate. Complete
+the deadline clock, operation/state, fragment and history/live contracts
+before drafting the affected issues. No implementation or live change is
+authorized by this design approval.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2166,7 +2196,10 @@ K-1–K-4 remain open; this is not approval to draft issues or implement.
 
 ### P-66. Put the covered sender in the existing bridge, behind a durable queue
 
-Recommend one sender inside the existing shared chat bridge process. Clients
+Resolved by D-77, owner decision 2026-10-21, accepting this proposal at
+`380b967943` with the deadline precision note. The accepted proposal follows.
+
+Use one sender inside the existing shared chat bridge process. Clients
 call the shared Python API to record commands in a durable local queue and
 read results; they never take over its IRC writes. This implements the
 already-selected Python API/no-new-daemon boundary from earlier D-16 and
@@ -2215,9 +2248,9 @@ but spreads persistent connection lifetime and restart recovery across web
 and command-line processes. Recommend the existing bridge to keep one
 owner of those responsibilities without adding a service.
 
-Owner approval is pending because this fixes execution ownership and makes
-covered sends depend on bridge availability. It affects K-1, particularly
-CHAT-1 and CHAT-4–CHAT-6, and their consumers. It does not resolve the rest
+This fixes execution ownership and makes covered sends depend on bridge
+availability. It affects K-1, particularly CHAT-1 and CHAT-4–CHAT-6, and
+their consumers. D-77 does not resolve the rest
 of K-1: exact deadline clock semantics, operation records, fragment identity,
 history/live cursors and evidence validation still need the detailed contract.
 
@@ -2869,9 +2902,10 @@ owner; exact field spelling and test mechanics are implementation details.
 D-75 resolves tracking and local skills delivery. D-68's HEIC question is a
 deliberately conditional verification gate, not a mandatory decoder dependency:
 stop and return evidence to the owner only if actual phone input remains HEIC.
-K-1 starts with P-66's concrete sender-ownership proposal; its approval is
-pending. K-2–K-4 are unchanged and remain open. No gate has been marked
-resolved by boundary approval or by source inspection alone.
+K-1's execution ownership is resolved by D-77. Its remaining deadline,
+operation/state, fragment and history/live contracts are still open.
+K-2–K-4 remain open. No gate has been marked resolved by boundary approval
+or by source inspection alone.
 
 ### Stage checkpoints
 
