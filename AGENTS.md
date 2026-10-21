@@ -66,3 +66,18 @@ this repository: the default branch is `master`, and the drainer needs
 `reviewed:approve` and the `review-approved` gate
 (`.github/workflows/review-gate.yml`), plus `build-test` once CI exists. One
 issue per pull request unless the owner groups them.
+
+Shared-skills issues are the exception: those whose spec names the local
+skills repository as the implementation owner. They are delivered without a
+pull request, under `docs/chat_design.md` D-75:
+
+- an isolated checkout and branch of the local skills repository;
+- opposite-brand review of the exact commit;
+- recorded local test results;
+- a merge into the canonical checkout only with the owner's or a level-2
+  agent's authorization.
+
+The issue links the reviewed commit and its test evidence as completion.
+Never copy shared chat code into this repository or give the skills repository
+a remote for it. Everything else follows the pull-request rules above (owner
+decision 2026-10-21).
