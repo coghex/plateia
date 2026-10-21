@@ -1498,6 +1498,27 @@ the full pixel buffer. These limits alone are not a total processing-memory
 guarantee; bound concurrent image processing as part of the implementation.
 Verify the actual content instead of trusting client-supplied sizes.
 
+### D-70. Keep one self-describing structured archive log
+
+Owner decision 2026-10-21. Reject P-60. The owner expects agents to read
+archives, so keep the structured conversation log as the only conversation
+format, alongside the preserved capped images. Do not generate a separate
+plaintext transcript or a second rendering of the conversation.
+
+Make the structured archive self-describing and readable by an agent without
+extra tooling. Include enough context to interpret it independently of the
+live service: schema/version information, room identity, sender and timestamp
+fields, stable message IDs, preserved message text and line breaks, image
+references, and explicit gap notes with later-confirmation annotations under
+D-65/D-66. Any archive verification metadata supports that one record rather
+than becoming a second conversation log. Exact schema and filenames remain
+implementation details to document and verify.
+
+The existing image preservation, verification, closure and bounded late-send
+correction requirements still apply. A later correction updates the structured
+record and referenced images; there is no transcript to synchronize. This
+adds no milestone-1 archive browser or search interface.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1971,21 +1992,25 @@ failed-upload rule; saved images still obey the 1280-pixel/1-MiB cap.
 
 ### P-60. Make milestone-1 room archives readable as local files
 
-Recommend one folder per room containing its structured conversation log,
-a plain-text transcript and its capped images. The transcript lets the owner
-read the preserved conversation in an ordinary editor before the milestone-2
-archive browser exists. Include sender, timestamp, message line breaks,
-image-file references and D-65/D-66 gap notes and later-confirmed annotations.
+Rejected by D-70, owner decision 2026-10-21. No plaintext transcript:
+agents will read a self-describing structured log, with preserved images
+and gap notes, without extra tooling. Do not maintain two conversation formats.
 
-Generate the transcript from the same verified structured archive; it is
-not a second conversation authority. Late verified corrections update both
-representations together. Keep a verification manifest for the log and images
-so partial copies are detectable. Exact schema, filenames and atomic update
-mechanics remain implementation details to specify and verify.
+### P-61. Leave an archived room on every owner account
 
-This does not add archive browsing or search to the milestone-1 page. The
-choice pending owner approval is providing the readable local transcript
-alongside the structured log and images rather than structured files alone.
+Recommend that archiving a work room also remove it from every owner's
+joined rooms through IRC PART. Under D-63, that removes the room for the
+same account's other IRC clients as well as plateia. Preserve its log and
+images; this is membership cleanup, not deletion of the conversation or
+logout from the account.
+
+Apply this to the canonical owner set, not agent/assistant presence records.
+Tie the cleanup to the shared archive lifecycle and verify its outcome;
+do not display a successful leave on a failed or unknown IRC result.
+Respect D-51 reopening races so an old closure cannot part a newly reopened
+room after the owner joins it. Existing archive rules still prevent an
+archived-link visit from rejoining the room. Owner approval is pending;
+the alternative is keeping owner IRC membership in the archived room.
 
 ## Open questions
 
@@ -2238,8 +2263,10 @@ The manager owns D-44's concrete activation procedure and parked-room
 mapping. Do not reopen the rejected gradual-migration plan.
 Include the conversation's images in the archive and its verification
 (D-20).
-P-60 proposes a readable local transcript alongside the structured log and
-images, without adding a milestone-1 archive browser.
+**Archive format resolved by D-70:** one self-describing structured
+conversation log with images and gap notes, without a plaintext transcript
+or extra reading tools. P-61 asks whether archiving also parts every owner
+account from the room across its IRC clients.
 For rooms being archived, preserve conversation history and references.
 Discarded design rooms are exempt. Do not assume existing JSONL
 files alone prove a complete archive, or that removing a room from a client
@@ -2500,6 +2527,12 @@ remain protected independently of draft removal.
 Archive checks must show that the conversation and its image files are
 preserved together, that references still resolve, and that a missing image
 cannot be silently treated as a fully verified archive.
+For D-70, inspect a synthetic archive without the running service or a
+project-specific reader: its schema/context, accounts, times, message IDs,
+text and image references must be understandable from the structured files.
+Verify that gap notes and later-confirmation annotations identify their sends
+unambiguously, and that no separate plaintext transcript is produced. Test
+reading after a late correction and a close/reopen/close cycle.
 Check stored dimensions and file size against the approved caps independently
 of viewport width. Resizing the window changes only display; opening and
 archiving use the capped version, with no retained high-resolution original.
@@ -2571,6 +2604,9 @@ IRC history as the record and protect uncertain image references. Include
 D-66's bounded late-send checks and verified archive correction in that
 shared lifecycle work: 24 hours from closure, plus a check on genuine reopen,
 with no indefinite watcher or browser-owned background job.
+Use D-70's single self-describing structured archive format in that work;
+exclude plaintext transcript generation. Settle P-61's owner membership
+cleanup before finalizing the archive lifecycle slice.
 Exclude D-30's optional current-task line and setting from all milestone-1
 slices; retain only the milestone-2 note.
 The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
