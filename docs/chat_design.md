@@ -177,6 +177,8 @@ Out of scope:
 - A current-task line under agent names: optional milestone-2 setting,
   with its default still undecided (D-30).
 - The board and its workflow, reactions, and tracker mini-cards.
+- Markdown rendering: deferred to a later milestone, with no milestone
+  number selected (D-72).
 - Dedicated design rooms (rejected by D-16).
 - Custom rooms with their own rules: an owner-requested future requirement,
   deferred beyond milestone 1 with no target milestone or design selected
@@ -1539,6 +1541,20 @@ or unknown PART as successful. Guard closure/reopen races so an old archive
 operation cannot part an account after it joins the reopened room. Apply
 the owner cleanup without altering agent or assistant session records.
 
+### D-72. Render literal text, links and images; defer Markdown
+
+Owner decision 2026-10-21. Accept P-62. Milestone 1 displays message text
+exactly as typed, keeping pasted line breaks and spacing, with clickable
+links and the approved inline images. Do not interpret Markdown headings,
+emphasis, lists or code fences; their punctuation remains literal text.
+Markdown rendering is deferred to a later milestone, not assigned to
+milestone 2 by this decision.
+
+Keep D-26's minimal composer schema and D-37's exact logical message in IRC.
+Wrapping to fit phone or desktop is presentation only and must not rewrite
+stored text. The existing safe-link and untrusted-content rules still apply:
+render text as text, and make only http/https destinations clickable.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1798,13 +1814,16 @@ Proposed implementation contract under D-45, not a claim of existing code:
    may accelerate a positive lookup but cannot prove absence unless its
    coverage is known complete. Missing access, pruned history or an
    interrupted page means unknown, not cancelled.
-5. On a healthy original connection, an ordered round-trip after the write,
-   followed by history retrieval, is the candidate settlement barrier. A
-   reconnect alone is not one: an old server session might still process
-   buffered bytes. Recovery must prove the prior write can no longer appear
-   before declaring absence or allowing another write for the ID. Validate
-   this against the installed server's session lifecycle and crash cases;
-   a guessed sleep or local socket close is insufficient.
+5. An ordered round-trip after the write does not establish durable recording:
+   P-39's verified publication-before-history gap rules it out as sufficient
+   proof for retry. A reconnect likewise does not settle an old session's
+   buffered bytes. Recovery may report posted when the complete matching
+   message is found; it must not turn a missing record after a write began
+   into cancellation merely because a PONG arrived or a session disconnected.
+   Conclusive cancellation before any write began remains available under
+   the exclusive writer's journal and attempt fencing. Other cancellation
+   evidence must establish both no possible later publication and no prior
+   unrecorded delivery; otherwise D-47 requires unconfirmed with no retry.
 6. If the matching complete message is found, record posted and return it
    without writing again. If absent after proven settlement and proven
    completeness of recording, record the cancelled attempt. Before an explicit
@@ -2025,17 +2044,22 @@ does not reopen or join it.
 
 ### P-62. Keep message text literal in milestone 1
 
-Recommend displaying message text as typed, preserving line breaks and
-whitespace, with clickable http/https links and the approved inline images.
-Do not interpret Markdown emphasis, headings, lists or code fences in
-milestone 1. Markdown punctuation remains visible text; no rich-formatting
-toolbar is added. This matches D-26's minimal composer schema and avoids
-changing the meaning of pasted text through formatting interpretation.
+Resolved by D-72, owner decision 2026-10-21: literal message text with
+clickable links and inline images, preserving spacing and line breaks.
+Markdown is deferred to a later milestone, without a selected milestone number.
 
-This concerns presentation only: the exact logical message and image links
-remain the IRC record under D-37. Safe wrapping on phone and desktop must
-not rewrite stored text. Markdown rendering can be revisited later without
-changing that record. Owner approval is pending.
+### P-63. Inline only images stored by plateia
+
+Recommend rendering an image inline only when its URL identifies an image
+in plateia's managed image store. Other http/https links, including links to
+external images, remain clickable text in milestone 1; do not fetch them
+automatically for image or website previews.
+
+This keeps inline rendering tied to the approved stored-image caps, retention
+and archival contract. Recognize managed image references using the configured
+origin and actual stored object identity, not just a filename extension.
+The early placeholder-link slice still uses links for managed images until
+inline rendering ships. Owner approval is pending.
 
 ## Open questions
 
@@ -2146,8 +2170,9 @@ images across switches and reloads on the same device.
 D-34 supersedes the minimal framing for submitted messages.
 **Keyboard submission resolved by D-31:** desktop Enter sends,
 Shift+Enter adds a line; phone Return adds a line and Send posts.
-P-62 proposes literal message text with clickable links and inline images,
-without Markdown rendering in milestone 1.
+**Text rendering resolved by D-72:** literal text, spacing and line breaks,
+with clickable links and inline images. Markdown is deferred to a later
+milestone. P-63 proposes which image links render inline.
 **Sending and failure presentation resolved by D-32:** small grey
 “sending...” below the message; failed messages remain temporarily in the
 app with a red exclamation mark that retries when clicked. Failed entries
@@ -2257,6 +2282,8 @@ larger inputs follow the failed-upload rule. Remaining:
 device paste and chooser validation, processing mechanics, link access and
 archive mechanics.
 Plateia stores images; shared chat records their links.
+P-63 proposes inline rendering for managed image references only, with
+external image URLs remaining clickable links in milestone 1.
 
 ### Q-7. Which page framework, evaluation method and browser layout?
 
@@ -2483,6 +2510,12 @@ draft unsent. Exercise paste and chooser paths, inaccurate declared sizes,
 interrupted uploads and concurrent processing. For each accepted format,
 verify that saved and archived files satisfy both output caps and that no
 high-resolution source becomes a retained attachment.
+For D-72, round-trip text with multiple spaces, indentation, tabs, blank
+lines, Markdown punctuation and literal HTML through compose, IRC, live
+display, history and structured archive. Preserve the underlying text and
+line breaks; responsive wrapping must not alter them. Links stay clickable
+only for allowed destinations, and inline images retain their composition
+position. Do not add Markdown parsing or a rich-formatting toolbar.
 Check D-31's desktop Enter/Shift+Enter and phone Return/Send behavior,
 including input-method composition and attempts to submit while an image
 upload is unfinished or the connection is unavailable.
@@ -2655,6 +2688,9 @@ cleanup and verified rejoin on opening the reopened room in the same shared
 lifecycle contract, with protection against stale closure operations.
 Exclude D-30's optional current-task line and setting from all milestone-1
 slices; retain only the milestone-2 note.
+Apply D-72's literal rendering in the first working-chat slice. Exclude
+Markdown rendering from milestone-1 dependencies and slices; no later
+milestone number is assigned. Settle P-63 before the inline-image slice.
 The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
 dependency pins and web CI job feeding `build-test`. Keep implementation
 in normal isolated code worktrees; this document does not install tools.
