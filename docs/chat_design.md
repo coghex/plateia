@@ -1519,6 +1519,26 @@ correction requirements still apply. A later correction updates the structured
 record and referenced images; there is no transcript to synchronize. This
 adds no milestone-1 archive browser or search interface.
 
+### D-71. Archive parts every owner; opening the reopened room joins again
+
+Owner decision 2026-10-21. Accept P-61. Archiving a work room makes every
+owner account in the canonical `owner` plus `owners` set leave it through
+IRC PART. Under D-63 this removes membership in the owner's other IRC
+clients too. Keep the structured conversation log and images; leaving the
+room does not log the account out or disable its always-on setting.
+
+If the work room is legitimately reopened under D-51, opening it joins
+again under D-56 as the browser's bound owner account. This does not make an
+archived-link visit reopen or join a room under D-58, or automatically join
+every owner account merely because work resumes. Preserve the room identity,
+history and images through the cycle.
+
+The shared room lifecycle owns this cleanup, including when plateia is
+closed. Verify actual per-account membership instead of presenting a failed
+or unknown PART as successful. Guard closure/reopen races so an old archive
+operation cannot part an account after it joins the reopened room. Apply
+the owner cleanup without altering agent or assistant session records.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -1998,19 +2018,24 @@ and gap notes, without extra tooling. Do not maintain two conversation formats.
 
 ### P-61. Leave an archived room on every owner account
 
-Recommend that archiving a work room also remove it from every owner's
-joined rooms through IRC PART. Under D-63, that removes the room for the
-same account's other IRC clients as well as plateia. Preserve its log and
-images; this is membership cleanup, not deletion of the conversation or
-logout from the account.
+Resolved by D-71, owner decision 2026-10-21. Archive parts every owner
+account while preserving the log and images. When the room legitimately
+reopens, opening it joins again under D-51/D-56. An archived-link visit still
+does not reopen or join it.
 
-Apply this to the canonical owner set, not agent/assistant presence records.
-Tie the cleanup to the shared archive lifecycle and verify its outcome;
-do not display a successful leave on a failed or unknown IRC result.
-Respect D-51 reopening races so an old closure cannot part a newly reopened
-room after the owner joins it. Existing archive rules still prevent an
-archived-link visit from rejoining the room. Owner approval is pending;
-the alternative is keeping owner IRC membership in the archived room.
+### P-62. Keep message text literal in milestone 1
+
+Recommend displaying message text as typed, preserving line breaks and
+whitespace, with clickable http/https links and the approved inline images.
+Do not interpret Markdown emphasis, headings, lists or code fences in
+milestone 1. Markdown punctuation remains visible text; no rich-formatting
+toolbar is added. This matches D-26's minimal composer schema and avoids
+changing the meaning of pasted text through formatting interpretation.
+
+This concerns presentation only: the exact logical message and image links
+remain the IRC record under D-37. Safe wrapping on phone and desktop must
+not rewrite stored text. Markdown rendering can be revisited later without
+changing that record. Owner approval is pending.
 
 ## Open questions
 
@@ -2036,6 +2061,8 @@ Archived pages keep Join unavailable under D-58.
 account joined; membership is shared with its other IRC clients. D-64 requires
 Ergo always-on for every owner account, retaining only joined rooms if every
 IRC client disconnects.
+**Archive membership resolved by D-71:** archive parts every owner account;
+opening the legitimately reopened room joins again as the bound account.
 **Issue closure without any PR resolved by D-10:** close and preserve the log.
 **Multiple PRs resolved by D-11:** share the issue room and close after the
 last open PR closes.
@@ -2067,6 +2094,13 @@ Settle discovery, history/live handoff, posting as the owner, stable operation
 identity, mention routing, delivery failure facts and presence. Verify the
 canonical source before specifying changes. New workflow behavior belongs in
 the skills repository. Do not revive retired packages by inference.
+
+Earlier `plateia_design.md` D-16 selected a shared, versioned Python API
+inside the existing bridge/client processes, without a new initial IPC
+daemon. Carry that interface direction forward alongside D-78's canonical
+skills ownership. Existing connection/post helpers are not yet the typed
+history, membership, delivery and serialized-sender contract required here;
+define those extensions without assuming the retired capture is available.
 
 D-34/D-45 require browser-created IDs, one shared sender serializing
 submission/check/cancel/retry, and a history check before any same-ID retry.
@@ -2112,6 +2146,8 @@ images across switches and reloads on the same device.
 D-34 supersedes the minimal framing for submitted messages.
 **Keyboard submission resolved by D-31:** desktop Enter sends,
 Shift+Enter adds a line; phone Return adds a line and Send posts.
+P-62 proposes literal message text with clickable links and inline images,
+without Markdown rendering in milestone 1.
 **Sending and failure presentation resolved by D-32:** small grey
 “sending...” below the message; failed messages remain temporarily in the
 app with a red exclamation mark that retries when clicked. Failed entries
@@ -2265,8 +2301,8 @@ Include the conversation's images in the archive and its verification
 (D-20).
 **Archive format resolved by D-70:** one self-describing structured
 conversation log with images and gap notes, without a plaintext transcript
-or extra reading tools. P-61 asks whether archiving also parts every owner
-account from the room across its IRC clients.
+or extra reading tools. D-71 parts every owner on archive and rejoins the
+bound account when it opens the legitimately reopened room.
 For rooms being archived, preserve conversation history and references.
 Discarded design rooms are exempt. Do not assume existing JSONL
 files alone prove a complete archive, or that removing a room from a client
@@ -2533,6 +2569,15 @@ text and image references must be understandable from the structured files.
 Verify that gap notes and later-confirmation annotations identify their sends
 unambiguously, and that no separate plaintext transcript is produced. Test
 reading after a late correction and a close/reopen/close cycle.
+For D-71, archive a synthetic work room joined by multiple owner accounts
+and multiple clients of one account: each owner's actual membership must
+be removed across its clients while its login, other rooms, log and images
+remain intact. Include an additional owner from the shared owner set and
+an owner already absent from the room. Verify failed/unknown PART handling
+and restart recovery without claiming success. Reopen the same work room,
+open it as one owner and verify that account rejoins with the preserved
+conversation. Race an older closure against that join; it must not remove
+the new membership. Agent/assistant session records remain unchanged.
 Check stored dimensions and file size against the approved caps independently
 of viewport width. Resizing the window changes only display; opening and
 archiving use the capped version, with no retained high-resolution original.
@@ -2605,8 +2650,9 @@ D-66's bounded late-send checks and verified archive correction in that
 shared lifecycle work: 24 hours from closure, plus a check on genuine reopen,
 with no indefinite watcher or browser-owned background job.
 Use D-70's single self-describing structured archive format in that work;
-exclude plaintext transcript generation. Settle P-61's owner membership
-cleanup before finalizing the archive lifecycle slice.
+exclude plaintext transcript generation. Include D-71's all-owner PART
+cleanup and verified rejoin on opening the reopened room in the same shared
+lifecycle contract, with protection against stale closure operations.
 Exclude D-30's optional current-task line and setting from all milestone-1
 slices; retain only the milestone-2 note.
 The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
