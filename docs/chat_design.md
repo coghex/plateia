@@ -179,6 +179,7 @@ Out of scope:
 - The board and its workflow, reactions, and tracker mini-cards.
 - Markdown rendering: deferred to a later milestone, with no milestone
   number selected (D-72).
+- Automatic previews for outside image or website links (D-73).
 - Dedicated design rooms (rejected by D-16).
 - Custom rooms with their own rules: an owner-requested future requirement,
   deferred beyond milestone 1 with no target milestone or design selected
@@ -1555,6 +1556,19 @@ Wrapping to fit phone or desktop is presentation only and must not rewrite
 stored text. The existing safe-link and untrusted-content rules still apply:
 render text as text, and make only http/https destinations clickable.
 
+### D-73. Inline only plateia-stored images; leave outside URLs as links
+
+Owner decision 2026-10-21. Accept P-63. Milestone 1 renders inline only
+images stored by plateia. Outside image URLs remain clickable links, with
+no automatic image or website previews. Merely displaying a message must
+not fetch an outside URL to produce a preview.
+
+Recognize managed image references using the configured origin and stored
+object identity, not a filename extension or an arbitrary URL claiming to
+be an image. Keep the stored-image caps and retention/archive requirements.
+The early placeholder-link slice still shows links until inline rendering
+ships; the completed milestone displays managed images inline under D-17.
+
 ## Proposals
 
 ### P-1. Make issue/PR room semantics shared
@@ -2050,16 +2064,34 @@ Markdown is deferred to a later milestone, without a selected milestone number.
 
 ### P-63. Inline only images stored by plateia
 
-Recommend rendering an image inline only when its URL identifies an image
-in plateia's managed image store. Other http/https links, including links to
-external images, remain clickable text in milestone 1; do not fetch them
-automatically for image or website previews.
+Resolved by D-73, owner decision 2026-10-21. Only plateia-stored images render
+inline; outside image URLs stay clickable links, without automatic image or
+website previews.
 
-This keeps inline rendering tied to the approved stored-image caps, retention
-and archival contract. Recognize managed image references using the configured
-origin and actual stored object identity, not just a filename extension.
-The early placeholder-link slice still uses links for managed images until
-inline rendering ships. Owner approval is pending.
+### P-64. Deliver text chat, then images, then the new room lifecycle
+
+Recommend this milestone-1 delivery order:
+
+1. Establish the necessary shared API/sender contracts and deliver usable
+   text chat in existing configured rooms: reading, posting and history
+   together, with owner identity, draft handling, user lists and reliability.
+2. Add image sharing through paste and the image button, first as managed
+   links and then inline, with caps, retention, references and phone testing.
+3. Deliver the shared issue/PR room model, remaining room-type integration,
+   verified conversation/image archives and the per-project clean cutover.
+   Make the owner-specific global skill changes here, as D-8 requires.
+
+All three stages are required for milestone 1. This order lets the new
+archive lifecycle be exercised against working image storage immediately,
+and lets the owner use text chat while the room migration is still pending.
+Initial shared contracts must anticipate room identities, archive/image
+references and lifecycle generations so later stages do not create competing
+records. Shared prerequisite work can precede its visible stage where needed.
+
+This is proposed delivery ordering, not approval of implementation, live
+cutover, a ready design or final child-issue boundaries. Resolve the remaining
+shared technical contracts and define reviewable dependency-ordered slices
+after the owner settles this order. Owner approval is pending.
 
 ## Open questions
 
@@ -2172,7 +2204,7 @@ D-34 supersedes the minimal framing for submitted messages.
 Shift+Enter adds a line; phone Return adds a line and Send posts.
 **Text rendering resolved by D-72:** literal text, spacing and line breaks,
 with clickable links and inline images. Markdown is deferred to a later
-milestone. P-63 proposes which image links render inline.
+milestone. D-73 limits inline rendering to plateia-stored images.
 **Sending and failure presentation resolved by D-32:** small grey
 “sending...” below the message; failed messages remain temporarily in the
 app with a red exclamation mark that retries when clicked. Failed entries
@@ -2282,8 +2314,8 @@ larger inputs follow the failed-upload rule. Remaining:
 device paste and chooser validation, processing mechanics, link access and
 archive mechanics.
 Plateia stores images; shared chat records their links.
-P-63 proposes inline rendering for managed image references only, with
-external image URLs remaining clickable links in milestone 1.
+**Inline scope resolved by D-73:** managed image references render inline;
+external image URLs stay clickable links with no image or website previews.
 
 ### Q-7. Which page framework, evaluation method and browser layout?
 
@@ -2516,6 +2548,12 @@ display, history and structured archive. Preserve the underlying text and
 line breaks; responsive wrapping must not alter them. Links stay clickable
 only for allowed destinations, and inline images retain their composition
 position. Do not add Markdown parsing or a rich-formatting toolbar.
+For D-73, display managed image references, outside image URLs and ordinary
+website links in both live messages and loaded history. Only verified
+managed objects may render inline. Observe network requests to confirm that
+outside links are not fetched merely to display messages, including links
+whose path looks like an image or whose hostname resembles the managed
+origin. Explicitly opening a link remains a normal owner action.
 Check D-31's desktop Enter/Shift+Enter and phone Return/Send behavior,
 including input-method composition and attempts to submit while an image
 upload is unfinished or the connection is unavailable.
@@ -2659,6 +2697,10 @@ dismissed. No new browser-push path belongs in milestone 1.
 
 ## Delivery plan
 
+P-64 proposes text chat first, image sharing second, and the shared work-room
+lifecycle/archive/cutover third, all within milestone 1. This ordering is
+awaiting the owner's decision; it is not yet a finalized slice ledger.
+
 No fully specified child slices yet. Define stable `CHAT-N` entries and mirror them in
 Processing status after blocking choices are settled. Each must identify its
 owning repository, dependencies and a reviewable outcome. Include D-8's
@@ -2690,7 +2732,8 @@ Exclude D-30's optional current-task line and setting from all milestone-1
 slices; retain only the milestone-2 note.
 Apply D-72's literal rendering in the first working-chat slice. Exclude
 Markdown rendering from milestone-1 dependencies and slices; no later
-milestone number is assigned. Settle P-63 before the inline-image slice.
+milestone number is assigned. Apply D-73 in the inline-image slice and do
+not add an external-link preview service or dependency.
 The first frontend slice includes D-26/D-27's Svelte/Vite setup, exact
 dependency pins and web CI job feeding `build-test`. Keep implementation
 in normal isolated code worktrees; this document does not install tools.
