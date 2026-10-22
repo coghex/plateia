@@ -47,7 +47,7 @@ concrete precondition
 - [x] CHAT-18. Implement shared room identities and issue/PR lifecycle mapping — [#55]
 - [x] CHAT-19. Verify structured room archives with their images and membership cleanup — [#56]
 - [x] CHAT-20. Close dismissed send gaps and reconcile bounded late history — [#57]
-- [ ] CHAT-21. Present every room type and its lifecycle in plateia
+- [x] CHAT-21. Present every room type and its lifecycle in plateia — [#58]
 - [ ] CHAT-22. Provide guarded per-project cutover and owner-specific guidance
 - [ ] CHAT-23. Qualify the complete milestone across service and browser boundaries
 
