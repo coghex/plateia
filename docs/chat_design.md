@@ -44,7 +44,7 @@ concrete precondition
 - [x] CHAT-24. Connect shared chat to image pins and retention receipts — [#52]
 - [x] CHAT-16. Compose image links through paste and the image button — [#53]
 - [x] CHAT-17. Render managed images inline and verify phone formats — [#54]
-- [ ] CHAT-18. Implement shared room identities and issue/PR lifecycle mapping
+- [x] CHAT-18. Implement shared room identities and issue/PR lifecycle mapping — [#55]
 - [ ] CHAT-19. Verify structured room archives with their images and membership cleanup
 - [ ] CHAT-20. Close dismissed send gaps and reconcile bounded late history
 - [ ] CHAT-21. Present every room type and its lifecycle in plateia
