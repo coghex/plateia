@@ -9,7 +9,12 @@ D-97 separately authorizes the implementing slices to install pinned project
 dependencies in their own environments; it does not authorize global installs
 or live service changes.
 
-Design state: `ready for issue processing`
+Design state: `exploring`
+
+D-99 records the approved additional shared-skills image-pinning boundary.
+Exact ledger, delivery-plan and epic alignment is awaiting project-manager
+signoff before issue processing resumes; the owner has authorized continuing
+with CHAT-15 after that alignment.
 
 Vision-edit rule (owner decision 2026-10-20, D-50): present the exact proposed
 wording and obtain owner approval before any future edit to `docs/vision.md`.
@@ -2039,6 +2044,30 @@ detail within this behavior.
 
 This resolves CHAT-11's deliberately open URL/navigation choice in Q-7,
 without changing the approved slice boundaries or prior owner decisions.
+
+### D-99. Add shared image-pinning integration before image composition
+
+Owner decision 2026-10-22. Amend D-76's original 23 boundaries by adding
+one shared-skills child after CHAT-15 and before CHAT-16, with a new stable
+ID and no renumbering. Use CHAT-24 for this additional child. It connects
+the shared sender and history/live observers to P-75's local asset command:
+pin before an IRC write, retain the receipt in the shared send journal,
+transfer send protection to message protection, preserve uncertain/retry
+references, and pin managed links observed from other IRC clients.
+
+CHAT-15 delivers the Plateia-owned catalog, local command and contract
+fixtures. CHAT-24 delivers and verifies the real shared integration before
+CHAT-16 enables image composition. Keep the existing repository separation:
+CHAT-24 follows D-75's local shared-skills delivery; CHAT-15 and CHAT-16
+remain Plateia pull-request work. No already-filed child gains this work.
+The accepted retention and image behavior in D-86/P-75 is unchanged.
+
+The owner authorizes recording this boundary change, bringing the exact
+ledger/dependency and epic edits to the project manager under D-96, then
+continuing with CHAT-15. Until that alignment is signed off and applied,
+the current 23-entry ledger remains the prior approved tracker cursor.
+The resulting plan has 24 children, with all existing IDs preserved.
+No issue creation, implementation acceptance or live activation is implied.
 
 ## Proposals
 
