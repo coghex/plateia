@@ -9,12 +9,11 @@ D-97 separately authorizes the implementing slices to install pinned project
 dependencies in their own environments; it does not authorize global installs
 or live service changes.
 
-Design state: `exploring`
+Design state: `ready for issue processing`
 
-D-99 records the approved additional shared-skills image-pinning boundary.
-Exact ledger, delivery-plan and epic alignment is awaiting project-manager
-signoff before issue processing resumes; the owner has authorized continuing
-with CHAT-15 after that alignment.
+D-99 amends the original boundaries with CHAT-24 between CHAT-15 and CHAT-16.
+The owner authorized this change and continuation with CHAT-15; the ledger,
+delivery plan and epic carry the project-manager-approved alignment.
 
 Vision-edit rule (owner decision 2026-10-20, D-50): present the exact proposed
 wording and obtain owner approval before any future edit to `docs/vision.md`.
@@ -42,6 +41,7 @@ concrete precondition
 - [x] CHAT-13. Show room users and owner join/leave controls — [#49]
 - [x] CHAT-14. Display bridge-backed agent-delivery errors on messages — [#50]
 - [ ] CHAT-15. Store capped images with durable references and safe cleanup
+- [ ] CHAT-24. Connect shared chat to image pins and retention receipts
 - [ ] CHAT-16. Compose image links through paste and the image button
 - [ ] CHAT-17. Render managed images inline and verify phone formats
 - [ ] CHAT-18. Implement shared room identities and issue/PR lifecycle mapping
@@ -51,8 +51,9 @@ concrete precondition
 - [ ] CHAT-22. Provide guarded per-project cutover and owner-specific guidance
 - [ ] CHAT-23. Qualify the complete milestone across service and browser boundaries
 
-These 23 slices follow D-74's approved stage order. D-76 approves their
-boundaries at `e6107c0663`, boundaries only. D-81 settles K-1's design
+These 24 slices follow D-74's approved stage order. D-76 approved the original
+23 boundaries at `e6107c0663`; D-99 adds CHAT-24 between CHAT-15 and CHAT-16
+without renumbering the existing slices. D-81 settles K-1's design
 contract; D-82 settles K-2's state mapping; D-86 settles K-3's image contract.
 Their integration checks remain required. D-87–D-94 settle K-4's design
 contract, as mapped in the coverage review below. Epic [#36](https://github.com/coghex/plateia/issues/36)
@@ -2064,9 +2065,12 @@ The accepted retention and image behavior in D-86/P-75 is unchanged.
 
 The owner authorizes recording this boundary change, bringing the exact
 ledger/dependency and epic edits to the project manager under D-96, then
-continuing with CHAT-15. Until that alignment is signed off and applied,
-the current 23-entry ledger remains the prior approved tracker cursor.
-The resulting plan has 24 children, with all existing IDs preserved.
+continuing with CHAT-15. The aligned plan has 24 children, with all existing IDs preserved.
+CHAT-24 depends on CHAT-15 and the existing shared history/sender contracts
+in CHAT-3, CHAT-5 and CHAT-6; CHAT-16 additionally depends on CHAT-24.
+The project-manager-approved alignment restores issue-processing readiness
+under the owner's instruction to continue; each child still needs its own
+exact-draft signoff before filing.
 No issue creation, implementation acceptance or live activation is implied.
 
 ## Proposals
@@ -3340,9 +3344,11 @@ removed as part of accepting this design.
 The repository currently has only the routine-inbox package and no asset
 catalog/export implementation. This is a new contract, not an existing
 capability verified by source inspection. CHAT-15 provides the catalog, local
-API, reference transitions and cleanup; CHAT-16 supplies browser draft and
+API, reference transitions and cleanup with contract fixtures. D-99 assigns
+real sender/live/history pin integration and retained journal receipts to
+CHAT-24, between CHAT-15 and CHAT-16. CHAT-16 supplies browser draft and
 retry-disposal evidence; CHAT-19/CHAT-20 consume archive operations from shared
-lifecycle code under the later K-4 contract. Keep those approved boundaries.
+lifecycle code under the later K-4 contract. These are separate delivery lanes.
 
 Verify crash points around file/catalog commit, pin/enqueue/draft release,
 retry disposal, deletion versus new acquisition and archive copying. Stop the
@@ -4831,9 +4837,11 @@ dismissed. No new browser-push path belongs in milestone 1.
 ## Delivery plan
 
 D-74 approves three stages: text chat, images, then the new room lifecycle,
-archives and per-project cutovers. D-76 approves the following **23 slice
-boundaries** at `e6107c0663`. The contract gates are resolved and D-95 records
-readiness approval at `872b7eb262`. Each epic/child draft still needs its
+archives and per-project cutovers. D-76 approved the original 23 boundaries
+at `e6107c0663`; D-99 adds CHAT-24, giving **24 slice boundaries** with no
+renumbering. The contract gates are resolved; D-95 records the original
+readiness approval at `872b7eb262`, and D-99 authorizes continuation after
+the boundary alignment. Each epic/child draft still needs its
 own signoff before filing; no pull request is created by design processing.
 
 All issues use `coghex/plateia`. “Shared skills” means implementation in the
@@ -4859,7 +4867,8 @@ checks actually ran in CI versus locally; neither substitutes for the other.
 
 These gates separate settled contracts from unfinished design work; they
 are not permission to let implementers invent behavior. D-76 approves the
-dependency decomposition, while D-81/D-82/D-86 settle K-1/K-2/K-3's design contracts.
+original dependency decomposition, amended by D-99; D-81/D-82/D-86 settle
+K-1/K-2/K-3's design contracts.
 The K-4 coverage review below maps its later approvals. Approved boundaries
 alone never settle a contract. Carry each accepted contract into its affected
 issue. Bring any new user-visible behavior or serious ownership choice to the
@@ -4869,7 +4878,7 @@ owner; exact field spelling and test mechanics are implementation details.
 | --- | --- | --- |
 | K-1 / Q-3 | Versioned Python API execution in existing shared processes; single-writer ownership and restart fencing; durable journal states; browser/server deadline clock basis; logical fragment identity/completeness; authoritative history/live cursor and retry evidence. Retain D-47's unknown outcome whenever proof is absent. | CHAT-1–CHAT-6, CHAT-8–CHAT-12 |
 | K-2 / Q-5 | Verify sources that distinguish idle, working and waiting on the owner from mere live-session registration; specify freshness and unknown results without guessing. | CHAT-7, CHAT-13 |
-| K-3 / Q-6 | Upload encoding within the approved browser boundary, processor/pins and resource bounds; persisted image drafts before/after failed upload without retained HD attachments; one asset-reference/export contract usable by shared archiving while the web process is down. | CHAT-15–CHAT-17, CHAT-19 |
+| K-3 / Q-6 | Upload encoding within the approved browser boundary, processor/pins and resource bounds; persisted image drafts before/after failed upload without retained HD attachments; one asset-reference/export contract usable by shared archiving while the web process is down. | CHAT-15, CHAT-24, CHAT-16–CHAT-17, CHAT-19 |
 | K-4 / Q-2, Q-8 | Tracker-to-room lifecycle evidence/generations; posting barrier covering other IRC clients; authoritative archive coverage, image verification and atomic completion/correction; membership cleanup and interruption/reopen recovery. | CHAT-18–CHAT-22 |
 
 D-75 resolves tracking and local skills delivery. D-68's HEIC question is a
@@ -4903,7 +4912,7 @@ This is a consolidation of accepted decisions, not a new behavior proposal.
 | Owner cleanup and reopen fencing | D-71: part all owners at archive, join the bound owner on legitimate opening. D-89/P-78 and D-93/P-82: generations, operation receipts, blocked unknown old commands, current-state verification and reconnect repair. | CHAT-18–CHAT-21 |
 | Unconfirmed sends and all-client late posts | D-65/D-66 and D-88/P-77: named dismissed gaps, correction across all clients for 24 hours and on legitimate reopen only; no indefinite history watcher. D-93 accepts the IRC restart gap. | CHAT-19, CHAT-20 |
 | Legacy rollout | D-44: per-project clean cutover, warning and owner closure prerequisites, explicit parked exceptions. D-16: discard old design rooms without logs. The manager owns concrete rollout mapping; live actions retain their authorization gates. | CHAT-22 |
-| Web independence | D-93/D-94: all shared operations and local archives work with the web stopped; web-served content is unavailable. The dependency audit is closed, with explicit runtime qualification still required. | CHAT-15, CHAT-18–CHAT-23 |
+| Web independence | D-93/D-94: all shared operations and local archives work with the web stopped; web-served content is unavailable. The dependency audit is closed, with explicit runtime qualification still required. | CHAT-15, CHAT-24, CHAT-18–CHAT-23 |
 
 K-4's design contract is resolved. Preserve its limits when drafting: a
 snapshot is not proof that all server handlers finished, confirmed IRC state
@@ -4912,7 +4921,7 @@ reopening until manager-first recovery obtains evidence. Never convert those
 limits into a success inferred from elapsed time.
 
 Readiness checks: the epic goal/done condition and non-goals are explicit;
-the 23 approved boundaries remain in dependency order with matching ledger
+the 24 approved boundaries remain in dependency order with matching ledger
 entries; K-1–K-4 have accepted contracts; compatibility, retention, recovery,
 privacy, local shared-skills delivery and live setup gates are recorded.
 HEIC remains deliberately conditional under D-68, and concrete per-project
@@ -5117,9 +5126,10 @@ and no hook, live config or service was changed during these checks.
   and desktop, including history, drafts, correct identity/membership, user
   lists, send recovery and bridge-backed delivery errors. Intermediate PRs
   are not represented as a finished reliable chat experience.
-- **Stage 2, CHAT-15–CHAT-17:** managed image links, then inline images,
-  with reference retention/cleanup and both input methods from the first
-  image feature. Stored caps apply from the start.
+- **Stage 2, CHAT-15, CHAT-24, CHAT-16, CHAT-17:** capped catalog and local
+  asset command, real shared pin integration, then managed image links and
+  inline images. Reference retention/cleanup and both input methods apply
+  from the first image feature. Stored caps apply from the start.
 - **Stage 3, CHAT-18–CHAT-23:** new room types and issue/PR conventions,
   verified archives, bounded gap correction, per-project cutover readiness
   and full integration evidence. No live cutover is bundled into a code
@@ -5283,20 +5293,31 @@ and no hook, live config or service was changed during these checks.
 
 - **Outcome:** Capped image assets survive every valid reference and expire only when proven unused.
 - **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
-- **Scope:** Add bounded PNG/JPEG/WebP processing, protected upload/read endpoints, durable capped assets and draft/send/archive reference accounting. Include 24-hour deletion only after proven unreferenced, plus a documented archive export/pinning contract usable without the web process.
+- **Scope:** Add bounded PNG/JPEG/WebP processing, protected upload/read endpoints, durable capped assets and draft/send/archive reference accounting. Include 24-hour deletion only after proven unreferenced, plus the versioned local archive export/pinning command usable without the web process. Verify catalog transitions with contract fixtures; CHAT-24 owns the real shared callers.
 - **Phase:** 2. **Depends on:** CHAT-12, CHAT-13, CHAT-14. **Ordering:** critical path.
-- **Relevant decisions:** D-18–D-23, D-49, D-68, D-69, D-83–D-86, D-93, D-94.
+- **Relevant decisions:** D-18–D-23, D-49, D-68, D-69, D-83–D-86, D-93, D-94, D-99.
 - **Acceptance signals:** Input/output limits and malformed-image failures are enforced. Drafts, retries, uncertain sends and archives protect assets across restart; only provably unused objects expire. No retained HD attachment and no unconditional HEIC dependency.
-- **Out of scope:** Inline rendering, archive UI and live data cleanup.
+- **Out of scope:** Shared sender/live/history caller implementation (CHAT-24), browser composition, inline rendering, archive UI and live data cleanup.
 - **Open questions / stop conditions:** K-3 is settled by D-83–D-86. Implement and verify P-75's catalog/reference/export contract and the approved processing bounds; do not treat approval as runtime qualification.
+
+### CHAT-24. Connect shared chat to image pins and retention receipts
+
+- **Outcome:** Shared sends and observed messages retain their managed images through restart and uncertainty before browser image composition ships.
+- **Implementation owner:** Shared skills, local delivery under D-75.
+- **Scope:** Connect the shared sender and live/history observers to CHAT-15's versioned local asset command under P-75. Acquire pins before IRC writes, journal receipts, transfer send references to message references, preserve uncertain/retry protection, reconcile separate durable operations, and pin managed links observed from other clients. Ordinary text remains usable if the helper is unavailable; affected image operations fail unresolved without releasing their protection.
+- **Phase:** 2. **Depends on:** CHAT-15, CHAT-3, CHAT-5, CHAT-6. **Ordering:** critical path.
+- **Relevant decisions:** D-20, D-49, D-77, D-86/P-75, D-93, D-94, D-99.
+- **Acceptance signals:** Real shared integration with the reviewed asset command verifies pin-before-write, receipt/restart recovery, send-to-message transfer, conservative retry/unconfirmed retention and managed links from independent IRC clients. Web-stopped operation and helper failures preserve assets without extending send deadlines or blocking ordinary text. Contract fakes alone do not qualify this child.
+- **Out of scope:** Image normalization/catalog implementation, browser upload/composition/rendering, archive lifecycle implementation (CHAT-19/CHAT-20), retention-policy changes and live activation.
+- **Open questions / stop conditions:** D-99 assigns the previously missing shared integration without changing P-75's behavior. Report any incompatible command/journal contract before weakening reference safety or duplicating the catalog.
 
 ### CHAT-16. Compose image links through paste and the image button
 
 - **Outcome:** The owner can paste or select images into a persistent draft and send their managed links.
 - **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
 - **Scope:** Insert managed placeholder links at the draft position from paste or chooser, upload immediately and post only on Send. Preserve text/images across switches and reloads, tie references to send IDs, and block the whole message on failed or unfinished uploads.
-- **Phase:** 2. **Depends on:** CHAT-15, CHAT-11. **Ordering:** critical path.
-- **Relevant decisions:** D-17–D-19, D-23, D-33, D-38, D-49, D-67–D-69.
+- **Phase:** 2. **Depends on:** CHAT-15, CHAT-24, CHAT-11. **Ordering:** critical path.
+- **Relevant decisions:** D-17–D-19, D-23, D-33, D-38, D-49, D-67–D-69, D-99.
 - **Acceptance signals:** Both phone and desktop entry paths use the same durable draft/upload flow. Cancelled selection preserves the draft; failed uploads remain retryable/removable and image links count toward the text limit.
 - **Out of scope:** Inline images, external image fetching and retaining an HD source as a saved attachment.
 - **Open questions / stop conditions:** K-3 is settled. Verify D-83's unfinished-image reload behavior and P-75's draft/reference transitions.
@@ -5380,7 +5401,8 @@ and no hook, live config or service was changed during these checks.
 - **Out of scope:** A new feature batch, duplicated unit tests, production fault injection and claiming HEIC or live cutover verification without evidence.
 - **Open questions / stop conditions:** K-1–K-4's design contracts are resolved; qualification must prove their agreed outcomes and limits. Any triggered D-68 dependency decision still needs owner approval, and owner acceptance determines milestone completion.
 
-D-76 and D-95 approve the slice boundaries and design readiness.
+D-76 and D-95 approve the original boundaries and readiness; D-99 adds the
+shared image-pinning child and authorizes continuation after alignment.
 `process-design-doc` processes the epic first and one child
 at a time, obtaining separate signoff before each tracker artifact is filed.
 Under D-96, bring future child drafts to the project manager for signoff; new
