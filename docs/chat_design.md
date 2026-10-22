@@ -5,6 +5,10 @@ phone and desktop. It records the milestone's existing owner decisions and
 keeps unresolved choices explicit. It does not authorize implementation,
 installation, live configuration or service changes.
 
+D-97 separately authorizes the implementing slices to install pinned project
+dependencies in their own environments; it does not authorize global installs
+or live service changes.
+
 Design state: `ready for issue processing`
 
 Vision-edit rule (owner decision 2026-10-20, D-50): present the exact proposed
@@ -1993,6 +1997,26 @@ Owner clarification 2026-10-21: epics are tracking issues and do not require
 the solvable-issue readiness review gate. Epic #36 is verified and its owner
 filing approval stands. Each filed child still receives the opposite-brand
 issue review launched by the project manager.
+
+### D-97. Use Starlette and Uvicorn; authorize project dependency installation
+
+Owner decision 2026-10-22. Use Starlette for the Python web application,
+served by Uvicorn, with exact dependency pins and the new application's
+Python 3.11/3.14 checks under D-84. The Python adapter serves the API, live
+responses and Svelte build from one protected origin; shared chat workflow
+remains in the bridge. CHAT-10 implements this selection.
+
+The owner also authorizes the implementing milestone-1 slices to install
+the libraries and toolchain they need into the project's own environments
+and lockfiles in their isolated worktrees. This includes Starlette/Uvicorn,
+D-84/P-73's Pillow dependency and D-26/D-27's Node/Svelte toolchain when
+their slices reach them. Preserve exact pins, reproducible installation and
+the existing component-specific Python compatibility boundaries.
+
+This authorization does not extend to global installs, changing live services,
+IRC configuration or activating the application. Existing deployment and
+shared-skills merge/activation gates remain in force. The design session
+does not need to install these dependencies merely to draft issues.
 
 ## Proposals
 
@@ -5119,9 +5143,9 @@ and no hook, live config or service was changed during these checks.
 
 - **Outcome:** The browser reaches shared chat through one protected Python adapter as its bound owner.
 - **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
-- **Scope:** Add the Python 3.11+ application/static serving and typed shared-API adapter. Bind Phone/Desktop profiles through the server-backed cookie and enforce the approved localhost/Tailscale, Host, Origin and mutation protections. Expose history/live, send and membership operations without duplicating shared workflow. Add separate backend 3.11/3.14 checks under D-84, retaining the inbox's 3.10/3.14 matrix.
+- **Scope:** Add the Python 3.11+ Starlette application, Uvicorn/static serving and typed shared-API adapter under D-97. Bind Phone/Desktop profiles through the server-backed cookie and enforce the approved localhost/Tailscale, Host, Origin and mutation protections. Expose history/live, send and membership operations without duplicating shared workflow. Add separate backend 3.11/3.14 checks under D-84, retaining the inbox's 3.10/3.14 matrix.
 - **Phase:** 1. **Depends on:** CHAT-3, CHAT-4, CHAT-6, CHAT-7, CHAT-8, CHAT-9. **Ordering:** critical path.
-- **Relevant decisions:** D-6, D-25, D-61, D-62, D-75.
+- **Relevant decisions:** D-6, D-25, D-61, D-62, D-75, D-84, D-97.
 - **Acceptance signals:** Synthetic requests reject arbitrary actors and invalid bindings; operations keep their original owner. API failures stay typed and static/API serving uses one protected origin.
 - **Out of scope:** Copied chat code, browser IRC credentials, new shared IPC daemon and live service installation.
 - **Open questions / stop conditions:** K-1 design resolved by D-81; consume P-70's accepted API/feed through the protected web boundary. Q-7's remaining page-level details stay separate.
