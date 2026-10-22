@@ -24,7 +24,7 @@ concrete precondition
 - [x] CHAT-4. Share owner IRC sessions and verified room membership — [#40]
 - [x] CHAT-5. Persist and fence logical send attempts before IRC writes — [#41]
 - [x] CHAT-6. Connect the shared sender to Ergo with conservative recovery — [#42]
-- [ ] CHAT-7. Publish role and agent-state facts from real sessions
+- [x] CHAT-7. Publish role and agent-state facts from real sessions — [#43]
 - [ ] CHAT-8. Expose durable per-recipient bridge delivery outcomes
 - [ ] CHAT-9. Apply mention routing to complete logical messages
 - [ ] CHAT-10. Serve a protected Python web adapter with browser owner binding
