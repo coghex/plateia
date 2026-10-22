@@ -33,7 +33,7 @@ concrete precondition
 - [x] CHAT-9. Apply mention routing to complete logical messages — [#45]
 - [x] CHAT-10. Serve a protected Python web adapter with browser owner binding — [#46]
 - [x] CHAT-11. Build the first text chat page with live history and composition — [#47]
-- [ ] CHAT-12. Complete browser send recovery and remembered dismissal
+- [x] CHAT-12. Complete browser send recovery and remembered dismissal — [#48]
 - [ ] CHAT-13. Show room users and owner join/leave controls
 - [ ] CHAT-14. Display bridge-backed agent-delivery errors on messages
 - [ ] CHAT-15. Store capped images with durable references and safe cleanup
