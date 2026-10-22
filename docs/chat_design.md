@@ -40,7 +40,7 @@ concrete precondition
 - [x] CHAT-12. Complete browser send recovery and remembered dismissal — [#48]
 - [x] CHAT-13. Show room users and owner join/leave controls — [#49]
 - [x] CHAT-14. Display bridge-backed agent-delivery errors on messages — [#50]
-- [ ] CHAT-15. Store capped images with durable references and safe cleanup
+- [x] CHAT-15. Store capped images with durable references and safe cleanup — [#51]
 - [ ] CHAT-24. Connect shared chat to image pins and retention receipts
 - [ ] CHAT-16. Compose image links through paste and the image button
 - [ ] CHAT-17. Render managed images inline and verify phone formats
