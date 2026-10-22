@@ -48,7 +48,7 @@ concrete precondition
 - [x] CHAT-19. Verify structured room archives with their images and membership cleanup — [#56]
 - [x] CHAT-20. Close dismissed send gaps and reconcile bounded late history — [#57]
 - [x] CHAT-21. Present every room type and its lifecycle in plateia — [#58]
-- [ ] CHAT-22. Provide guarded per-project cutover and owner-specific guidance
+- [x] CHAT-22. Provide guarded per-project cutover and owner-specific guidance — [#59]
 - [ ] CHAT-23. Qualify the complete milestone across service and browser boundaries
 
 These 24 slices follow D-74's approved stage order. D-76 approved the original
