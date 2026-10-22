@@ -31,7 +31,7 @@ concrete precondition
 - [x] CHAT-7. Publish role and agent-state facts from real sessions — [#43]
 - [x] CHAT-8. Expose durable per-recipient bridge delivery outcomes — [#44]
 - [x] CHAT-9. Apply mention routing to complete logical messages — [#45]
-- [ ] CHAT-10. Serve a protected Python web adapter with browser owner binding
+- [x] CHAT-10. Serve a protected Python web adapter with browser owner binding — [#46]
 - [ ] CHAT-11. Build the first text chat page with live history and composition
 - [ ] CHAT-12. Complete browser send recovery and remembered dismissal
 - [ ] CHAT-13. Show room users and owner join/leave controls
