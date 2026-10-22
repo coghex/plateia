@@ -561,8 +561,8 @@ Design selection 2026-10-20 under D-25's explicit instruction:
   a second production server. Development servers bind to localhost.
 - Use the official `@sveltejs/vite-plugin-svelte`. SvelteKit's client-only
   static mode is viable, but its routing/loading conventions are unnecessary
-  for the current chat page. Room URL and browser-history handling still
-  need a small explicit contract.
+  for the current chat page. D-98 settles room URL and browser-history
+  behavior.
 - Use Tiptap 3's open-source core and ProseMirror packages through a Svelte
   component: create the editor on mount, track editor transactions, and
   destroy it on unmount. Enable only the message schema needed for text,
@@ -2017,6 +2017,28 @@ This authorization does not extend to global installs, changing live services,
 IRC configuration or activating the application. Existing deployment and
 shared-skills merge/activation gates remain in force. The design session
 does not need to install these dependencies merely to draft issues.
+
+### D-98. Give rooms bookmarkable addresses and browser navigation
+
+Owner decision 2026-10-22. Accept P-84. Each room has a bookmarkable
+address. Selecting a room updates the address; browser Back and Forward
+switch rooms while keeping each room's draft under D-23. Reloading or
+opening a bookmark returns to that room after the normal owner-access and
+Phone/Desktop profile check. The home address shows the room chooser,
+without silently selecting or joining a room. An unknown address shows
+“room unavailable” instead of opening another room.
+
+Existing join and archive rules still apply. Opening an eligible room joins
+as the bound owner, preserves earlier joins and does not turn rerendering
+into another join. A bookmark cannot authorize an arbitrary channel or
+reopen an archive. CHAT-11 starts with existing rooms; CHAT-21 applies the
+approved room model and archived-room behavior. Use shared room identity
+and the protected origin; no draft, send content, credential or browser
+binding token belongs in a URL. Route encoding remains an implementation
+detail within this behavior.
+
+This resolves CHAT-11's deliberately open URL/navigation choice in Q-7,
+without changing the approved slice boundaries or prior owner decisions.
 
 ## Proposals
 
@@ -4075,12 +4097,12 @@ No slice boundary change or live action is proposed.
 
 ### P-84. Give each room a bookmarkable address and normal browser navigation
 
-Proposed 2026-10-22 while processing CHAT-11; not an owner decision.
-D-26 and CHAT-11 explicitly leave room URL/browser-history behavior open.
-There is still no frontend in the repository; CHAT-10 is filed as #46 and
-supplies the protected adapter and browser owner binding, not this choice.
+Accepted by D-98, owner decision 2026-10-22. Proposed while processing
+CHAT-11's deliberately open room URL/browser-history contract. At that
+point there was no frontend in the repository; CHAT-10 (#46) supplies the
+protected adapter and browser owner binding.
 
-Recommend one bookmarkable address per room. Selecting a room updates the
+The accepted proposal gives one bookmarkable address per room. Selecting a room updates the
 address; browser Back and Forward switch rooms, retaining each room's draft
 under D-23. Reloading or opening a bookmark returns to that room after any
 required owner-access/profile setup. The root page shows the room chooser
@@ -4096,8 +4118,8 @@ account selection, draft retention or slice boundaries.
 
 The alternative is keeping room selection only inside the page, which does
 not give the owner a room bookmark or room-by-room browser Back/Forward.
-Owner approval of the proposed navigation behavior resolves this part of
-Q-7 before CHAT-11's issue draft. URL encoding and route implementation must
+D-98 resolves this part of Q-7 before CHAT-11's issue draft.
+URL encoding and route implementation must
 use the shared room identity and #46's protected origin; a URL contains no
 draft, send content, owner credentials or browser-binding token.
 
@@ -4383,11 +4405,11 @@ as untrusted content; restrict links to http/https and safe new-tab behavior.
 Its JSON/custom-header mutation rule still applies. D-85's bounded JSON
 upload encoding stays within that boundary.
 
-**Room URL and browser navigation remain open for CHAT-11:** P-84 proposes
-bookmarkable room addresses, Back/Forward room navigation and an explicit
-root-page room chooser. Obtain the owner's answer before drafting this child.
-This is the deliberately open stop condition already named in D-26 and the
-approved CHAT-11 boundary; it does not undo approval of the filed children.
+**Room URL and browser navigation resolved by D-98:** bookmarkable room
+addresses, Back/Forward room navigation retaining drafts, an explicit home
+room chooser and an unavailable notice for unknown addresses. Keep the
+existing owner-binding, join and archive rules. This resolves the deliberately
+open stop condition in D-26 and CHAT-11 without changing slice boundaries.
 
 ### Q-8. How should existing rooms be archived and migrated?
 
@@ -5190,10 +5212,10 @@ and no hook, live config or service was changed during these checks.
 - **Implementation owner:** Plateia (`coghex/plateia`), normal PR delivery.
 - **Scope:** Introduce Svelte/Vite/TypeScript, Tiptap's minimal schema, pinned toolchain/lockfile and web CI feeding build-test. Implement responsive project/room navigation, literal live/history rendering, paging and Jump to latest, text drafting and posting in existing rooms.
 - **Phase:** 1. **Depends on:** CHAT-10. **Ordering:** critical path.
-- **Relevant decisions:** D-1, D-23–D-28, D-31, D-38–D-40, D-72.
+- **Relevant decisions:** D-1, D-23–D-28, D-31, D-38–D-40, D-72, D-98.
 - **Acceptance signals:** Phone and desktop can read and post through the real adapter; drafts retain exact text across room switches/reload. Keyboard and scrolling rules hold; web checks/build pass alongside existing Python tests.
 - **Out of scope:** Images, Markdown, work-room migration and claiming stage 1 complete before CHAT-12–CHAT-14.
-- **Open questions / stop conditions:** Q-7; resolve room URL/navigation contract and include owner-access binding from CHAT-10.
+- **Open questions / stop conditions:** Q-7's room URL/navigation contract is resolved by D-98; include owner-access binding from CHAT-10. Bring any new material design choice to the owner.
 
 ### CHAT-12. Complete browser send recovery and remembered dismissal
 
