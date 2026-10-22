@@ -35,7 +35,7 @@ concrete precondition
 - [x] CHAT-11. Build the first text chat page with live history and composition — [#47]
 - [x] CHAT-12. Complete browser send recovery and remembered dismissal — [#48]
 - [x] CHAT-13. Show room users and owner join/leave controls — [#49]
-- [ ] CHAT-14. Display bridge-backed agent-delivery errors on messages
+- [x] CHAT-14. Display bridge-backed agent-delivery errors on messages — [#50]
 - [ ] CHAT-15. Store capped images with durable references and safe cleanup
 - [ ] CHAT-16. Compose image links through paste and the image button
 - [ ] CHAT-17. Render managed images inline and verify phone formats
