@@ -4073,6 +4073,34 @@ CHAT-15 owns serving and the local asset command; CHAT-23 must check the
 approved availability boundary with the web stopped and after restart.
 No slice boundary change or live action is proposed.
 
+### P-84. Give each room a bookmarkable address and normal browser navigation
+
+Proposed 2026-10-22 while processing CHAT-11; not an owner decision.
+D-26 and CHAT-11 explicitly leave room URL/browser-history behavior open.
+There is still no frontend in the repository; CHAT-10 is filed as #46 and
+supplies the protected adapter and browser owner binding, not this choice.
+
+Recommend one bookmarkable address per room. Selecting a room updates the
+address; browser Back and Forward switch rooms, retaining each room's draft
+under D-23. Reloading or opening a bookmark returns to that room after any
+required owner-access/profile setup. The root page shows the room chooser
+instead of silently choosing or joining a room. An unknown room address
+shows an unavailable notice rather than silently opening another room.
+
+Opening an eligible room still follows D-56/D-60: join as the bound owner,
+keep previous joins, and do not turn a rerender into another join. A bookmark
+is not authority to create an arbitrary channel. CHAT-11 uses existing rooms;
+CHAT-21 later applies the approved room model, including D-58's archived
+notice with no join or reopen. This proposes no change to room lifecycle,
+account selection, draft retention or slice boundaries.
+
+The alternative is keeping room selection only inside the page, which does
+not give the owner a room bookmark or room-by-room browser Back/Forward.
+Owner approval of the proposed navigation behavior resolves this part of
+Q-7 before CHAT-11's issue draft. URL encoding and route implementation must
+use the shared room identity and #46's protected origin; a URL contains no
+draft, send content, owner credentials or browser-binding token.
+
 ## Open questions
 
 ### Q-1. Where does the new room model live?
@@ -4354,6 +4382,12 @@ configured identity, and protected mutating/streaming endpoints. Render chat
 as untrusted content; restrict links to http/https and safe new-tab behavior.
 Its JSON/custom-header mutation rule still applies. D-85's bounded JSON
 upload encoding stays within that boundary.
+
+**Room URL and browser navigation remain open for CHAT-11:** P-84 proposes
+bookmarkable room addresses, Back/Forward room navigation and an explicit
+root-page room chooser. Obtain the owner's answer before drafting this child.
+This is the deliberately open stop condition already named in D-26 and the
+approved CHAT-11 boundary; it does not undo approval of the filed children.
 
 ### Q-8. How should existing rooms be archived and migrated?
 
