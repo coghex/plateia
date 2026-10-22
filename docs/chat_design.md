@@ -42,7 +42,7 @@ concrete precondition
 - [x] CHAT-14. Display bridge-backed agent-delivery errors on messages — [#50]
 - [x] CHAT-15. Store capped images with durable references and safe cleanup — [#51]
 - [x] CHAT-24. Connect shared chat to image pins and retention receipts — [#52]
-- [ ] CHAT-16. Compose image links through paste and the image button
+- [x] CHAT-16. Compose image links through paste and the image button — [#53]
 - [ ] CHAT-17. Render managed images inline and verify phone formats
 - [ ] CHAT-18. Implement shared room identities and issue/PR lifecycle mapping
 - [ ] CHAT-19. Verify structured room archives with their images and membership cleanup
