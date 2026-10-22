@@ -45,7 +45,7 @@ concrete precondition
 - [x] CHAT-16. Compose image links through paste and the image button — [#53]
 - [x] CHAT-17. Render managed images inline and verify phone formats — [#54]
 - [x] CHAT-18. Implement shared room identities and issue/PR lifecycle mapping — [#55]
-- [ ] CHAT-19. Verify structured room archives with their images and membership cleanup
+- [x] CHAT-19. Verify structured room archives with their images and membership cleanup — [#56]
 - [ ] CHAT-20. Close dismissed send gaps and reconcile bounded late history
 - [ ] CHAT-21. Present every room type and its lifecycle in plateia
 - [ ] CHAT-22. Provide guarded per-project cutover and owner-specific guidance
